@@ -1,0 +1,114 @@
+# Generic acceptance review
+
+Acceptance runs in a persistent task session: an hc terminal or app-terminal
+host whose reviewer takes its instructions from the `deep-reasoner` role in
+`agents/fleet/`.
+Attach the CI status of the head and the recorded evidence
+(`repo-harness-issue-flow`, `references/acceptor.md` §2.1), provide a
+dedicated linked reviewer checkout and a JSON
+address file `{endpoint:{socket,home?},parent_pane}` (the hc core socket and the
+owner's hc terminal). Trust the exact
+checkout through the normal operator workflow before starting; never respond to
+trust/update/approval prompts automatically.
+
+Before review, configure the repository's manual `external_sources` policy and
+provide working provider access. The default policy is off; initialization does
+not enable it. The trusted upstream Bot must authenticate the human, authorize
+the scope, and supply the bound request. Its integration calls
+`rh review admit --repo <execution-checkout> --request <authorized-request.json>`.
+The request contains `{admission, approval, expectedRevision}`. To withdraw that
+approval, the Bot integration calls
+`rh review revoke --repo <execution-checkout> --request <revocation-request.json>`.
+That request contains
+`{repository_id, issue_id, campaign_id, expectedGrantSha256, expectedRevision}`.
+The store revokes only the exact active grant at the expected revision. Do not create an
+approval from these examples: actor IDs and authorization references are binding
+data, not authentication. Select the resulting active grant and policy digests
+below, and supply the current immutable issue claim. A contract or plan file
+cannot grant permission. A user waiver requires a separate upstream-authorized
+decision; waiver eligibility in an admission does not grant one.
+
+```bash
+rh review round --repository-id <repository-id> --issue-id <issue-id> --campaign-id <campaign-id> --grant-sha256 <approved-grant-sha256> --policy-sha256 <policy-sha256> --actor <actor-id> --reviewer-repo <linked> --herdr-endpoint <address.json> --verification <native-report> --claim-ref <claim-reference> --claim-revision <claim-sha256>
+rh review status --repository-id <repository-id> --issue-id <issue-id> --campaign-id <campaign-id> --grant-sha256 <approved-grant-sha256> --policy-sha256 <policy-sha256> --actor <actor-id>
+rh review close --repository-id <repository-id> --issue-id <issue-id> --campaign-id <campaign-id> --grant-sha256 <approved-grant-sha256> --policy-sha256 <policy-sha256> --actor <actor-id>
+```
+
+Default selection uses an existing typed task binding for the parent terminal and chooses
+its opposite. Unknown identity requires `--harness claude|codex|pi`. Pi is selected
+only by explicit `--harness pi`. Explicit
+selection never falls back; only a missing opposite executable before start
+allows a reported fallback to a separate owner-harness reviewer. No launch or
+request is replayed after an ambiguous outcome.
+
+Changed-subject repair rounds reuse the same task session, up to
+`REVIEW_MAX_ROUNDS` (`src/core/review/generic-review.ts`). The
+reviewer reads the current diff only; a defect outside the diff is a non-blocking
+note. From the second round, the scope follows the round rules
+(`repo-harness-issue-flow`, `references/acceptor.md` §2.2). Prior findings
+require stable IDs and open/resolved status. The reviewer may write
+only each exact Result file; terminal history/sentinel/idle are observation.
+The owner immutably collects the file, validates domain identity and findings,
+consumes OAR Session model observation and calls the existing generic-review
+Receipt writer/verifier. Receipt validity is launcher-independent.
+
+Close requires the current passing Receipt to equal the final accepted round.
+On failure use `rh review cancel` with the same six admission selectors for identity-proven
+cleanup without acceptance. Preserve unknown delivery and cleanup evidence.
+The hc core and the parent terminal remain with their existing owner.
+Drain pre-cutover sessions with the prior version; archive old evidence read-only.
+
+The fixed Node >=24 OAR host runs in an hc terminal under macOS
+Seatbelt: all filesystem writes outside the canonical output tree are denied, except the
+proved /dev/null device literal; TMPDIR is private inside output,
+including inherited descendant writes. The paired zero-model fixture proves
+that policy; real native/runtime behavior is still unverified. Other platforms
+fail closed. The host deletes inherited OAR_CODEX_SANDBOX; stock OAR selects Codex
+danger-full-access, with cwd=output. The OS boundary is the protection authority. Stock OAR supplies Claude's bypass flag under the
+explicitly approved OS boundary; the app adds no vendor arguments.
+
+Claude's current OAR model event is system/init only. It cannot certify the
+actual gateway backend, so the host records a Claude model as `null`. A null
+model still mints a Receipt with `model_relation: unknown` and grants no
+cross-model claim. A non-string or blank model fails with
+`review_actual_model_unverified`. Only `different-family` counts as a
+cross-model review. Hooks,
+complete packet ingestion, forced host-loss cleanup and native isolation remain
+unverified. On normal cleanup SDK dispose acknowledgement and execution-owner
+exit precede terminal close; missing proof remains pending.
+The independent direct Codex advisory runtime is retired. New acceptance
+requests use this generic domain; the removed command is not an alias or fallback.
+
+Codex runs with an owner-prepared `output/.codex-home` as `CODEX_HOME`, passed through OAR SessionOptions.env. No native state directory is granted.
+Only auth is copied (exclusive/no-follow, modes 0700/0600) and only its access `exp` is checked against the run window. Config, trust and instructions are not copied.
+The owner deletes the copy on close, cancel, start failure and timeout. A failed deletion is `cleanup_pending`.
+
+## App terminal launch
+
+Use this mode when an operator works in the Claude desktop app without Herdr.
+The Claude app session is the owner, so the default reviewer is Codex.
+
+```bash
+rh review round --launch app-terminal --repository-id <repository-id> --issue-id <issue-id> --campaign-id <campaign-id> --grant-sha256 <approved-grant-sha256> --policy-sha256 <policy-sha256> --actor <actor-id> --reviewer-repo <linked> --verification <report> --claim-ref <claim-reference> --claim-revision <claim-sha256>
+```
+
+1. The first call prepares the packet, the Seatbelt profile and the host spec.
+   It sends no request. It prints `status: "launch_required"` with `command`.
+2. Run that exact `command` once in a Claude app Terminal tab
+   (`run_in_terminal`). Do not edit it. Do not hand-write a Codex CLI call.
+3. Run the same `review round` command again, in the background. The CLI
+   waits for the host, binds it by pid, start time and exact argv, then sends
+   the round. It blocks until the Result or the round deadline.
+4. Later repair rounds reuse the same host. Do not launch it again.
+
+The terminal shows the host event stream, not a Codex TUI. The host claims the
+control directory once, so a repeated launch exits before it opens a Session.
+A cancel before any claim writes a tombstone claim, so a later launch also
+exits before it opens a Session. If the host exits or is not ready in time, the
+round fails. Read the terminal output, then run `review cancel`; do not launch
+again. Keep the tab open until `review close`. Closing the tab sends SIGHUP;
+the host disposes and exits, and the session can then only be cancelled.
+Cleanup never signals the terminal process. It waits for the host to dispose
+and exit. If a host exits after it began a Session but before `disposed.json`,
+cleanup stays pending; check for a leftover reviewer process. Terminal history
+is not available to the CLI.

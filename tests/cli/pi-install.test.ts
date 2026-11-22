@@ -1,0 +1,585 @@
+import { describe, expect, test } from 'bun:test';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { delimiter, dirname, join, relative } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import { copyPackageRuntimeFixture, tmpWorkspace, writeBunWrapper } from '../helpers/repo-fixture';
+import { installPiPackage, ownedPiPackages, piPackagePresent, piUserPackageSources, runPi, planPiPackage } from '../../src/cli/installer/pi-package';
+import { installStateStatus, prepareInstallSelectionSwitch, readInstallState, versions } from '../../src/cli/installer/install-profile';
+import { ownedPath } from '../../src/effects/host-config/path-records';
+import { openHostConfigGate } from '../../src/effects/host-config/gate';
+import { hostConfigPaths } from '../../src/effects/host-config/store';
+import { jsonFragment } from '../../src/core/host-config/json-fragment';
+import { buildManagedHooks } from '../../src/cli/installer/managed-entries';
+import { hostSkillRoot } from '../../src/effects/host-skill-roots';
+import { checkPiHost } from '../../src/cli/commands/doctor';
+import { dependencies } from '../../package.json';
+import { runTransactionalRuntimeRefresh } from '../../src/cli/runtime-transaction';
+import { installStateFixturePath, recordInstallOwnership, seedGlobalPackageFixture } from '../helpers/install-ownership';
+import { runUserUninstall } from '../../src/cli/installer/uninstall';
+import { migrateInstallState } from '../../src/cli/installer/install-state-migration';
+import { bunGlobalPackageRoot } from '../../src/cli/installer/skill-projection';
+import { piAgentDir } from '../../src/effects/pi-agent-dir';
+import { piExecutable } from '../../src/effects/pi-executable';
+import { configureRequiredHerdrSkill } from '../../src/cli/commands/herdr-skill';
+import { piReviewLaunchBlocker } from '../../src/effects/pi-host-probe';
+import { writeFakeHc } from '../helpers/fake-hc';
+
+const ROOT = join(import.meta.dir, '../..');
+const CLI = join(ROOT, 'src/cli/index.ts');
+
+// Pi package ownership belongs to the pi plugin, so a seeded state selects it beside the full set.
+const PI_FULL_PLUGINS = ['architecture', 'cross-review', 'mcp', 'operator', 'peer-runtime', 'pi', 'platform', 'product', 'strategy-memory'] as const;
+function recordPiSelection(env: NodeJS.ProcessEnv): void {
+  recordInstallOwnership([], env);
+  const path = installStateFixturePath(env);
+  const seeded = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+  writeFileSync(path, JSON.stringify({ ...seeded, ...versions(PI_FULL_PLUGINS), selection: PI_FULL_PLUGINS }));
+}
+
+function writeAdapterHook(env: NodeJS.ProcessEnv, path: string, host: 'claude' | 'codex'): void {
+  openHostConfigGate({ env }).apply([{ path, fragments: [{ owner: 'core', selector: 'hooks.Stop[default]',
+    kind: 'add', strategy: jsonFragment, value: buildManagedHooks(host, env).Stop![0] }] }]);
+}
+
+function writeOwnedHostFile(env: NodeJS.ProcessEnv, path: string, content: string, transaction?: string): void {
+  openHostConfigGate({ env }).writePaths([{ path, owner: 'core', entry: { type: 'file', bytes: Buffer.from(content) } }], { transaction });
+}
+
+function fixture(run: (f: ReturnType<typeof createFixture>) => void) {
+  const root = tmpWorkspace('pi-install');
+  try { run(createFixture(root)); } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+function createFixture(root: string) {
+  const home = join(root, 'home');
+  const bin = join(root, 'bin');
+  const host = join(root, 'pi-host');
+  const source = join(home, '.bun/install/global/node_modules/repo-harness');
+  const write = (path: string, content: string) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, content); };
+  const env = { ...process.env, HOME: home, BUN_INSTALL: join(home, '.bun'), PI_CODING_AGENT_DIR: join(root, 'pi-config'),
+    PATH: `${bin}:${process.env.PATH}`, PI_PACKAGE_DIR: undefined, PI_FIXTURE_ROOT: root, PI_FIXTURE_VERSION: '1.5.2', REPO_HARNESS_BUN_EXECUTABLE: join(bin, 'bun') };
+  write(join(source, 'package.json'), JSON.stringify({ name: 'repo-harness', version: '0.0.0', dependencies, pi: { extensions: ['./extension.ts'] } }));
+  seedGlobalPackageFixture(env, { mutable: true });
+  symlinkSync(join(ROOT, 'node_modules'), join(source, 'node_modules'), 'dir');
+  write(join(host, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent', version: '1.5.2', type: 'module', main: './dist/index.js' }));
+  write(join(host, 'dist/index.js'), `import {readFileSync} from 'node:fs';
+import {fileURLToPath} from 'node:url';
+export function getPackageDir() { return process.env.PI_PACKAGE_DIR || fileURLToPath(new URL('../',import.meta.url)); }
+let metadata={};
+try { metadata=JSON.parse(readFileSync(getPackageDir()+'/package.json','utf8')); } catch(error) { if(error.code!=='ENOENT') throw error; }
+export const VERSION=process.env.PI_PACKAGE_DIR ? metadata.version || '0.0.0' : process.env.PI_FIXTURE_VERSION || metadata.version || '0.0.0';
+`);
+  write(join(host, 'dist/core/tools/path-utils.js'), 'export function resolveToCwd(path) { return path; }');
+  const settings = join(env.PI_CODING_AGENT_DIR, 'settings.json');
+  /** The stub writes the settings as Pi does: the whole file, two-space JSON. */
+  const setPackages = (packages: readonly unknown[], extra: Record<string, unknown> = {}) => write(settings, `${JSON.stringify({ theme: 'user', ...extra, packages }, null, 2)}\n`);
+  const packages = () => JSON.parse(readFileSync(settings, 'utf8')).packages as unknown[];
+  setPackages(['npm:other-package']);
+  write(join(env.PI_CODING_AGENT_DIR, 'auth.json'), '{"fixture":true}\n');
+  write(join(host, 'pi'), `#!${process.execPath}
+import {appendFileSync,existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
+import {relative,resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
+const root=process.env.PI_FIXTURE_ROOT;
+const agentDir=process.env.PI_CODING_AGENT_DIR.replace(/^~(?=$|[\\\\/])/,process.env.HOME);
+const args=process.argv.slice(2);
+appendFileSync(root+'/argv.jsonl', JSON.stringify(args)+'\\n');
+const file=agentDir+'/settings.json';
+const settings=existsSync(file)?JSON.parse(readFileSync(file,'utf8')):{};
+const entries=settings.packages??[];
+const sourceOf=(p)=>typeof p==='string'?p:p.source;
+/** Pi 1.5.2 resolvePathFromBase: trimmed, ~ and ~/ against HOME, file:// URLs as paths, then against the agent dir. */
+const localPath=(s)=>{ s=s.trim(); return s==='~'?process.env.HOME:s.startsWith('~/')?process.env.HOME+s.slice(1):s.startsWith('file://')?fileURLToPath(s):resolve(agentDir,s); };
+const save=(next)=>(mkdirSync(agentDir,{recursive:true}),writeFileSync(file,JSON.stringify({...settings,packages:next},null,2)+'\\n'));
+switch(args[0]) {
+case '--version': console.log(process.env.PI_FIXTURE_VERSION); break;
+case 'list':
+  if(process.env.PI_FIXTURE_BAD_LIST==='1') { console.log('invalid'); break; }
+  if(entries.length) { console.log('User packages:'); for(const p of entries) { const s=sourceOf(p); console.log('  '+s+(typeof p==='string'?'':' (filtered)')); if(!s.startsWith('npm:')) console.log('    '+localPath(s)); } }
+  else console.log('No packages installed.');
+  break;
+case 'install':
+  entries.push(relative(agentDir,args[1])); save(entries);
+  if(process.env.PI_FIXTURE_FAIL_INSTALL==='1') process.exit(1);
+  break;
+case 'remove':
+  if(process.env.PI_FIXTURE_FAIL_REMOVE==='1') { console.error('PI_FIXTURE_REMOVE_FAILED'); process.exit(1); }
+  save(entries.filter(p=>sourceOf(p).startsWith('npm:')||localPath(sourceOf(p))!==resolve(args[1]))); break;
+default: process.exit(99);
+}
+`);
+  chmodSync(join(host, 'pi'), 0o755);
+  mkdirSync(bin, { recursive: true });
+  writeBunWrapper(root, join(bin, 'bun'));
+  symlinkSync(join(host, 'pi'), join(bin, 'pi'));
+  writeFakeHc(bin);
+  write(join(home, '.bun/bin/rh'), '#!/bin/sh\nexit 0\n');
+  chmodSync(join(home, '.bun/bin/rh'), 0o755);
+  const argv = () => existsSync(join(root, 'argv.jsonl')) ? readFileSync(join(root, 'argv.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]) : [];
+  const cli = (...args: string[]) => spawnSync(process.execPath, [CLI, ...args], { cwd: root, env, encoding: 'utf8', timeout: 60_000 });
+  return { root, home, env, source, host, write, argv, cli, settings, setPackages, packages };
+}
+
+describe('Pi package and skill installation', () => {
+  test('the shared Pi executable resolver returns a canonical path or null and doctor names a dangling link', () => {
+    const root = tmpWorkspace('pi-executable');
+    try {
+      const target = join(root, 'native-pi'); writeFileSync(target, '#!/bin/sh\nexit 0\n'); chmodSync(target, 0o755);
+      const command = join(root, process.platform === 'win32' ? 'pi.EXE' : 'pi'); symlinkSync(target, command);
+      const env = { PATH: root, PATHEXT: '.EXE' };
+      expect(piExecutable(env)).toBe(realpathSync(target));
+      unlinkSync(command); symlinkSync(join(root, 'missing-pi'), command);
+      expect(piExecutable(env)).toBeNull();
+      expect(checkPiHost(env).find(check => check.id === 'pi-path')).toMatchObject({ status: 'fail', detail: 'PI_EXECUTABLE_DANGLING_SYMLINK' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('a dangling Pi link is skipped by package planning and does not throw during install state status', () => fixture(f => {
+    recordPiSelection(f.env);
+    expect(installPiPackage(f.source, true, f.env).created).toBe(true);
+    unlinkSync(join(f.root, 'bin/pi')); symlinkSync(join(f.root, 'missing-pi'), join(f.root, 'bin/pi'));
+    const env = { ...f.env, PATH: join(f.root, 'bin') };
+    expect(planPiPackage(f.source, true, env)).toMatchObject({ status: 'skipped', detail: 'pi not found on PATH' });
+    const state = readInstallState(env);
+    if (!state) throw new Error('fixture install state missing');
+    expect(() => installStateStatus(state, env)).not.toThrow();
+    expect(installStateStatus(state, env).drift.status).toBe('drift');
+  }));
+
+  test('rejects a relative agent directory before any skill tree is created', () => fixture(f => {
+    copyPackageRuntimeFixture(ROOT, f.source);
+    const result = spawnSync(process.execPath, [join(f.source, 'src/cli/index.ts'), 'install', '--plugins', 'pi', '--no-cli', '--no-external-skills', '--no-codegraph', '--json'],
+      { cwd: f.root, env: { ...f.env, PI_CODING_AGENT_DIR: 'rel-agent' }, encoding: 'utf8', timeout: 60_000 });
+    expect(result.status).toBe(1);
+    expect(result.stderr + result.stdout).toContain('PI_CODING_AGENT_DIR');
+    expect(existsSync(join(f.source, 'rel-agent'))).toBe(false);
+    expect(existsSync(join(f.root, 'rel-agent'))).toBe(false);
+    expect(existsSync(join(f.home, '.codex/skills'))).toBe(false);
+    expect(existsSync(join(f.home, '.claude/skills'))).toBe(false);
+  }));
+
+  test('names the Bun requirement instead of launching a TypeScript child under Node', () => fixture(f => {
+    const descriptor = Object.getOwnPropertyDescriptor(process.versions, 'bun')!;
+    try {
+      Object.defineProperty(process.versions, 'bun', { value: undefined, configurable: true });
+      expect(checkPiHost(f.env).find(c => c.id === 'pi-capability')).toMatchObject({ status: 'fail', detail: 'PI_CAPABILITY_PROBE_REQUIRES_BUN' });
+    } finally { Object.defineProperty(process.versions, 'bun', descriptor); }
+  }));
+
+  test('list parsing keeps the final user section and ignores output noise and project entries', () => {
+    expect(piUserPackageSources('added 2 packages\n  unrelated install output\nUser packages:\n  old\nUser packages:\n  ../current\n    /absolute/current\ninstall notice\nProject packages:\n  ../project')).toEqual(['../current']);
+    expect(() => piUserPackageSources('  ../unscoped')).toThrow('PI_PACKAGE_LIST_INVALID');
+  });
+
+  test('an explicit environment never borrows the parent Bun installation', () => fixture(f => {
+    const previous = process.env.BUN_INSTALL;
+    try {
+      process.env.BUN_INSTALL = join(f.root, 'parent-bun');
+      expect(bunGlobalPackageRoot({ HOME: f.home })).toBe(f.source);
+      expect(bunGlobalPackageRoot({})).toBeNull();
+      expect(bunGlobalPackageRoot({ USERPROFILE: f.home })).toBe(f.source);
+      expect(bunGlobalPackageRoot()).toBe(join(f.root, 'parent-bun/install/global/node_modules/repo-harness'));
+    } finally {
+      if (previous === undefined) delete process.env.BUN_INSTALL; else process.env.BUN_INSTALL = previous;
+    }
+  }));
+
+  test('tilde agent directories share package identity and skill projection paths', () => fixture(f => {
+    const env = { ...f.env, PI_CODING_AGENT_DIR: '~/pi-agent' };
+    const agent = join(f.home, 'pi-agent');
+    expect(piAgentDir(f.home, env)).toBe(agent);
+    expect(piAgentDir(f.home, { PI_CODING_AGENT_DIR: '~' })).toBe(f.home);
+    expect(hostSkillRoot(f.home, 'pi', env)).toBe(join(agent, 'skills'));
+    expect(installPiPackage(f.source, true, env).status).toBe('ok');
+    expect(piPackagePresent(f.source, env)).toBe(true);
+    expect(configureRequiredHerdrSkill('both', env).status).toBe('ok');
+    expect(existsSync(join(agent, 'skills/herdr/SKILL.md'))).toBe(true);
+    const invalid = configureRequiredHerdrSkill('both', { ...env, PI_CODING_AGENT_DIR: 'relative-agent' });
+    expect(invalid).toMatchObject({ status: 'failed', detail: expect.stringContaining('PI_CODING_AGENT_DIR') });
+  }));
+
+  test('package identity compares real paths across a symlinked source', () => fixture(f => {
+    const alias = join(f.root, 'package-alias');
+    symlinkSync(f.source, alias, 'dir');
+    f.setPackages([relative(f.env.PI_CODING_AGENT_DIR, alias)]);
+    expect(piPackagePresent(f.source, f.env)).toBe(true);
+  }));
+  test('relative Pi entry shape is recorded and detected after install', () => fixture(f => {
+    expect(installPiPackage(f.source, true, f.env)).toMatchObject({ status: 'ok', created: true });
+    const source = relative(f.env.PI_CODING_AGENT_DIR, f.source);
+    expect(f.packages()).toEqual(['npm:other-package', source]);
+    expect(runPi(['list'], f.env)).toContain(`  ${source}\n    ${f.source}`);
+    expect(piPackagePresent(f.source, f.env)).toBe(true);
+  }));
+
+  test('another Pi version still installs: the proved entry is recorded, a change outside it is reported, and status names the version', () => fixture(f => {
+    recordPiSelection(f.env);
+    const env = { ...f.env, PI_FIXTURE_VERSION: '1.6.0' };
+    f.write(f.settings, '{"theme":"user","packages":["npm:other-package"]}\n');
+    const step = installPiPackage(f.source, true, env);
+    const notice = 'pi 1.6.0 is not the measured 1.5.2; writes outside the declared set were not measured';
+    expect(step).toMatchObject({ status: 'ok', created: true });
+    expect(step.detail).toContain(`host_config_unattributed_diff: ${realpathSync(f.settings)} sha256:`);
+    expect(step.detail).toContain(notice);
+    const status = spawnSync(process.execPath, [CLI, 'status', '--json'], { cwd: f.root, env, encoding: 'utf8', timeout: 60_000 });
+    expect(JSON.parse(status.stdout).installState.pi_version_notice).toBe(notice);
+    // The reformatted file is not rh's: a revert takes out only the recorded entry.
+    expect(openHostConfigGate({ env }).revert([f.settings]).map(entry => entry.action)).toEqual(['text_removed']);
+    expect(JSON.parse(readFileSync(f.settings, 'utf8'))).toEqual({ theme: 'user', packages: ['npm:other-package'] });
+  }));
+
+  test('the one-shot move to protocol 5 records a protocol 4 Pi claim only while its entry is in the Pi settings', () => {
+    for (const present of [true, false]) fixture(f => {
+      recordPiSelection(f.env);
+      const path = installStateFixturePath(f.env);
+      const state = JSON.parse(readFileSync(path, 'utf8'));
+      writeFileSync(path, JSON.stringify({ ...state, protocol: 4, pi_packages: [f.source] }));
+      if (present) f.setPackages(['npm:other-package', relative(f.env.PI_CODING_AGENT_DIR, f.source)]);
+      migrateInstallState(f.env);
+      const moved = JSON.parse(readFileSync(path, 'utf8'));
+      expect([moved.protocol, 'pi_packages' in moved, ownedPiPackages(f.env)]).toEqual([5, false, present ? [f.source] : []]);
+      // Ownership probe P3: the moved claim is adopted text, a record only while the entry of this source is on disk.
+      expect(openHostConfigGate({ env: f.env }).recorded(join(f.env.PI_CODING_AGENT_DIR!, 'settings.json')).map((record) => record.preimage === record.inserted)).toEqual(present ? [true] : []);
+    });
+    // Pi switched off: only the previous snapshot holds the claim, and the user registers the package by hand later.
+    for (const protocol of [3, 4] as const) fixture(f => {
+      recordInstallOwnership([], f.env);
+      const path = installStateFixturePath(f.env);
+      const base = JSON.parse(readFileSync(path, 'utf8'));
+      const { previous: _none, ...fields } = base;
+      const piFields = { ...fields, ...versions(PI_FULL_PLUGINS), selection: PI_FULL_PLUGINS, protocol };
+      const claim = { owner: 'pi', authority: 'repo-harness-install-transaction', removal: 'managed-surfaces-only', path: f.source,
+        type: 'pi-package', content_hash: null, managed_marker: 'pi-package-source', symlink_target: null };
+      writeFileSync(path, JSON.stringify(protocol === 3
+        ? { ...base, protocol, ownership_manifest: [], previous: { ...piFields, ownership_manifest: [claim] } }
+        : { ...base, protocol, pi_packages: [], previous: { ...piFields, pi_packages: [f.source] } }));
+      f.setPackages(['npm:other-package', relative(f.env.PI_CODING_AGENT_DIR, f.source)]);
+      migrateInstallState(f.env);
+      expect(ownedPiPackages(f.env)).toEqual([]);
+      expect(runUserUninstall({ target: 'both', env: f.env }).exitCode).toBe(0);
+      expect([f.packages(), f.argv().filter(args => args[0] === 'remove')]).toEqual([['npm:other-package', relative(f.env.PI_CODING_AGENT_DIR, f.source)], []]);
+    });
+  });
+
+  test('pre-existing relative Pi entry is present and is not installed again', () => fixture(f => {
+    f.setPackages(['npm:other-package', relative(f.env.PI_CODING_AGENT_DIR, f.source)]);
+    expect(piPackagePresent(f.source, f.env)).toBe(true);
+    expect(installPiPackage(f.source, true, f.env)).toMatchObject({ status: 'ok', created: false });
+    expect(f.argv().some(args => args[0] === 'install')).toBe(false);
+  }));
+
+  test('a failed refresh takes out the Pi entry that it recorded through the ledger rollback, with no pi remove', () => fixture(f => {
+    recordPiSelection(f.env);
+    const codex = join(f.home, '.codex/hooks.json');
+    const claude = join(f.home, '.claude/settings.json');
+    const skill = join(f.home, '.codex/skills/repo-harness-check/SKILL.md');
+    const originalCodex = '{"theme":"original codex"}\n';
+    const originalClaude = '{"theme":"original claude"}\n';
+    const originalPackage = readFileSync(join(f.source, 'package.json'), 'utf8');
+    f.write(codex, originalCodex);
+    f.write(claude, originalClaude);
+    const writeSkill = (content: string, transaction?: string) => {
+      const source = join(f.root, 'managed-skill-source');
+      f.write(join(source, 'SKILL.md'), content);
+      openHostConfigGate({ env: f.env }).writePaths([{ path: dirname(skill), owner: 'core', entry: { type: 'directory', source } }], { transaction });
+    };
+    writeSkill('# original skill\n');
+    const env = { ...f.env, PI_FIXTURE_FAIL_REMOVE: '1' };
+    const result = runTransactionalRuntimeRefresh({ env }, ({ transaction }) => {
+      expect(installPiPackage(f.source, true, env).created).toBe(true);
+      writeAdapterHook(env, codex, 'codex');
+      writeAdapterHook(env, claude, 'claude');
+      writeSkill('# failed update\n', transaction);
+      f.write(join(f.source, 'package.json'), '{"name":"repo-harness","version":"failed-update"}');
+      return { exitCode: 1, steps: [], lines: ['candidate reconciliation failed'], stdout: '', stderr: 'candidate reconciliation failed' };
+    });
+    expect(result.exitCode).toBe(1);
+    expect(readFileSync(codex, 'utf8')).toBe(originalCodex);
+    expect(readFileSync(claude, 'utf8')).toBe(originalClaude);
+    expect(readFileSync(skill, 'utf8')).toBe('# original skill\n');
+    expect(readFileSync(join(f.source, 'package.json'), 'utf8')).toBe(originalPackage);
+    expect([f.packages(), ownedPiPackages(f.env), f.argv().some(args => args[0] === 'remove')]).toEqual([['npm:other-package'], [], false]);
+  }));
+
+  test('install rollback restores snapshots and takes out the recorded Pi entry without pi remove', () => fixture(f => {
+    const claude = join(f.home, '.claude/settings.json');
+    const codex = join(f.home, '.codex/hooks.json');
+    f.write(claude, '{"theme":"original claude"}\n');
+    f.write(codex, '{"theme":"original codex"}\n');
+    rmSync(join(f.home, '.bun/bin/rh'));
+    const isolatedPath = f.env.PATH.split(delimiter).filter(directory => !['repo-harness', 'rh', 'repo-harness-hook'].some(name => existsSync(join(directory, name)))).join(delimiter);
+    const result = spawnSync(process.execPath, [CLI, 'install', '--plugins', 'pi', '--no-cli', '--no-external-skills', '--no-codegraph', '--json'],
+      { cwd: f.root, env: { ...f.env, PATH: isolatedPath, PI_FIXTURE_FAIL_REMOVE: '1' }, encoding: 'utf8', timeout: 60_000 });
+    expect(result.status).toBe(1);
+    expect(result.stderr + result.stdout).toContain('install projection is incomplete');
+    expect(readFileSync(claude, 'utf8')).toBe('{"theme":"original claude"}\n');
+    expect(readFileSync(codex, 'utf8')).toBe('{"theme":"original codex"}\n');
+    expect([piPackagePresent(f.source, f.env), ownedPiPackages(f.env), f.argv().some(args => args[0] === 'remove')]).toEqual([false, [], false]);
+  }));
+
+  test('filesystem rollback errors are reported with the reconciliation error', () => fixture(f => {
+    recordPiSelection(f.env);
+    const codex = join(f.home, '.codex/rules/english.md');
+    const claude = join(f.home, '.claude/settings.json');
+    const originalCodex = '{"theme":"missing snapshot fixture"}\n';
+    writeOwnedHostFile(f.env, codex, originalCodex);
+    f.write(claude, '{"theme":"original claude"}\n');
+    const env = { ...f.env, PI_FIXTURE_FAIL_REMOVE: '1' };
+    let backupRoot = '';
+    let failure: unknown;
+    try {
+      runTransactionalRuntimeRefresh({ env }, ({ candidateHandoff, transaction }) => {
+        backupRoot = candidateHandoff!.transactionBackupRoot;
+        expect(installPiPackage(f.source, true, env).created).toBe(true);
+        writeOwnedHostFile(env, codex, '{"theme":"failed update"}\n', transaction);
+        writeAdapterHook(env, claude, 'claude');
+        const preimages = join(backupRoot, 'host-config-paths');
+        const backup = readdirSync(preimages).map(name => join(preimages, name))
+          .find(path => statSync(path).isFile() && readFileSync(path, 'utf8') === originalCodex)!;
+        expect(backup).toBeDefined();
+        rmSync(backup);
+        return { exitCode: 1, steps: [], lines: ['candidate reconciliation failed'], stdout: '', stderr: 'candidate reconciliation failed' };
+      });
+    } catch (error) { failure = error; }
+    expect(readFileSync(claude, 'utf8')).toBe('{"theme":"original claude"}\n');
+    expect((failure as Error).message).toContain('candidate reconciliation failed');
+    expect((failure as Error).message).toContain('install transaction compensation failed');
+    expect((failure as Error).message).toContain(codex);
+    expect([f.packages(), ownedPiPackages(f.env)]).toEqual([['npm:other-package'], []]);
+  }));
+
+  test('removes a stale relative entry when its package directory is missing', () => fixture(f => {
+    recordPiSelection(f.env);
+    expect(installPiPackage(f.source, true, f.env).created).toBe(true);
+    rmSync(f.source, { recursive: true });
+    const result = runUserUninstall({ target: 'both', env: f.env });
+    expect(result.exitCode).toBe(0);
+    expect(f.argv().filter(args => args[0] === 'remove')).toEqual([]);
+    // The report names the ranges that the installer measurement did not cover.
+    expect(result.items.some(item => item.action === 'note' && item.reason.includes('the Skills CLI lock path without XDG_STATE_HOME'))).toBe(true);
+    expect(f.packages()).toEqual(['npm:other-package']);
+    expect(readInstallState(f.env)).toBeNull();
+  }));
+
+  test('an entry removed outside rh releases its record at uninstall with no pi remove; a later hand registration stays', () => fixture(f => {
+    recordPiSelection(f.env);
+    expect(installPiPackage(f.source, true, f.env).created).toBe(true);
+    f.setPackages(['npm:other-package']);
+    expect(runUserUninstall({ target: 'both', env: f.env }).exitCode).toBe(0);
+    expect(ownedPiPackages(f.env)).toEqual([]);
+    const entry = relative(f.env.PI_CODING_AGENT_DIR, f.source);
+    f.setPackages(['npm:other-package', entry]);
+    expect(runUserUninstall({ target: 'both', env: f.env }).exitCode).toBe(0);
+    expect([f.packages(), f.argv().filter(args => args[0] === 'remove')]).toEqual([['npm:other-package', entry], []]);
+  }));
+
+  test('doctor reports a missing package directory without a raw filesystem error', () => fixture(f => {
+    f.setPackages([relative(f.env.PI_CODING_AGENT_DIR, f.source)]);
+    rmSync(f.source, { recursive: true });
+    const check = checkPiHost(f.env).find(c => c.id === 'pi-package')!;
+    expect(check.status).toBe('warn');
+    expect(check.detail).toContain('package directory missing');
+    expect(check.detail).not.toContain('ENOENT');
+  }));
+
+  /** The recorded entry and the user's spellings of the same package that Pi 1.5.2 `pi remove` would also match. */
+  function piAliases(f: ReturnType<typeof createFixture>) {
+    const entry = relative(f.env.PI_CODING_AGENT_DIR!, f.source);
+    return { entry, aliases: [{ source: `~/${relative(f.home, f.source)}`, extensions: [] }, pathToFileURL(f.source).href] };
+  }
+
+  /** The recorded string with its slashes escaped: the same JSON value, other text at the selector. */
+  function editRecordedText(f: ReturnType<typeof createFixture>, entry: string): void {
+    f.write(f.settings, readFileSync(f.settings, 'utf8').replace(JSON.stringify(entry), JSON.stringify(entry).replaceAll('/', '\\/')));
+  }
+
+  test('uninstall takes out only the recorded Pi package entry: a ~/ or file:// alias stays, alone or beside it; edited text stays unresolved', () => {
+    for (const index of [0, 1]) for (const beside of [false, true]) fixture(f => {
+      recordPiSelection(f.env);
+      expect(installPiPackage(f.source, true, f.env).created).toBe(true);
+      const { entry, aliases } = piAliases(f);
+      f.setPackages(['npm:other-package', ...(beside ? [entry] : []), aliases[index]]);
+      const ledger = hostConfigPaths(f.env).ledger;
+      const before = [readFileSync(f.settings), readFileSync(ledger)];
+      expect(runUserUninstall({ target: 'both', env: f.env, dryRun: true }).exitCode).toBe(0);
+      expect([readFileSync(f.settings), readFileSync(ledger)]).toEqual(before);
+      expect(runUserUninstall({ target: 'both', env: f.env }).exitCode).toBe(0);
+      expect([f.packages(), f.argv().filter(args => args[0] === 'remove'), ownedPiPackages(f.env)]).toEqual([['npm:other-package', aliases[index]], [], []]);
+    });
+    fixture(f => {
+      recordPiSelection(f.env);
+      expect(installPiPackage(f.source, true, f.env).created).toBe(true);
+      editRecordedText(f, piAliases(f).entry);
+      const before = readFileSync(f.settings);
+      const result = runUserUninstall({ target: 'both', env: f.env });
+      expect(result.exitCode).toBe(1);
+      expect(result.items).toContainEqual({ path: f.source, action: 'unresolved', reason: 'changed since rh wrote it; preserved' });
+      expect([readFileSync(f.settings).equals(before), ownedPiPackages(f.env)]).toEqual([true, [f.source]]);
+    });
+  });
+
+  test('a failed staged write of the Pi settings keeps their bytes and the ownership record', () => fixture(f => {
+    recordPiSelection(f.env);
+    expect(installPiPackage(f.source, true, f.env).created).toBe(true);
+    const before = readFileSync(f.settings);
+    // The temporary file beside the settings cannot be created, so the replacement fails before the rename.
+    chmodSync(dirname(f.settings), 0o555);
+    let result: ReturnType<typeof runUserUninstall>;
+    try { result = runUserUninstall({ target: 'both', env: f.env }); } finally { chmodSync(dirname(f.settings), 0o755); }
+    expect(result.exitCode).toBe(1);
+    expect(result.items.some(item => item.action === 'unresolved' && item.reason.startsWith('uninstall incomplete: '))).toBe(true);
+    expect([readFileSync(f.settings).equals(before), ownedPiPackages(f.env), readInstallState(f.env) !== null]).toEqual([true, [f.source], true]);
+  }));
+
+  test('a plugin switch away from Pi takes out only the recorded entry and refuses edited text', () => {
+    const away = PI_FULL_PLUGINS.filter(id => id !== 'pi');
+    for (const index of [0, 1]) for (const beside of [false, true]) fixture(f => {
+      recordPiSelection(f.env);
+      expect(installPiPackage(f.source, true, f.env).created).toBe(true);
+      const { entry, aliases } = piAliases(f);
+      f.setPackages(['npm:other-package', ...(beside ? [entry] : []), aliases[index]]);
+      prepareInstallSelectionSwitch(away, f.env, join(f.root, 'transaction'));
+      expect([f.packages(), f.argv().filter(args => args[0] === 'remove'), ownedPiPackages(f.env)]).toEqual([['npm:other-package', aliases[index]], [], []]);
+    });
+    fixture(f => {
+      recordPiSelection(f.env);
+      expect(installPiPackage(f.source, true, f.env).created).toBe(true);
+      editRecordedText(f, piAliases(f).entry);
+      const before = readFileSync(f.settings);
+      expect(() => prepareInstallSelectionSwitch(away, f.env, join(f.root, 'transaction'))).toThrow(`refusing plugin switch because managed surface drifted: ${f.source}`);
+      expect(readFileSync(f.settings).equals(before)).toBe(true);
+    });
+  });
+
+  test('failed candidate handoff compensates the new entry recorded in the shared ledger', () => fixture(f => {
+    recordPiSelection(f.env);
+    const result = runTransactionalRuntimeRefresh({ env: f.env }, () => {
+      expect(installPiPackage(f.source, true, f.env).created).toBe(true);
+      return { exitCode: 1, steps: [], lines: [], stdout: '', stderr: 'candidate receipt failed' };
+    });
+    expect(result.exitCode).toBe(1);
+    expect([piPackagePresent(f.source, f.env), ownedPiPackages(f.env)]).toEqual([false, []]);
+  }));
+
+  test('uninstall takes out the recorded Pi entry with no pi on PATH', () => fixture(f => {
+    recordPiSelection(f.env);
+    expect(installPiPackage(f.source, true, f.env).created).toBe(true);
+    const result = runUserUninstall({ target: 'both', env: { ...f.env, PATH: '' } });
+    expect(result.exitCode).toBe(0);
+    expect(result.items).toContainEqual({ path: f.source, action: 'reverted', reason: 'recorded Pi package entry taken out; other entries of the package stay' });
+    expect([f.packages(), ownedPiPackages(f.env), f.argv().some(args => args[0] === 'remove')]).toEqual([['npm:other-package'], [], false]);
+  }));
+
+  test('dry-run, install, update and uninstall use Pi CLI ownership and preserve user files', () => fixture(f => {
+    const settings = readFileSync(join(f.env.PI_CODING_AGENT_DIR, 'settings.json'));
+    const auth = readFileSync(join(f.env.PI_CODING_AGENT_DIR, 'auth.json'));
+    const dry = f.cli('install', '--plugins', 'pi', '--dry-run', '--json');
+    expect(dry.status, dry.stderr).toBe(0);
+    const plan = JSON.parse(dry.stdout);
+    expect(plan.hosts).toEqual(['claude', 'codex', 'pi']);
+    expect(plan.pi_package.command).toEqual(['pi', 'install', f.source]);
+    expect(plan.skill_projections.some((p: { host: string; destination: string }) => p.host === 'pi' && p.destination === join(f.env.PI_CODING_AGENT_DIR, 'skills/repo-harness'))).toBe(true);
+    expect(f.argv()).toEqual([]);
+    const install = f.cli('install', '--plugins', 'pi', '--no-cli', '--no-external-skills', '--no-codegraph', '--json');
+    expect(install.status, install.stderr + install.stdout).toBe(0);
+    expect(ownedPiPackages(f.env)).toEqual([f.source]);
+    const piRoot = hostSkillRoot(f.home, 'pi', f.env);
+    expect(ownedPath(f.env, join(piRoot, 'repo-harness'))).not.toBeNull();
+    expect(existsSync(join(piRoot, 'repo-harness/SKILL.md'))).toBe(true);
+    f.write(join(piRoot, 'user-skill/SKILL.md'), '# user\n');
+    const update = f.cli('update', '--no-cli', '--no-codegraph', '--json');
+    expect(update.status, update.stderr + update.stdout).toBe(0);
+    expect(f.argv().filter(args => args[0] === 'install')).toEqual([['install', f.source]]);
+    const beforePreview = f.argv().filter(args => args[0] === 'remove').length;
+    const preview = f.cli('uninstall', '--dry-run', '--json');
+    expect(preview.status, preview.stderr + preview.stdout).toBe(0);
+    expect(f.argv().filter(args => args[0] === 'remove')).toHaveLength(beforePreview);
+    const uninstall = f.cli('uninstall', '--json');
+    expect(uninstall.status, uninstall.stderr + uninstall.stdout).toBe(0);
+    expect(f.argv().filter(args => args[0] === 'remove')).toEqual([]);
+    expect(existsSync(join(piRoot, 'repo-harness'))).toBe(false);
+    expect(readFileSync(join(piRoot, 'user-skill/SKILL.md'), 'utf8')).toBe('# user\n');
+    expect(f.packages()).toEqual(['npm:other-package']);
+    expect(readFileSync(join(f.env.PI_CODING_AGENT_DIR, 'settings.json'))).toEqual(settings);
+    expect(readFileSync(join(f.env.PI_CODING_AGENT_DIR, 'auth.json'))).toEqual(auth);
+    expect(existsSync(join(f.source, 'package.json'))).toBe(true);
+    expect(f.argv().every(args => !args.includes('--approve'))).toBe(true);
+  }), 120_000);
+
+  test('does not claim or duplicate a pre-existing entry; malformed list fails closed', () => fixture(f => {
+    f.setPackages([f.source, 'npm:other-package']);
+    expect(installPiPackage(f.source, true, f.env)).toMatchObject({ status: 'ok', created: false });
+    expect(f.argv()).toEqual([['list']]);
+    expect(installPiPackage(f.source, true, { ...f.env, PI_FIXTURE_BAD_LIST: '1' })).toMatchObject({ status: 'failed', detail: 'PI_PACKAGE_LIST_INVALID' });
+    expect(f.argv().some(args => args[0] === 'install')).toBe(false);
+    expect(piUserPackageSources(`Project packages:\n  ${f.source}`)).toEqual([]);
+  }));
+
+  test('uninstall preserves a pre-existing Pi package and a changed owned skill', () => fixture(f => {
+    f.setPackages([f.source, 'npm:other-package']);
+    const install = f.cli('install', '--plugins', 'pi', '--no-cli', '--no-external-skills', '--no-codegraph', '--json');
+    expect(install.status, install.stderr + install.stdout).toBe(0);
+    expect(ownedPiPackages(f.env)).toEqual([]);
+    const skill = join(hostSkillRoot(f.home, 'pi', f.env), 'repo-harness-check');
+    rmSync(skill);
+    f.write(join(skill, 'SKILL.md'), '# user change\n');
+    const uninstall = f.cli('uninstall', '--json');
+    expect(uninstall.status).toBe(1);
+    expect(readFileSync(join(skill, 'SKILL.md'), 'utf8')).toBe('# user change\n');
+    expect(piPackagePresent(f.source, f.env)).toBe(true);
+    expect(f.argv().some(args => args[0] === 'install' || args[0] === 'remove')).toBe(false);
+  }));
+
+  test('a failed install keeps the record of the entry that Pi wrote, so the transaction rollback takes it out', () => fixture(f => {
+    expect(installPiPackage(f.source, true, { ...f.env, PI_FIXTURE_FAIL_INSTALL: '1' }).status).toBe('failed');
+    expect([piPackagePresent(f.source, f.env), ownedPiPackages(f.env), f.argv().some(args => args[0] === 'remove')]).toEqual([true, [f.source], false]);
+  }));
+
+  test('missing Pi and unselected Pi skip without executing commands', () => fixture(f => {
+    expect(installPiPackage(f.source, true, { ...f.env, PATH: '' })).toMatchObject({ status: 'skipped', detail: 'pi not found on PATH' });
+    expect(installPiPackage(f.source, false, f.env).status).toBe('skipped');
+    expect(f.argv()).toEqual([]);
+    expect(hostSkillRoot(f.home, 'pi', {})).toBe(join(f.home, '.pi/agent/skills'));
+  }));
+
+  test('setup probes the PATH Pi SDK instead of the bundled SDK', () => fixture(f => {
+    // Selected metadata differs from the bundled 1.5.2 SDK.
+    f.write(join(f.host, 'dist/index.js'), `export const VERSION = '1.3.9';
+export function getPackageDir() { return ${JSON.stringify(f.host)}; }`);
+    const checks = checkPiHost(f.env);
+    expect(checks.find(c => c.id === 'pi-cli-version')).toMatchObject({
+      status: 'fail', version: '1.3.9', detail: expect.stringContaining('PI_HOST_UNSUPPORTED_VERSION'),
+    });
+    expect(checks.find(c => c.id === 'pi-capability')).toMatchObject({
+      status: 'fail', capability: { state: 'unavailable', code: 'PI_HOST_UNSUPPORTED_VERSION' },
+    });
+  }));
+
+  test('setup reports supported and unsupported versions, capability and package state', () => fixture(f => {
+    expect(checkPiHost(f.env).map(c => [c.id, c.status])).toEqual([
+      ['pi-path', 'ok'], ['pi-cli-version', 'ok'], ['pi-capability', 'ok'], ['pi-package', 'warn'],
+    ]);
+    expect(checkPiHost({ ...f.env, PI_FIXTURE_VERSION: '1.3.9' }).find(c => c.id === 'pi-cli-version')).toMatchObject({ status: 'fail', detail: expect.stringContaining('PI_HOST_UNSUPPORTED_VERSION') });
+    expect(checkPiHost({ ...f.env, PI_FIXTURE_VERSION: '1.5.1' }).find(c => c.id === 'pi-cli-version')).toMatchObject({ status: 'fail', detail: expect.stringContaining('PI_HOST_UNSUPPORTED_VERSION: 1.5.1; minimum 1.5.2; upgrade the PATH pi') });
+    expect(checkPiHost({ ...f.env, PI_FIXTURE_VERSION: '2.0.0' }).find(c => c.id === 'pi-cli-version')?.status).toBe('ok');
+    expect(checkPiHost({ ...f.env, PI_FIXTURE_VERSION: '2.0.0-beta+build' }).find(c => c.id === 'pi-cli-version')).toMatchObject({ status: 'ok', version: '2.0.0-beta+build' });
+    f.write(join(f.host, 'dist/core/tools/path-utils.js'), 'export const resolveToCwd = null;');
+    expect(checkPiHost(f.env).find(c => c.id === 'pi-capability')).toMatchObject({ status: 'fail', capability: { state: 'unavailable', code: 'PI_HOST_PATH_RESOLVER_UNAVAILABLE' } });
+    const empty = join(f.root, 'empty-package');
+    mkdirSync(empty);
+    expect(checkPiHost({ ...f.env, PI_PACKAGE_DIR: empty }).find(c => c.id === 'pi-capability')).toMatchObject({ status: 'fail', capability: { state: 'unavailable', code: 'PI_HOST_UNSUPPORTED_VERSION' } });
+    f.write(join(empty, 'package.json'), JSON.stringify({ version: '1.5.2' }));
+    expect(checkPiHost({ ...f.env, PI_PACKAGE_DIR: empty }).find(c => c.id === 'pi-capability')).toMatchObject({ status: 'fail', capability: { state: 'unavailable', code: 'PI_HOST_PATH_RESOLVER_UNAVAILABLE' } });
+    f.write(join(empty, 'dist/core/tools/path-utils.js'), 'export function resolveToCwd(path) { return path; }');
+    expect(checkPiHost({ ...f.env, PI_PACKAGE_DIR: empty }).find(c => c.id === 'pi-capability')).toMatchObject({ status: 'ok', capability: { state: 'ready' } });
+    expect(checkPiHost({ ...f.env, PATH: '' }).every(c => c.status === 'na')).toBe(true);
+  }));
+});
+
+test('the Pi review launch gate blocks an old Pi or a failed probe', () => fixture(f => {
+  const executable = piExecutable(f.env)!;
+  expect(piReviewLaunchBlocker(executable, f.env)).toBeNull();
+  for (const version of ['1.3.9', '1.4.0', '1.5.1']) expect(piReviewLaunchBlocker(executable, { ...f.env, PI_FIXTURE_VERSION: version })).toBe('PI_HOST_UNSUPPORTED_VERSION');
+  expect(piReviewLaunchBlocker('/usr/bin/true', f.env)).toBe('PI_HOST_PROBE_FAILED');
+}));

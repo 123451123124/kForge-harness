@@ -1,0 +1,50 @@
+import { mkdirSync, appendFileSync } from 'fs';
+import { dirname } from 'path';
+import { publicationSha256, stablePublicationJson } from '../../src/core/publication/publication-receipt';
+import { validateReactionAttemptReceipt, type ReactionAttemptReceiptV1 } from '../../src/core/publication/feedback';
+import { feedbackReactionLedgerPath } from '../../src/effects/publication/feedback-store';
+
+export function seedReactionReceipt(root: string, publicationId: string, receipt: ReactionAttemptReceiptV1, gitBin = 'git'): string {
+  const path = feedbackReactionLedgerPath(root, publicationId, gitBin);
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, `${stablePublicationJson(validateReactionAttemptReceipt(receipt))}\n`);
+  return path;
+}
+
+export interface HistoricalRepairProof {
+  readonly protocol: 1;
+  readonly kind: 'repo-harness-repair-dispatch-proof';
+  /** Derived from immutable source fences, not supplied by a caller. */
+  readonly repair_id: string;
+  readonly publication_id: string;
+  readonly receipt_sha256: string;
+  readonly task_id: string;
+  readonly task_revision: string;
+  readonly claim_id: string;
+  readonly generation: number;
+  readonly head_sha: string;
+  readonly ship_transaction_key: string;
+  readonly feedback_revision: string;
+  readonly before_reaction_token: string;
+  readonly action: 'resume_same_owner' | 'explicit_takeover';
+  readonly phase: 'prepared' | 'dispatched';
+  readonly successor_claim_id: string | null;
+  readonly successor_generation: number | null;
+  readonly successor_state: 'bound' | 'reserving' | null;
+}
+
+
+type HistoricalRepairInput = Omit<HistoricalRepairProof, 'protocol' | 'kind' | 'repair_id'>;
+/** Literal historical evidence, without lifecycle mutation or authority checks. */
+export function historicalRepairProof(input: HistoricalRepairInput): HistoricalRepairProof {
+  const kind = 'repo-harness-repair-dispatch-proof' as const;
+  const repairId = publicationSha256(stablePublicationJson([kind, input.publication_id,
+    input.receipt_sha256, input.task_id, input.task_revision, input.claim_id, input.generation,
+    input.head_sha, input.ship_transaction_key, input.feedback_revision, input.before_reaction_token, input.action]));
+  return { protocol: 1, kind, repair_id: repairId, ...input };
+}
+export function dispatchedRepairFixture(proof: HistoricalRepairProof, successor: {
+  successor_claim_id: string; successor_generation: number; successor_state: 'bound' | 'reserving';
+}): HistoricalRepairProof {
+  return { ...proof, phase: 'dispatched', ...successor };
+}

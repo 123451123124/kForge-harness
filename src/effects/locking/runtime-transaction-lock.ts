@@ -1,0 +1,107 @@
+import { requireHome } from '../repo-harness-home';
+import { userInfo } from 'os';
+import { realpathSync } from 'fs';
+import { join } from 'path';
+import { processExists } from '../process-group-termination';
+import { acquireExclusiveDirectoryLock, readExclusiveDirectoryLockOwner, type ExclusiveDirectoryLockHandle } from './exclusive-directory-lock';
+
+/**
+ * The state one runtime transaction protects. `global` is the account home,
+ * where installer state lives.
+ */
+export interface RuntimeTransactionScope {
+  readonly kind: 'global';
+  readonly root: string;
+}
+
+/** Created only for a held lock, or after candidate capability validation. */
+export interface RuntimeTransactionContext {
+  readonly scope: RuntimeTransactionScope;
+  assertOwned(): void;
+}
+export type RuntimeTransactionLock = ExclusiveDirectoryLockHandle & RuntimeTransactionContext;
+const contexts = new WeakMap<RuntimeTransactionContext, { root: string; kind: RuntimeTransactionScope['kind']; assertOwned: () => void }>();
+
+export function assertRuntimeTransactionContext(context: RuntimeTransactionContext, scope: RuntimeTransactionScope): void {
+  const owned = contexts.get(context);
+  if (!owned || owned.kind !== scope.kind || owned.root !== realpathSync(scope.root)) {
+    throw new Error('runtime transaction context does not own this scope');
+  }
+  owned.assertOwned();
+}
+
+/** The caller first consumes the existing one-shot candidate capability. */
+export function parentRuntimeTransactionContext(
+  scope: RuntimeTransactionScope,
+  parent: { readonly pid: number; readonly lockPath: string; readonly ownerToken: string },
+): RuntimeTransactionContext {
+  const root = realpathSync(scope.root);
+  const assertOwned = () => {
+    if (parent.pid !== process.ppid) throw new Error('candidate runtime context requires its parent owner');
+    if (!processExists(parent.pid)) throw new Error('candidate parent no longer owns the global runtime lock');
+    const owner = readExclusiveDirectoryLockOwner(root, runtimeTransactionLockRelativePath(scope));
+    if (!owner || owner.pid !== parent.pid || owner.lockPath !== parent.lockPath || owner.token !== parent.ownerToken) {
+      throw new Error('candidate parent no longer owns the global runtime lock');
+    }
+  };
+  assertOwned();
+  const context: RuntimeTransactionContext = { scope: { kind: scope.kind, root }, assertOwned };
+  contexts.set(context, { root, kind: scope.kind, assertOwned });
+  return context;
+}
+
+/**
+ * The lock, transaction metadata and candidate reconciliation share the Windows
+ * account scope. Host configuration paths use the supplied HOME.
+ */
+export function globalRuntimeScope(env: NodeJS.ProcessEnv = process.env): RuntimeTransactionScope {
+  const home = requireHome(env);
+  return { kind: 'global', root: process.platform === 'win32' ? userInfo().homedir : home };
+}
+
+export function runtimeTransactionRoot(scope: RuntimeTransactionScope): string {
+  return join(scope.root, '.repo-harness', 'transactions');
+}
+
+/** Relative to the canonical scope root. The file name carries the scope. */
+export function runtimeTransactionLockRelativePath(scope: RuntimeTransactionScope): string {
+  return `.repo-harness/transactions/${scope.kind}-runtime.lock`;
+}
+
+export function withRuntimeTransactionLock<T>(
+  scope: RuntimeTransactionScope,
+  run: (lock: RuntimeTransactionLock) => T,
+  options: { readonly waitTimeoutMs?: number } = {},
+): T {
+  const lock = acquireRuntimeTransactionLock(scope, options);
+  try { return run(lock); } finally { lock.release(); }
+}
+
+export function acquireRuntimeTransactionLock(
+  scope: RuntimeTransactionScope,
+  options: { readonly waitTimeoutMs?: number } = {},
+): RuntimeTransactionLock {
+  const root = realpathSync(scope.root);
+  const lock = acquireExclusiveDirectoryLock(
+    root,
+    runtimeTransactionLockRelativePath(scope),
+    { reclaimStaleOwner: true, waitTimeoutMs: options.waitTimeoutMs },
+  );
+  const context: RuntimeTransactionLock = { ...lock, scope: { kind: scope.kind, root } };
+  contexts.set(context, { root, kind: scope.kind, assertOwned: () => lock.assertOwned() });
+  try { lock.assertOwned(); return context; }
+  catch (error) { lock.release(); throw error; }
+}
+
+export function withRuntimeTransactionContext<T>(
+  scope: RuntimeTransactionScope,
+  context: RuntimeTransactionContext | undefined,
+  run: (context: RuntimeTransactionContext) => T,
+  options: { readonly waitTimeoutMs?: number } = {},
+): T {
+  if (context) {
+    assertRuntimeTransactionContext(context, scope);
+    return run(context);
+  }
+  return withRuntimeTransactionLock(scope, run, options);
+}

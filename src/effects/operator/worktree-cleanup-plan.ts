@@ -1,0 +1,205 @@
+import { sha256Hex } from '../../core/evidence/sha256';
+import { canonicalize } from '../../core/evidence/canonical-json';
+import { cleanupContentsDigestInput, type CleanupLossEvidence } from '../../core/operator/worktree-cleanup-observation';
+import {
+  archiveStagingRefuses, cleanupPlanDigestInput, cleanupSelection, decodeAuthorizedCleanupRequest, decodeCleanupAdvice, decodeCleanupPlan, gitArchiveRefuses, isArchivePr,
+  type AuthorizedCleanupRequest, type CleanupAdvice, type CleanupExecutionItem, type CleanupExecutionResult, type CleanupPlan, type CleanupPlanItem,
+  type CleanupReason, type CleanupStage,
+} from '../../core/operator/worktree-cleanup-plan';
+import { selectionDigestInput, worktreeDigestRow } from '../../core/operator/worktree-cleanup';
+import type { WorktreeView } from '../../core/public-projections/worktrees';
+
+/** Server-only observation. Use observeCleanupLoss and the existing worktree classifier. */
+export interface CleanupObservation {
+  readonly worktree: WorktreeView;
+  /** Null means incomplete evidence, including an unsupported orphan or path. */
+  readonly loss: CleanupLossEvidence | null;
+}
+/** Bind complete raw contents, directory incarnation, index and all unpublished commits. */
+export function cleanupLossSha256(observed: CleanupObservation): string | null {
+  return observed.loss === null ? null : sha256Hex(canonicalize({ version: 1,
+    selection: selectionDigestInput([worktreeDigestRow(observed.worktree)]),
+    loss: cleanupContentsDigestInput(observed.loss),
+  }));
+}
+
+/**
+ * Loss paths that archive staging can take. A worktree entry decides when one
+ * exists, because staging reads it first: only a regular file qualifies, never a
+ * directory or a symlink. A path without a worktree entry qualifies through any
+ * index version; staging saves each blob with its mode, including 120000. A
+ * staged deletion has neither, and an unchanged tracked file is not a loss.
+ */
+function archivablePaths(loss: CleanupLossEvidence): string[] {
+  const entries = new Map(loss.files.map(file => [file.path, file]));
+  const staged = new Set(loss.index.map(entry => entry.path));
+  return [...new Set([...loss.changed_paths, ...loss.ignored])].filter(path => {
+    if (path === '.git') return false;
+    const entry = entries.get(path);
+    return entry ? entry.kind === 'file' : staged.has(path);
+  }).sort();
+}
+
+/** Called only on server observations. Agent text is advice, never an authorization. */
+export function createCleanupPlan(sessionId: string, inputs: readonly { observation: CleanupObservation; advice: CleanupAdvice }[]): CleanupPlan {
+  const items = inputs.map(({ observation, advice }) => {
+    advice = decodeCleanupAdvice(advice);
+    const loss = observation.loss;
+    let summary: CleanupPlanItem['loss'] = null;
+    if (loss !== null) {
+      // Staging saves the worktree file and every index version of a path, so the largest of them decides the size rule.
+      const archivable = archivablePaths(loss), largest = new Map<string, number>();
+      for (const { path, size } of [...loss.files, ...loss.index]) largest.set(path, Math.max(size, largest.get(path) ?? 0));
+      const unreadable = new Set(loss.index.filter(entry => archiveStagingRefuses(entry.size)).map(entry => entry.path));
+      const noDestination = archivable.filter(path => unreadable.has(path));
+      const privateOnly = archivable.filter(path => !unreadable.has(path) && gitArchiveRefuses(path, largest.get(path)!));
+      const selected = [...(advice.archive.git?.paths ?? []), ...(advice.archive.private?.paths ?? [])], allowed = new Set(archivable), refused = new Set(privateOnly);
+      if (new Set(selected).size !== selected.length || selected.some(path => !allowed.has(path))) throw new Error('worktree_cleanup_archive_paths_invalid');
+      if (selected.some(path => unreadable.has(path))) throw new Error('worktree_cleanup_archive_refused');
+      if (advice.archive.git?.paths.some(path => refused.has(path))) throw new Error('worktree_cleanup_archive_git_refused');
+      if (loss.commits.length && advice.recommendation !== 'keep' && !advice.archive.git?.include_commits) throw new Error('worktree_cleanup_commits_need_archive');
+      summary = { files: [...loss.changed_paths], ignored: [...loss.ignored].sort(), commits: [...loss.commits], archivable, private_only: privateOnly, no_destination: noDestination };
+    }
+    const item: Omit<CleanupPlanItem, 'plan_sha256'> = {
+      worktree: observation.worktree, advice, loss: summary,
+      loss_sha256: cleanupLossSha256(observation),
+    };
+    return { ...item, plan_sha256: sha256Hex(cleanupPlanDigestInput(sessionId, item)) };
+  });
+  return structuredClone(decodeCleanupPlan({ protocol: 1, kind: 'operator_worktree_cleanup_plan', session_id: sessionId, items }));
+}
+
+/** The digest covers the selected rows, just as the existing green cleanup route does. */
+export function cleanupPlanSelectionDigest(plan: CleanupPlan, ids: readonly string[]): string {
+  const selected = plan.items.filter(item => ids.includes(item.worktree.id));
+  if (selected.length !== ids.length || new Set(ids).size !== ids.length) throw new Error('worktree_cleanup_selection_invalid');
+  return sha256Hex(selectionDigestInput(selected.map(item => worktreeDigestRow(item.worktree))));
+}
+
+/** A readback result, not a receipt supplied by the caller. The adapter verifies the durable receipt. */
+export type CleanupReconciliation = { readonly state: 'absent' } | {
+  readonly state: 'pending' | 'completed';
+  readonly key: string;
+  readonly id: string;
+  readonly loss_sha256: string;
+  readonly plan_sha256: string;
+  readonly archive_pr: string | null;
+};
+
+function reconciliation(value: unknown, key: string, item: CleanupPlanItem): CleanupReconciliation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('cleanup reconciliation invalid');
+  const record = value as Record<string, unknown>;
+  const fields = Object.keys(record).sort().join(',');
+  if (record.state === 'absent' && fields === 'state') return { state: 'absent' };
+  if (fields !== 'archive_pr,id,key,loss_sha256,plan_sha256,state' || !['pending', 'completed'].includes(record.state as string)
+    || record.key !== key || record.id !== item.worktree.id || record.loss_sha256 !== item.loss_sha256 || record.plan_sha256 !== item.plan_sha256
+    || (item.advice.archive.git === null ? record.archive_pr !== null : !isArchivePr(record.archive_pr))) throw new Error('cleanup reconciliation identity invalid');
+  return value as CleanupReconciliation;
+}
+
+/**
+ * Integration ports, not browser inputs. No production actuator is installed by this module.
+ * The host owns loadPlan and observe. #1023 owns archive publication. The deletion
+ * adapter must call verify at the exact cleanup topology barrier, before the first
+ * mutation, and use the existing trash receipts for readback/recovery. Each archive
+ * method must reconcile the stable key before retrying an uncertain provider write.
+ */
+export interface CleanupExecutionPorts {
+  readonly loadPlan: (sessionId: string) => Promise<CleanupPlan>;
+  readonly observe: (id: string) => Promise<CleanupObservation>;
+  /** Read only, before live observation. absent means no durable intent exists. pending never means success.
+   * completed requires the exact key/plan/loss-bound receipt plus registration and local-branch removal
+   * readback. A missing source alone is not proof. Do not synthesize an old observation on retry. */
+  readonly reconcile: (key: string, item: CleanupPlanItem) => Promise<CleanupReconciliation>;
+  /** Stage private files (0600), SOURCE.md, all selected worktree/index versions and format-patches, then commit.
+   * Re-observe and verify the bound loss while capturing bytes; never publish credential files to Git. */
+  readonly archiveCommit: (key: string, item: CleanupPlanItem) => Promise<void>;
+  /** Return only after the pushed archive commit is read back from the remote. */
+  readonly archivePush: (key: string, item: CleanupPlanItem) => Promise<void>;
+  /** Return only after the exact Draft PR is read back. Not called for private-only archives. */
+  readonly archivePr: (key: string, item: CleanupPlanItem) => Promise<string | null>;
+  /** verify must run within the topology lock; the adapter returns only after removal readback. */
+  readonly remove: (key: string, item: CleanupPlanItem, verify: () => Promise<void>) => Promise<void>;
+}
+
+class CleanupRefusal extends Error {
+  constructor(readonly reason: CleanupReason) { super(reason); }
+}
+function refuse(reason: CleanupReason): never { throw new CleanupRefusal(reason); }
+const unsafeObservation = (view: WorktreeView) => view.repository_id === null || view.process_count === null || view.reasons.some(reason =>
+  ['primary', 'process_unknown', 'runtime_unknown', 'probe_failed'].includes(reason));
+
+function approved(request: AuthorizedCleanupRequest, item: CleanupPlanItem): void {
+  if (item.worktree.judgment === 'red' || item.worktree.process_count! > 0) refuse('in_use');
+  if (unsafeObservation(item.worktree) || item.loss_sha256 === null) refuse('unavailable');
+  if (!cleanupSelection(item).selectable) refuse('not_approved');
+  if (item.worktree.judgment === 'yellow') {
+    const approval = request.approvals.find(row => row.id === item.worktree.id);
+    if (!approval) refuse('not_approved');
+    if (approval.plan_sha256 !== item.plan_sha256) refuse('plan_changed');
+    if (approval.loss_sha256 !== item.loss_sha256) refuse('loss_changed');
+  }
+}
+
+async function executeItem(request: AuthorizedCleanupRequest, item: CleanupPlanItem, ports: CleanupExecutionPorts): Promise<CleanupExecutionItem> {
+  let stage: CleanupStage = 'observe', archivePr: string | null = null;
+  const key = `${request.session_id}:${item.worktree.id}:${item.plan_sha256}`;
+  const result = (outcome: CleanupExecutionItem['outcome'], reason: CleanupReason | null): CleanupExecutionItem =>
+    ({ id: item.worktree.id, outcome, reason, stage, archive_pr: archivePr });
+  const verify = async () => {
+    const fresh = await ports.observe(item.worktree.id);
+    if (fresh.worktree.judgment === 'red' || (fresh.worktree.process_count ?? 0) > 0) refuse('in_use');
+    if (unsafeObservation(fresh.worktree)) refuse('unavailable');
+    if (fresh.worktree.id !== item.worktree.id || cleanupLossSha256(fresh) !== item.loss_sha256) refuse('loss_changed');
+  };
+  try {
+    approved(request, item);
+    stage = 'reconcile';
+    const prior = reconciliation(await ports.reconcile(key, structuredClone(item)), key, item);
+    if (prior.state !== 'absent') {
+      archivePr = prior.archive_pr;
+      return prior.state === 'completed' ? result('removed', null) : result('reconcile_required', 'removal_unproven');
+    }
+    stage = 'observe';
+    await verify();
+    if (item.advice.recommendation === 'archive_then_delete') {
+      // Hashes bind the plan and loss. Publication adapters use the same key on retry.
+      stage = 'archive_commit'; await ports.archiveCommit(key, structuredClone(item));
+      if (item.advice.archive.git !== null) {
+        stage = 'archive_push'; await ports.archivePush(key, structuredClone(item));
+        stage = 'archive_pr';
+        const published = await ports.archivePr(key, structuredClone(item));
+        if (!isArchivePr(published)) {
+          throw new Error('archive PR readback missing');
+        }
+        archivePr = published;
+      }
+    }
+    stage = 'remove';
+    // An archive can take minutes. Recheck inside the deletion adapter's topology barrier.
+    let checked = false;
+    await ports.remove(key, structuredClone(item), async () => { await verify(); checked = true; });
+    if (!checked) throw new Error('removal barrier did not verify');
+    return result('removed', null);
+  } catch (error) {
+    if (error instanceof CleanupRefusal) return result('skipped', error.reason);
+    if (stage === 'observe') return result('skipped', 'unavailable');
+    // A thrown provider write or removal may already have taken effect. Do not auto-retry it.
+    return result('reconcile_required', stage === 'remove' || stage === 'reconcile' ? 'removal_unproven' : 'archive_failed');
+  }
+}
+
+/** Shared effect entry; the write channel supplies serialization, audit and request-id replay. */
+export async function executeCleanupPlan(input: unknown, ports: CleanupExecutionPorts): Promise<CleanupExecutionResult> {
+  const request = decodeAuthorizedCleanupRequest(input);
+  const plan = structuredClone(decodeCleanupPlan(await ports.loadPlan(request.session_id)));
+  if (plan.session_id !== request.session_id) throw new Error('worktree_cleanup_session_changed');
+  // A persisted plan fingerprint is checked again; a hash is freshness, not authority.
+  for (const item of plan.items) {
+    if (sha256Hex(cleanupPlanDigestInput(plan.session_id, item)) !== item.plan_sha256) throw new Error('worktree_cleanup_plan_changed');
+  }
+  if (cleanupPlanSelectionDigest(plan, request.ids) !== request.expected_digest) throw new Error('worktree_cleanup_digest_changed');
+  const items: CleanupExecutionItem[] = [];
+  for (const id of request.ids) items.push(await executeItem(request, plan.items.find(item => item.worktree.id === id)!, ports));
+  return { protocol: 1, kind: 'operator_authorized_worktree_cleanup', session_id: request.session_id, items };
+}

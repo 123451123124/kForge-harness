@@ -1,0 +1,6852 @@
+# Changelog
+
+All notable changes to this skill are documented here.
+
+## [0.36.0] - 2026-11-21
+
+### Added
+
+- Antigravity is the fourth hook host. `rh install --target antigravity` adds the owned `repo-harness` member in `~/.gemini/config/hooks.json`, a Global Working Rules block in `~/.gemini/config/AGENTS.md`, and skill links under `~/.gemini/config/skills/`. Targeted update refreshes managed entries. Uninstall preserves user entries and parent directories. `rh doctor` checks the hooks, rules and skill links. Default install and update exclude Antigravity. (#3251, #3376, #3380)
+- Native Antigravity (`agy`) can run the Herdr advisor, council, workers and `gatekeeper-fallback`. Launch requires stable `agy` 1.5.0 or later and checks the repository opt-in, installed hooks, sign-in and exact catalog model. The advisor supports Stop handoffs and manual relaunch. Workers have a write tool profile with optional GitHub access. The advisor, council and gatekeeper fallback have read-only tool profiles. (#3246, #3377, #3383)
+- Configure an optional council in Operator Settings. Run `rh seats council --issue <n> --members <csv>` to open Herdr consultation tabs for up to three distinct members from `fable`, `carbon` and `astra`. Each member writes a reference plan outside Git. (#3297, #3298, #3366, #3378)
+- `rh seats pool` and Operator Settings show available recommended models by seat. Pi seats can set separate scaffold models for `explorer` and `deep-reasoner` under `seats.pi_sub_agent_models`, within each seat's fleet grants. (#3253, #3268)
+- `rh board cluster --open --json` and `rh board cluster --parent <n> --json` group open issues by module and defect pattern. Add `--include-loose` to a parent scan to include loose issues. The command resolves cited files through ArchContext and groups issues with overlapping files. It reports blockers and cycles. If overlapping issues have an intervening dependency, it splits the overlap to keep the proposed merge order valid. (#3282, #3348, #3357, #3359, #3362)
+- Board attention rule R8 alerts the advisor when a plan has two or more ready, unclaimed single-issue units in the same module and tier group. `rh board triage-apply --manifest <path>` checks the plan and split rules before changing labels, sub-issues or the parent plan. `--dry-run` shows the operations without writes. (#3359, #3362)
+- Experimental `rh rules status --proposals` reports review findings and recurring rule-opportunity themes after the ledger watermark. Add `--include-low` or `--include-bot` for more findings. The scan reports when it reaches its GitHub call limit. (#3263)
+- `rh doctor` checks the local Magpie gateway when a configured seat or review route uses it. The tooling guide lists the supported provider routes. (#3254)
+
+### Changed
+
+- The logical model catalog supplies the vendor families, native and Magpie routes, quota accounts, and seat recommendations. Astra and Sonnet leave the non-council recommendations. Explorer uses Haiku at high effort. Codex deep-reasoner and harness-evaluator use GPT-6.2 Sol. Pi Gemini 4 Neon shares the Claude Opus seat tier. (#3340, #3352, #3363)
+- `rh quota` and Operator show separate `agy_gemini` and `agy_other` accounts with weekly and five-hour limits. A Pi advisor on Magpie's `agy-cli` route uses its configured model at 50% or more Gemini weekly quota. It uses Neon below 50% or when the reading is unknown. Native `agy` uses its configured model. Worker routes check seats in configured order and reserve Gemini quota for the advisor below `routing.agy_saving_below_remaining`, which defaults to 25%. (#3286, #3288, #3366, #3378)
+- The seat schema has 11 seats and narrower fleet grants. Herdr seats can use the read-only scaffold roles where their grants permit. Standalone Claude and Codex installs retain `explorer`, `deep-reasoner` and `harness-evaluator`. (#3305, #3306, #3307, #3366, #3378)
+- Seat launch, board dispatch and board review check runtime availability before starting an agent. Dispatch skips unavailable workers. Board protocol 14 attributes review seats from GitHub acceptance evidence. Medium PRs prefer the gatekeeper and use the reviewer when the writer shares the gatekeeper model family or the gatekeeper is unavailable. A High second review checks the recorded gatekeeper family. Manual `rh review publish` requires `--seat gatekeeper` or `--seat reviewer`. (#3253, #3353, #3369, #3371, #3374)
+- `rh worktrees start` can seed a private CodeGraph index from the shared base. It builds a full index when a seed is unavailable and preserves occupied index directories. The architecture advisory checks constraints through `rh arch constraints check`. (#3188, #3347, #3361)
+- The ArchContext 0.17.0 adoption batches architecture verification and PR impact and uses the same Git base for both formats of `rh arch projection slice`. The release ships ArchContext and contracts 0.17.1 with CodeGraph 1.6.4. Native `archctx debt --base` now owns shared-base indexing, comparison and cache management for `rh arch debt --base <ref>`. Standalone `rh arch debt` still measures the current checkout with `archctx complete`. (#3350, #3373, #3372, #3381)
+- `rh arch refactor recommendations` accepts `--node <capability-id>` or repeatable `--path <repo-relative-path>` and preserves typed provider errors. Refactor decisions use the recommendation scan digest. The ArchContext client reuses compatible Node probes and rechecks the executable before reuse. (#3346, #3347, #3361, #3373)
+
+### Fixed
+
+- Whole-path ownership requires the recorded file-system entry identity and content. Restore, removal and the hook exemption preserve a user replacement with the same bytes. (#3266)
+- `rh worktrees cleanup` keeps a merged checkout with unrecognized Git-ignored local data. Preview and apply check the Git inventory. Apply checks it again under the topology lock. (#3338)
+- A failed acceptance write leaves the previous receipt verifiable. The writer stores the result and observation by digest before it publishes the receipt. (#3335)
+- Seat launch uses the same login shell in tabs and splits. Seat reset refuses an untracked requester immediately and reads the registry from the requester's launch directory. Pi reset seats receive their seat environment and support Pi session records, Stop handoffs and peer reset. (#3279, #3300, #3302, #3364, #3368)
+- Native Antigravity denies state-changing board commands, including the paths through `rh board --parent` and `rh board attention start`. Use `rh board cluster --parent <n>` for a read-only parent scan. (#3364, #3368)
+- Operator Settings refuses to disable a runtime while effective seats use it and lists the seats to move first. (#3287)
+
+### Removed
+
+- The bundled `fast-worker`, `deep-worker`, `root-cause-prover` and in-process `gatekeeper` agents are retired. Use the Herdr seats for implementation and acceptance. (#3305, #3306, #3307)
+- `rh seats consult` and the `planner` seat give way to `rh seats council`. The `gatekeeper-deep` seat is retired. (#3366, #3378)
+- Direct ArchContext `audit`, `investigate`, `agents` and `jobs` point to the seat and issue-flow commands. `hook` points to `rh install`. (#3346)
+
+### Documentation and maintenance
+
+- ADR-0006 records the seat, model, fleet, review and bundling design. The issue-flow procedures cover council consultation, dispatch skeletons and the optional `rule-opportunity` marker. Advisor and acceptor skills use scoped refactor recommendations, module review prompts and `rh arch verify` for architecture changes and High-risk cross-module changes. (#3262, #3299, #3343, #3349, #3367, #3378)
+- The rules review PRD and lessons record the discovery pilot, retro responsibilities, enforcement reconciliation and ledger watermark. (#3258, #3259, #3260, #3261, #3265)
+- Refresh generated architecture projections through `281260593`, `edf29b3ab` and `284404e4a`, with earlier refreshes in the release checklist. (#3301, #3318, #3322, #3328, #3358, #3365, #3379)
+- Record the 0.35.2 released managed values. The architecture provider timeout test now starts its timer after the fixture signals readiness. (#3295, #3294)
+
+### Upgrade
+
+- Run `rh update` once on each host to install 0.36.0 and migrate the entry-identity ledger. From 0.35.2, the user and repository host configuration ledgers move from protocol 4 to 5. The update records identity for eligible entries that still match the ledger. It removes or restores retired files only when it can prove ownership. It keeps edited or unproved files and reports retained vault copies. Install state stays at protocol 5, plan blocks at protocol 3 and the hook bridge at protocol 1. (#3266, #3306)
+- The same update moves saved seat settings to the 11-seat schema. Review `planner` → `council`, `worker-important` → `worker-opus`, `worker-important-fast` → `worker-neon`, the removal of `gatekeeper-deep`, and the new Gemini saving threshold. Update automation that refers to the old names or `rh seats consult`. Relaunch the seats after all participating hosts update. (#3366, #3367, #3378)
+- Record fresh acceptance if an open review still uses the old local receipt layout. Receipt protocol 4 now reads the result and observation from digest paths. Pass `--seat` when publishing manually. (#3335, #3371, #3374)
+- To opt in to Antigravity, run `rh install --target antigravity`. If the host is already opted in, run `rh update --target antigravity` to refresh its managed entries. Run `rh doctor` and confirm that the installed hook commands resolve to the current executable. On the actual seat host, verify guard activation in fresh `agy` sessions and launch the advisor through Herdr in an opted-in checkout. Record the live results before relying on native seats. (#3251, #3246, #3380)
+- After upgrading the tools and checking a successful `rh arch debt --base <ref>` run, remove the retired repo-harness cache at `.git/repo-harness/cache/arch-debt` if it still exists. In a linked worktree, look for `repo-harness/cache/arch-debt` under the directory that `git rev-parse --git-common-dir` prints. ArchContext manages its own cache. (#3372, #3381)
+
+### Rollback
+
+- Before publication, close the prep PR or revert its squash commit. After publication, keep the tag and release a corrective patch.
+- Version 0.35.2 rejects protocol 5 host configuration ledgers. Keep 0.36.0 on migrated hosts, or restore the pre-upgrade ledgers with their matching host state and seat settings before returning to 0.35.2. Before a downgrade, move native `agy` seats to a supported runtime. If the host state restore does not cover Antigravity, remove the new managed entries with 0.36.0 first.
+
+## [0.35.2] - 2026-11-19
+
+### Added
+
+- The board records seat lifecycle events, CLI refusals and hook summaries in a sanitized index outside task worktrees. (#3204)
+- `rh board retro --parent <n>` or `rh board retro --since <duration>` reports bottlenecks from lifecycle records and GitHub data. The advisor runs it after batch close and release. (#3205)
+- `rh config status`, `diff`, `restore` and `gc` show managed changes, revert a selected file and clear retired backups after 30 days. (#2851)
+- `rh install` and `rh update` accept `--override <owner>:<selector>` to select overrides. `rh update --dry-run` and the install dry run preview host configuration writes. (#2851)
+- `rh config restore --repo <worktree>` restores repository hook files that `rh init` or `rh upgrade` changed when removing retired rh hooks. (#2854)
+- `rh uninstall --with-tools` removes recorded herdr-core files, the `hc` link and the Windows user PATH entry when they still match the ledger. (#2853)
+- A Pi seat can use `magpie/agy-cli/gemini-4-neon`. (#3245)
+
+### Changed
+
+- Plan block protocol 3: a `merge_order` entry is one issue or a bundle unit (an array of two or more issues). `rh board dispatch` starts one seat, one worktree and one PR for each ready unit, with tier and route guards; `--issues` selects one declared unit only; `rh board merge` checks the order by unit. A protocol 2 block reads as `plan block invalid: unsupported protocol 2; repost plan with rh board post plan`. After the install, post the plan comment of each open parent again with `"protocol": 3` (`rh board post plan`), and update every machine that runs seats together. (#3281)
+- `rh uninstall` reverts host configuration through the ledger, checks the baseline before a full restore and keeps edited files when it cannot prove what to revert. Use `--remove-edited-block <path>` to back up a file and remove its recorded block even after edits. (#2851)
+- Pi and Skills CLI installs record declared, verified configuration changes in the ledger and report changes outside the declarations. (#2852)
+- `rh` records herdr-core, its `hc` link, the Windows user PATH entry and a Bun installed by the bootstrap. Plain `rh uninstall` keeps shared tools and reports them. (#2853)
+- `rh` records the runtime-state block in `.git/info/exclude` in the repository ledger. Uninstall keeps and reports an edited, unbalanced or unproved block. (#3080)
+- `rh init` records repository writes for undo with `rh config restore --repo <worktree>`, which replaces `rh init rollback`. Run `rh init` at the worktree root. (#2903)
+- The issue-flow skill requires five user-file states in the PR verification for High-tier changes that can delete or overwrite user files. Releases wait for an open migration or ledger batch unless the release fixes a released I1 or I2 defect and names the open work. (#3242)
+- Fix a second defect of the same rule in the same file in the current PR if you find it before review round 1. (#3274)
+- Seats accept a model ID in the form required by their runtime. An ID with an unknown model family cannot satisfy a different-family review requirement. (#3250)
+- The Seats page suggests models for each seat kind on its selected runtime. (#3252)
+
+### Fixed
+
+- Rebuild the released managed values list for v0.35.1. (#3211)
+- Workflow changes limited to timeouts or path filters qualify for Medium review when the remaining tier checks permit it. (#3187)
+- `rh upgrade --registered --apply --pr` stages changes when the backup directory is ignored. (#3212)
+- Repair two source links in the Operator architecture reference. (#3214)
+- `rh publication merge` blocks a PR with an unresolved review-bot thread that has no human reply. (#3218)
+- Host configuration revert retires a ledger claim before deleting its entry or removing text that rh added. A missing replaced file also releases its claim, and rollback keeps released claims retired. (#2854, #3227)
+- Repository backups and staging files are ignored before `rh init` or `rh upgrade` writes user-file copies. (#3228, #2854)
+- Legacy JSON migration records a `statusLine` or rh-tagged hook command inline in `ledger.json` only when its text matches a released rendering. (#3232, #3237)
+- On Claude, a Bash guard failure denies the command. (#3267, #3271)
+- Hook output and failure records omit the denied command and raw crash text. (#3267, #3273)
+- `rh uninstall` and a plugin switch away from Pi remove only the exact recorded Pi package entry and write the settings atomically. (#3249)
+- The safety hook checks that a recorded path still matches what rh wrote before exempting it from the user-file guard. (#3266, #3272)
+- Whole-path writes check all destinations before writing and refuse links that lead outside the install root. (#3266, #3278)
+- An invalid stored seat setting reports its field path. (#3244)
+
+### Upgrade
+
+- Run `rh update` after installing 0.35.2. It moves install state to protocol 5 and the host configuration ledger to protocol 4. The move is one-way: 0.35.1 does not read install state protocol 5 or ledger protocol 4. (#2851, #2852, #2853)
+- If you put a secret inline in an rh-tagged hook or statusLine command before upgrading to 0.35.1, check `ledger.json` for it and rotate that secret. (#3237)
+- After the install, use `rh board post plan` to repost the newest plan comment of each open parent with `"protocol": 3`. Update every machine that runs seats together. (#3281)
+
+## [0.35.1] - 2026-11-18
+
+### Fixed
+
+- `rh` and `repo-harness-hook` start when `HOME` is not set: `--version`, `--help` and the hook usage run, and a command that needs the recorded plugin selection fails closed with `install_state_home_missing`. The account home is `HOME`, else `USERPROFILE` (a plain Windows shell); the value must be an absolute path. The tarball smoke runs the packed CLI and hook under `env -i`. (#3200)
+- `rh update` from 0.34.0 no longer exits 1 on `~/.codex/skills/repo-harness-{orchestrator,advisor,seat-handoff}` links that 0.34.0 made but did not record. The skill sync adopts an existing link with no record only when its target is exactly the package source of that skill, and records it; another target, a dangling link, a file, a directory or a user-managed record stays refused. (#3201)
+- Rebuild the released managed values list for v0.35.0. (#3199)
+
+### Upgrade
+
+- Run `rh update` once after the package install. It refreshes the managed Global Working Rules block, the hook adapters and the hook code. A 0.34.0 host with unrecorded Codex facade skill links now updates without a manual move of those links.
+
+## [0.35.0] - 2026-11-18
+
+### Breaking
+
+- Migration path: each old name below stops working in this release and has no alias. Use the replacement that its line names.
+- Migration: install state protocol 3 with `ownership_manifest`, and the fleet receipt `~/.repo-harness/agent-fleet-user-managed.json` → ledger path records (install state protocol 4, ledger protocol 2); `rh status` and the other readers fail with `install_state_protocol_retired` until `rh update` migrates the state once. (#2896)
+- Migration: `rh uninstall --recover-interrupted` → removed with no replacement; `rh update` migrates the configuration receipt `~/.repo-harness/configuration-restore.json` into ledger records once, and a receipt with a `pending` entry or a malformed receipt fails closed with `host_config_invalid_state` and a recovery step. (#2848)
+- Migration: `rh rules check TestBudget --body-file <path>` → `rh rules check TestBudget` without the flag; the rule reads no PR body, reports `over_budget` as data, and a rule result never fails the command. (#3181)
+- Migration: the `Test budget exception` section of a PR body → removed with no replacement; merge readiness no longer reads a `Test budget` result, and the `test_budget_stale`, `test_budget_missing`, `test_budget_pending`, `test_budget_violation`, `test_budget_error` and `test_budget_policy_invalid` blockers are gone. (#3181)
+- Migration: board attention rule R6 → removed with no replacement; an idle seat with no ready bundle is not a finding. (#3182)
+
+### Added
+
+- `rh seats launch <seat> --cwd <path> --task <text>` opens the seat in a Herdr.app tab with the `rh seats argv` argv. The space comes from `--space` or from the `herdr.space` label of the calling terminal; without one, or when Herdr.app refuses the tab, the launch fails closed and starts no terminal.
+- Attention rule A21 (P1, orchestrator) names a live seat terminal that no Herdr.app pane shows, so a seat started with `hc run --bg` is no longer invisible. The board seat terminals carry the Herdr.app `where` label as `where` (null when unbound).
+- `rh board dispatch --issues a,b,c` starts one seat, one worktree and one pull request for a module bundle. Each claim carries an `Issues:` line; attention rules A4, A12 and A13 read the whole bundle, and `rh board merge` accepts a pull request that closes every issue of its bundle claim, on its head branch, without a split.
+- Attention rule A22 tells the orchestrator about a stalled seat: it reports `working` for more than 300 s, its program has no child process, and its screen without spinner frames and elapsed-time counters is the same as in the board read before. The board shows the probes as `seat_liveness`; nothing kills the seat. The board protocol is 13.
+- `rh review collect` closes the done review seat of its pull request after the record publishes and reports the result as `seat_close`.
+- A seat has an `advisor_model` setting (default null). A Claude seat with a value launches with `--advisor <model>`; Codex and Pi seats reject a value, and the Seats page shows the control for Claude seats only. A Claude seat in saving mode launches with `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`, which also turns off an `advisorModel` from the user's Claude Code settings. (#2930, #3091)
+- The policy key `review.i3_paths` names the I3 paths of a repository as path globs. (#3181, #3187)
+
+### Changed
+
+- rh changes `~/.codex/config.toml` through the host-config gate with the `toml-fragment` strategy, and a revert restores the original bytes. An explicit user value of `default_mode_request_user_input` stays, and install names it. The Codex CodeGraph table comes from `codegraph install --print-config codex`; the `rh arch codegraph configure --json` action is `configure-codex` (before: `codex-project-path`). An indented table header and a table at the end of the file without a final newline round-trip. A profile switch that cannot remove a fragment (invalid TOML or JSON, an unsupported spelling, a user edit) prints `[install] kept_edited <path>: …`, keeps the bytes and continues. (#2847, #3038, #3046, #3109, #3079)
+- rh changes `~/.claude/settings.json`, `~/.codex/hooks.json` and `~/.claude.json` by text edits through the gate, and a revert restores the original bytes. A mixed hook entry (an rh route command beside a user command, or a retired rh command beside a user command) fails with `host_config_invalid_state`, keeps the file bytes and names the entry to move out. The Claude CodeGraph server goes to `mcpServers.codegraph` from `codegraph install --print-config claude`, and its tool rule goes to `permissions.allow`; a configure no longer writes the codegraph `UserPromptSubmit` hook or `~/.claude/CLAUDE.md`. (#2848, #3058)
+- The Global Working Rules block in `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` changes through the gate with the `marked-block` strategy. A refresh keeps the bytes and line endings around the block, so uninstall restores the original file. Links are followed. Uninstall prints `[note] <path>: file already absent` and retires the records of a recorded file that is gone. rh no longer writes `~/.repo-harness/global-context-backups/`. (#2849, #3082)
+- Whole host paths (files, links and skill trees) change through the gate with `created`, `replaced` and `user_managed` path records. Uninstall and the plugin switch revert them. A write at a user link writes the link target and keeps the link. `scripts/install-agent-fleet.sh --force` saves the replaced user file in the 0600 vault and prints a `cp` restore command; it imports `~/.repo-harness/replaced-agents/` once, and a stray file there stops the fleet before any change. `rh install --state` prints an `ownership` list of the path records. (#2850, #2896, #3102, #3065, #3161)
+- Herdr, the Waza shared rules, bundled skills, staged skill links and installed command copies write through the gate. A rollback keeps a later user edit. A user copy of a Waza, Herdr or bundled skill that the gate refuses is a skipped row with `host_config_replacement_refused`, `refused_path` and a move-out step, and the other writes commit. (#3076, #3132)
+- `rh upgrade` removes a legacy hook command from `~/.claude/settings.json`, `~/.codex/hooks.json` and repository hook files by a text edit only when it is exactly a hook that a released rh wrote; all other bytes stay. A customized hook, the bare `HOOK_HOST=<host> repo-harness hook <Event> --route <id>` form and other unmatched commands are reported, and the file keeps its bytes. (#3044)
+- `rh rules check TestBudget` reports the budget as data. The second, cross-model review row runs only for an I1, I2 or I3 path, a `.github/**` path, an incomplete file list or a `tier:high` label. A round-1 `PASS` row carries to the fix head, and a High head with no seat starts the gatekeeper and the reviewer in parallel. (#3181, #3187)
+- `worker-deep` and `gatekeeper-deep` default to `gpt-6.2-sol`, and the Sol and Astra fleet roles move to their 6.2 models. Codex and Pi seats accept both 6.2 models; `gpt-6.1-sol` and `gpt-6-astra` stay selectable. The Pi seat range accepts `magpie/agy-cli/gemini-4-carbon`. (#3147, #3086)
+- Round 1 of a Codex or Pi review pins `review_model` in the review session, and each later round checks the isolated configuration against the pin. An open Codex or Pi review without a pin fails with `review_model_unpinned`, which names the `rh review cancel` command and the restart steps. (#3155, #3171)
+- `rh seats argv` only prints the argv. `rh seats launch` failures are `seat_space_missing`, `seat_tab_failed` and `seat_tab_unknown`. (#3166)
+
+### Fixed
+
+- The safety hook judges each output path of a `find` and of a copy: one `find` parser for GNU and BSD (an unknown word is an unknown target, and a writing `find` with one refuses), the `-fprint`, `-fprint0`, `-fls` and `-fprintf` output files, each `-exec`, `-execdir`, `-ok` and `-okdir` template as a simple command, each output that `cp` or `ln` writes below a destination directory (recursive for `-r`, `-R` and `-a`, through links, refused above 1000 children), and `install` destinations under the GNU and BSD option readings. A writing `find` below a link-following start walks the links instead of a refusal. An over-limit glob in an in-root directory is judged by its children, so `rm -f big/*` passes. (#3037, #3041, #3054, #3055, #3057, #3073)
+- A transient ownership lookup failure (`capability_ownership:unavailable`) no longer sends `[Architecture] notice unavailable` to the model at each Stop and turn. The hook writes one stderr line and one `hook-events.jsonl` entry. (#3190)
+- The lock holder settles the copies that a killed install left under `~/.repo-harness/transactions/install-*`: a copy with the same bytes as its host file goes, and a different copy moves to the 0600 vault. Nothing is restored to a host path. A rollback with a missing backup keeps the host path and reports a failure. (#3043)
+- An update from an rh 0.34.0 parent whose candidate fails keeps the converted ledger entries and puts the ledger and `agent-fleet-user-managed.json` back byte for byte. (#3167)
+- A parse error of a user or rh-written JSON or TOML file names only the path (`<path>: the file is not valid JSON` or `TOML`) and the fix, without the parser text. The acceptance receipt reader still prints the parser text. (#3164, #3183, #3175)
+- `rh arch debt --base <ref>` caches the base report under `<git-common-dir>/repo-harness/cache/arch-debt/`, and a killed run leaves no `repo-harness-debt-base-*` checkout. An invalid cache record fails with `RH_ARCHITECTURE_DEBT_CACHE_INVALID`. (#3186)
+- A corrupt `archctx resolve` JSON raises `RH_ARCHCTX_RESOLVE_CORRUPT_JSON` and keeps its exit code, the stdout size, the first and last 128 bytes of stdout, the last 128 bytes of stderr and the parse error. (#3075)
+- Rebuild the released managed values list for v0.34.0. (#3061)
+
+### Removed
+
+- Attention rule R6 (free worker seats and a short ready queue) is gone: an idle seat with no ready bundle is not a finding.
+- Merge readiness no longer reads the `TestBudget` result, and the PR-body `Test budget exception` parser is deleted. (#3181)
+- `rh uninstall --recover-interrupted` is deleted. (#2848)
+
+### Documentation
+
+- The managed Global Working Rules block and the issue-flow skill describe diff-only review with one reviewer by default, a second cross-model row only for I1, I2 or I3 paths, at most two review rounds, P2 and P3 findings kept in the review record without an issue, module bundles, and a Test budget report without a cap. (#3190, #3181)
+- The issue-flow skill asks for one CI run per change: a clean stacked PR merges without a merge of main, and a worker pushes once per review round. (#3067)
+- The Herdr Dispatch guide starts seats with `rh seats launch`, `rh board dispatch` or `rh board review`. (#3172)
+
+### Upgrade
+
+- Run `rh update` once after the package install. It migrates the install state to protocol 4 and the ledger to protocol 2, imports the configuration receipt, and refreshes the Global Working Rules block, the hook adapters and the skills through the gate. Until it runs, `rh status` fails with `install_state_protocol_retired`.
+- When `rh install` or `rh update` stops with `host_config_invalid_state` for a hook entry, move the named rh command out of the user hook entry, then run the command again. `rh upgrade` removes legacy rh hook commands that are exactly a released form.
+
+### Rollback
+
+- A downgrade below 0.35.0 after `rh update` fails closed: an older rh cannot read the protocol 2 ledger or a `replaced` path record. Run `rh uninstall` with 0.35.0 first.
+
+## [0.34.0] - 2026-11-17
+
+### Breaking
+
+- Migration path: each old name below stops working in this release and has no alias. Use the replacement that its line names.
+- Migration: `operations.agent_writable_private_dirs` in `.ai/harness/policy.json` → removed with no replacement; agent writes inside `_ops/` and `_ref/` pass without it, the key has no effect, and `rh init` removes it. (#2916)
+- Migration: `ProtectedNameGuard`, `RepoScopeGuard`, `OpsPrivateGuard`, `ExternalReferenceGuard` and `WorktreeCreateGuard` → `CredentialGuard` (I1), `UserFileGuard` (I2) and `RecursiveDeleteGuard`; a deny or a failure record no longer names an old guard. (#2916)
+- Migration: `routing.codex_hyper_at_or_above_remaining` in the seats section of `~/.repo-harness/config.json` → removed with no replacement; each seats read fails with `seats_config_migration_required` until `rh update` removes the key once, and a seats settings save that sends it is rejected. (#3004)
+
+### Added
+
+- `LedgerEnforcement` checks `tasks/lessons.md` in each PR against the Lessons Retro contract: every non-blank line belongs to a parsed entry, the required and known fields, the `Missed by` values, a cumulative `Seen` for each theme, a resolving `Enforced by` path or rule id, `Promoted` at `Seen` 3× or more with `Enforced by: judgment`, and every `Triggered by correction` reference of the merge-base. `Mistake pattern` is the immutable theme key (lowercase words joined by `-`), and a head theme continues only the merge-base theme with the same key: a key that leaves the ledger fails, a theme maximum never falls, a consolidation keeps on the consolidated entry the maximum, the `Promoted` references of the entries that it replaces (a consolidated entry lists them, separated by `, `) and the current `Enforced by`, and a `Name` change is free. The latest entry can raise its `Seen` for another correction on the same `Date`, and a consolidation that also adds a new event is found from the merge-base dates that the head drops. A field line is exactly `- <Field>: <value>`, and a continuation line is indented prose without a list marker; any other line in the ledger is a finding. Each finding names the entry, the field and the fix. An existing `Enforced by` reference stops at human review. A theme state that the merge-base already has is reported as carried and does not fail. `scripts/check-ci.sh ledger --base <ref>` runs it; the new `LedgerEnforcement` CI job runs on each PR, documentation-only PRs included, and its failure fails `Required / CI`. `scripts/maintenance-triage.sh --entries <file>` prints the parsed entries with the lines that each entry owns, so the ledger keeps one parser; a repeated field in one entry now keeps its first value, and the `--json` judgment themes group by the exact key and drop the `key` field (use `theme`).
+- Merge readiness reads the `TestBudget` result when the policy has a `rules.TestBudget` configuration. It takes the newest completed `Test budget` check run of the PR head, binds its Actions run to the PR, head and base, and reads its one result annotation. It recomputes the five bound inputs (head, merge-base, rule configuration digest, rule version, exception digest) and blocks with `test_budget_stale` when one differs, `test_budget_missing` when no usable result exists, `test_budget_pending` while a newer run is not complete, `test_budget_violation`, `test_budget_error` or `test_budget_policy_invalid`. A disabled rule needs its matching `skipped` result. An edit of other PR body text keeps the result valid. `rh publication merge` compares the result with the rule configuration at the live tip of the base branch and with the merge-base of that tip and the head, and refuses with `test_budget_stale` when its final PR read shows a changed exception.
+- SessionStart shows the ArchContext posture and constraint count of the active issue task. The task text comes from the issue number and the branch slug. The pinned package-local `archctx` prepare runs only with an adopted model authority and a responding daemon (probed with `archctx daemon status --json`, which starts no daemon), and only when 1500 ms or more of the shared 3000 ms SessionStart deadline remain after the debt read. A timeout, a setup error or an invalid task context omits the posture block and gives one short diagnostic. Debt keeps priority in the 800-byte notice. (#2874)
+
+### Changed
+
+- `rh install` and `rh update` write the runtime-state ignore block into each adopted, registered repository's `.git/info/exclude` (one block per Git common directory; user links are followed) and no longer into the user-level Git excludes file. `~/.repo-harness/repository-excludes.json` records each repository write, and `rh uninstall` removes only those blocks; an edited or unbalanced block stays and is reported. `rh update` removes the old block from the user-level Git excludes file once every registered repository holds its own block; until then it keeps the old block and says why. A repository that is not adopted gets no rule. (#2844)
+- One safety hook runs on the PreToolUse bash route (Claude, Pi) and edit route (Claude, Codex, Pi). I1: `CredentialGuard` refuses a call that prints or sends a credential store (an SSH private key or `.ssh`, `auth.json`, `*credentials*.json`, `.env*` other than example, sample and template files, a keychain dump, `env` or `printenv` of the whole environment). I2: `UserFileGuard` refuses a removal or overwrite of an existing file outside the worktree, the managed worktree root, the system temp directory and the host agent's own memory and plan directories (Claude `~/.claude/projects/*/memory` and `~/.claude/plans`, Codex `~/.codex/memories`), unless the install ledger records it as rh-created; a create or an append passes everywhere, and a removal whose target is not known is refused. An interactive Claude session (any `permission_mode` other than `bypassPermissions` or `dontAsk`) gets the host's ask decision instead; the deny names every allowed root and the `! <command>` line or target path that the user can act on themselves. `RecursiveDeleteGuard` keeps the whole-repository `rm -r`, `find -delete` and `git clean -x` rule. I1 judges the file operands that each program reads after quote removal and brace and glob expansion, and counts a curl `@file` upload. I2 checks every simple command, also after control words and inside a subshell, counts a target as outside when the working directory is not certain, and resolves targets through symlinks as the kernel does. The prompt, stderr and failure record carry the reason and fix after secret redaction. The hook is on by default for every installed host; running sessions use it as soon as the new version is installed. Only `rh install --no-hooks` keeps a host without the hook routes; `rh update --no-hooks` skips the adapter refresh, and the adapters that are already installed run the new hook. (#2916)
+- I2 expands each Bash operand in-process as the shell does (brace expansion, a leading `~`, `$HOME` or `${HOME}`, then glob expansion) and judges each literal operand and each match with one rule; the hook runs no shell. An unknown removal or change target is refused, also when its literal directory is inside an allowed root (`rm -rf build/$X`). An unknown overwrite target is refused when its literal directory exists outside the roots and the install ledger does not record it. A word above the brace limit or above 1000 glob matches is refused for every target kind. `mv` refuses a destination that resolves to an existing directory outside the roots, and `rm -rf link/` refuses when the link resolves outside. A writing `find` that follows links (`-L`, `-follow`, or `-H` on a link start) is refused as an unknown target; a read-only `find -L` passes. (#3019, #3026)
+- Codex and Pi-Codex seats keep their configured model and effort at every ChatGPT quota level. The Seats page and `rh quota` no longer use a ChatGPT hyper threshold. Run `rh update` once to remove the retired setting from a stored seats section. The advisor keeps its configured model; Claude modes stay the same. (#3004)
+- The Pi seat range accepts `magpie/opencode-go/deepseek-v4.1-flash`, `magpie/group/deepseek-v4.1-flash`, `magpie/zcode/GLM-5.3` and `magpie/zcode/GLM-5.3-Flash`. (#3005)
+
+### Fixed
+
+- `rh update` writes one `config.json.bak-<UTC timestamp>-update` backup (mode `0600`) next to `~/.repo-harness/config.json` before its first one-shot migration replaces the file. The update report names the path, also when the installed candidate runs the migration. A failed backup stops the update before the configuration changes. An existing backup path stays, and the report names it and a remedy. An unchanged configuration gets no backup. (#3011, #3020)
+- SessionStart writes a notice delivery marker only after the complete block fits in the 800-byte notice, so a status, map or debt block that the limit drops comes back at the next SessionStart. The unowned-path and checkpoint debt blocks keep separate markers. The archctx calls, Node selection included, stop within the shared SessionStart deadline. (#3017)
+- Rebuild the released managed values list for v0.33.2. (#3012)
+
+### Removed
+
+- The protected-name gate (`ProtectedNameGuard`) with its strict form and read-only and git allowlists, `RepoScopeGuard`, `OpsPrivateGuard`, `ExternalReferenceGuard` and `WorktreeCreateGuard` are deleted. Agent edits and Bash writes inside the worktree, `_ops/` and `_ref/` included, pass; Stop still reports changes under `_ops/` and `_ref/`. The `operations.agent_writable_private_dirs` policy key has no reader, and `init` removes it. (#2916)
+
+## [0.33.2] - 2026-11-17
+
+### Breaking
+
+- Migration path: each old name below stops working in this release and has no alias. Use the new name.
+- Migration: `rh run contract-worktree <start|cleanup|notify-merged|sweep|status>` → `rh worktrees <start|cleanup|notify-merged|sweep|status>`. (#2864)
+- Migration: `rh run contract-worktree-runtime` → `rh worktrees runtime`. (#2864)
+- Migration: `rh run ship-worktrees` → `rh worktrees ship`. (#2864)
+- Migration: `rh run worktree-merge-lib` → no command; the worktree helpers load it as a library. (#2864)
+- Migration: `rh run verify-sprint` → `rh verify`. (#2865)
+- Migration: `rh run verification-plan <validate|evaluate|execute>` → `rh verify plan <validate|evaluate|execute>`. (#2865)
+- Migration: `rh run run-bounded-verifier-command` → `rh verify plan execute`. (#2865)
+- Migration: `rh capability-context <status|sync>` → `rh capability context <status|sync>`. (#2866)
+- Migration: `rh run capability-resolver` → `rh capability resolve`. (#2866)
+- Migration: `rh run capability-config` → `rh capability register`. (#2866)
+- Migration: `rh run select-agent-context-blocks` → `rh capability blocks`. (#2866)
+- Migration: `rh architecture-projection <subcommand>` → `rh arch projection <subcommand>`. (#2871)
+- Migration: `rh architecture-debt` → `rh arch debt`. (#2871)
+- Migration: `rh module <list|review-prompt>` → `rh arch module <list|review-prompt>`. (#2871)
+- Migration: `rh refactor <recommendations|decide>` → `rh arch refactor <recommendations|decide>`. (#2871)
+- Migration: `rh tools ensure codegraph` → `rh arch codegraph ensure`. (#2871)
+- Migration: `rh tools configure codegraph` → `rh arch codegraph configure`. (#2871)
+- Migration: `rh brain <command>`, `--brain-root` on `rh install` and `rh update`, and the `brainRoot` config key → removed with no replacement; `rh update` removes `brainRoot` once. (#2937)
+- Migration: `rh migrate` → removed; `rh init` removes the repo-local host adapters. (#2937)
+- Migration: `AGENTIC_DEV_SOURCE_ROOT` → `REPO_HARNESS_SOURCE_ROOT`. (#2941)
+- Migration: `AGENTIC_DEV_LINK_INSTALLED_COPIES` → `REPO_HARNESS_LINK_INSTALLED_COPIES`. (#2941)
+- Migration: `AGENTIC_DEV_CODEGRAPH_LOCAL_BIN` → `REPO_HARNESS_CODEGRAPH_LOCAL_BIN`. (#2941)
+- Migration: `AGENTIC_DEV_CODEGRAPH_GLOBAL_BIN` → `REPO_HARNESS_CODEGRAPH_GLOBAL_BIN`. (#2941)
+- Migration: `AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL` → `REPO_HARNESS_CODEGRAPH_ALLOW_REPO_LOCAL`. (#2941)
+- Migration: `AGENTIC_DEV_CODEGRAPH_ALLOW_GLOBAL` → `REPO_HARNESS_CODEGRAPH_ALLOW_GLOBAL`. (#2941)
+- `rh worktrees` owns the contract worktree lifecycle: `start`, `cleanup`, `notify-merged`, `sweep` and `status` (the actions of `contract-worktree`), `runtime` (`contract-worktree-runtime`) and `ship` (`ship-worktrees`). Each passes its arguments unchanged to the helper and exits with its exit code. `worktrees` is a core command; `list`, `clean` and `path` still need the `operator` plugin. (#2864)
+- `rh run contract-worktree`, `rh run contract-worktree-runtime`, `rh run ship-worktrees` and `rh run worktree-merge-lib` exit 2 with the replacement command and run nothing, with no alias. The contract lists these ids in the new `helpers.internal`; `rh run --help` omits them. An unchanged 0.33 root context that names `rh run contract-worktree start` refreshes to the new text. (#2864)
+- Use `rh verify [args...]` for selected checks and `rh verify plan <validate|evaluate|execute> [args...]` for Verification Plans. Both preserve helper arguments, output and exit codes. The former public helper ids `verify-sprint` and `verification-plan` now exit 2 from `rh run` with the replacement command. `execute-eval` remains script-only. (#2865)
+- Capability commands now share `rh capability`: use `context status|sync`, `resolve`, `register` and `blocks`. The top-level `capability-context` command is removed. The `capability-resolver`, `capability-config` and `select-agent-context-blocks` helper IDs are internal; `rh run` refuses them with exit 2 and the replacement command. The registration command in the 0.33.0 scaffold notes is now `rh capability register add --repo <repo> --prefix <dir>`. (#2866)
+- The architecture commands move under `rh arch`: `rh arch projection <policy|status|check|plan|apply|adopt|anchors|render-check|hand-edits|publish>`, `rh arch debt`, `rh arch module <list|review-prompt>`, `rh arch refactor <recommendations|decide>` and `rh arch codegraph <ensure|configure>`. Their options, JSON output and exit codes do not change. The top-level commands `architecture-projection`, `architecture-debt`, `module`, `refactor` and `tools` are deleted, with no alias. (#2871)
+- `rh arch projection` passes the archctx `snapshot`, `freshness`, `publish-status` and `verify-pr` subcommands through. `run`, `recover` and `readback` exit 2 with `arch_command_owned`. (#2871)
+- `rh brain` is deleted: the command, `--brain-root` on `install` and `update`, and the `brainRoot` key of `~/.repo-harness/config.json`. The gbrain dependency left earlier (d5a802795) and #2795 retired `check:brain` and `sync:brain`; this removes the rest of the surface, with no alias. `rh update` removes the `brainRoot` key once and keeps every other byte of the file. Configuration reads reject invalid UTF-8 and duplicate JSON member names before a write. (#2937)
+- `rh migrate` is deleted. `rh init` already removes the repo-local host adapters through `addLegacyCleanup`. (#2937)
+- `rh init` no longer writes `.ai/harness/brain-manifest.json`, and the `information_lifecycle.external_knowledge` policy keys are unknown to the schema, so `rh init` removes them from an adopted repository. (#2937)
+- The `obsidian-memory` skill keeps the vault, but it resolves the root from the task only. No `rh` command reads or writes a vault.
+- The `AGENTIC_DEV_*` environment variables are renamed to `REPO_HARNESS_*` with no alias: `REPO_HARNESS_SOURCE_ROOT`, `REPO_HARNESS_LINK_INSTALLED_COPIES`, `REPO_HARNESS_CODEGRAPH_LOCAL_BIN`, `REPO_HARNESS_CODEGRAPH_GLOBAL_BIN`, `REPO_HARNESS_CODEGRAPH_ALLOW_REPO_LOCAL` and `REPO_HARNESS_CODEGRAPH_ALLOW_GLOBAL`. A script or CI job that sets an old name has no effect. `rh doctor` no longer reports a legacy `.ai/hooks/lib/workflow-state.sh` copy, `mcp doctor` no longer names a retired `[mcp_servers.repo_harness]` Codex block, and `mcp serve` and `mcp doctor` no longer refuse a repo-scope `.repo-harness/mcp.local.json`. A retired global `architecture` setting now fails as an unknown key in place of the `projection_apply: automatic` migration. (#2941)
+
+### Added
+
+- `rh upgrade --registered --apply --pr --expected-revision <digest>` refreshes the tracked repo-harness files of each registered repo in a temporary worktree on the branch `repo-harness/refresh`, pushes one commit and opens or updates one PR per repo with `gh`. The primary checkout does not change, and the command never merges. The fetch URL and every push URL of `origin` must name the same github.com repository (else `remote_target_mismatch`); that repository is the `--repo` of every `gh` call. The local branch is created create-only (an existing branch gives `refresh_branch_exists`) and deleted only at the commit that the run created. `rh update` does not run `--pr`. (#2320)
+- `rh seats argv <seat> --repository-id <id> --owner-exception <url>` lifts the Claude quota reservation refusal for one launch. The URL must name an issue or PR of the checkout's origin repository; the seat label `repo-harness.owner-exception` and the `--json` launch record keep it. A new `seats.routing.unavailable_pi_providers` list (default empty; `rh update` adds it) names Pi model prefixes such as `magpie/anthropic` that routing skips; while it is non-empty, a Pi seat with a null model is unavailable too. `rh quota` route, review and advisor lines give the reason, and a direct launch refuses with `seat_provider_unavailable`. (#2769)
+- A new read-only review seat `gatekeeper-deep` (default Codex `gpt-6.1-sol`, high; tools `net`, `read`, `shell`; no `edit`, no `gh`, no fleet) gives a project a second Codex review row on a different model without a writer seat. `rh seats argv gatekeeper-deep --pr <n>` launches it, `rh quota` prints its own route line, and `rh update` adds the default to a stored seats section. A host that ran `rh update` and then downgrades must remove the `gatekeeper-deep` key first. ChatGPT hyper mode does not remap `gatekeeper-deep`; it keeps its configured model, and `codex_credit_mode: review` does not admit it. When its effective model equals that of the route the gatekeeper launch selects (the fallback included), `rh quota` prints `gatekeeper-deep: none (same model as gatekeeper)` and `seats argv` refuses with `seat_model_repeats_gatekeeper`. (#2796)
+- `rh rules check TestBudget --base <rev> --head <rev> --body-file <path>` measures the test lines and test files that a PR adds from the merge-base to the head, with the parameters of `rules.TestBudget` in the base policy. It prints the `repo-harness/test-budget-result/v1` document (ADR-0004) and exits 1 on a violation and 2 on an error. A valid `## Test budget exception` section (the three measured numbers and a reason) turns an over-budget PR into `pass`; the result keeps the measured numbers. The new `Test budget` workflow runs it on `opened`, `synchronize` and `edited` and writes the document as a notice annotation. The base policy states the caps and the test and product path prefixes in `rules.TestBudget`; an enabled rule needs each of them. New rules stay off in adopted repositories; this repository enables `TestBudget`.
+- `rh rules check TestBudget --github-summary <path>` appends a Markdown summary of the result document to the file. The `Test budget` workflow writes it to the job summary. The summary names the state and its cause: pass within budget, pass with a valid exception (over budget), violation with a missing or invalid exception, skipped for no configuration or for the rule off, and not checked for an invalid configuration or another error. It keeps the measured numbers, the exception counts, the caps, the head and the diff start. It never shows the exception reason or other PR body text. The job log line for a skipped result also names the cause.
+- `rh board post <plan|hold|release|disposition|question> --target <n> --fields-file <path> [--dry-run] [--json]` writes the five protocol comments that the board parses: the plan, the merge hold, the merge hold release, the acceptance disposition and the boundary question. Each kind renders one comment next to its parser in `src/core/board/`, and the existing parser decodes the rendered text before anything is posted, so `rh board --parent <n>` cannot meet a plan or a hold that this command wrote. `--fields-file` holds the field names of the template in `templates.md` in lower snake case; an unknown key, a missing required field or a wrong type exits 2 with `board_post_fields_invalid: <key>: <reason>` and posts nothing. A plan also needs `supersedes` when the thread holds a plan, and that URL must name a plan comment of the thread. `--dry-run` prints the checked comment and posts nothing. (#2867)
+- `rh arch verify --base <ref> [--json]` gives one verdict for a change from seven read-only ArchContext checks: `validate`, `flows check --no-sync`, `state-machines check`, `constraints check`, `docs anchors`, `projection verify-pr --base` and `debt`. The document is `{"kind":"repo-harness.arch-verify","protocol":1,"base","head","archctx_version","verdict","checks"}`; each check is `pass`, `findings`, `error` or `unavailable`, with its finding count. `error` outranks `findings`, and an `unavailable` check never changes the verdict. The exit code is 0 for `pass`, 1 for `findings`, 2 for `error` and for a usage error, and an unresolvable `--base` exits 2 with `arch_verify_base_invalid`. Without `--json` it prints one line per check, then the verdict. (#2873)
+- `rh rules status [--target <path>] [--json]` prints the read model of the rules page: the ledger state (`path`, `head`, `blob`, `dirty`, `valid`, `entries`), every theme of `tasks/lessons.md` with its governance and open promotion actions, and a stable `candidate_id` for each action. The ledger comes from the `maintenance-triage` helper, so the repository keeps one parser. `candidate_id` is the SHA-256 of `repo-harness.rules.candidate.v1`, the repository identity, the theme key and the action on four lines. The repository identity is `github:<owner>/<name>` from the parsed remote URLs, or `local:<16 hex>` of the git common directory when no GitHub remote answers, so two hosts of one GitHub repository name the same candidate. (#2882)
+- A new `seats.routing.exhausted_at_or_above_used` setting (default 95, range 50–100; `rh update` adds it to a stored section) is the line at or above which a quota window reads `exhausted`. `rh quota`, `rh seats argv` and `rh board dispatch` classify at the stored line, so a window of 95% used reads `tight` and still launches when the owner raises the line to 100. A provider-reported `rate_limit_reached_type` stays `exhausted` at any value. The console Seats page owns the field, and a config save refuses a value outside the range. (#2909)
+- `rh commands [--json]` lists every registered `rh` command. The text form prints the visible leaf paths; `--json` prints every leaf, hidden included, with its plugin, arguments and options. The new `check:cli-manifest` gate in the governance lane fails when a skill or root document names an `rh` command or option that is not registered. (#2862)
+- `rh bots list [--json]` and `rh bots show <bot-id> [--json]` read the Bot registry without the operator server. An invalid id exits 2 with `bot_id_invalid`; an unknown id exits 1 with `bot_not_registered`. A record that does not decode, or that holds a credential-shaped value, fails the read with `bot_registry_invalid`, and `rh bots register` refuses such a value. Error output names the record file, not its absolute path. (#2868)
+- `rh arch <command> [args...]` runs a command of the pinned archctx after the version handshake, with unchanged arguments and the archctx exit code. A command that repo-harness owns, refuses or holds exits 2 with `arch_command_<disposition>: <cmd>. Use: <use>`; an unknown command exits 2 with `arch_command_unknown`. The worker skill uses `rh arch` and no longer resolves Node and archctx paths by hand. (#2870)
+- `rh run maintenance-triage --json` adds `themes`: each theme of `tasks/lessons.md` with its cumulative `seen`, `enforced_by`, `promoted` and the line of each entry. `judgment` is now the filter of `themes` with `seen` of 3 or more and `enforced_by` `judgment`. (#2881)
+- The docs page of the operator console checks an `eraser-diagram` code block before any render. It shows checking, valid, invalid with an `element / field / fix` list, or "Render capability not installed". An `icon` value with a remote address fails the check. (#2823)
+- The operator console renders an `eraser-diagram` block in the background when its document changes and shows the stored SVG as an image. Opening a document starts no browser. The render needs the optional capability under `<home>/operator/render-capability` and a local Chrome, Edge or Chromium; until then the page names the missing part. No install command for the capability exists yet. (#2824)
+- The docs page offers an "Export SVG" link for a shown diagram. The file holds the stored bytes that the page shows; no file is written before the user follows the link. (#2825)
+- `rh operator diagram <file|->` renders a diagram block once and prints `{ok:true, hash, png}`, or a result with `status` `invalid` (with issues), `failed` or `unavailable`. It exits 0 on success, 1 for an invalid or failed block and 2 for a missing capability or an unreadable file. (#2826)
+- The operator console has a read-only Rules page in the Observe group (`#rules`). The Candidates segment lists each lessons-ledger theme with an open promotion action: theme key, name, `Seen`, governance and the action labels. The Ledger segment (`#rules/ledger`) lists every theme with `Enforced by`, `Promoted` and its ledger lines. Field errors replace the lists with each error's line and fix; evidence errors keep the candidates under a warning. The page reads `GET /api/v1/repositories/<id>/rules` and sends no write. (#2886)
+- The operator console can file a rules promotion task with `POST /api/v1/repositories/<id>/rules/promotions` and complete its label and parent link with `POST /api/v1/repositories/<id>/rules/promotions/reconcile`. Both run `rh rules promote` in a child process, answer the CLI refusal codes as HTTP 409 and refuse with `herdr_unavailable` while the runtime status is unavailable. The rules snapshot adds the task progress of `rh rules status --tasks`, one prefilled prompt for each routing class of each open action, the seat of each routing class and the Herdr state.
+- The Rules page of the operator console opens a candidate drawer from each candidate row. The drawer shows the lesson fields, the correction sources, the enforcement ladder and the prefilled prompt with a read-only marker line. The owner selects one of the five routing classes, sees the expected seat as an estimate, and files the task with Submit (`rules_promote`) or copies the prompt. With Herdr unavailable the drawer offers only Copy prompt. A refused or unconfirmed answer shows the code, the existing issue and a Reconcile control (`rules_reconcile`). The task view shows the issue, the claim seat, the pull request, the progress and the governance as two labels, and the GO command as copyable text. Ask the advisor opens the advisor dialog for the rules parent with the candidate summary as the draft.
+- The operator console serves `GET /api/v1/repositories/<id>/rules` from a cache. A background collector runs `rh rules status --json` for each registered checkout every five minutes, so a GET starts no process. A ledger with errors returns HTTP 200 with `ledger.valid: false` and its error rows. (#2885)
+- `rh rules promote --candidate <id>` files one lesson promotion task under the rules parent of the repository. `--print-prompt` prints the prompt and makes no GitHub call; filing needs `--route <class>` and `--ledger-blob <sha>`; `--reconcile` completes the label and parent link of a filed task without a second task. A changed ledger, a missing candidate or an open task for the same candidate refuses before any write. The command never dispatches a seat. (#2887)
+- `rh rules status --tasks` adds the GitHub progress of each open promotion action: the task issue, the worker claim seat and the pull request. A GitHub or hc read failure gives `unknown` progress with a reason and keeps the ledger exit code. Without `--tasks` the document and the command stay offline. (#2888)
+
+### Changed
+
+- Codex and pi reviews hold no native credential. The review child reaches its model only through the local magpie gateway (`http://127.0.0.1:3425/v1`) with the placeholder key `magpie`. Its `config.toml` (codex), and its `models.json`, `settings.json` and empty `auth.json` (pi), come from product constants; the model is the review role's `magpie/codex/gpt-6-astra`. When magpie does not answer, the round fails with `review_magpie_unreachable`. A review that is open across the update fails with `review_isolation_changed`; cancel it and start a new one. (#2764)
+- `rh init` no longer writes the `check:brain` and `sync:brain` package scripts. The next `rh init` removes each of them from `package.json` when its value is a released value (`rh brain check`, `rh brain sync`, or the older `repo-harness brain` form), and keeps a custom value with a notice. `rh brain` itself is deleted in this release (#2937). (#2795)
+- Review seats get one hand-off: the packet names the round, `risk_tier`, head, the `reviewer.harness` value and the `RECEIPT-JSON` hand-off, and the review brief no longer lets a seat publish. `rh review collect` reads Pi, Claude Code and Codex session records and binds a record to its seat by the packet, the PR and the PR head, not by file age (#2838).
+- `rh board review` and board attention no longer assume a Claude reviewer. The `reviewer` seat of the seats config sets the one reviewer family; an acceptance row belongs to a seat by the family of the model in its Role cell. `claude_review` is now `second_review` (same values), and the board carries `reviewer_family`. `board review` starts the reviewer seat on any runtime and skips a head with `review_family_unavailable` when the reviewer family is unknown or, on a High head, equals the gatekeeper family. The delta base of each seat and attention rule A10 use the same family rule. The High acceptance rule is unchanged. (#2860)
+- `rh board migrate-dependencies` takes `--apply` instead of `--write`, the flag form that every other command of the CLI uses for a checked plan. `--write` is an unknown option after this change; no alias stays. (#2867)
+- A High head's two reviews run as a relay. `rh board review` starts the gatekeeper seat only, and it starts the reviewer seat for that head only when the gatekeeper recorded `PASS` for it. The board carries that verdict per pull request as `gatekeeper_review` (`pass`, `fail`, `none`, `unknown`), and `BOARD_PROTOCOL` is 12. A reviewer `FAIL` sends the fix back to the gatekeeper first, because the fix is a new head. The reviewer's delta base stays the newest earlier head that the reviewer itself reviewed, else the whole diff. Attention rule A10 fires only for a head that has the gatekeeper `PASS` and no reviewer row; before it, such a head is no attention item. The High acceptance rule is unchanged: two `PASS` rows of the head from distinct claims, one different-family. Medium and Low do not change. (#2910)
+- A review returns `FAIL` only for a P0 or P1 finding. `PASS` may carry P2 and P3 findings. A P2 is one follow-up issue per PR under the same parent, and the fix loop counts P0 and P1 only. A finding that touches I1 (a credential leak) or I2 (an unauthorized deletion or overwrite of a user file) is rated at least P1. One rule in `src/core/review/finding-severity.ts` serves the publish receipt, the generic review result and the acceptance receipt. (#2936)
+- The seats settings save accepts `zai/glm-5.3` as the model of a Pi seat. Seat defaults do not change. (#2956)
+- Pi review seats (`gatekeeper`, `gatekeeper-deep`, `reviewer`) load the rh Pi extension, so they run the rh PreToolUse hook. A missing extension file fails the launch with `pi_extension_missing`. Pi worker seats do not change. (#2913)
+- The `rh board dispatch` packet ends with an `Authority:` line that states what the worker may do, so a worker does not wait for a push go. `templates.md` quotes the same text, and a test checks that the two agree. (#2923)
+- `rh run maintenance-triage --json` groups the ledger entries by `Mistake pattern` and lists in `judgment` each theme whose latest entry has `Seen` of 3 or more and `Enforced by: judgment`. An entry without a readable `Mistake pattern`, `Seen` or `Enforced by` goes into `field_errors`, sets `judgment` to `null` and exits 1. The `guard`, `eval` and `skill_proposal` arrays are gone. (#2814)
+
+### Fixed
+
+- Treat the PATH archctx that `rh update` links to the Bun global copy at the pin as managed. The doctor no longer tells you to remove it when repo-harness runs a nested copy or the source checkout.
+- Report the CodeGraph index as not applicable outside a Git repository.
+- Rebuild the released managed values list for v0.33.1.
+- `rh setup check` prints a remediation that `rh` accepts for a partial Codex automation profile: `rh update --target <host> --with-external-skills`. The command comes from the tooling report, like every other tool gap. The retired string used `rh init` with `--no-cli` and `--no-hooks`, which `rh init` never had.
+- The retired-command scan no longer reports the repository slug `<owner>/repo-harness` as a call. `rh update` and `rh upgrade` now leave `Ancienttwo/repo-harness issue #2008` as written, and the shipped Global Working Rules no longer produce an unsatisfiable notice on every update. A launcher path such as `~/.bun/bin/repo-harness update` stays a call.
+- Name retired receipt protocol 1 and missing or extra fields in review publish errors.
+- `rh uninstall` removes a managed block only when the install or update proof accepts it. The Global Working Rules block must equal a released block or the current render of its recorded language. The runtime-state block in the user-level Git excludes file must equal the current render or a released block. An edited block leaves the file byte-identical and gives `[unresolved] <path>: <block> was edited; preserved`. A released rules block is proved even when the package template is unreadable. Codex hook trust entries in `[hooks.state]` now give a `[note]` item, so a user who trusted the hooks reaches `[uninstall] complete` and the install state is retired. (#2842)
+- `rh commands` and `check:cli-manifest` now agree on Commander's implicit help command. `rh commands` no longer prints the 31 help leaves (`rh review help`, `rh fleet help`, ...), and the gate accepts `rh <path> help [<command>]` where the CLI prints help and exits 0. Both read one rule, `implicitHelpCommand()`, and one command walk. (#2942)
+- `check:cli-manifest` now resolves the target of an implicit help path (`rh help <command>`, `rh <path> help [<command>]`) in the same command walk. An unknown target fails the gate as an unknown command, as it already fails at run time. (#2948)
+- `install-agent-fleet --force` saves a changed agent file that has no current rh ownership record to `~/.repo-harness/replaced-agents/` before it writes, and prints the backup path and a restore command. A failed backup leaves the target intact and exits 1 with `backup-failed`. (#2843)
+- The installer records the Herdr skill copies that it wrote under the `core` owner, proved by the owner marker, so `rh uninstall` removes them. A Herdr skill directory that the user changed stays the user's and is not removed. (#2844)
+- A seats settings save decodes the new section with the read-path decoder before it writes. A section that `rh quota` and `rh seats argv` would refuse, such as a non-Claude frontend seat, now fails the save with `config_invalid` and the stored file does not change. (#2917)
+- The generic review result refuses `FAIL` with `review_conflicting_verdict` when no unresolved P0 or P1 finding exists, the same rule as the publish and acceptance receipts. (#2955)
+- `rh rules promote --reconcile` keeps a task under its existing rules parent, a closed parent included, and writes nothing when the task is complete. (#2963)
+- `rh setup check` offers `rh init` as the cleanup command for repo-local host adapters. A user-level adapter or an adapter of unknown origin still needs a manual review and gets no command. (#2964)
+- `rh rules promote --reconcile` keeps a parent issue from another repository and compares global issue ids, so it never writes to a local issue with the same number. `rh rules status --tasks` reads the repository of the status document even when `GH_REPO` or the gh default names another one. (#2969)
+- The Rules page notice for a dirty lessons ledger states that the collector reads the working-tree ledger; HEAD is reference data only. (#2970)
+- `rh upgrade` reports a user package script that calls `rh run contract-worktree` and names `rh worktrees start` as its replacement. The user's `package.json` does not change. (#2974)
+- The import-limit remedy and the architecture guidance name `rh arch refactor recommendations` and `rh arch refactor decide`, not the commands that #2871 removes. (#2977)
+- The rules candidate drawer keeps an unresolved promotion attempt until Reconcile resolves it, shows the `reconcile_required` code and the issue, and stays open with the last good data when a background read fails. A repository switch never shows the data of the previous repository. (#2988)
+
+### Removed
+
+- `rh setup check` is the one name of the read-only setup checklist. `rh init-hook` is gone; it now fails as an unknown command. `rh update --check`, `rh update --no-runtime-refresh` and `rh update --check-updates` are gone; they now fail as unknown options and start no runtime refresh. Each name had no second caller, and each ran the same `runInitHook` report. The `rh setup check` text and JSON output, its `--target`, `--check-updates` and `--json` options, and its exit code (1 on `blocked`, else 0) are unchanged. (#2863)
+- `src/cli/commands/init-hook.ts` is now `src/cli/commands/setup-check.ts`; the report builder, the formatter and the test file keep their names, and the test file is now `tests/cli/setup-check.test.ts`. The `init-hook` header comment and its `rh init-hook:` error prefix are gone. (#2863)
+
+### Documentation
+
+- Land the PRD for ledger enforcement and the test-budget CI loop at `docs/prds/20261116-0323-ledger-enforcement-test-budget.prd.md`, so each child issue of #2809 can link it at a pinned SHA. The PRD keeps the final rules, the inputs, the consumers and the acceptance conditions; it links the budget caps in the root files and does not restate them.
+
+## [0.33.1] - 2026-11-15
+
+### Added
+
+- `rh review publish` resolves the earlier-round review threads that the receipt names in its new `confirmed_fixed` field. It posts a `review reply` that cites the acceptance record on each thread, then resolves the thread. It leaves a confirmed thread that is already resolved unchanged and lists it in `already_resolved_threads`. It refuses, with nothing posted, an id that is not a thread opened by an earlier `review publish` round of the same PR, by an account with write access. It checks the PR head again before each reply and resolve. It stops at the first failed reply or resolve, at a reply or resolve whose response does not confirm the write, or at a head change, and names the record URL and the resolved and unresolved thread ids. The publish receipt is now protocol 2; a protocol 1 receipt is refused (#2768).
+
+### Changed
+
+- 0.33.0 ships `archctx` and `archctx-contracts` 0.15.0 (#2772). The 0.33.0 section names 0.14.1, because that section was fixed before #2772 merged. The protocols, renderers and features that repo-harness reads do not change. A machine that projects this repository runs `rh update` to get the new archctx, and the rolling projection writer republishes the projection once on the new pin (#2770).
+
+### Fixed
+
+- `rh doctor` now reports a retired pi extension that calls `repo-harness-hook` with the old `--route` argv protocol, and prints an `mv -n` command that moves it out of the extensions folder without overwriting an earlier archive. (#2776)
+- Fix the shared ArchContext daemon check for Bun global installs that hoist archctx. (#2782)
+- Rebuild the released managed values list for v0.33.0.
+
+### Documentation
+
+- Update the impact-scoped CI owner drift contract to check an exact reviewed surface and five mutation probes (#2767).
+- Use the pinned archctx in architecture guidance and correct the refactor statistics description. (#2774)
+- Document the single release prep PR and the post-release managed values rebuild.
+
+## [0.33.0] - 2026-11-14
+
+### Breaking
+
+- The CLI command is `rh`. The `repo-harness` command is retired with no alias: `package.json` `bin` declares `rh` and `repo-harness-hook`, and `rh --help` names the program `rh`. The npm package name `repo-harness`, the hook command `repo-harness-hook`, the hook configuration, `~/.repo-harness`, the `REPO_HARNESS_*` variables and the `repo-harness.*` herdr labels do not change. Persisted record headers such as `repo-harness plan` and `repo-harness acceptance record` stay byte-equal. Every packaged invocation (skills, seat argv, reference configs, templates, generated package scripts, release scripts, docs) now calls `rh <command>`. (#2700)
+
+### Added
+
+- `rh review collect --seat <terminal> --pr <n> [--owner-record <url>] [--json]` publishes a Pi review receipt from the seat session record. It refuses a missing or invalid receipt and a receipt for an old PR head. (#2737)
+
+### Changed
+
+- The managed `archctx` and `archctx-contracts` pins move from 0.13.0 to 0.14.1. Projection readiness requires manifest v4. Module freshness follows rendered target changes, and an old archctx daemon needs `archctx daemon upgrade`. (#2686)
+- Operator collectors use one GitHub owner/name grammar. A stored slug that the grammar rejects no longer decodes, and unsupported package metadata remote forms no longer resolve a repository. (#2702)
+- `rh init`, `rh update` and the bash scaffold change or delete a managed value only when it equals a value that a release wrote, or the current value. The released values come from `assets/released-managed-values.v1.json`, which `scripts/check-released-managed-values.ts` rebuilds from the release tags. The surfaces are the managed and retired package script keys, the reference-config stubs, the managed block in the project `.gitignore` and in the user-level Git excludes, and the Global Working Rules block and its unmarked sections in `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`. Any other value stays and gets a notice: an init warning `customized-managed-value`, an update step detail, or a `skipped-edited` rules detail. A stub marker or a section heading alone no longer starts a replacement (#2708).
+- `rh board merge` and `rh board review` no longer refuse a parent without a plan that has two children or fewer. Blocked-by order applies to it. A parent with more than two children and no plan stays refused as `plan_unavailable`, with the detail `the plan is absent and #<parent> has N children; a parent with more than two children needs a plan` (#2725).
+- `rh init` is the only writer of scaffold seed files and managed project scripts, reference stubs and the `.gitignore` block. Run `rh init --repo <target>` after the scaffold. The scaffold no longer discovers existing context blocks; register each with `rh run capability-config add --repo <repo> --prefix <dir>`. (#2734, #2753)
+
+### Fixed
+
+- The Bash guard applies one protected-name gate when a command line names `_ops` or `_ref`. It checks the whole line and denies unsafe writes and unsupported shell forms. For git reads it admits only listed options, denies expandable `-C` paths and signature formats that can run a verifier, and gives a fix with each denial. The gate does not track data passed through stored state between commands. (#2369, #2748, #2757)
+- The daily architecture freshness lane starts its 3 h lag clock at the first commit after the newest manifest commit that changes an input of a differing target, as archctx at HEAD declares it: the archctx version, the architecture model, and the declared source footprint of the target's capability, or every declared footprint for a whole-model target. The committed manifest row type sets the target class. Without such a commit the clock starts at the manifest commit. Under projection manifest v4 the manifest changes only with a render, so the former clock gave a false stale after a quiet period (#2375).
+- In registry mode with a projection manifest, capability readers use the manifest for module page paths. A malformed manifest fails closed. Without a manifest, registry values still apply. (#2707)
+- Pi reviews use the canonical model from Pi and record the actual model. A missing provider credential, a non-canonical model or a credential that can expire during the review fails closed. The review sandbox permits the Pi `auth.json.lock` directory and stops the owned process tree at the round deadline. (#2732)
+- Worktree and scaffold scripts drain first-match pipeline input, so a long input does not cause a SIGPIPE failure under `pipefail`. (#2740, #2744)
+- `rh run contract-worktree start` uses the base branch upstream for a new or attached branch and prints its ref and commit. It fails if the upstream cannot resolve. Fetch before starting the worktree. (#2746)
+- Merge readiness ignores a failed job outside the required check’s transitive needs only when the workflow proves the relationship and the required check succeeded in every attempt. A non-passing check stays blocked, and an unproven result fails closed. (#2749, #2759)
+
+### Upgrade
+
+- Run `repo-harness update` once from 0.32.x. Update removes a launcher only on an exact proof: a symlink whose realpath equals the installed CLI entry. Every other launcher file gets a notice and no change. Update refreshes the user-level files that it manages (skills, global working rules, agent fleet). As its last step, and only when every other step passed, it removes `~/.bun/bin/repo-harness` when that symlink resolves to the installed CLI entry. On Windows, `repo-harness.exe` and `repo-harness.bunx` stay; update prints the PowerShell `Remove-Item` command for them. Update writes no project file. It lists each line in `~/.claude/CLAUDE.md`, `~/.claude/settings.json` and `~/.codex/AGENTS.md` that still calls `repo-harness <command>`, and it names the registered repositories with pending project work and the apply command `rh upgrade --registered --apply --expected-revision <digest>`. That apply runs `rh init` in each repository. Init keeps its existing contract: it writes the four managed package scripts (`check:brain`, `check:context-files`, `check:deploy-sql`, `sync:brain`) with their `rh` values, and it rewrites the reference-config stubs and the `.gitignore` block by their markers, and the apply refreshes an unchanged 0.32 root `CLAUDE.md`/`AGENTS.md`. `rh upgrade` reports user-owned calls of the retired command (other package scripts, an edited root context, `tasks/lessons.md`, the policy `sync_script`) and does not edit them. `rh doctor` warns while `repo-harness` stays on PATH. Rollback: run `rh update --version 0.32.0`, or `bun add -g repo-harness@0.32.0` and then `repo-harness update`. The `rh` launcher then stays and runs 0.32.0 until a 0.33.0 update. (#2700)
+- Update herdr-core to 0.1.21 with `hc update`. The minimum supported version is now 0.1.21. (#2724)
+- Immediately after installing 0.33.0, run `npm i -g @earendil-works/pi-coding-agent@1.5.2`. `MIN_PI_VERSION` is 1.5.2; the Pi extension blocks edit, write and bash on an older Pi. Pi review launches also refuse an older Pi. (#2732)
+- From 0.32.0, run `bun add -g repo-harness@0.33.0 --no-cache`, then install Pi 1.5.2 as above, then run `repo-harness update --version 0.33.0`. The update retires the old launcher when it can prove ownership; use `rh` for later commands. In `~/.claude/settings.json`, change the permission `Bash(repo-harness run *)` to `Bash(rh run *)`. Apply the registered project changes that `rh upgrade` reports. (#2700)
+
+### Rollback
+
+- To return to 0.32.0, run `rh update --version 0.32.0`, or run `bun add -g repo-harness@0.32.0 --no-cache && repo-harness update --version 0.32.0`. Restore `Bash(repo-harness run *)` in `~/.claude/settings.json` and use `repo-harness` for commands. The `rh` launcher remains until a later 0.33.0 update. (#2700)
+
+## [0.32.0] - 2026-11-13
+
+### Breaking
+
+- The stored credit mode replaces `--spend-credits` (#2630). `seats.routing` has two new keys: `codex_credit_mode` (`off`, `review` or `all`; default `off`) and `codex_credit_floor` (a number >= 0; default 0). The mode acts only while the ChatGPT account is exhausted and reports credits at or above the floor; with plan quota left, or below the floor, it acts as `off`. Credits that the provider reports as unlimited pass any floor; a missing or non-numeric balance fails closed at every floor. `review` admits the gatekeeper, the gatekeeper fallback and a ChatGPT-bound reviewer; `all` admits every ChatGPT-bound seat. `repo-harness quota`, `seats argv`, `board dispatch`, `board review`, the operator cleanup investigation (only under `all`) and the Seats page preview read the same answer. A route or seat line on credits says `on credits`; the `chatgpt` account line stays `exhausted`. The console Seats page shows and edits both keys. `repo-harness quota --spend-credits` and `repo-harness seats argv --spend-credits` are removed. A stored section without the two keys needs `repo-harness update`, which adds them with the defaults. Only the owner sets the mode.
+- Claude has a `hyper` mode (#2633). `seats.routing.claude_hyper_at_or_above_remaining` (0 to 100; default 50) sets it: weekly remaining quota at or above it gives `hyper`; saving still wins below its own threshold. Only in `hyper` does the advisor take its config entry (`fable` high by default); in `normal`, `saving`, `exhausted` and `unknown` it uses `opus` high. The orchestrator rule and the worker routes do not change. `repo-harness quota` prints the Claude mode with both bounds and a new last line `advisor: advisor (<runtime> <model> <effort>)`. The console Seats page edits the new key. A stored section without the key needs `repo-harness update`, which adds it with the default. `seats argv` for the orchestrator and the advisor with `--repository-id` adds `REPO_HARNESS_SEAT_MODEL` and `REPO_HARNESS_SEAT_EFFORT` (the effective model and effort) to the env, and every seat argv unsets them. The SessionStart hook writes them to `session.json` as `model` and `effort`. A tier-2 `seats reset` (action `reset`) whose effective model or effort differs from that record starts the seat again from its argv and types no `/clear`; the log detail is `restarted`. Equal values, or a record without a model, type `/clear` as before; a launch that cannot be built, or one under an unknown Claude mode (a missing, unreadable or stale weekly reading), logs `model_check_failed` and types `/clear`. `compact` never restarts.
+
+### Added
+
+- The `repo-harness-archimap` skill links each declared state machine to the diagram that archctx projected. `measure.ts` reads `.archcontext/model/state-machines/` beside `--model` and gives each module `modules[].stateMachines` (`{ id, name, capabilityId, path, doc }`) for the capabilities that it covers; `doc` is null when the capability has no projected document. A machine whose capability no map module covers exits 2 with `state_machine_uncovered:<machine id>`; a model with no state-machine directory gives `[]`. The behavior board of a module with declared machines has one row for each machine, with a link to its diagram heading, and draws no state of a declared machine. `docs/architecture/archimap.html` is refreshed at 52d029dc and links the 6 operator machines. (#2179)
+- feat(ci): `.github/workflows/probe.yml` runs named test files on a chosen runner for a branch head, with no probe PR and no temporary commit: `gh workflow run probe.yml --ref <branch> -f runner=windows-latest -f files='<test paths>'`. Lane `home-isolation` runs each file as `Test HOME isolation` does; lane `affected-shard` (ubuntu-latest, `-f shard=<index>/<total>`) runs one shard through `scripts/check-ci.sh affected` with the split of the selection job, from the new `select-test-suite.ts plan <index>/<total> <files...>`, which fails on an empty shard and names the files of the chosen shard. Each lane fails when a named file is missing. A green `home-isolation` run proves that each named file ran (each leaves a JUnit report); a green `affected-shard` run proves only that the files of the chosen shard ran. It has `contents: read`, no secret and no environment, and it is not a required check; `ci.yml` and `Required / CI` are unchanged. (#2610)
+- ci: lane `release-rehearsal` of `.github/workflows/probe.yml` (ubuntu-latest and macos-latest) rehearses the upgrade of a release on a GitHub-hosted runner, which is the isolation: `gh workflow run probe.yml --ref <release prep branch> -f lane=release-rehearsal -f runner=ubuntu-latest`. `scripts/check-release-upgrade-rehearsal.sh` first refuses a machine with `repo-harness` or `hc` on PATH, `~/.repo-harness`, or a global `repo-harness` package. It packs `repo-harness` and `repo-harness-operator-web` from a `git archive` copy of HEAD, serves both candidate tarballs from a registry on 127.0.0.1 (every other request goes to registry.npmjs.org), installs the version that npm serves as latest, runs that parent's `repo-harness update --version <parent> --no-cli` so that the parent makes its managed `~/.bun/bin/archctx` link, and then runs the parent's `repo-harness update --version <candidate>`. It fails unless the update exits 0, `repo-harness --version` and the global `repo-harness-operator-web` give the candidate, `~/.bun/bin/archctx` resolves to the parent's `archctx` pin before the update and to the candidate's pin after it, and the registry served each candidate tarball once. It needs an unpublished candidate. The script builds no scratch HOME or PATH and deletes nothing; the `release` lane of `scripts/check-ci.sh` does not call it. (#2626)
+- ci: the daily architecture lane (`scripts/check-ci.sh architecture`) fails when `docs/architecture/archimap.html` has a module document link whose file is gone, or when a `modules[].docs` path from `measure.ts` has no link in the map. The new `scripts/check-archimap-links.ts` reads the committed map with Bun's HTML parser and reuses the measure output. The summary keeps the lists in `archimapLinks`, and the daily repair issue names them with the refresh action. (#2685)
+
+### Changed
+
+- The repository has one merge lane: direct squash, one `Required / CI` run for each PR head. `ci.yml` no longer runs on `merge_group`, `select-ci-coverage.ts` reads a `merge_group` event as `unknown-event` (invalid), and `.ai/harness/policy.json` no longer has `publication.merge_queue`. (#2462)
+- The orchestrator and advisor seat reset has two tiers. At the 380,000-token crossing, the Stop hook picks the action from the transcript file size and records `action` and `transcript_bytes` in `request.json`: below 32 MiB the peer's `seats reset` types `/compact`, at or above it `/clear` as before. `seats reset` carries out the recorded action and does not measure again. One validator reads the request for both: a request without a valid `action` (for example from the old code), or a `request.json` that is not a JSON object, is not open for the hook, and `seats reset` types nothing for it and sends `NO-RESET` (`request_invalid`), so the next crossing writes a fresh request. A `session.json` record newer than the request at the time of the reset (an auto-compaction) types nothing and sends `NO-RESET` (`request_closed`). The block text tells the seat to finish the planning and dispatch in hand and start nothing new before it writes the handoff. The hook blocks once per session segment: the SessionStart hook now also records the source `compact`, and a `session.json` record newer than the request ends the segment, so the next crossing in the same transcript blocks again. After `/compact`, the command waits up to 300 s for the `compact` record of the same transcript and sends a resume prompt without the git and gh check. No record types no second `/compact`: one log entry, one notice, and auto-compaction stays as the net. The handoff file, its checks and the relaunch after 3 retries stay. (#2625)
+- feat(release): the release has one path, the host command list of `bash scripts/release-owner-steps.sh plan <version>`. `.github/workflows/release.yml` and `release-owner-steps.sh workflow-guard` are deleted. A new `release-owner-steps.sh wait <package> <version>` polls npm every 10 s for 15 minutes before the core publish and before `check published`; a wait that ends without the version fails with the package name. On the owner's word for one release, the orchestrator seat runs the list; the owner confirms the npm login. A host publish has no npm provenance statement. (#2641)
+- Each PR writes its changelog entry in its own file, `docs/changelog.d/<issue>.<category>.md`: one or more `- ` lines, with the category `breaking`, `added`, `changed`, `fixed`, `removed`, `documentation`, `tests`, `upgrade` or `rollback`. `docs/CHANGELOG.md` holds only released sections and has no `## [Unreleased]` heading. The release prep runs `bun scripts/changelog-fragments.ts assemble --version <x.y.z> --date <YYYY-MM-DD>`, which writes the `## [x.y.z]` section and deletes the fragments. `scripts/check-changelog-released-sections.ts` also fails a merge result that keeps `## [Unreleased]` or holds a fragment path that does not parse. Board attention rule R2 now counts `docs/CHANGELOG.md` as a shared path of two PRs. The issue-flow worker and orchestrator references and `release-deploy.md` name the fragment. (#2660)
+- The `repo-harness-archimap` skill links every capability document. A new board, `8 · Module documents`, has one link for each path of each module's `modules[].docs`; the overview node still links only the first path and shows `+N`. Before, a module with more than one document linked only the first one, so 14 of the 23 module documents of this repository had no link on the map. A repository that uses the skill gets the board at its next map refresh; its current map does not change. `docs/architecture/archimap.html` is refreshed at d56141f0 and links all 23 documents. (#2674)
+
+### Fixed
+
+- hook: a timeout on the architecture notice path gives no notice block at SessionStart or Stop. One classifier covers an archctx deadline or process timeout, a Git call killed by its timeout (the archimap read included) and the ownership resolve timeout (`ARCHCONTEXT_RESOLVE_TIMEOUT`). Each hook run gives at most one fixed diagnostics line for them, with no command and no raw error text, and the next hook measures again. Before, a Claude Stop got a feedback line, so the seat took one more turn and ran `repo-harness architecture-debt --json`, which fails in a worktree with no CodeGraph index. The checkpoint timeout text now names no command and no fixed duration. A measured debt, an inactive state and each other failure, `ARCHCONTEXT_RESOLVE_FAILED` included, keep their block and text. (#2491)
+- ci: `run_bun_tests` (and `bun run test:files`) fails before any test starts when an argument has the test file name form and is not a file, and names the path. Before, such a path was dropped and the run was green with fewer files. The daily native path list no longer names three deleted files. (#2608)
+- On Windows, a file operation that races another process no longer fails at once with `EPERM`. A rename over a file that another process holds open, the host test queue ticket read of a ticket that another member just unlinked, and the lock owner read of a lock directory that a release just removed wait and run again: 8 attempts, at most 127 ms of wait. A refusal that lasts longer throws the first `EPERM`; other codes, and every error on other platforms, throw at once. The renames are those of the stores that another process reads: the stores of `publishFileByRename`, the host test queue tickets, the effective-state version, `~/.repo-harness/config.json`, `.ai/harness/policy.json` from the operator, the Claude quota capture, the repo registry, worktree records, the bot registry, task inbox and feedback delivery receipts, acceptance records, and the installer writes of host configuration and install state. The one-lstat rules of #2588 and #2609 are replaced by this rule. (#2615, #2609)
+- ci: a PR that changes a released `docs/CHANGELOG.md` section fails `Required / CI`. `scripts/check-changelog-released-sections.ts` reads the merge result of the PR base and the head, so a branch that started before a release commit can no longer put its `[Unreleased]` entry inside the released section. The check fails closed on a merge conflict in any path. A new version section and an `[Unreleased]` entry pass. A correction of released notes goes through a release PR or an `[Unreleased]` entry that names the correction, and the check has no bypass switch. A diff that changes only documentation does not run the check, because the job that runs it is not started for that diff; such a merge can still change a released section, and no check reports it. (#2622)
+- release: `scripts/check-skill-version.ts` requires exactly one README release line, ``- npm: `repo-harness@<v>` · workflow stamp `repo-harness@<v>+template@<v>` ``, and each of its three versions must equal `package.json`. Before, a release prep could leave the README pin at the previous version, and no check reported it. (#2623)
+- ci: the probe JUnit read accepts the Windows `file` attribute. Bun writes `tests\unit\a.test.ts` on a Windows runner, and `parseJUnitReport` rejected it as `junit invalid: file`, so a Probe run on `windows-latest` failed after the tests passed. The parser converts the attribute to forward slashes before the `TEST_FILE` check; `TEST_FILE` and the other report readers do not change. (#2632)
+- seats: `seats reset` now counts the RESUMED answer when the resume prompt arrived while the seat was in a turn. Claude Code writes such a prompt as an `attachment` entry with `attachment.type` `queued_command` and no `type: "user"` entry, so `sentResumed` read no prompt, logged `no_evidence` and sent the prompt again; after 3 retries it relaunched a healthy seat with its background shells. The evidence rule takes the prompt from an entry whose `type` is `attachment` with `attachment.type` `queued_command`, or from a user entry; the rest of the rule is unchanged: an assistant Bash call that is exactly `hc send <peer> RESUMED` after the prompt, and its tool result without an error. A transcript line that is not a JSON object is skipped. (#2637)
+- `repo-harness update` no longer fails with `RH_ARCHCTX_BIN_CONFLICT` or `RH_ARCHCTX_BIN_READBACK` when the candidate pins another archctx version than the installed one. The link `<bun root>/bin/archctx` is managed when it resolves into `<bun root>/install/global/node_modules/archctx`; a managed link of another version gets `bun add -g archctx@<pin>`. Only a link that resolves elsewhere, or a dangling link, is a conflict. The read-back takes the package root and the link target after the install. (#2642)
+- ci: a name in `BUN_TEST_FILES` with the test file name form that is not a file fails before any test starts and names it, through the same guard as the positional paths. Before, isolated mode put the name into the run list, the tests of the other names started, and the run failed with a Bun filter line instead of the missing path. (#2647)
+- On Windows, an absolute `REPO_HARNESS_NODE_BIN` is no longer refused as `not an executable file`. Windows sets no execute bit: libuv reports a regular file as `0666`, or `0444` when read-only, so a real `node.exe` failed the `mode & 0o111` test in `selectCompatibleNode`, and the same test made the trusted-candidates tier skip every candidate. One predicate now serves both tiers: on `win32` a regular file, elsewhere a regular file with an execute bit, from the `platform` input that the PATH tier already reads. The PATH tier, the absolute-path rule and the version check do not change, and the explicit tier still fails closed instead of falling back to PATH. (#2653)
+- test: `PI_CODING_AGENT_DIR` is a tool root of the test HOME isolation (`scripts/lib/test-home-isolation.mjs`), like `CODEX_HOME` and `CLAUDE_CONFIG_DIR`. An isolated test environment removes the inherited value, so a bare child starts without it. Before, a test in a shell that had the variable set could reach the Pi agent directory readers `src/effects/pi-agent-dir.ts` and `src/effects/board/pi-shell.ts` and write the real Pi agent directory. (#2655)
+- `repo-harness board closeout` no longer keeps a pull request worktree for a finished seat terminal whose cwd directory is gone. That pane has no checkout and no work to protect, so closeout removes its record through the host and does not report it as kept. A live terminal, and a finished terminal whose cwd exists, keep the current pane rules. (#2658)
+- ci: a provider request timeout in `scripts/report-ci.ts` is a provider outage, the same as a 5xx. The `api` boundary reports a read that its 30 s deadline ends as `CIReportError` with no HTTP status, so the merge section gives `Merge reporting unavailable (attention_owner: external)` and files no `merge-pr-<n>` repair issue. Before, the `TimeoutError` reached the merge loop as a rollback boundary defect and filed one. The token redaction, the cross-repository refusal and the deadline do not change. (#2663)
+- `repo-harness update` across an archctx pin change no longer fails with `RH_ARCHCTX_BIN_READBACK`. Bun 1.4.3 installs the candidate pin nested under `node_modules/repo-harness` while the global `package.json` still pins the previous version, and `bun add -g archctx@<pin>` keeps that nested copy. The link check took the package that repo-harness resolves, so it compared the link (into the top-level package) with the nested bin and never passed. The target, the comparison that skips the install, and the read-back now use one package root, `<bun root>/install/global/node_modules/archctx`: the package that `bun add -g` installs and links. The dependency check of repo-harness still reads the copy that repo-harness imports. (#2669)
+- `repo-harness board closeout` also removes the finished seat terminals of earlier pull requests whose cwd directory is gone. Before, only the closeout of the bound PR removed such a record, so `hc ls --all` kept growing (59 of 63 finished seat records of this repository had no cwd). The JSON lists them in the new `stale_terminals` array (`closed`, or `kept` with the host reason when `hc rm` fails); a failed removal keeps no worktree and does not change the exit code. A live terminal, a finished terminal whose cwd exists and a terminal without a seat label are not touched. (#2675)
+- While Claude is reserved (saving or exhausted), only an important route that holds a Claude-account seat goes to `worker-light`; an important route without a Claude-account seat is read as stored. Before, every important route became `[worker-light]`, so with a Pi `worker-important` on `magpie/anthropic/claude-opus-5-5` the important task went to the DeepSeek seat and the simple task went to the Opus seat. The `none` lines for a null or non-Pi `worker-light` apply only to a route that holds a Claude-account seat. `repo-harness seats argv worker-light` no longer refuses a non-Pi `worker-light` while Claude is reserved: routing decides the seat, and the launch judges the seat on its own account. (#2679)
+- operator: the docs refusal `github_remote_missing` names the GitHub repository it expected and the GitHub repositories (`owner/name`) parsed from the local remote URLs, in the message, in `error.detail` and on the docs page. No remote name and no URL text leaves the collector, because a URL can hold a credential. The collector reads remote URLs with `git config --null`, so a newline inside a URL can no longer add a second remote. On 2026-11-12 an `origin` that still had the repository name from before the transfer gave this refusal with no detail. (#2684)
+- The docs collector checks the `github_remote_missing` detail with the console decoder before it caches it. A detail that fails the decoder (for example a remote URL with a non-ASCII letter such as `ſ`) gives the plain `github_remote_missing` reason, and the console shows that reason instead of `docs_invalid`. (#2691)
+- The release commit keeps `docs/changelog.d/`: `docs/changelog.d/README.md` is not a fragment, and `assemble` does not delete it, so the capability export finds the directory after the last fragment is assembled. The check for a kept `## [Unreleased]` heading reads heading lines only, so a released entry that quotes the heading in prose passes. (#2697)
+
+### Upgrade
+
+- Upgrade with `bun add -g repo-harness@0.32.0 --no-cache && repo-harness update --version 0.32.0`. Run `repo-harness update` once before the first seat launch: 0.32.0 refuses a 0.31.0 `seats.routing` section with `seats_config_migration_required`, and the update adds `codex_credit_mode: "off"`, `codex_credit_floor: 0` and `claude_hyper_at_or_above_remaining: 50`. The archctx pin (0.13.0) and the herdr-core floor (0.1.20) do not change. (#2630, #2633)
+- Replace each `repo-harness quota --spend-credits` and `repo-harness seats argv --spend-credits` call: the flag is removed. The owner sets `codex_credit_mode` (and `codex_credit_floor`) on the console Seats page or in `~/.repo-harness/config.json`. (#2630)
+- After the update, write the handoff of the orchestrator and advisor seats and start them again from `repo-harness seats argv <seat> --repository-id <id>`. A seat started by 0.31.0 has no `REPO_HARNESS_SEAT_MODEL` in its env, so its tier-2 reset types `/clear` and never restarts the seat on a model change. (#2633)
+- The release itself has one path: the owner runs the command list of `bash scripts/release-owner-steps.sh plan <version>` after the release PR merges. `.github/workflows/release.yml` is deleted. (#2641)
+
+### Rollback
+
+- Before a return to 0.31.0, remove `codex_credit_mode`, `codex_credit_floor` and `claude_hyper_at_or_above_remaining` from `seats.routing` in `~/.repo-harness/config.json` by hand: 0.31.0 refuses a routing object with a key that it does not know. Keep `gatekeeper-fallback`. Then run `bun add -g repo-harness@0.31.0 --no-cache && repo-harness update --version 0.31.0`, and start the orchestrator and advisor seats again. A seat `session.json` with source `compact` reads as no record on 0.31.0 until the next session start.
+
+## [0.31.0] - 2026-11-12
+
+### Breaking
+
+- `~/.repo-harness/mcp.local.json` must have `"version": 3`, and the workspace reader key is `capabilities.workspaceReader`. A file with no version, version 1 or 2, or `capabilities.reader` now fails closed. Fix: set `"version": 3` and rename `capabilities.reader` to `capabilities.workspaceReader`. No command rewrites the file. A refused `mcp.local.json` fails `repo-harness update` with the loader's refusal text, before any write, and the update exits 1; an absent file is skipped. (#2443, #2593)
+- The operator server no longer serves the doc session routes: the six GET routes `session_list`, `session_detail`, `session_events`, `session_finalization`, `session_diff` and `session_loss`, and the POST route `sessions_create` (`/api/v1/sessions`). The command `repo-harness operator doc-sessions` is removed. The docs host was closed, so no session could exist and these entries could only answer empty, 404 or 501. Old `docs_session_create` lines in `audit.jsonl` stay readable. (#2456)
+- Board protocol 8 replaces protocol 7, and the board decoder refuses a protocol-7 board. Each item has `claim` (the newest `issue claim` that no `done` or `released` status closes: `active` with its URL, time and `Role:`, `none`, or `unknown` when the comment read is cut) and `open_questions`; each pull request has `open_questions` and `review_fail` (the newest acceptance record with an unresolved FAIL row for the head). A reader of `board --json` must accept protocol 8. (#2489)
+- Board protocol 9 replaces protocol 8 (#2264). The board takes the required check of each pull request from `required_status_checks.contexts` of the base branch protection, read once for each base ref, not from the name `Required / CI`. `required_check` carries `contexts`, the status of each required context on the head. A name keeps the reports that `gh pr checks` keeps: the newest commit status of that context, and the newest check run of that name for each workflow and event; a commit status maps as the `gh pr checks` bucket (SUCCESS passes, PENDING and EXPECTED wait, FAILURE and ERROR fail). The reports of a name, and the names, join: `missing` when one has no run, then `pending`, then `failure`, else `success`. A failed protection read, or a base with no context list, gives the new status `unavailable` with a `reason`; no name is assumed. `board merge` and `board review` name each context that is not `success`. A merged pull request is judged on the current base protection. A reader of `board --json` must accept protocol 9.
+- Board protocol 10 replaces protocol 9 (#2568). Each pull request has `review_records`: the comment time of the newest acceptance record with a row of each harness (`claude`, `codex`, `pi`), any subject SHA, or null when no record has one; `unknown` with a `reason` when the comment read is cut or a record has no table row. The new attention rule A19 (P1, orchestrator) names a live `gatekeeper`, `gatekeeper-fallback` or `reviewer` seat that is done or idle for more than 10 min on an open board pull request with no record of its harness newer than the seat status time. A reader of `board --json` must accept protocol 10.
+
+### Added
+
+- feat(board): attention rule A20 (P2, orchestrator) names an open, ready, unheld PR whose required check is `pending` or `missing` more than 60 min after its head commit, with the contexts that are not `success`. A PR whose check read is `unavailable` lists A20 as not evaluated with the reason of the check. The rule adds no board field and no GitHub read. `orchestrator.md` §8.1 names the follow-up. (#2576)
+- feat(board): `board attention start` starts the watcher with the live orchestrator seat terminal of the repository as its hc parent and with `--outlive-parent`, so hc types an exit note into the orchestrator when the watcher ends. With no live orchestrator seat terminal, or with more than one, the watcher starts with no parent as before. `orchestrator.md` §8.1 names the start command and the restart after a note; `advisor.md` §2 names the `board-attention-watcher` doctor check. (#2567)
+- feat(seats): a Pi seat launch (`seats argv`, board dispatch, board review, relaunch) refuses when the shell that Pi will use runs a backtick span in a heredoc body, as /bin/bash 3.2 does (#2370). The shell is `shellPath` of `<cwd>/.pi/settings.json`, else of `~/.pi/agent/settings.json`, else `/bin/bash` on a non-Windows host; any other case is the same refusal. `shellPath` and `PI_CODING_AGENT_DIR` must be absolute paths; the check expands no `~`. Fix: set `shellPath` in `~/.pi/agent/settings.json` to a bash 4 or newer. A probe that cannot start or does not finish gives `pi_shell_probe_failed`.
+- feat(seats): an optional `gatekeeper-fallback` seat (review tools only: read, shell and network; default `null`) takes the gatekeeper review while the gatekeeper account is exhausted. `repo-harness quota` names it on the gatekeeper route line, `seats argv gatekeeper` launches it under the gatekeeper label and brief, and `board review` skips a PR with `review_family_unavailable` when the effective gatekeeper cannot give the review: no known model family, Claude where the head needs a non-Claude gatekeeper, or the writer's family on a Medium head or on a High head that needs no Claude review (a High head with a Claude review may use a same-family gatekeeper). Run `repo-harness update` once: it adds the key as `null`. (#2253)
+- feat(board): attention rules A12 to A18 report what the orchestrator found only by reading each thread: a writer claim two hours old with no PR and no claim status (A12, P1), a done or idle worker whose item has no PR (A13, P1), a required check red for 30 min (A14, P2), an unresolved FAIL record of the head for 60 min (A15, P2), a `boundary question` to the coordinator with no `Re:` answer in its thread for 15 min (A16, P1), a blocked claim status for 15 min (A17, P1) and an open PR with the readiness blocker `not_mergeable` (A18, P2). A rule with an unread input lists it as not evaluated. Dispatch and the board read an active claim through one function. The orchestrator rebuilds its queue with `board attention` and `board review --dry-run` for each open batch parent. (#2489)
+- feat(board): advisor rules R6 and R7 read two states that the scheduled review counted by hand. R6 (P1) fires when a worker seat is free and the plan has fewer than two ready issues (an open merge-order item with no plan hold, no open blocker, no active claim and no live worker seat). R7 (P2) fires when an accepted PR waits behind an earlier open merge-order entry that is held, by a plan hold or a merge hold record. R6 and R7 are not evaluated while the plan is absent or unavailable, R6 also while the seats or a claim read is incomplete, R7 for an earlier entry outside the board. `advisor.md` §2 step 2 drops the checks that the rules read. (#2490)
+- feat(board): each attention finding names its priority, and an `[rh-attention]` message is a notice (#2488). `BoardFindingV1` carries `priority` and `BOARD_RULE_PRIORITY` is its only source; `board attention` prints the priority first on each line, the watcher writes `<priority> <rule>: <message>` in each delivery entry, highest priority first, and the review message reads `[rh-attention] #<parent> P3 review: ...`. Board attention protocol 2 replaces protocol 1. The orchestrator queues one item for each entry, at the priority in the entry, and the advisor treats a P0 or P1 entry as a same-turn review.
+- feat(seats): `--spend-credits` lets `repo-harness quota` and `repo-harness seats argv` treat an exhausted ChatGPT account as `tight` (`chatgpt tight, on credits`) while an owner authorization for credits is recorded. `seatAccountQuotas` takes an optional `{ spendCredits: boolean }` that applies only when the account state is `exhausted` and `codex.credits.has_credits` or `unlimited` is true. Without the flag every output is unchanged, and board dispatch, the console and `seats reset` keep the default. (#2251)
+
+### Fixed
+
+- The daily architecture job no longer fails on a render difference that the rolling writer has not published yet (#2590). The time of the oldest unpublished main commit is the committer time of the first first-parent commit after M, else of M. M is the newest first-parent commit that changes `docs/architecture/.projection-manifest.json`. A difference is `lag` (a warning, exit 0) while that commit is younger than 3 h, and `stale` (exit 1) after. Human action, an incomplete check and a failed git read still fail, with no grace. The summary adds `freshness` (`fresh`, `lag`, `stale`, `human-action` or `incomplete`) and `unpublishedSince`, and the repair issue title names the freshness. When no commit changes the manifest, the job fails and uploads no summary.
+- The attention watcher writes the review start or refusal lines as one entry of its `[rh-attention] #<parent> P3 review:` message: the lines join with ` · `, not with the `; ` that separates the findings, so the orchestrator queues one item for the message (`orchestrator.md` §8.1 names it). The watcher also drops a `sent` slot that keeps no open finding key when it builds the next map, so a long run keeps no empty slot for each seat terminal that ever got a finding; a review send sets no slot. No rule, window, log record or send-once behavior changed. (#2577)
+- `board merge` and `board review` name why the plan block of a parent does not decode: the detail of `plan_unavailable` is `the plan is unavailable: <reason>`, for example `plan block invalid: unsupported protocol 1`, as `board dispatch` already gave it. The absent plan keeps `the plan is absent`. A parent whose plan comment is still protocol 1 therefore names its cause until the coordinator posts it again with `"protocol": 2`. (#2575)
+- On Windows, the lock owner read no longer throws `EPERM` when a concurrent release leaves the lock directory delete-pending. After the `EPERM`, one lstat of the lock path decides: a missing directory, or a directory with a different identity (the next acquirer), reads as no observed owner. The same directory still throws, so a real access refusal stays an error. No retry and no wait Evidence: unit cases inject the race. The Windows evidence is probe run 43152208936 (14/14) and daily run 43153425598 (lock file 14/14 on windows-latest). (#2588)
+- On Windows, the lock owner start time now comes from kernel32 `OpenProcess` and `GetProcessTimes` through `bun:ffi`, with no `powershell.exe` child. The `powershell.exe` start-time query could exceed its 10 s timeout on hosted Windows runners and timed out the host test queue; the cold start of PowerShell is the inferred cause (#2578). The value is the same UTC FILETIME as before, so existing owner records stay valid. A killed process that another handle still holds now reads as gone.
+- `publication merge` and the readiness read no longer give `provider_data_incomplete` for an open PR when GitHub reports `mergeable` UNKNOWN (#2383). GitHub reports UNKNOWN while it recomputes mergeability, for example after the base moves. The read now gives the blocker `mergeability_pending` (attention owner `external`). It still blocks the merge. Run the command again when GitHub reports MERGEABLE. The board does not store this answer. Only CONFLICTING gives `not_mergeable`. A mergeable value outside MERGEABLE, CONFLICTING and UNKNOWN still gives `provider_data_incomplete` with the detail `provider PR mergeable is invalid`.
+- A merge-readiness read of the board no longer loses a gh stdout that reached the maxBuffer limit. The workflow definition read and the check-run annotations read are optional, so the transport loop swallowed every error of them. A read that the product cannot take in full now fails the readiness read with the limit message. Other errors of an optional read keep their result. (#2551)
+
+### Changed
+
+- The doc session modules, `src/effects/review/docs-host-isolation.ts` and their two reference documents are removed (#2457). The worktree cleanup now owns the four helpers that it used: `cleanupGitRunner`, `createGithubDraftPrPublisher`, `isRepositoryRelativePath` and `CLEANUP_GIT_OUTPUT_MAX_BYTES`. The cleanup behavior does not change.
+- The managed `archctx` and `archctx-contracts` dependencies move from 0.12.0 to 0.13.0 (#2354). `repo-harness update` installs the new pin.
+- The herdr-core floor is 0.1.20 (#2255). Run `hc update` to 0.1.20 before this release is installed: an hc 0.1.19 client fails the floor check.
+- `publication merge` no longer needs strict status checks on the base (#2462). The merge proof accepts a squash whose one parent is the expected base or a descendant of it, and it proves the content of the squash with `git merge-tree` when the parent moved. `Required / CI` runs one time for each PR head.
+- A review row counts only for the head SHA that it names (#2462). A head that takes a merge of main is a new head: it needs its own `Required / CI` run and delta-check rows.
+- `repo-harness init` writes only the policy keys that a reader uses, and it removes each key outside the policy schema, with one `unknown-policy-keys` warning (#2367). init no longer copies the workflow templates and the hooks README into the repository. `repo-harness docs path|show` resolves `prd.template`, `research.template`, `spec.template` and `design-brief.template` from the package. A copy with the released bytes is a retired generated file (`retired-copied-workflow-templates`); a copy with other bytes is reported and kept.
+- The board of a parent selects a seat terminal by its `issue` label (an item of the parent) or its `pr` label (a pull request of the board), so a worker, gatekeeper or reviewer seat started without `--parent` is on the board, and the attention watcher uses the 15-minute window while it is live (#2492). The parent label decides only for a terminal with neither label. A seat with a parent label and the issue of another parent leaves that board.
+
+### Removed
+
+- The merge queue lane, the integration batch lane and the merge-only sync carry (#2462). `publication merge` has one lane, the direct squash. Removed: the `publication batch build` command, the `publication.merge_queue` policy key (a policy that keeps it is refused with `publication_policy_invalid`; `repo-harness init` removes the key), `publication merge --batch`, `report-ci --batch`, the `merge_queue_policy_mismatch` and `merge_queue_removed` refusals, the `batches` key of the plan block, attention rule A2 and the Office batch cart. A base that requires a merge queue is not supported.
+- The `--dry-run` flag of `repo-harness capability-context sync` (#2475). The flag gave no preview: `sync --apply --dry-run` wrote files. A caller that passes it now gets `error: unknown option '--dry-run'`. A run without `--apply` gives the preview.
+- The `--migrate-worktree-template` option of `repo-harness upgrade` and the policy key `worktree_strategy.worktree_dir_template` (#2367). The worktree location is the package default (`/tmp/<repo>-wt-<slug>`, Windows: `os.tmpdir()`); `scripts/contract-worktree.sh` reads no policy key for it.
+- The policy keys `context.capability_registry_file`, `minimal_change.mode` and `upgrade.strategy_version` (#2367), and `guards`, `enforcement` and `merge_gate` (#2405). No code reads them. A policy that still holds them is not refused; `repo-harness init` removes them. An explicit `context.capability_source: "registry"` now declares the capability registry.
+- Board protocol 7 has no `merge_queue` field and no `sync` acceptance. Plan block protocol 2 has no `batches` key: post each open parent's plan comment again with `"protocol": 2`.
+
+### Upgrade
+
+- Before the install: run `hc update` to hc 0.1.20, and set `~/.repo-harness/mcp.local.json` to `"version": 3` with `capabilities.workspaceReader` (rename `capabilities.reader`). A refused `mcp.local.json` fails `repo-harness update` with the loader's refusal text, before any write; no file under `~/.repo-harness` changes. (#2255, #2593)
+- Upgrade with `bun add -g repo-harness@0.31.0 --no-cache && repo-harness update --version 0.31.0`. Run `repo-harness update` once before the first seat launch: 0.31.0 refuses a 0.30.0 `seats` section with `seats_config_migration_required`, and the update adds `"gatekeeper-fallback": null` to it. The update writes no backup file. Version sources: `package.json`, `packages/operator-web/package.json` and `assets/skill-version.json`. (#2253)
+- After the install: post the plan comment of each open parent again with `"protocol": 2` and no `batches` key; a protocol 1 block reads as `plan block invalid: unsupported protocol 1`. Start the attention watchers from the new CLI (`board attention start`). Run `repo-harness init` in each adopted repository whose `.ai/harness/policy.json` holds `publication.merge_queue`: `publication merge` refuses that policy with `publication_policy_invalid`, and `init` removes the key. (#2462, #2567, #2575)
+
+### Rollback
+
+- Before a return to 0.30.0, remove the `gatekeeper-fallback` key from the `seats` section of `~/.repo-harness/config.json` by hand: 0.30.0 refuses a `seats` section that holds it (`config_invalid`). Then run `bun add -g repo-harness@0.30.0 --no-cache && repo-harness update --version 0.30.0`. A version 3 `mcp.local.json` with `capabilities.workspaceReader` stays valid on 0.30.0. A repository whose policy lost `publication.merge_queue` keeps the 0.30.0 direct merge.
+
+## [0.30.0] - 2026-11-10
+
+### Added
+
+- [feat(release): one workflow run publishes, tags and releases a merged release commit (#2194)](https://github.com/aimpact-inc/repo-harness/pull/2198). One run of `.github/workflows/release.yml` publishes, tags and releases a merged release commit after the owner approves the run in the GitHub `release` environment.
+- [feat(review): publish a round above 5 only with an owner-record URL](https://github.com/aimpact-inc/repo-harness/pull/2138)
+- [feat(publication): enqueue through a required merge queue; CI runs on merge_group (#2076)](https://github.com/aimpact-inc/repo-harness/pull/2089). The direct merge stays the default.
+- [feat(seats): seats prefix sets panePrefix in the registry (#2058)](https://github.com/aimpact-inc/repo-harness/pull/2129). `repo-harness seats prefix --repo <path> --pane-prefix <p>` sets the prefix and prints JSON (`ok`, `path`, `registryPath`, `registered`, `changed`, `panePrefix`).
+- [feat(seats): explicit orchestrator, advisor and seat-handoff skills (#2175)](https://github.com/aimpact-inc/repo-harness/pull/2182). Each launch skill is one Bash script: `gh api`, `herdr-app ls`, `hc ls` and `seats argv --json` run as separate checked steps; a failed or unparsable probe stops the script and never reads as "no seat" or "no space".
+- [feat(archimap): measure.ts reports geometry findings of the boards that hold nodes](https://github.com/aimpact-inc/repo-harness/pull/2168). Findings do not change the exit code.
+- [feat(archimap): measure.ts reports line_through_box by the 8 px inset rule (#2185)](https://github.com/aimpact-inc/repo-harness/pull/2189). `measure.ts --map` reports `line_through_box` by one stated rule with no path-end case.
+- [feat(operator-web): the module map draws directed domain routes and lists a selected card's relations (#2153)](https://github.com/aimpact-inc/repo-harness/pull/2200). A selected card shows its relations in the right panel (PRD 2-ARCH-P2).
+- [feat(specs): check the boss command send with TLC (#2180)](https://github.com/aimpact-inc/repo-harness/pull/2191). Keep a checked TLA+ model of the boss command send on main, with one command to run it and an architecture entry that names it.
+- [feat(operator): observe repository seats from hc events (#2163)](https://github.com/aimpact-inc/repo-harness/pull/2201). Serve seats from memory so a seats GET starts no CLI read.
+
+### Changed
+
+- [feat(operator-web): one first-viewport rule for the architecture maps (#2151)](https://github.com/aimpact-inc/repo-harness/pull/2167). Each architecture map opens with its first row and its left edge on screen, at a readable size.
+- [feat(operator-web): topology routes follow the dagre route on screen and in the SVG file (#2152)](https://github.com/aimpact-inc/repo-harness/pull/2192)
+- [feat(operator-web): Layers draws its lanes on the placed scene and the shared shell (#2160)](https://github.com/aimpact-inc/repo-harness/pull/2203). Layers uses the shared scene, shell and exporter.
+- [feat(operator-web): Sequence returns a placed scene, and message labels fit their columns (#2161)](https://github.com/aimpact-inc/repo-harness/pull/2205). Its SVG file draws the picture on the screen.
+- [feat(operator-web): the Office room shows the seats before the board read ends (#2149)](https://github.com/aimpact-inc/repo-harness/pull/2174)
+- [feat(operator): the board summaries route reads one parent and starts no board CLI run](https://github.com/aimpact-inc/repo-harness/pull/2159). A missing, repeated or other key gets 400 `invalid_request` with `The board summaries route needs exactly one parent issue number.`
+- [perf(board): one board read asks GitHub once for the repository identity and each base-commit fact (#2150)](https://github.com/aimpact-inc/repo-harness/pull/2184). It stores an answer only for exit 0, or exit 1 with a JSON object body of `"status": "404"`.
+- [fix(board): Low labels give Medium to a fix above 50 changed lines or of unknown size (#2113)](https://github.com/aimpact-inc/repo-harness/pull/2118). The High-list, hazard and incomplete-file-list checks still run first and are unchanged.
+- [refactor(review): remove the unused v1 diff fingerprint (#2211)](https://github.com/aimpact-inc/repo-harness/pull/2226). The unused v1 path and one unused provenance copy are gone.
+
+### Fixed
+
+- [fix(board): read every comment page of the batch parent (#2157)](https://github.com/aimpact-inc/repo-harness/pull/2158). A parent thread above 10,000 comments fails the board read and dispatch closed with `board source invalid: issue.comments has more than 100 pages of 100`; it never reads a partial thread.
+- [fix(board): read every sub-issue page of the batch parent (#2123)](https://github.com/aimpact-inc/repo-harness/pull/2130). `readParent` runs the same query again with each cursor until the last page. A repeated cursor and more than `BOARD_SUB_ISSUE_PAGES` (20) pages fail closed in the `readParent` loop.
+- [fix(board): an unreadable reviewed head gives no merge-only sync proof (#2091)](https://github.com/aimpact-inc/repo-harness/pull/2136). A reviewed head that git cannot read must not drop a FAIL candidate from the merge-only sync proof.
+- [fix(seats): restrict resets to the same repository peer (#2196)](https://github.com/aimpact-inc/repo-harness/pull/2199). Check that the reset caller is the opposite peer seat in the same repository as the handoff.
+- [fix(git): replace provider-token values in git output and errors (#2131)](https://github.com/aimpact-inc/repo-harness/pull/2169). `spawnGit` and `runGit` throw for a call that keeps a token.
+- [fix(git): keep provider tokens away from local git child processes (#2102)](https://github.com/aimpact-inc/repo-harness/pull/2103). Git child processes do not get provider tokens, except the remote operations that need them for `gh auth git-credential`.
+- [fix(review): move modelFamily to its own module so the browser graph imports no Node built-in (#2146)](https://github.com/aimpact-inc/repo-harness/pull/2170). `modelFamily` now lives in `src/core/review/model-family.ts`, which has no import.
+- [fix(operator): the architecture map collector publishes a repository when its child returns](https://github.com/aimpact-inc/repo-harness/pull/2186). A failed child publishes `unavailable` at once.
+- [fix(board): read gh status and cap watcher errors (#2120)](https://github.com/aimpact-inc/repo-harness/pull/2124). Read a whole `gh: HTTP NNN` line, a trailing `(HTTP NNN)`, or an `HTTP NNN:` line.
+- [fix(ci): count late scheduled runs as delivered (#2121)](https://github.com/aimpact-inc/repo-harness/pull/2126). Count a matching scheduled `ci.yml` run on `main` as delivered when its status is `requested`, `queued`, `pending`, `waiting`, `in_progress` or `completed`.
+- [fix(ci): select shared platform lanes for consumer scripts (#2132)](https://github.com/aimpact-inc/repo-harness/pull/2144). Add `scripts/ci-path-consumers.ts` and `scripts/ci-documentation-consumers.ts` to the existing shared-input predicate.
+- [fix(evidence): classify package manager mismatch codes (#2122)](https://github.com/aimpact-inc/repo-harness/pull/2125). Existing assertions retain precedence over excerpt install errors.
+- [fix(evidence): recognize install verbs and prioritize excerpt assertions (#2114)](https://github.com/aimpact-inc/repo-harness/pull/2116). Recognize failed install steps with install verb forms and give excerpt assertions priority over excerpt install errors.
+
+### Documentation
+
+- [docs(rules): code ownership default in the global working rules (#2187)](https://github.com/aimpact-inc/repo-harness/pull/2188). The sync treats an unlisted section as a user section, so the `SHIPPED_GLOBAL_RULES_SECTIONS` entry is required.
+- [docs(rules): clarify owner decisions for hooks (#2195)](https://github.com/aimpact-inc/repo-harness/pull/2197). Changes to hook behavior or configuration remain owner decisions.
+- [docs(issue-flow): clarify model-free writer claims (#2127)](https://github.com/aimpact-inc/repo-harness/pull/2128). Keep a dispatched writer claim valid when the seat has no configured model.
+- [docs(herdr-notify): set pane prefix with seats command (#2137)](https://github.com/aimpact-inc/repo-harness/pull/2139). Replace the manual registry edit in both herdr-notify reference copies with `repo-harness seats prefix --repo <path> --pane-prefix <p>`.
+- [docs(release): record 0.29.2 publication (#2143)](https://github.com/aimpact-inc/repo-harness/pull/2147). Update the 0.29.2 checklist with the registry readback, release tag, GitHub Release and post-publish checks.
+- [chore(projection): refresh generated architecture outputs for main@edf140e8e63f](https://github.com/aimpact-inc/repo-harness/pull/2119)
+- [chore(projection): refresh generated architecture outputs for main@f39523789188](https://github.com/aimpact-inc/repo-harness/pull/2141)
+- [chore(projection): refresh generated architecture outputs for main@67fefda5110f](https://github.com/aimpact-inc/repo-harness/pull/2171)
+- [chore(projection): refresh generated architecture outputs for main@e8c717a26ae6](https://github.com/aimpact-inc/repo-harness/pull/2183)
+- [skills: verify-boss-command names src/effects/operator/server.ts in its change list (#2209)](https://github.com/aimpact-inc/repo-harness/pull/2210). The verify-boss-command skill tells a person to run the TLA+ check when `src/effects/operator/server.ts` changes.
+- [chore(projection): refresh generated architecture outputs for main@176afd079d9a](https://github.com/aimpact-inc/repo-harness/pull/2217)
+- [docs(rules): the publish gate is the owner's release environment approval](https://github.com/aimpact-inc/repo-harness/pull/2224). Since #2194 (PR #2198), `release.yml` publishes after the owner approves its run in the GitHub `release` environment.
+
+### Tests
+
+- [test(release): one drift check binds the two CHANGELOG section extractions (#2204)](https://github.com/aimpact-inc/repo-harness/pull/2206). A check now fails when the two inline `awk` copies drift.
+- [test(herdr-task): synchronize late child before leader exit (#2140)](https://github.com/aimpact-inc/repo-harness/pull/2142). The child now sends an IPC readiness message after it installs its TERM and HUP handlers.
+
+### Upgrade
+
+- Upgrade with `bun add -g repo-harness@0.30.0 --no-cache && repo-harness update --version 0.30.0`; restart the Operator server and reload the page. Version sources: `package.json`, `packages/operator-web/package.json` and `assets/skill-version.json`.
+- Before the first owner run of `.github/workflows/release.yml`, create and verify npm Trusted Publishing for both packages (repository `aimpact-inc/repo-harness`, workflow `release.yml`, environment `release`) and the GitHub `release` environment (owner required reviewer, `main` only, admin bypass disabled). Use the read-only environment check in `deploy/release-checklists/261110-repo-harness-0.30.0.md` before dispatch. ([PR #2198](https://github.com/aimpact-inc/repo-harness/pull/2198))
+- `src/cli/installer/global-context.ts` adds `Code Ownership` to the shipped titles. Sync replaces the managed block and legacy sections with shipped titles outside the markers; personal sections with other titles outside the markers stay. ([PR #2188](https://github.com/aimpact-inc/repo-harness/pull/2188))
+- The two launch skills are `assets/skills/repo-harness-orchestrator/SKILL.md` and `assets/skills/repo-harness-advisor/SKILL.md`; they use `seats argv`. The handoff skill, `assets/skills/repo-harness-seat-handoff/SKILL.md`, invokes `seats handoff` and follows its printed steps. `assets/skill-commands/manifest.json` declares all three for Claude with owner `peer-runtime`; the selected plugins must include `peer-runtime`. ([PR #2182](https://github.com/aimpact-inc/repo-harness/pull/2182))
+- `src/effects/operator/server.ts` changes the board summaries route: 0.29.2 accepted a request with no query string and rejected query parameters; 0.30.0 requires exactly one `parent` query parameter and returns 400 `invalid_request` without it. ([PR #2159](https://github.com/aimpact-inc/repo-harness/pull/2159))
+- `src/core/board/parents.ts` changes the parents document to protocol 5 and refuses protocol 4; `src/effects/operator/server.ts` serves seats separately. Update custom parents-route clients with the CLI and web console. ([PR #2201](https://github.com/aimpact-inc/repo-harness/pull/2201))
+- `src/core/publication/acceptance-merge-policy.ts` defaults `publication.merge_queue` to `off`. A repository that enables it needs the `merge_group` trigger and matching `Required / CI` jobs, as shipped in `.github/workflows/ci.yml`. ([PR #2089](https://github.com/aimpact-inc/repo-harness/pull/2089))
+
+### Rollback
+
+- Run `bun add -g repo-harness@0.29.2 --no-cache && repo-harness update --version 0.29.2`. Restart the Operator server and reload the page. Version sources: `package.json` and `packages/operator-web/package.json` at `v0.29.2`.
+
+## [0.29.2] - 2026-11-10
+
+### Changed
+
+- Medium acceptance requires a claimed different-family PASS row. `board review` selects a reviewer of a different family. A FAIL row blocks acceptance. (#2084, PR #2098)
+- Dispatch binds each writer claim to the active parent coordinator. It refuses dispatch when no active coordinator claim is available. (#2100, PR #2104)
+- Dispatch writes the writer model in the claim. The board derives the writer family from `Model:`, skips plan-held PRs in review, and accepts `board review --pr <n>`. Claims without a model have an unknown family. (#2101, PR #2105)
+- The newest proven reviewed subject decides merge-only sync carry. A FAIL on that subject or the head blocks carry; a FAIL on an older proven subject does not. (#2107, PR #2110)
+
+### Fixed
+
+- The attention watcher records provider HTTP 5xx failures and retries in the next 15-minute window. Other board read errors still stop it. (#2109, PR #2111)
+- Required check evidence classifies install failures from failed install steps or matching install error text. Setup warnings alone no longer mask assertion or timeout failures. (#2108, PR #2112)
+
+### Documentation
+
+- The issue-flow worker pushes its branch, opens its PR and handles its own fix rounds. The orchestrator retains dispatch, review starts and merge. (#2066, PR #2097)
+- Current reference configs, skill links and localized install instructions use the transferred repository address `aimpact-inc/repo-harness`. (#2095, PR #2099)
+
+### Upgrade
+
+- Run `bun add -g repo-harness@0.29.2 --no-cache && repo-harness update --version 0.29.2`. Restart the Operator server and reload the page.
+- Installed 0.29.1 does not write the `Coordinator:` and `Model:` claim lines, apply the newest-subject carry rule, or keep the attention watcher running after a provider 5xx. Claims without `Model:` have an unknown writer family; start a different-family review by hand when needed.
+
+### Rollback
+
+- Run `bun add -g repo-harness@0.29.1 --no-cache && repo-harness update --version 0.29.1`. Restart the Operator server and reload the page.
+
+## [0.29.1] - 2026-11-09
+
+This release lets the board merge one eligible batch PR (`board merge`), makes
+High-tier acceptance need two PASS reviews, and moves the review tier to a
+High list. It also carries the merge-only sync rule for acceptance, a wider
+Bash tripwire and a Markdown-aware reference parser.
+
+### Added
+
+- `repo-harness board merge --parent <n> [--pr <p>] [--dry-run]` merges one eligible PR of a batch through `publication merge`. It requires a PASS acceptance record for the head at every tier, for High the two PASS rows of the board acceptance rule (#2061), `Required / CI`, a ready readiness verdict, plan merge order and no hold. `repo-harness merge hold` and `merge hold released` records on the parent, an issue or a PR narrow it, and the GitHub events Worker filter passes both headers. Board rule A11 wakes the orchestrator when a PR is eligible; the watcher never merges. The board document is protocol 4; a protocol-3 board fails decode. (#2003)
+- `board attention --watch --deliver --review --space <id>` runs the `board review` path once per window, after the board read and before delivery, and starts only the read-only review seats. Each start or refusal is one `review` line in the attention jsonl and one hc message to the orchestrator; a failed run is a refusal line and does not end the watcher. `board attention start --review --space <id>` starts the watcher with the flag. The flag is off by default. (#2078)
+- `bash scripts/release-owner-steps.sh plan <version>` prints the owner's release command list, bound to the release commit on `origin/main`: publish both packages, read them back, tag that commit, create the GitHub Release, then the post-release steps. `check published` and `check tagged` read back each owner step and stop at the first failure; `notes` prints the CHANGELOG section. The script only reads git, npm and GitHub. `check:release-published --before-tag` skips only the tag check. (#2006)
+
+### Changed
+
+- Review by risk follows the owner ABD decision (#2079). High is only permissions, sandbox and tool grants; hooks and the mutation guard; credentials and secrets; deletion; release, publish and deploy; merge and push paths; and the change hazard list. Code that writes GitHub comments, records, reviews or labels is Medium. Low is docs-only, tests-only, the projection PR, or a fix of at most 50 changed lines outside the High list. `assets/review-high-list.v1.json` holds the path-visible High list; `agentic-development-flow.md` renders it. Board rule R5 reads it instead of the capability count. A changed path on the High list or the hazard list, or an incomplete file list, sets the effective tier of a pull request to High, so `board review` and acceptance use the same tier.
+- Board acceptance of an open High or unknown-tier pull request needs `PASS` rows of the head that cite two distinct `acceptance claim` comments of the pull request with the row's subject and round (the comment id is the identity), at least one with `Model relation: different-family`, and no `FAIL` row. One review no longer accepts a High head. A missing, blank or malformed `Claim:`, or one that names no claim comment, proves no claim, and `Model relation: unknown` (an unknown writer family) never counts as the different-family review. `claude_review` is now a projection of that rule: `pending` for every open High head that does not meet it and has no Claude row, a Claude writer included, so `board review` starts the Claude reviewer seat and A10 reports the head until the second review exists. The writer claim's `Runtime:` no longer decides it. A sync head is a new head: High needs two sync check rows by the same rule, Medium one (`acceptor.md` §2.2). `repo-harness review publish` accepts rounds 1 to 5 (round 5 is the hard stop), so a High head that converges in round 4 or 5 also gets two claimed rows; the hand-posted record of a round above 3 is retired. Medium and Low are unchanged. (#2061)
+- Board acceptance carries the acceptance rows of an earlier reviewed head to a later head that is a merge-only sync of it. Git must prove two facts: the reviewed head is an ancestor of the head, and each commit that the head adds outside the reviewed head and the base is the clean automatic merge of a base commit (`git merge-tree --write-tree` of its parents exits 0 with the tree of the merge commit, one merge base). The board reads the rows of the head and of the newest proven reviewed subject. A FAIL row on that subject or the head stops the carry; a FAIL on an older proven subject does not. (#2107) An empty PR diff, or a git error on any candidate, gives no proof. The board then reports `via: sync` with `carried_from: <reviewed head>`, so a sync after a merge needs CI only. A conflict (even one resolved to the PR side), an edit in a merge, a new commit, a failed git step or fetch, an incomplete file list or a hook path keeps the head unaccepted until its own review. (#2074)
+- The repository moved to `aimpact-inc/repo-harness` (same repository id; old URLs redirect). The package `repository.url`, the external tooling doc URL in the tool catalog, and the install and clone lines in README and `docs/usage.md` use the new owner. Localized READMEs and the rest follow in #2095.
+
+### Fixed
+
+- The Bash write tripwire denies more forms that reach `_ops` or `_ref`. A case variant such as `_OPS/x` counts as `_ops/x`, because macOS and Windows filesystems ignore case by default. Unquoted brace words (`_op{s,x}`, `_op{r..t}`) are expanded and `~+` reads as the working directory; quoted characters stay literal. Subshells and `$(...)` between commands are parsed, and a backslash-newline or a quoted newline joins lines; heredoc forms outside the grammar, quoted or mid-argument command substitution, process substitution, glob matches that are symlinks, a bracket-only `cd` glob (`cd _op[s]`), a target with a quoted newline, `~` and `~user` stay unmodeled (#2082). After a `cd` with an option or an expanded operand that can reach a protected or external directory, a relative write is denied. Denied as targets with no known destination: a glob that can reach `..` (bash 3.2 expands `.*` to `..`), a relative `..` target from an unknown directory, `~-`, a brace expansion above 1024 words or outside safe integers, and a command with unbalanced parentheses, an unclosed quote or a `(` glued to a word. (#2060)
+- `board closeout` also closes the seat terminals that work in the PR head worktree, so a PR that only says `Refs #<issue>` closes its seats and removes its worktree in one run. Such a seat needs an issue label that the PR closes or that `parseRefs` reads after `Refs` in the PR body. (#2071)
+- The board reference parser reads the PR and issue body as Markdown. A reference example in a code span, code block, blockquote or HTML comment no longer links an issue, and a real reference after a line break or after HTML still does. Board selection, effective tiers and closeout share this one parser. It adds the runtime dependency `mdast-util-from-markdown@2.1.0`, already in the lockfile. (#2085)
+
+### Documentation
+
+- The issue-flow skill and the root agent rules use one module + tier work package per PR (150-500 product lines), publish ready green PRs once per window with `publication batch build` and `publication merge --batch`, count only blocking findings (P0-P2) in the fix-loop rule, and add the writer pre-check before round 2 and later. (#2086)
+- Record the 0.29.0 publication in its release checklist. (#2065)
+- Refresh generated architecture outputs. (#2070, #2075)
+
+### Upgrade
+
+- Run `bun add -g repo-harness@0.29.1 --no-cache && repo-harness update --version 0.29.1`.
+  Restart the Operator server and reload the page.
+- Installed 0.29.0 lacks the two-row High check (#2061), the Medium/High lists of #2083 and the merge-only sync carry of #2081. The board document is protocol 4 (#2003), so update the Operator server and any board reader together.
+- `repo-harness update` installs the Bash tripwire hook from #2069. The tripwire is still a literal-write check, not a shell parser; the forms it leaves unmodeled are listed in #2082.
+
+### Rollback
+
+- Run `bun add -g repo-harness@0.29.0 --no-cache && repo-harness update --version 0.29.0`.
+  The 0.29.0 CLI has no `board merge` and decodes only protocol-3 board documents. The 0.29.0 hook returns to the narrower tripwire. (#2003, #2060)
+
+## [0.29.0] - 2026-11-09
+
+This release lets the board run the issue flow: `board dispatch` starts a
+worker seat for each ready sub-issue, `board review` starts the gatekeeper
+and Claude reviewer seats for a ready, green PR, and `board closeout` closes
+seat terminals and removes the merged worktree. The owner delegates merge,
+dispatch and fix-round decisions to the life cycle (#2008). The Operator
+protocol moves to 3, and a repository can open listed `_ops/` directories
+to agent edits.
+
+### Upgrade
+
+- Run `bun add -g repo-harness@0.29.0 --no-cache && repo-harness update --version 0.29.0`.
+  Restart the Operator server and reload the page.
+- `/healthz.protocol` is now 3. A protocol-2 desktop app refuses a
+  protocol-3 server. Update the desktop app together with the CLI. (#1968)
+- The root `CLAUDE.md` and `AGENTS.md`, the issue-flow skill and the Herdr
+  Dispatch guide carry the #2008 owner decisions. In an owner-approved
+  batch, a Medium or High PR merges by rule; a Low PR that meets the Low
+  accept-seat skip merges on `Required / CI` and its verification evidence.
+  Fix loops can run to round 5 while findings shrink. The orchestrator and
+  the advisor make the other decisions by joint decision. The owner keeps
+  security, the safety net, unrecoverable deletion, `npm publish`, the tag,
+  the GitHub Release and production deployments. A GitHub comment is a
+  record: it never starts an action. (#2008)
+- The GitHub review bot is a reference. The coordinator decides `adopt`,
+  `decline` or `outdated` for each bot finding. (#2007)
+- Every seat comment ends with `Seat: <seat id> <hc address>`. It is a
+  reader trace, not authentication. (#2051)
+- `board dispatch` needs exactly one `route:<class>` label on each issue
+  (`route:important_deep`, `route:important_fast`, `route:simple_deep`,
+  `route:simple_fast`, `route:frontend`). Create these labels, and
+  `touches:credentials`, in each repository that uses it. (#2004)
+- `_ops/` stays closed to agents by default. A repository can list
+  directories strictly below `_ops/` in `operations.agent_writable_private_dirs`
+  of `.ai/harness/policy.json`. Edit, Write and apply_patch may write there;
+  Bash writes under `_ops/` stay denied. The Bash tripwire also denies
+  more glob and symlink forms. (#2037, #2039, #2041)
+- Known gap, present before 0.29.0 and not a regression: the Bash
+  tripwire does not catch a case-variant `_OPS` path on a case-insensitive
+  APFS volume, a glob segment that can match `..`, or brace and `~+` forms.
+  The tripwire is a literal-write check, not a shell parser. (#2060)
+- The Daily governance ContextScan matches `read`, `cat` and `copy` as
+  whole words only. (#2056)
+- The `schedule` tool group and `edit` for the advisor are off by default.
+  Turn them on in the Seats page. (#2014, #2032)
+
+### Rollback
+
+- Run `bun add -g repo-harness@0.28.0 --no-cache && repo-harness update --version 0.28.0`.
+  A 0.28.0 CLI refuses a stored seats config that lists `schedule`, or
+  `edit` for the advisor, until you remove them. It ignores
+  `operations.agent_writable_private_dirs`, so every agent write under
+  `_ops/` is denied again. Downgrade the desktop app to protocol 2 too.
+  (#1968, #2014, #2032, #2037)
+
+### Added
+
+- `repo-harness board dispatch --parent <n> --space <id> [--dry-run]` starts a worker seat for each ready sub-issue of the plan. An issue is ready when it is open, in the plan, not held, has no open blocker and no active claim, and the parent has fewer live worker seats than `seat_limits.worker`. The seat comes from the quota route of the issue's `route:<class>` label. Work with the `touches:credentials` label never goes to a Pi seat. (#2004)
+- `repo-harness board review --parent <n> --space <id> [--dry-run]` starts the gatekeeper seat for each open, non-draft pull request whose `Required / CI` passed, whose tier is Medium or High, and that has no acceptance and no start marker for its head. The tier is the highest tier of the issues it closes or refs (the parent excluded); an issue outside the board or without a tier label counts as High. The seat opens in the writer worktree, and only when that worktree is at the PR head. One `repo-harness review start` comment marks the head, so a head starts once; a run holds a per-repository lock and reads the board inside it. A new head starts a delta review only when an earlier started head has an acceptance record; otherwise the review is full. A High pull request needs a Claude review too, unless its writer claim (`Role: writer`, `Branch:` equal to the PR branch) names the Claude runtime. The board shows it as `claude_review: pending` (new `tier` and `claude_review` fields on each pull request, additive, same board protocol), and attention rule A10 reports it (an unknown tier too) until a Claude reviewer has an acceptance row for the head. The Low acceptance path uses the same tier of every linked issue. `board dispatch` now writes a `Runtime:` line in the claim. The seat stays read-only. (#2002)
+- `repo-harness board closeout --pr <n>` closes the clean, pushed seat terminals of a merged PR
+  and removes its merged worktree through the `contract-worktree cleanup` path. A dirty or
+  unpushed pane and its worktree stay with the reason. Board rule A9 reports each live seat
+  of a merged PR. (#2005)
+- `repo-harness board closeout` also removes finished seat terminals of the merged PR. It lists them with `hc ls --all`, under the same label binding and checkout proofs, and runs `hc rm` only. A retry after a failed `hc rm` now removes the terminal. (#2021)
+- `repo-harness board closeout` stops a CodeGraph MCP server whose command line names exactly the merged worktree (`serve --mcp --path <worktree>`) and lists its PID in `stopped_codegraph_servers`. Any other process, or a process that stays after the stop, still keeps the worktree with `process_in_use`. (#2029)
+- `repo-harness worktrees path --repository <id> --worktree <id>` prints
+  the absolute path of one registered worktree as one JSON line. In the
+  desktop shell, a registered Worktree row shows "Open in Terminal" and
+  "Open in Editor". The page passes only ids; the shell resolves the path
+  with the command. A plain browser shows no open control. (#1968)
+- A Claude seat can take the new `schedule` tool group (`CronCreate`, `CronList`, `CronDelete`). The group is off for every seat by default; Codex and Pi launches ignore it. (#2014)
+- A repository can list directories strictly below `_ops/` in `operations.agent_writable_private_dirs` of `.ai/harness/policy.json`. Edit, Write and apply_patch writes below a listed directory pass when the target is written as its canonical repository path. A glob character, a dangling symlink or another spelling of a listed target is denied, and an invalid entry denies every `_ops/` write. Bash writes under `_ops/` stay denied. (#2037, #2039)
+- `global-working-rules.md` carries an opt-in Delegation profile outside the managed block. The managed block and the downstream defaults stay unchanged. (#2011)
+- The issue-flow acceptor SOP treats the GitHub review bot as a reference. The coordinator decides `adopt`, `decline` or `outdated` for each bot finding, replies, resolves the thread and records the decision in one plain PR comment. Only adopted findings count in the review loop. (#2007)
+
+### Changed
+
+- `repo-harness board review` also starts the Claude `reviewer` seat when a pull request shows `claude_review: pending`. A start marker now carries `Seat: gatekeeper|reviewer` (a marker without `Seat` covers no seat), so a seat that was not sent retries without restarting the other. The delta base of each seat comes from an acceptance row of that seat's own family (Claude for the reviewer, another harness for the gatekeeper); otherwise the seat reviews the whole diff. Board acceptance via a record no longer accepts a head while `claude_review` is `pending`. The `second_reviewer_required` output is gone. (#2025)
+- Every seat comment ends with `Seat: <seat id> <hc address>`, a reader trace only. The issue-flow skill states the rule. `repo-harness board dispatch` adds the line to its claim comments when `REPO_HARNESS_SEAT` and `HC_TERMINAL_ID` are set. No command refuses a comment without it. (#2051)
+- The root `CLAUDE.md` and `AGENTS.md`, the issue-flow skill and the Herdr Dispatch guide state the owner decisions of #2008. Merge by rule at every tier, fix rounds up to round 5 while findings shrink, ordered dispatch of an approved batch plan, and joint orchestrator + advisor decisions replace the four hard boundaries. The owner keeps credentials, permissions, the safety net, deletion that git cannot restore, `npm publish`, the tag, the GitHub Release and production deployments. (#2008)
+- The seats range lets the advisor seat take the `edit` tool group, as the owner approved. The orchestrator range still refuses `edit`. (#2032)
+- The brief of a review seat with the `net` tool group lets it publish its own round with `repo-harness review publish` (#1996). It forbids every other GitHub write. A seat without `net` keeps the full GitHub write ban.
+- `/healthz.protocol` is now 3 (ADR-0003). A protocol-2 desktop app
+  refuses a protocol-3 server; update the desktop app together with the
+  CLI. (#1968)
+- Host tests take one queue per host. `bash scripts/check-ci.sh <lane>`,
+  `bun run test`, `bun run test:files`, `bun run test:coverage` and the
+  `test:core`, `test:integration` and `test:full` suites wait their turn,
+  run alone and release. Release checks go first, then FIFO. A holder or
+  waiter whose PID is free or reused is skipped and its lock is freed;
+  a holder's lock stays held while its command's process group runs.
+  `bun scripts/host-test-queue.ts status [--json]` shows the holder and the
+  waiters. (#2001)
+
+### Fixed
+
+- The Bash write tripwire denies more forms that can write under `_ops/` or `_ref/`: a glob whose segment at the repository root can match a protected directory (`_op*/env/x`, `./_op[s]/x`, `rm -rf *`), an unquoted glob destination (`echo x > _ops/env/*`, `rm *` in `_ops/env`), a symlink below `_ops/` that leads outside the repository, and a symlink, dangling or not, that leads into `_ops/` or `_ref/`. Gaps that existed before this release stay open in #2060. (#2041)
+- The tarball install smoke compares `/healthz` with the installed package's `OPERATOR_SERVER_PROTOCOL` and `OPERATOR_SERVICE_NAME`. It expected protocol 2 after #1990 raised the protocol to 3, so the daily package job failed. (#2033)
+- The governance ContextScan matches `read`, `cat` and `copy` as whole words. Before, `cat` inside "publication" in `AGENTS.md` failed the Daily run. (#2056)
+- A `context-scan` workflow runs the ContextScan on a pull request that changes a root or nested `AGENTS.md` or `CLAUDE.md`, the scan script or the workflow. It is not part of `Required / CI`. (#2057)
+- `repo-harness review publish` keys an acceptance claim by round, subject and agent. The second reviewer of a High round posts its own claim and record for the same head; before, it exited 2 with `review_publish_conflict`. A retry of the same agent still reuses its claim, and the same agent with another tier is still a conflict. (#2061)
+- Board attention rules A3 and A4 and the delivery window recognize every configured worker seat kind. (#2016)
+- Board rule R2 no longer counts `docs/CHANGELOG.md` as a shared file of two open PRs. A pair that shares other files still gets the finding, and the message names only those files. (#2034)
+- `review publish` puts a finding on a line outside the PR diff into the review body, so GitHub no longer rejects the review with HTTP 422. A retry reuses the acceptance claim already on the PR instead of posting a second one (#2009).
+- `contract-worktree start` starts a node-shebang `codegraph` with the trusted node runtime. The installed helper PATH has no node, so the first index of every new worktree failed and `board dispatch` stopped. A failed init now prints the last lines of codegraph's stderr, at most 2000 bytes (#2023).
+
+### Tests
+
+- Two test fixtures no longer read a half-written pid file as pid 0. The dev-activity collector test waits for a non-empty pid, and the herdr task lifecycle cleanup skips a pid that is not positive. Before, `process.kill(0, 'SIGKILL')` could stop the whole CI test group with exit 137. (#2052)
+
+### Documentation
+
+- Refresh generated architecture outputs. (#2012, #2019, #2036, #2043, #2050, #2062)
+
+## [0.28.0] - 2026-11-08
+
+This release derives each account's seat mode from weekly quota, makes
+every seat, route and threshold editable on the Seats page, and gives
+seats with the `net` tool group network access. Orchestrator and advisor
+seats reset through a checked handoff before auto-compaction. It pins
+herdr-core 0.1.19 and archctx 0.12.0.
+
+### Upgrade
+
+- Run `bun add -g repo-harness@0.28.0 --no-cache && repo-harness update --version 0.28.0`.
+  Restart the Operator server and reload the page.
+- Update migrates a stored `seats.routing.mode` and `seats.routing.hyper`
+  once to the two quota thresholds. Before update, seats and quota routes
+  fail with `seats_config_migration_required`. (#1954, #1960)
+- The default `worker-light` is a Pi seat on
+  `magpie/cursor/deepseek-v41-flash-1017`. `agents.enabled` must include
+  `pi`, and Pi must have that provider and model configured. Otherwise set
+  `worker-light` to `null` on the Seats page. (#1954, #1964)
+- Seats with `net` now get network access, including writable Codex seats.
+  This reverses M87 (#1770). Removing `net` turns off Codex sandbox network
+  access and web search. Other runtime paths, such as MCP or shell, can stay
+  available. For Pi seats the limit is instructions only. (#1961, #1962)
+- The hc floor moves from 0.1.17 to 0.1.19; 0.28.0 skips 0.1.18.
+  `repo-harness update` runs `hc update --version 0.1.19` only when hc is
+  below the floor. That restarts the core, so programs in hc terminals end.
+  Finish or stop agent sessions first. (#1979, #1981, #1991, #1992)
+- On Linux and macOS, closing a pane no longer ends a deliberately detached
+  program (`nohup`, `setsid`, daemon). Stop background servers before you
+  close the pane. Windows still ends everything. Terminals opened before
+  the core update keep the old behavior until you reopen them.
+  (#1991, #1992)
+- Update installs the managed `archctx` entry at 0.12.0. The package
+  depends on archctx-contracts 0.12.0. archctx 0.12.0 removes the GitHub
+  App governance bridge (ADR-0053); repo-harness used none of it.
+  (#1946, #1952, #1995, #1999)
+
+### Rollback
+
+- Run `bun add -g repo-harness@0.27.0 --no-cache && repo-harness update --version 0.27.0`.
+  The 0.27.0 decoder refuses the migrated `seats.routing` keys with
+  `seats_config_invalid`, so seats and quota routes stay unavailable until
+  the routing section has the 0.27.0 shape again. (#1954)
+
+### Changed
+
+- Stored quota thresholds replace `routing.mode` and `routing.hyper`.
+  Claude saving and Codex hyper modes follow weekly remaining quota.
+  `repo-harness update` runs the one-shot migration. The decoder refuses
+  the old keys before and after migration. (#1954)
+- The default `worker-light` is now an unsandboxed Pi seat with worker
+  tool groups, including edit, gh, net and shell. A host without Pi enabled
+  cannot save the Seats page until Pi is enabled or `worker-light` is set
+  to `null`. (#1954)
+- A writable Codex seat with `net` runs with
+  `sandbox_workspace_write.network_access=true`. A read-only review seat
+  with `net` stays `-s read-only` and allows web search. Worker and review
+  defaults include `net`. `seat_codex_edit_net` is removed. (#1961, #1962)
+- The Seats page edits every seat, the ordered routing lists, the
+  low-quota explorer and the two quota thresholds. Save stays off while the
+  shared decoder refuses the draft and shows the refusal code. (#1926, #1964)
+- A Pi seat model is `<provider>/<model id>`; the launch passes
+  `--provider` and `--model`. The decoder refuses another shape. (#1950, #1956)
+- A Pi seat on `magpie/codex/<model>` runs the GPT family as a Codex
+  alternative. It takes an effort (`--thinking`), counts against the
+  ChatGPT account and gets the Codex hyper model. (#1976, #1978)
+- `repo-harness board seats --json` lists every live seat of one
+  repository, including seats without a parent issue. (#1944, #1949)
+- `repo-harness operator serve --exit-on-stdin-close` stops the server when
+  stdin closes, so a crashed desktop shell leaves no server. (#1935, #1953)
+- Update and install with `architecture` add the pinned archctx with Bun.
+  A foreign `<bun>/bin/archctx` fails with `RH_ARCHCTX_BIN_CONFLICT`.
+  `init-hook check` fails `tooling.archctx` for an unrelated PATH copy and
+  names the fix. (#1946, #1952)
+- Dependencies move within their major versions, including OAR 0.95.0 and
+  archctx 0.11.4. Codex review runs now log `collabAgentToolCall` tool
+  events (OAR 0.93); no parser reads them. (#1980, #1984)
+- The architecture constraints report is decoded with the schema that
+  archctx-contracts 0.11.4 publishes. A rejected report names the schema
+  path. (#1982, #1985)
+- The global working rules dispatch the gatekeeper only to a Herdr seat, so
+  update no longer reverts that owner rule. (#1945, #1948)
+- Update archctx and archctx-contracts to 0.12.0. This release removes
+  the GitHub App governance bridge (ADR-0053), which repo-harness did not
+  use. (#1995, #1999)
+- The docs reader uses mermaid 12.3.0, and the operator-web tests use
+  happy-dom 21.0.4. Mermaid 12 draws diagrams with ELK layout and the `neo`
+  look by default. (#1987, #1994)
+- `architecture-projection publish follow` keeps its source checkout at
+  `origin/main` with dependencies installed for that commit. When main moves,
+  it refuses a dirty checkout, fast-forwards, reinstalls and exits 75 for a
+  supervisor restart. It does not publish while the update fails, and logs a
+  `writer_update_failed` JSON line. It runs one archctx `once` per 300-second
+  iteration. (#1983, #1989)
+- Task agent cancel and close end the provider's whole process group
+  (TERM, then KILL) after two leader proofs, so a group member that ignores
+  hangup still ends (#754). An unproven group is reported as
+  `cleanup_pending` `provider_group_alive` and is never signaled.
+  (#1991, #1992)
+- Orchestrator and advisor Claude seats reset through a checked handoff.
+  When `REPO_HARNESS_SEAT` and `REPO_HARNESS_SEAT_REPOSITORY` are set, the
+  Stop hook asks for a handoff at 380,000 context tokens, and SessionStart
+  records the new session. Other sessions are unchanged. (#1972, #1975)
+- A Pi seat on `magpie/codex/*` gets its own fleet roles, named `rh-<role>`,
+  through `PI_SUBAGENT_EXTRA_AGENT_DIRS`. Other Pi seats get no fleet; the
+  decoder refuses one. (#1977, #1993)
+
+### Fixed
+
+- The board watcher parses the `hc wait` status of hc 0.1.18 and later
+  and reports a program end only for a terminal that is no longer live.
+  (#1979, #1981)
+
+### Tests
+
+- Test fixtures refuse install-state writes outside a temp HOME, and every
+  direct write goes through that guard. (#1957, #1967, #1971, #1986)
+- The Mermaid install projects twice into one scratch HOME. (#1958, #1970)
+
+### Documentation
+
+- Record the 0.27.0 publication and upgrade evidence. (#1947)
+- Refresh generated architecture outputs. (#1942, #1955)
+- Seat docs describe the #1961 network rule. (#1963, #1965)
+- The issue-flow skill and development flow run the gatekeeper only in a
+  Herdr seat. (#1951, #1966)
+- The seat that receives an owner decision posts it to the issue.
+  (#1973, #1974)
+
+## [0.27.0] - 2026-11-07
+
+This release separates the Operator console into a matching npm package and
+installs it when `operator` is selected. It adds quota-aware seats routing
+and Operator language settings.
+
+### Upgrade
+
+- Run `bun add -g repo-harness@0.27.0 --no-cache && repo-harness update --version 0.27.0`.
+  Update installs the matching console when `operator` is selected. Restart
+  the Operator server and reload the page. (#1892, #1916)
+- Users with a stored seats config must run `repo-harness update` before
+  seats or quota routes read it. (#1925, #1928)
+
+### Rollback
+
+- An older CLI ignores the console package. Run
+  `bun remove -g repo-harness-operator-web` to remove it. (#1891, #1908)
+
+### Changed
+
+- `seats` now stores eight required seats, an optional `worker-light` seat,
+  and five quota-aware task routes. `worker-light` defaults to `null`, and
+  routes cannot name it until it is configured. The default routes do not
+  require Pi. Gatekeeper and reviewer settings accept only read/shell tools
+  and no fleet roles at the decoder boundary.
+  Pi review seats disable the edit/write tools and report the remaining
+  shell path as `common_commands`.
+  Human `repo-harness quota` output names each route, reserves tight Claude
+  capacity for the advisor and orchestrator, and keeps frontend work on Claude.
+  Hyper mode shares model overrides between route lines and launch argv;
+  only an exhausted Claude advisor falls back to Codex. A stored seats config
+  without the new keys fails with `seats_config_migration_required`; update
+  migrates it. A malformed present value stays `seats_config_invalid`.
+  Saves write the full section. Quota JSON is unchanged. (#1925, #1928)
+- Install the matching Operator console when `operator` is selected. Checkout
+  installs link the console and require `bun run build:operator-web`. (#1892, #1916)
+- The npm release gates check both the core and operator web packages at the
+  same version. The console publishes first, and the published check verifies
+  both packages. (#1893, #1912)
+- The built Operator console ships in `repo-harness-operator-web` at the same
+  version as the CLI. Core packages and installed skill copies exclude the
+  console build and source. Page requests return 503 when the console is
+  absent or has another version; API routes and `/healthz` stay available.
+  Run `repo-harness update`, restart the server and reload the page. (#1891, #1908)
+- The Herdr notify setup states that the relay child runs the `peer-runtime`
+  command `herdr notify relay`. Its gate reads the selection under the `HOME`
+  of the hc core. Select `peer-runtime` for that `HOME` too, or the relay
+  exits 1 with `install_plugin_unavailable`. (#1906, #1911)
+- Operator exposes routes to read and set the reporting language and a
+  registered repository's documentation language. Writes use the existing
+  Operator write channel. Console controls expose these settings.
+  (#1919, #1921, #1920, #1937)
+- Architecture module cards use a uniform layout with five signal slots.
+  (#1936, #1940)
+
+### Fixed
+
+- Generated context follows the repository documentation language policy.
+  (#1918, #1922)
+- Candidate reconciliation uses the supplied environment for global runtime
+  projection. (#1900, #1923)
+- Operator opens repository policy files without blocking on a FIFO or
+  following a symlink. It writes changes by temp file and rename. (#1927, #1929)
+- Review runtime mappings are exhaustive. An unsupported harness fails with
+  `review_harness_unsupported`. (#1932, #1933, #1938)
+
+### Documentation
+
+- Refresh generated architecture outputs after 0.26.6. (#1882)
+- Refresh the architecture map for P7 and the console package split. (#1913)
+- Record the 0.26.6 publication and installed upgrade evidence. (#1915)
+- Record G10 review isolation research for antigravity and dsh. (#1857, #1930)
+- Clarify null actual model behavior in review. (#1934, #1939)
+- Refresh generated architecture outputs for main at `309ce4556`. (#1910)
+
+## [0.26.6] - 2026-11-06
+
+This release adds the `peer-runtime` command gate, binds managed hooks to
+absolute runtime paths, and adds Board status desks and desktop health
+protocol 2. OAR is pinned to 0.91.0. The hook route registry is unchanged.
+
+### Breaking
+
+- `review round|status|close|cancel`, `herdr`, `events` and the hidden Operator
+  cleanup-investigation job now need `peer-runtime`. A refusal exits 1 with
+  empty stdout, `install_plugin_unavailable` and a repair command before loading
+  plugin code. Help stays open. Core review admission and publication, worktree
+  closeout, doctor, hooks, `hc`, the Herdr skill and fleet stay in core. (#1889, #1904)
+
+### Upgrade
+
+- For selection `all`, run `repo-harness update`. For an explicit list, run
+  `repo-harness install --plugins <your plugins>,peer-runtime`. No migration
+  changes an explicit list. `peer-runtime` is available on every target and
+  has no owner probe row; its portal skill installs only on Claude. (#1889, #1904)
+- Upgrade with `bun add -g repo-harness@0.26.6 --no-cache` followed by
+  `repo-harness update --version 0.26.6`. Update rewrites managed Codex and
+  Claude hooks and the repo-harness-owned Claude status line to the resolved
+  absolute Bun and global `dist/hook-entry.js` paths. Run update again if
+  Bun moves. A missing runtime or bundle fails closed. User-owned hooks and
+  status lines stay intact. The hook route digest is unchanged. (#1895)
+- Restart the Operator server and reload its page together for the new
+  Board protocols. Stored summaries become available after the next board
+  read. (#1876)
+
+### Rollback
+
+- To restore the previous selection, use `repo-harness install --rollback`.
+  This keeps the new guards. To restore commands without the gate, run
+  `bun add -g repo-harness@0.26.5 --no-cache && repo-harness update --version 0.26.5`. (#1889, #1904)
+
+### Changed
+
+- Operator `/healthz` now returns protocol 2 and the core package version.
+  The protocol is the desktop integration contract. UI-only changes do not
+  bump it. (#1890, #1897)
+- Update `@botiverse/oar` to 0.91.0. A handled input has no turn outcome and
+  cannot complete a review. A Codex `unauthorized` error now stops a review
+  as an auth failure. (#1899, #1901)
+- The board now reports `blocked`, `error` and `done` desks and the hc status
+  message of each seat. `BOARD_PROTOCOL` moves to 3, `BOARD_PARENTS_PROTOCOL`
+  to 4 and `BOARD_SUMMARIES_PROTOCOL` to 3, with no read of the old protocols.
+  The web client and the server ship together, so an open page must reload. A
+  stored summary shows as unavailable until the next board read writes it.
+  (#1867, #1876)
+- A plugin command guard on a recorded `all` selection now prints
+  `repo-harness update`. An explicit `--plugins` list ended `all`, so later
+  plugins did not join at `update`. (#1869, #1875)
+- `repo-harness init` writes `base_branch` and `merge_back.target` from the
+  same Git read as `review_base`, only when it creates the policy. An existing
+  policy keeps its keys: a policy without `base_branch` or `merge_back.target`
+  stays without the key, and `init` no longer adds `main` there. (#1865, #1878)
+- `scripts/create-project-dirs.sh` and `scripts/init-project.sh` no longer
+  write `.ai/harness/policy.json`. `repo-harness init` is the one policy
+  writer and stays a separate step, so a scaffolded project has no policy
+  until `init` runs. (#1865, #1878)
+- Operator runtime observations now use the shared hc status classifier.
+  Unknown or unreported status stays unknown. (#1879)
+- `events install` writes the GitHub App hook configuration through core
+  publication. The three-step approval and partial-failure repair text stay
+  the same. (#1888, #1898)
+- Runtime closeout, the Herdr skill installer and the agent fleet belong to
+  core. Commands and installed behavior stay the same. (#1887, #1903)
+
+### Fixed
+
+- Keep hc terminal reads local. List, snapshot, missed-event and event reads
+  exclude remote addresses before validating their payloads. Malformed local
+  rows still fail. (#1874)
+- Use the marketplace entry name for a Claude plugin without a manifest.
+  A plugin with a manifest still uses its declared name. (#1885)
+- Explain how to repair a scoped npm plugin that has neither a manifest nor
+  an entry name: add `.claude-plugin/plugin.json` with a name, or reinstall
+  from a marketplace. (#1902)
+- Managed hooks invoke the absolute Bun runtime and global hook bundle,
+  so hook execution does not depend on finding `repo-harness-hook` on PATH.
+  (#1895)
+
+### Documentation
+
+- Refresh generated architecture outputs for the 0.26.5 merge. (#1871)
+- Record the 0.26.5 publication and installed upgrade results. (#1873)
+- Record research for the peer-runtime gate, separate packages and desktop
+  handshake. This research does not ship separate packages; #1891 is outside
+  this release. (#1886)
+
+## [0.26.5] - 2026-11-06
+
+This release adds the MCP and Operator plugin gates, updates OAR and Pi,
+and reads a new policy's review base from Git. The hook route registry is
+unchanged. Install state and candidate reconciliation stay at protocol 3.
+
+### Breaking
+
+- Installation refuses configuration receipts with the retired
+  `mcp_servers.repo_harness` selector. Remove the retired entry from
+  `~/.repo-harness/configuration-restore.json` before retrying. (#1839, #1846)
+- `mcp serve` and `mcp doctor` need the new `mcp` plugin. Selection `all`
+  gains it at the next `repo-harness update`. An explicit plugin list does not
+  gain it: add it with `repo-harness install --plugins <your plugins>,mcp`.
+  Without the plugin, each command exits 1 and prints the repair; `mcp serve`
+  prints nothing to stdout, so a client gets no JSON-RPC answer. `mcp --help`,
+  `mcp access set` and `bots` stay open. No migration runs. (#1849, #1856)
+- The text of a plugin command guard now starts with
+  `install_plugin_unavailable: `. This applies to every guarded command,
+  including `strategy` and the architecture commands. (#1849, #1856)
+- `operator`, `worktrees` and `catch-up` need the new `operator` plugin.
+  Selection `all` gains it at the next `repo-harness update`. An explicit
+  plugin list does not gain it: add it with
+  `repo-harness install --plugins <your plugins>,operator`. Without the
+  plugin, each command exits 1, prints the repair, loads no Operator module
+  and binds no port. Each `--help` stays open, and `seats`, `quota`, `bots`,
+  `mcp access set` and the status line hook route need no plugin. No migration
+  runs. (#1850, #1864)
+- The hc pin moved from `src/core/operator/herdr-core-pin.json` to
+  `src/core/terminal/herdr-core-pin.json`. `runtime.herdr_core.min_version_source`
+  is now `package:src/core/terminal/herdr-core-pin.json`. An external reader of
+  the pin file must change the path. (#1836)
+- Pi hosts need Pi 1.5.0 or newer. `doctor` and the Pi review launch refuse an
+  older Pi with `PI_HOST_UNSUPPORTED_VERSION`, and the optional Pi peer range
+  is `^1.5.0`. OAR 0.88.0 requires Pi 1.5. (#1854, #1862)
+- Antigravity needs agy CLI 1.5.0 or newer, because OAR 0.88.0 runs `agy acp`.
+  The runtime probe reports an older agy as `unsupported`. Antigravity sessions
+  from older OAR do not resume. (#1854, #1862)
+- `init` no longer writes `review_base: "main"` by default. When it creates
+  `.ai/harness/policy.json`, it reads `refs/remotes/origin/HEAD`, else the
+  current branch, and writes that name as `worktree_strategy.review_base`. An
+  unborn HEAD uses its branch name. An existing policy keeps its keys. In
+  standard mode, a detached HEAD without a remote HEAD or a non-git target
+  now refuses with `review_base_unresolved`, and the error names the policy
+  key and the repair.
+  Use `--mode minimal` for a non-git scaffold. (#1859, #1866)
+
+### Changed
+
+- repo-harness runs on `@botiverse/oar` 0.88.0, and the bundled Pi packages
+  move to 1.5.0. The agent runtime probe lists the DSH (DeepSeek Harness)
+  runtime. DSH is not a review, seat or docs-host runtime. (#1854, #1862)
+- `repo-harness update` on an explicit plugin list prints one
+  `[plugins] not selected` line for the command plugins that the list omits
+  (`mcp`, `operator`), with one command that keeps the list and adds them.
+  (#1850, #1864)
+- Operator document sessions and cleanup archives use shared publication
+  operations for remote branch pushes and draft PR creation. The commands,
+  routes and stored records keep their contracts. (#1837)
+- Shared CodeGraph readers and MCP audit paths move out of the MCP
+  directories. MCP command bodies load on use. Commands, tool schemas and
+  audit paths do not change. (#1851)
+- Seat settings, launch policy and quota move from Operator to core Board.
+  The CLI and status line keep their behavior and need no Operator plugin.
+  (#1852)
+
+### Upgrade
+
+- Install the CLI, then update to this exact version:
+
+  ```bash
+  bun add -g repo-harness@0.26.5 --no-cache
+  repo-harness update --version 0.26.5
+  ```
+
+- After `bun add -g repo-harness`, run `repo-harness update` to record `mcp`.
+  Until then an `all` state does not record it, and the guard prints an
+  explicit `--plugins` list. Do not run that list on an `all` state: an
+  explicit list stops `all` from growing. (#1849, #1856)
+- The same step records `operator`, and the same rule applies to the repair
+  that `operator`, `worktrees` and `catch-up` print on an `all` state.
+  (#1850, #1864)
+
+### Tests
+
+- Package and published-release smoke repositories use an explicit `main`
+  branch. The packed Stop hook check no longer depends on the host's
+  default branch. This fixes the #1843 smoke fixture defect. (#1863)
+
+### Documentation
+
+- The archimap reflects the #1287 step 3 module moves. (#1855)
+- Generated architecture outputs are refreshed for
+  `main@5a92c31ccf98`. (#1838)
+- The 0.26.4 release record includes publication and owner machine upgrade
+  values. (#1860)
+
+### Rollback
+
+- An older CLI refuses an install state that names `mcp`, with
+  `install_state_invalid`, until a reinstall. Run `repo-harness uninstall`
+  with this CLI, then install the older CLI. (#1849, #1856)
+- An older CLI refuses an install state that names `operator` in the same way,
+  until a reinstall. The same steps apply. (#1850, #1864)
+
+## [0.26.4] - 2026-11-05
+
+This release adds the Office landing page, repository rooms, advisor commands
+and dialog, stored board summaries and quota attention. It tightens review
+and Codex seat network limits and shares the private-key scan policy.
+
+### Upgrade
+
+- Install the CLI, then update to this exact version:
+
+  ```bash
+  bun add -g repo-harness@0.26.4 --no-cache
+  repo-harness update --version 0.26.4
+  ```
+
+  From 0.25.4 or earlier, follow the `[0.26.0]` Upgrade steps with 0.26.4
+  in place of 0.26.0.
+- Restart the Operator server and reload its page. Custom board readers
+  must accept board protocol 2 and parent-list protocol 3. Summary protocol
+  2 refuses an older stored snapshot as `snapshot_invalid`; the next board
+  read replaces it. No shape translator is shipped. (#1815, #1817)
+- `strategy` needs the `strategy-memory` plugin. An explicit plugin list
+  that omits it gets `install_plugin_unavailable` and a repair command that
+  adds it while keeping the selected plugins. Selection `all` is unaffected.
+  (#1833)
+- Remove `net` from each stored Codex seat that has `edit`. The console can
+  still read the stored seat, but save and `seats argv` refuse it with
+  `seat_codex_edit_net`. Writable Codex seats always run with sandbox network
+  off. (#1840)
+- A merge seal made by 0.26.3 does not verify under 0.26.4. Create a new seal
+  with the installed helper after upgrade. The fingerprint now hashes the
+  helper and its installed `src/core/security/secret-patterns.ts`, in that
+  order. The seal format stays `sha256:<hex>`. (#1829, #1831)
+- No hook runtime or install-state protocol change. Install state and
+  candidate reconciliation stay protocol 3. The install selection guard
+  now also covers `strategy`; the upgrade command stays the same. (#1833)
+
+### Breaking
+
+- Board JSON moves from protocol 1 to 2; the parent list moves from 2 to 3.
+  The board adds plan revision, default-branch merge policy and seat branch.
+  The decoders refuse absent fields. Unknown observations use explicit
+  `null` or `unknown` values. (#1815)
+- Board summaries use protocol 2 and add per-seat desk states, stalled
+  count, worker limit and current batch. Old protocol 1 snapshots fail
+  closed until a board read writes the new shape. (#1817)
+- The `strategy` command checks the recorded `strategy-memory` selection
+  before it loads the command body. Core-only installs and explicit lists
+  without that plugin can no longer run it. (#1833)
+- A writable Codex seat now always launches with
+  `sandbox_workspace_write.network_access=false`, and the default worker seat
+  drops the `net` tool group. With sandbox network on, the seat reached the
+  operator console write routes over loopback TCP and the herdr-core socket.
+  A Codex seat with both `edit` and `net` is invalid: a save and
+  `repo-harness seats argv` of that seat refuse with `seat_codex_edit_net`.
+  A stored seats section with such a seat stays readable in the console, and
+  each save is refused until the seat is fixed. Fix: remove `net` from that
+  seat, in the console or in `~/.repo-harness/config.json`. A read-only Codex
+  seat keeps `net` (web search on). Claude and Pi seats do not change. A Codex
+  worker seat runs no `gh` or `hc`; the orchestrator reads its last message.
+  (#1840)
+
+### Added
+
+- Four boss commands send server-owned text to the advisor. Cooldowns and
+  the repository turn lock guard sends; unknown delivery still needs
+  reconciliation. The route is `POST /api/v1/seats/advisor/boss-commands`.
+  (#1799)
+- Board reads store summaries by atomic replace with mode 0600. The
+  repository summaries route reports observed, not-read or unavailable
+  parents and keeps the newest observation. (#1803)
+- Each Office room represents one repository and shows live seats, the
+  acceptance queue, batch cart and boss commands. The scene uses pixel
+  sprites and supports reduced motion. (#1808)
+- The Office overview is the landing page, with one mini room per
+  repository. Its counts use observed summaries; reads stop while the tab
+  is hidden. Home stays available in the rail. (#1814)
+- The advisor dialog sends text and reads the redacted transcript and turn
+  status. It reads on open and after each send, with no background polling
+  or automatic resend. (#1816)
+- The Office shows a setup checklist when data is missing. Each row uses
+  the observed prerequisite state and gives a command to copy. Failed or
+  pending reads stay unknown. The checklist runs no command. (#1822)
+- Office rooms and cards show the board's plan revision, merge policy,
+  seat branch, desk states, worker limit, stalled count and current batch.
+  (#1824)
+- Board list and room views show quota attention for tight, exhausted and
+  unknown accounts. A failed quota read replaces the last report with its
+  reason. The Agents header Refresh now also reads quota. No timer polls
+  quota, and a running read finishes before another can start. (#1841)
+
+### Fixed
+
+- Worktree plan rows start unchecked. A review accepts 1 to 16 selected
+  rows; the selection and open review survive a console page change.
+  (#1798)
+- Cleanup plan review shows each item's advice, reason and evidence. A
+  running plan build shows the requested count and elapsed seconds. (#1800)
+- Task review, generic review and cleanup investigation deny local IPv4
+  TCP and all outbound IPv6 TCP for Codex, Claude and Pi. Pi can use declared
+  loopback model ports, but cannot select the default Operator port. (#1807)
+- A typed HTTP 403 `write_token_invalid` shows one reload banner on console
+  writes. Other errors keep their status; the client does not retry. (#1810)
+- Shared secret rules run in linear time, including failed matches on long
+  JWT, URL, credential and private-key input. (#1811)
+- The shared secret scanner and advisor transcript use one private-key
+  label grammar, including uppercase key types and PGP private blocks.
+  (#1823)
+- Orphan process-group identity reads the clock before `ps`, so `ps` run
+  time no longer makes a live group appear to have a reused ID. (#1828)
+- Merge-gate, agent-config and advisor readers use the shared private-key
+  block definition. It covers hyphenated key names, PGP secret blocks and
+  ssh.com private-key fences. (#1829)
+- Merge seals bind the installed key policy as well as the helper. A change
+  to that policy makes the seal stale. Both files must be outside the
+  candidate repository. (#1831)
+
+### Tests
+
+- Board page cases use one fixed clock across midnight. The elapsed-time
+  case keeps a running clock; no assertion was changed. (#1826)
+
+### Documentation
+
+- The 0.26.3 release record includes its publication values. (#1802)
+- The 0.26.3 release record includes the owner machine upgrade, hook probe
+  and Operator read-back. (#1805)
+- The approved Board office mockup adds pixel art, reference screenshots
+  and fixed poses under reduced motion. (#1793)
+- Generated architecture outputs are refreshed for
+  `main@1cf207939424`. (#1778)
+
+## [0.26.3] - 2026-11-04
+
+This release adds authorized worktree cleanup, agent investigation of a
+cleanup plan, advisor seat routes, the Board office view and three
+architecture views. It fixes MCP range redaction and repository seat reads.
+The board parent list moves to protocol 2. The install state and candidate
+reconciliation stay at protocol 3.
+
+### Upgrade
+
+- Install the CLI, then update to this exact version:
+
+  ```bash
+  bun add -g repo-harness@0.26.3 --no-cache
+  repo-harness update --version 0.26.3
+  ```
+
+  From 0.25.4 or earlier, follow the `[0.26.0]` Upgrade steps with 0.26.3
+  in place of 0.26.0.
+- Keep the Operator server and web on the same package version. The parent
+  list is protocol 2; an older web bundle refuses it as `parents_invalid`.
+  The board snapshot stays protocol 1 and adds `terminals[].agent`, the hc
+  string or null. Custom readers must accept these shapes. (#1791, #1776)
+- Open a new cleanup plan after the upgrade. The plan decoder requires
+  `private_only` and `no_destination`; older saved plans do not decode.
+  (#1751, #1764)
+- MCP `read_text` now refuses a file above 512 KiB with `FILE_TOO_LARGE`.
+  A smaller line range or `max_bytes` does not change the whole-file scan
+  limit. (#1772)
+- No hook or install protocol changes. The hc install/update messages now
+  name the client; core mismatch messages give the core repair steps.
+  (#1774)
+
+### Breaking
+
+- `board parents --json` moves from protocol 1 to 2 and adds `seats`, with
+  every live seat of the repository, with or without a parent label. Each
+  row keeps the raw parent label or null. One hc read supplies both the seat
+  rows and the existing per-parent counts. There is no protocol 1 reader.
+  (#1791)
+
+### Added
+
+- Operator worktree cleanup plan and execute routes use server observations,
+  persisted sessions, per-item authorization, the topology lock and write
+  audit. Removal requires fresh loss evidence and proof of preservation;
+  an archive requires its Draft PR read-back before removal. The page plans
+  at most 16 registered non-green worktrees per batch. (#1738)
+- The architecture Modules view groups capabilities by domain, rolls up
+  changes and violations, and shows commit, test and PR impact details. The
+  shared header adds the branch and archctx version from contract v7.
+  (#1743)
+- The architecture Layers view uses the model's declared layer order. It
+  shows selected-layer relations and violations and exports an SVG.
+  (#1753)
+- Cleanup plans mark paths that Git storage refuses by name or size as
+  `private_only`. The review page offers Private or Not archived for these
+  paths. Observation includes index blob sizes; staging retains the content
+  checks. (#1751)
+- The Board page has an Office / List switch, an office overview, one room
+  per board and a state legend. Desks, queues and plan displays use the
+  existing board data. The view adds no write action. (#1762)
+- `GET /api/v1/quota` serves the quota read model with a strict decoder.
+  One read runs at a time, with no cache or retry. (#1761)
+- The architecture Topology view has process, namespace and mount segments,
+  declared mount order, a deprecated-node switch and SVG export. (#1763)
+- The Agents page shows quota account and window states, usage, resets,
+  pace, plan, credits and unavailable reasons from the server report. It
+  reads on page open and Refresh, with no timer. (#1766)
+- The Operator can send plain text to the advisor seat and read its
+  redacted transcript. Each send uses the write audit; unknown delivery
+  requires reconciliation. The client cannot choose a terminal address.
+  (#1765)
+- Cleanup plan investigation runs one Codex turn through the review host
+  for at most eight items. It reads the server manifest and cannot read the
+  target worktrees or their Git directories. The job denies local IPv4 TCP
+  and all outbound IPv6 TCP. Advice reloads the plan with every authorization
+  box unchecked; only the user can authorize removal. (#1767)
+
+### Changed
+
+- archctx and archctx-contracts are pinned to exact 0.11.3, with the lock
+  entries and clean-room readback updated. (#1746)
+- Board seat terminals keep the hc `agent` string unchanged, or null when
+  hc reports none. The board snapshot protocol stays 1. (#1776)
+
+### Fixed
+
+- Cleanup plans offer no archive destination for a path with an index
+  version above the staging read limit of 512 KiB. `no_destination` is
+  disjoint from `private_only`; staging keeps the same read limit. (#1764)
+- Codex worker briefs define the publication handoff: the coordinator
+  commits the worker's diff, pushes it and opens the PR. (#1760)
+- MCP `read_text` redacts the whole admitted file before it cuts the line
+  range and byte limit. A range inside a PEM private key no longer exposes
+  its body. Redaction keeps source line numbers, counts matches in the whole
+  file and hashes the returned redacted text. (#1772)
+- Each hc reader checks its own component. Board A8 uses the shared numeric
+  comparator. Client messages name `hc update --version <floor>`; a core
+  mismatch gives that command when the client is below the floor, otherwise
+  `hc server restart`. (#1774)
+- Bots and Runtime core mismatch displays give the two repair commands in
+  the same order as the core error, using the snapshot's floor. (#1779)
+- Board rooms read the orchestrator and advisor by repository, with or
+  without a parent label. Workers still need the selected parent label.
+  Advisor resolution requires exactly one live advisor per repository;
+  sends from all parent rooms share that repository's lock. (#1782)
+- The advisor's rolling 24-hour wake cap counts successful sends across
+  every watched parent of the repository, rather than eight per parent.
+  (#1792)
+
+### Documentation
+
+- The 0.26.2 release record has the publication values and the TTY
+  requirement for npm web authentication. (#1747)
+- The 0.26.2 release record has the owner machine upgrade and post-upgrade
+  probe results. (#1749)
+- Generated architecture outputs are refreshed for
+  `main@c963e166640b` (#1728), `main@582a38ad229e` (#1759) and
+  `main@609c5599482f` (#1769).
+- The Operator PRD snapshot is at rev 269 and records D11/G38: console
+  messages go only to the advisor seat. (#1717)
+- The Board pixel office HTML mockup and its design index entry are in the
+  repository. (#1737)
+- Nineteen stale citations are removed from the human sections of six
+  architecture module docs. Generated regions are unchanged. (#1775)
+
+## [0.26.2] - 2026-11-04
+
+This release has one breaking change: the Reverse Skill integration is
+removed, and the candidate reconciliation protocol goes from 2 to 3. So a
+plain `repo-harness update` from 0.26.1 or 0.26.0 stops with the upgrade
+command. `install` and `update` now install or update herdr-core (`hc`) to the
+package pin, and install the Claude Code status line that captures the Claude
+quota. The install state stays protocol 3: no migration.
+
+### Upgrade
+
+- From 0.26.x, install the new CLI directly, then update:
+
+  ```bash
+  bun add -g repo-harness@0.26.2 --no-cache
+  repo-harness update
+  ```
+
+  A 0.26.1 or 0.26.0 CLI sends a candidate reconciliation request of
+  protocol 2. The 0.26.2 candidate does not accept a request of protocol 1 or
+  2: `update` fails with `candidate_request_protocol_retired`, and the message
+  gives the upgrade command above. (#1713)
+- `--with-reverse-skill` is now an unknown option: `install` and `update`
+  exit non-zero with `unknown option`. Remove the flag from your scripts. The
+  install ledger does not own an installed `reverse-skill-router` copy, so
+  0.26.2 does not delete it. (#1713)
+- The status line is installed only when none exists. When
+  `~/.claude/settings.json` has no `statusLine`, `install` and `update` add
+  the managed entry `repo-harness-hook statusline`. An existing status line
+  is not changed: `install` prints the documented pipe that sends the status
+  line input to `repo-harness-hook statusline` and then to your command.
+  (#1733)
+- When `hc` is missing or below the package pin floor (0.1.17), `install` and
+  `update` install or update it. On Windows, the hc install adds its directory
+  to the user PATH. On Unix, it prints the PATH hint when the directory is not
+  on PATH, and uses the directory for the rest of the run. (#1724)
+- From 0.25.4 or earlier, use the `[0.26.0]` Upgrade steps with 0.26.2 in
+  place of 0.26.0.
+
+### Breaking
+
+- The `reverse-skill-router` integration is removed: its catalog package, the
+  `--with-reverse-skill` flag of `install` and `update`, and the
+  `configure Reverse Skill` step of the global runtime setup.
+  `CANDIDATE_RECONCILIATION_PROTOCOL` goes from 2 to 3 and the
+  `reverse_skill` request field is removed. A protocol 1 or 2 request throws
+  `CandidateRequestProtocolRetiredError`, which names
+  `bun add -g repo-harness@<version> --no-cache && repo-harness update`. A
+  protocol 3 request with a retired field (`profile` or `reverse_skill`) fails
+  with `invalid shape`. (#1713)
+
+### Added
+
+- `repo-harness quota [--json]` reads the rate-limit windows of each provider
+  account (`claude`, `chatgpt`) and gives each account one state:
+  `exhausted`, `tight`, `unknown`, `normal` or `surplus`. The Codex reader
+  asks `codex app-server` for `account/rateLimits/read`. The Claude reader
+  reads only the capture file `~/.repo-harness/quota/claude.json`. Each
+  decoder fails closed per field with a named reason. A reading older than 30
+  minutes makes each window `unknown`. The command exits 0 when the read
+  completes, also for an `unknown` account. (#1723)
+- `repo-harness-hook statusline` writes the `rate_limits` object of the
+  Claude Code status line input to the quota capture file (mode 0600, temp
+  file then rename) and prints the windows, for example `5h 12% · 7d 30%`. A
+  `rate_limits` value that the decoder rejects is not written and exits 1.
+  `install` sets the managed `statusLine` only when none exists, and refreshes
+  it only while its command has the managed tag. A user status line is not
+  changed; `install` prints this pipe:
+  `input=$(cat); printf '%s' "$input" | repo-harness-hook statusline >/dev/null; printf '%s' "$input" | <your status line command>`.
+  `uninstall` removes only a tagged entry. (#1733)
+- `install` and `update` run the step `ensure herdr-core (hc)`. When `hc` is
+  missing, the step downloads the pinned asset with `curl`, checks its
+  sha256, checks the downloaded `hc --version`, and installs it in the layout
+  of the official installer: `~/.local/bin/herdr-core` and the `hc` link on
+  Unix, `%LOCALAPPDATA%\Programs\herdr-core` on Windows x64. Below the floor,
+  it runs `hc update --version <floor>` and reads the version back. On
+  Windows, the step adds the directory to the user PATH (`HKCU\Environment`
+  `Path`) when no entry matches, without `setx`. On Unix, it prints the PATH
+  hint, edits no shell profile, and puts the directory first on the PATH of
+  the later steps of the run. An existing install file is never overwritten:
+  the refusal says `add <dir> to PATH, then rerun repo-harness
+  <install|update>`. A checksum mismatch, a failed download, an incomplete
+  archive or a platform with no pin target installs nothing. `uninstall`
+  keeps `hc`. The pin adds the `linux-aarch64` and `windows-x86_64` assets.
+  `setup check` names the repair command for `runtime.herdr_core`. (#1724)
+- `repo-harness fleet remove <repo-ids...> [--apply --expected-revision
+  <digest>]` removes the registry rows of named repositories, also when their
+  paths are present. It uses the prune writer, the preview, the revision fence
+  and the mutation lock. An unknown ID removes nothing. `fleet prune` is
+  unchanged. (#1706)
+- `seats argv <seat> --repository-id <id>` labels its own terminal before the
+  agent starts, through the new `seats label` command. A label failure
+  (`terminal_unknown`, `label_failed`) starts no agent. The Board names the
+  missing seat labels and the start command for `no_seat_terminals`. (#1707)
+- Operator Skills page: the state of each skill per host (claude, codex, pi):
+  installed, missing or drifted. The page lists the other skills in each host
+  skill root, read only, and shows one copyable `repo-harness update` when a
+  skill needs attention. (#1714)
+- Operator architecture page: the Sequence view (#1734) and the History view
+  (#1735) per the design canvas. Both read the map route and decoder of
+  contract v7.
+- Worktree cleanup: the production archive ports commit, push and open a
+  Draft PR for an archive, and read back each write before the next stage. So
+  a removal runs only after a read-back archive and its Draft PR. (#1726) The
+  plan review page authorizes each non-green worktree per item; each approval
+  carries the two digests that the item shows. (#1727)
+- A TLA+ spec of the ship closeout claim, `specs/tla/ShipCloseoutClaim.tla`,
+  and the local TLC runner `scripts/contract-closeout-tla.sh`. The runner
+  pins tla2tools 1.7.4 by SHA-256 and downloads nothing. (#1736)
+- The archimap skill has a behavior (statechart) board. `measure.ts` reads
+  `extensions.behaviorSpecs` and fails closed on a bad entry. The first board
+  draws `ship-closeout-claim`. (#1739)
+
+### Changed
+
+- The package file `src/core/operator/herdr-core-pin.json` is now the only
+  hc (herdr-core) pin. It holds the `min_version` floor and the release assets
+  that CI installs. The Board, the Bots page, the runtime overlay,
+  `check-agent-tooling.sh` and the CI action read this file. The floor protects
+  the hc client code of the package, so each install reads the floor of its
+  own code. The repository policy key `external_tooling.herdr_core` is
+  retired: `init` and adoption no longer seed it, and they delete it and
+  report it in the retired policy keys. No reader reads the old key. (#1712)
+- `hc_pin_unavailable` (Bots page and runtime overlay), the Board reason
+  `pin_unavailable` and the `configuration-error` status of
+  `runtime.herdr_core` are removed. A missing pin file, or a pin file that is
+  not valid JSON, fails at module load. A `min_version` that is not `x.y.z`
+  loads, and the first version check then fails closed with
+  `hc_version_invalid`. `runtime.herdr_core.min_version_source` is now
+  `package:src/core/operator/herdr-core-pin.json`. (#1712)
+- The architecture map wire contract goes from
+  `repo-harness.architecture-map.v6` to v7 in the producer, the decoder, the
+  readers and the fixture. v7 adds `head_ref`, `archctx_version`,
+  `nodes[].domain`, `nodes[].namespace`, `nodes[].mount`,
+  `relations[].protocol`, the `changes.commits` rows and the `anchors`
+  findings rows. There is no v6 alias and no second decoder. (#1729)
+- archctx and CodeGraph resolve by module resolution from the package, not by
+  a walk to the first `package.json` named `repo-harness`. A missing package
+  is `RH_ARCHCTX_PACKAGE_MISSING` with action `update-repo-harness`. The
+  adoption notice names `references/worker.md` relative to the package.
+  (#1711)
+- The Operator architecture header follows the design. The canvas top is at
+  159 px at 1920x958, and the canvas fills the viewport below the lens row.
+  (#1715)
+- The Operator web strings move from `src/operator-web/i18n.ts` to one module
+  per page under `src/operator-web/i18n/`. (#1708)
+
+### Fixed
+
+- `repo-harness quota` requires a valid weekly reading (Claude `seven_day`,
+  Codex the 10080-min window). The worst window state across all windows sets
+  the account state. An absent non-weekly
+  window (Codex `secondary`, Claude `five_hour`) reports `absent` and does not
+  make the account `unknown`. A missing weekly window still makes the account
+  `unknown`, unless another window is `exhausted` or `tight`. (#1741, #1742)
+- The Operator empty-state command is now `repo-harness init --dry-run`, and
+  the next action names `repo-harness init`. Before, it was
+  `repo-harness adopt --help`, which printed the root help, because the CLI
+  has no top-level `adopt` command. (#1710)
+
+### Documentation
+
+- The README is a landing page: what repo-harness does, how to start, and how
+  a reviewer reads agent work. The Reverse Skill row is removed. (#1709)
+- The issue-flow coordinator reads `repo-harness quota --json` before each
+  dispatch wave and records the reading in its claim. (#1732)
+- The 0.26.1 publication values are in its release record. (#1704)
+- The generated architecture outputs are refreshed for `main@ccdc0587af67`.
+  (#1600)
+
+## [0.26.1] - 2026-11-04
+
+This release fixes the hook runtime of 0.26.0. In 0.26.0, the installed
+`repo-harness-hook` exited 1 on every event when the machine recorded an
+install state, so no hook route ran: the edit, bash and subagent guards, the
+inbox, SessionStart and Stop were all skipped. 0.26.1 has no breaking change
+and needs no migration.
+
+### Upgrade
+
+- From 0.26.0, install the new CLI directly, then update:
+
+  ```bash
+  bun add -g repo-harness@0.26.1 --no-cache
+  repo-harness update --version 0.26.1
+  ```
+
+  `update` runs from the CLI entry, not from the hook bundle, so the 0.26.0
+  fault does not stop it. A 0.26.0 state is protocol 3: no migration.
+- From 0.25.4 or earlier, use the `[0.26.0]` Upgrade steps with 0.26.1 in
+  place of 0.26.0.
+
+### Changed
+
+- The selection read of a hook or command root no longer checks the
+  ownership surfaces of the install state. In 0.26.0, a state with a surface
+  outside the host mutation paths made that read `unreadable`. With
+  `architecture` selected, every root that uses this read now loads the
+  architecture providers for such a state, where 0.26.0 skipped them: the
+  CLI root, the hook, the Operator architecture thread,
+  `scripts/capability-resolver.ts`, `scripts/check-managed-runtime.ts`,
+  `scripts/contract-worktree-runtime.ts`, and the shell gate
+  `scripts/lib/architecture-plugin.sh`, so `check-ci.sh`,
+  `contract-worktree.sh` and `check-agent-tooling.sh` start archctx or
+  CodeGraph. `install`, `update`, `doctor`, `status`, `uninstall` and
+  `upgrade` still check each surface and fail with
+  `install_state_invalid_ownership`. (#1683)
+- The Operator module review diff reads path owners through the
+  architecture ownership port. When the `architecture` plugin is not
+  selected, it fails with `diff_owner_resolution_failed` before any archctx
+  call. `component.architecture.owners` is a target of the plugin-internals
+  constraint again. (#1682)
+
+### Fixed
+
+- Each `repo-harness-hook` run on a machine with a recorded install state
+  exited 1 with `invalid skill-surface catalog at
+  <bun global>/assets/skill-commands/manifest.json: MANIFEST_MISSING`. So no
+  guard, inbox, SessionStart or Stop route ran in 0.26.0. The hook read the
+  selection through the installer module, which loaded the skill-surface
+  manifest three directories above the `dist/hook-entry.js` bundle. The hook
+  now reads the selection through a small install-state read model with no
+  package-asset or host-path dependency, so the installer is not in the hook
+  bundle. The selection read of a hook or command root no longer fails on an
+  ownership surface outside the host mutation paths; `install`, `update`,
+  `doctor` and `status` still check each surface. The package version comes
+  from one static `package.json` import, and the single-file bundle marker is
+  the boolean `REPO_HARNESS_SINGLE_FILE_BUNDLE`. The tarball install smoke now
+  runs the installed hook with a recorded install state. (#1683)
+- The Operator architecture page names each map failure and its next step.
+  The archctx error code goes from the map worker to the page, so the page
+  tells a missing committed model (`AC_MODEL_ADOPTION_REQUIRED`) from an
+  invalid model (`AC_SCHEMA_INVALID`) and from a git read failure. (#1677)
+- The MCP server contexts require the CodeGraph adapter, with no default, so
+  no MCP entry can run CodeGraph without the selection check. A provider
+  import failure with the plugin selected reports `status: "invalid"` with
+  the import error. (#1675)
+
+### Documentation
+
+- 0.26.0 publication values in the release record. (#1679)
+
+## [0.26.0] - 2026-11-04
+
+This release has breaking changes. archctx and CodeGraph are the
+`architecture` plugin and run only when the install selection includes it.
+The DSH plugin is removed. Install-state protocol 2 is retired: 0.25.4 is the
+bridge release.
+
+### Upgrade
+
+- From 0.25.4 (install-state protocol 3), install the new CLI directly, then
+  update:
+
+  ```bash
+  bun add -g repo-harness@0.26.0 --no-cache
+  repo-harness update --version 0.26.0
+  ```
+
+  A 0.25.4 state needs no migration. `update` resolves the selection `"all"`
+  again from the plugin ids of 0.26.0, so a recorded `architecture` stays
+  selected. Check: `repo-harness install --state` shows `"protocol": 3`, and
+  its `plugins` list holds `architecture`. A state recorded with an explicit
+  list keeps that list; when it does not hold `architecture`, the
+  architecture tools report `not selected` with the repair command
+  `repo-harness install --plugins architecture,<your plugins>`. (#1671)
+- From 0.11.1 to 0.25.3 (install-state protocol 2), use the 0.25.4 bridge
+  first, then install 0.26.0:
+
+  ```bash
+  bun add -g repo-harness@0.25.4 --no-cache
+  repo-harness update --version 0.25.4
+  bun add -g repo-harness@0.26.0 --no-cache
+  repo-harness update --version 0.26.0
+  ```
+
+  `docs/CHANGELOG.md` `[0.25.4]` (Upgrade) gives the protocol 2 to 3
+  mapping. A protocol 1 state (before 0.11.1) runs the 0.25.3 step first:
+  `bun add -g repo-harness@0.25.3 --no-cache`, then its protocol 1
+  migration, then this bridge. (#1676)
+- The 0.25.4 workaround for #1650 ends: `repo-harness migrate --apply`
+  outside a repository now refuses before any write. (#1652)
+- A Herdr skill copy with a stale owner marker no longer stops `update`.
+  (#1661, #1669)
+
+### Breaking
+
+- Install-state protocol 2 is retired (owner decision M35). The protocol 2
+  to 3 one-shot in `update` is deleted. The strict reader refuses a protocol 2
+  state with `install_state_protocol_retired`, which names the 0.25.4 bridge:
+  `bun add -g repo-harness@0.25.4 --no-cache && repo-harness update --version
+  0.25.4`. The protocol 1 refusal names the same bridge after its 0.25.3
+  step. The code `install_state_migration_required` and the setup check
+  action `install-state.migrate` are removed; a retired state gets the
+  `install-state.repair` action. (#1676)
+- The DSH plugin and the `dsh` plugin id are removed (owner decision M45).
+  The package no longer ships `dist/dsh/` or `cordis.patch.yml`, and has no
+  `dsh` package key or `@deepseek-ai/cordis` peer dependency. `repo-harness
+  doctor` has no `dsh-plugin` check, the setup report and console have no DSH
+  host row, and the hook runtime accepts no `HOOK_HOST=dsh`. An install state
+  that records `dsh` in its plugins, in an explicit `selection` or in its
+  `previous` state fails closed with `install_state_invalid` (`install state
+  names unknown plugin "dsh"`); a ledger entry with owner `dsh` fails with
+  `install_state_invalid_ownership`. Fix: delete
+  `~/.repo-harness/install-state.json`, then run `repo-harness install` for a
+  former `"all"` selection, or `repo-harness install --plugins <ids>` with the
+  former list without `dsh`. No known machine records `dsh`. (#1657)
+- archctx and CodeGraph are the `architecture` plugin. A process loads them
+  only when the recorded install selection includes `architecture`. No
+  install state means not selected. With the plugin not selected, SessionStart,
+  the inbox and Stop hooks, `status`, `init`, `doctor`, `setup check` and
+  `update` start no archctx or CodeGraph process and write no architecture
+  configuration. `status` and `doctor` report `not selected` with the repair
+  command, and the hooks give no architecture notice. The MCP repo tools run
+  no CodeGraph read and report the absence in their `codegraph` summary.
+  `repo-harness run contract-worktree start` still creates the worktree and
+  skips only its CodeGraph index, with one
+  `[architecture] skipped CodeGraph index of the worktree: <reason>` line.
+  A shell script starts archctx or CodeGraph only through
+  `scripts/lib/architecture-plugin.sh`, which reads the selection through the
+  same reader. The worktree closeout stops no archctx daemon either: a daemon that
+  started while the plugin was selected keeps running after a deselection.
+  Stop it before you remove the plugin, or select the plugin again and run
+  the closeout.
+  `repo-harness architecture-projection`, `architecture-debt`, `refactor`,
+  `module`, `tools ensure codegraph` and `tools configure codegraph` fail
+  closed with
+  `install_plugin_unavailable` before they start a process or load the
+  plugin code.
+  A repository policy that sets `context.capability_source: archcontext` or
+  `tooling.codegraph.enabled: true` needs the plugin: `install`, `update` and
+  `init` (apply) on that repository fail closed with
+  `install_plugin_unavailable`. Fix: run the command in the error. For a
+  recorded selection it is `repo-harness install --plugins architecture,<your
+  plugins>`; without an install state it is `repo-harness install`. Known gap
+  until #1670: with the plugin not selected, `repo-harness operator serve`
+  still starts archctx in its architecture history and module routes and in
+  its architecture map collector, through `model-reader.ts` and
+  `architecture-read.ts`. (#1671)
+
+### Changed
+
+- The Board page lists the open parent issues of the chosen repository: the
+  open issues that have at least one sub-issue. Each row shows the number,
+  the title, the closed and total sub-issue counts and the number of live hc
+  seats that name the parent. Parents with live seats come first, then the
+  most recently updated. A filter matches the number or the title, and a row
+  opens that board. The free parent number input is removed; the board of a
+  closed parent stays reachable through its `#board/<repository>/<parent>`
+  link. The list comes from the new `repo-harness board parents --json` mode
+  (one paginated GitHub GraphQL read and one hc list) through
+  `GET /api/v1/repositories/<id>/board/parents`, under the board read
+  concurrency cap. A failed read shows its refusal code
+  (`parents_github_failed`, `parents_source_invalid`, `parents_hc_failed`,
+  `parents_timeout` and others), never an empty list. (#1666)
+- The operator console has one Agents page for hosts, sub-agents and seats
+  (owner decision M46). Its sections are Hosts (the setup check status of each
+  host with its enable switch, then the other agent runtimes), Subagents (read
+  only) and Seats. A seat offers only the runtimes that are saved as enabled. A
+  runtime that is not enabled shows its Hosts switch in place, and the seats
+  Save stays off until each seat runtime is enabled, so a save cannot fail
+  with `seat_runtime_not_enabled`. After a save of one section, the other
+  section reads again, and an edited draft moves to the new revision when its
+  own stored section did not change. The Settings page and its rail entry are
+  removed. `#settings` and `#settings/seats` open Home. (#1664)
+- `repo-harness run <helper>` selects a trusted Node runtime that satisfies
+  the package `engines.node` range (`>=24 <26`). Before, it used the archctx
+  range (`>=22.22 <26`), so a Node 22.22 to 23.x runtime outside the package
+  engine range could run helpers. (#1667)
+
+### Fixed
+
+- `repo-harness migrate` takes the project adapters from the repository
+  root. Outside a repository it fails with `repo-harness migrate: cwd is not
+  in a git repository: <cwd>` before any read or write, and it refuses a
+  candidate that is a user-level adapter (`~/.claude/settings.json`,
+  `~/.codex/hooks.json`, by real path) with `repo-harness migrate: refusing
+  user-level adapter: <path>`. The setup check reports the
+  `legacy.project-*` rows as `na` outside a repository and offers no
+  `migrate --apply` command when migrate would refuse. (#1652)
+- The Herdr skill step rewrites a stale owner marker on a copy whose
+  `SKILL.md` equals the render, when the copy holds only `SKILL.md` and the
+  marker as regular files. (#1661) The refusal for an unowned or changed
+  copy names the path and the manual remedy (move the copy out of the skills
+  root, then run `repo-harness update` again), and the equal-content path
+  checks the entries before it reads the marker, so a FIFO marker cannot
+  hang it. (#1669)
+- The operator architecture map: a lens that marks no map node dims nothing;
+  top-level nodes with no relation go on a grid below the dagre rows; a
+  relation between a group and its own member draws no line, and the
+  inspector and the relation count still include it. (#1665)
+- Ship-claim recovery acts only on the claim generation that it checked, so
+  a recovery never removes a live ship claim and two recoveries never share
+  one recovery lane. A claim or lane record without a generation fails
+  closed with status 5; a lane with a reclaim marker fails closed with
+  status 6. A crash between the claim create and its record write now needs
+  a manual removal. (#1645)
+
+### CI
+
+- `Required / CI` needs the `architecture-advisory` job. Its first step
+  fails on an ADR-0002 rule 5 import of task-agent-host or archctx-closure
+  internals from the operator, mcp-sidecar or task-fleet capabilities
+  (constraint `constraint.surface.plugin-internals`). (#1647)
+
+### Documentation
+
+- The archimap is refreshed at `f77f3d04`. (#1644)
+- The 0.25.4 release record holds the publication values. (#1649)
+
+## [0.25.4] - 2026-11-04
+
+This release has breaking changes. Install state is protocol 3 (core plus
+plugins, no install profile), the orchestrator is a seat that may call only
+read-only sub-agents, the old fleet board stack and the Fleet snapshot are
+removed, and the claim field `Seat:` is now `Role:`.
+
+### Upgrade
+
+- Install the new CLI directly, then update. A 0.25.x CLI before 0.25.4
+  cannot run the cutover, because it cannot read protocol 3 after the
+  candidate returns. This holds for every 0.25.x start point:
+
+  ```bash
+  bun add -g repo-harness@0.25.4 --no-cache
+  repo-harness update
+  ```
+
+  `update` migrates the protocol 2 state to protocol 3 once, under the install
+  transaction. `repo-harness update --check` prints the mapping first and
+  writes nothing. A `full` state becomes the selection `"all"`. A `minimal`
+  state becomes the explicit list `platform`, `strategy-memory`, plus the
+  owners of its recorded surfaces. Either one gets `dsh` only when a DSH
+  profile declares the repo-harness bundle. A `minimal` state that records a
+  Pi package maps to a list with `pi`; when `pi` is not on `PATH`, the
+  migration refuses before any write with `install_plugin_unavailable`.
+  Install Pi and run `repo-harness update` again, or use the rollback below. A former minimal install gains the
+  core surfaces, and the plan lists each one. Issue #1607 deletes this one-shot
+  in 0.26.0; after that, protocol 2 gets `install_state_protocol_retired`.
+  The one-shot commits `previous: null`. When the refresh in the same update
+  changes the state, it records the migrated state as `previous`, so
+  `repo-harness install --rollback` restores the migrated selection. An install
+  or update that changes nothing writes nothing: the state bytes and
+  `previous` stay. (#1625)
+- The selection `"all"` grows: `update` adds a plugin that a new version
+  ships, and adds `pi` or `dsh` when its host program appears. An explicit
+  list never grows, and an unavailable plugin in it fails closed with
+  `install_plugin_unavailable`. When a recorded plugin becomes unavailable,
+  `update` keeps it in the record and prints `[plugins] kept <id>: <reason>;
+  update keeps the recorded plugin; to remove it, run: repo-harness install
+  --plugins <ids>`. A partial refresh (`update --no-sync-skill` or
+  `--no-hooks`) never grows the set and prints `[plugins] not added <id> in a
+  partial refresh; run: repo-harness update`. `repo-harness status` prints a
+  `selection:` line. (#1625)
+- CodeGraph now follows the `architecture` plugin, not
+  `tooling.codegraph.enabled` in the current repository's policy. A repository
+  policy that enables CodeGraph while `architecture` is not selected fails
+  with the install command that adds it. A minimal state with a CodeGraph
+  surface migrates to a list with `architecture`, which also installs the
+  architecture skills. (#1625)
+- Only a Pi package registration selects `pi` in the migration. A `--target
+  both` install without Pi loses the unused Pi skill-root copies: the
+  migration deletes each owned, unchanged copy and keeps and reports each
+  changed one. Install Pi and run `repo-harness update` to bring them back,
+  because a fresh install and a migrated `full` state record `"all"`. (#1625)
+- Rollback after a committed migration: run
+  `bun add -g repo-harness@0.25.3 --no-cache`, delete
+  `~/.repo-harness/install-state.json`, then run
+  `repo-harness install --profile full|minimal` (the 0.25.3 command). The
+  fleet and CodeGraph files stay as user-managed files. A source `git revert`
+  does not restore a ledger. (#1625)
+- The protocol 2 to 3 migration in `update` removes the retired
+  `~/.claude/agents/orchestrator.md`. It deletes the file only when the install
+  state owns it and its hash did not change. It keeps a changed file and
+  reports it. It drops the file from the state and from the user-managed fleet
+  receipt. (#1585, #1625)
+- In each repository, run `repo-harness init --dry-run`, review the plan,
+  then run `repo-harness init`. The adoption apply removes `orchestrator`
+  from `external_tooling.agent_fleet.managed_agents` in
+  `.ai/harness/policy.json` and reports it under `retired-policy-keys`.
+  `repo-harness upgrade` does not change the policy. Until the apply, the
+  agent tooling check lists `orchestrator` as a missing fleet role, or as one
+  without a packaged source. (#1585)
+- Restart an orchestrator pane that runs `claude --agent orchestrator` or a
+  plain `claude` with the argv of `repo-harness seats argv orchestrator`.
+  Before, a plain `claude` pane had no task tools, so the triage queue did not
+  work. (#1585)
+- The managed Global Working Rules describe the orchestrator seat, not a
+  fleet role. After the update, readiness shows the `global-rules.claude` and
+  `global-rules.codex` blocks as stale. Run `repo-harness update` to refresh
+  them. (#1585)
+- Set the orchestrator fleet on the Seats page to `gatekeeper`, `explorer`
+  and `deep-reasoner` (owner decision M40). The orchestrator fleet takes only
+  these three roles; a save with `root-cause-prover` fails with
+  `seat_fleet_not_allowed`. Restart the orchestrator seat from
+  `repo-harness seats argv orchestrator` after `repo-harness update`, so
+  the seat reads the new managed rules and skills. (#1630, #1636)
+- The same `repo-harness init` apply removes `circuit_breakers` from
+  `.ai/harness/policy.json` and reports it under `retired-policy-keys`.
+  (#1599)
+
+### Breaking
+
+- The operator server no longer serves `GET /api/v1/fleet/snapshot` or the
+  task-session routes `/api/v1/fleet/task-sessions/<id>` and its `/context`,
+  `/activity` and `/diff` reads. They now answer 404. The new
+  `GET /api/v1/repositories` (protocol 1, kind `operator_repositories`) lists
+  the registered repositories from the registry: id, display name, access
+  mode and the count of stale registrations. The repository switcher, the
+  Docs, Tests and Architecture pages, the board form and the Repositories
+  page read only this list. The `#repository` workspace is removed; a
+  Repositories row opens the board for that repository. The Windows Job
+  controller is now `assets/operator/windows-job-controller.ps1`. Update the
+  browser and the server together. (#1541)
+- The old fleet board stack is removed. `repo-harness board --parent <n> --json`
+  is the one board read model.
+  - `fleet board` with `--admission-associations`, `--pr-associations`,
+    `--max-concurrency` and `--timeout-ms`, its `fleet_board_snapshot`
+    document (protocol 6) and the `fleet_board_argument_invalid` error:
+    use `repo-harness board --parent <n> --json`.
+  - `fleet watch`: use `repo-harness board --parent <n> --json`.
+  - `fleet ready` and its `repo-harness-fleet-readiness` document: use
+    `publication readiness` or the MCP tool `publication_readiness`.
+  - `state board` and its `repo-harness-provider-board` document: no
+    replacement.
+  - `external-source refresh`, `list`, `bind`, `bindings` and `context`: no
+    replacement. Store data stays on disk at
+    `<git-common-dir>/repo-harness/external-sources/v1`; no code reads or
+    deletes it.
+  - The `[repo-harness:board-slice]` block in the Claude `Agent` prompt and
+    the Codex `SubagentStart` context: no replacement. The block was
+    advisory and granted no scope or permission.
+
+  No MCP tool is removed. (#1590)
+- The orchestrator is a seat, not a fleet role. `agents/fleet/orchestrator.md`
+  and `claude --agent orchestrator` are removed. Start the seat with the argv
+  that `repo-harness seats argv orchestrator` prints (#1521). The argv names
+  the task tools, Glob and Grep, and sets
+  `CLAUDE_CODE_TASK_LIST_ID=repo-harness-orchestrator`, so the triage queue
+  keeps its name when the seat restarts. The fleet has seven roles, and the
+  installer projects each one to Claude and Codex. `CLAUDE_ONLY_AGENTS` is
+  removed. (#1585)
+- Install state is protocol 3. It records core, the enabled plugins and the
+  plugin selection, not an install profile. The plugin ids are
+  `architecture`, `cross-review`, `dsh`, `peer-runtime`, `pi`, `platform`,
+  `product` and `strategy-memory`. Each ledger entry has one `owner`: `core`
+  or a plugin id. Every hook route, the agent fleet files, issue-flow, ship,
+  test, Waza and Mermaid are core.
+  - The `install` option `--profile` is removed. `install` with no flag
+    records the selection `"all"` and installs every plugin that the host
+    can run. `--plugins <ids>` records and installs exactly those plugins.
+    `--no-plugins` records `[]` and installs core only. A plugin is
+    unavailable when its host program is absent (`pi`, `dsh`) or when none of
+    its skills has a host in `--target` (for example `peer-runtime` with
+    `--target codex`). `install` skips an unavailable plugin with a
+    `[plugins] skipped` line, and an explicit `--plugins` list fails closed
+    with `install_plugin_unavailable`.
+  - `install --migrate-profile-state` and the protocol 1 to 2 migration are
+    removed. A protocol 1 state fails with `install_state_protocol_retired`.
+  - Readers other than `update` fail on a protocol 2 state with
+    `install_state_migration_required`. `update` with no state fails with
+    `install_state_missing`.
+  - The candidate reconciliation request and receipt are protocol 2. The
+    request has no `profile`. A candidate refuses a protocol 1 request with
+    `candidate_request_protocol_retired`.
+  - The skill manifest and catalog are version 4: `owner` and `explicitOnly`
+    replace `profiles`, `component` and `expectedProjections`. The tool
+    catalog field `install_profiles` is now `owner`.
+    `REPO_HARNESS_INSTALL_PROFILE` is now `REPO_HARNESS_INSTALL_PLUGINS`.
+    `skill-surface-select.ts profile-projection --profile` is now
+    `selection-projection --plugins <ids>|--all-plugins`. The routing eval
+    takes `--plugins <ids>` or `--no-plugins`.
+  - The #1510 update step and the `retired-fleet-file` doctor check are
+    removed. The protocol 2 to 3 migration does that cleanup. (#1625)
+- The claim field `Seat:` is now `Role:` in the issue claim, the handoff
+  and the acceptance claim. The acceptance record header is
+  `| Round | Role | Subject | Verdict |`, and `repo-harness review publish`
+  writes `Role: acceptor`. No reader reads `Seat:`. Post an open claim again
+  with `Role:`. (#1598)
+
+### Added
+
+- `repo-harness board migrate-dependencies --parent <n> [--json]` prints the
+  plan that moves the `Depends on` lines of the open sub-issue bodies to
+  GitHub blocked-by links and tier labels. It writes nothing.
+  `--write --plan <digest>` applies exactly the plan with that digest. A
+  refused or unparsed line stops every write. The issue-flow plan data is
+  now only in GitHub native fields (sub-issue, blocked-by link, milestone,
+  tier label, base branch) and the `repo-harness plan` block. (#1519)
+- The Task drawer shows the stage source (Git and GitHub) after the branch,
+  head and base identifiers. (#1579)
+- `repo-harness board attention --parent <n> --watch --deliver` runs in an hc
+  terminal with the label `repo-harness.service=attention` and sends the
+  attention findings to the seat terminals with `hc send`. It calls no model.
+  `repo-harness board attention start --parent <n>` starts it when no live
+  watcher of that repository and parent exists. The doctor check
+  `board-attention-watcher` reports a stopped watcher as
+  `warn attention_stopped` with the start command. (#1580)
+- `GET /api/v1/repositories/<id>/tasks/<task_id>/messages` returns the task
+  inbox (read-only): message body, sender, recipients, age and delivery
+  receipts. The Task drawer shows it. (#1604)
+- `assets/review-hazards.v1.json` is the one change hazard list. The hazard
+  table in `agentic-development-flow.md` is generated from it. Board rule R3
+  reports a PR whose changed paths hit a hazard while its item has the label
+  `tier:low` or `tier:medium`. (#1621)
+- Board rule R5 reports the High signal when the changed paths of an open PR
+  have two or more owning capabilities (`archctx resolve`) and its item is
+  `tier:low` or `tier:medium`. `BoardV1.path_owners` gives the owner of each
+  changed file, or `unavailable` with a reason. R5 lists every unowned or
+  ambiguous path for every tier. (#1629)
+
+### Changed
+
+- The orchestrator seat may call the read-only sub-agents `gatekeeper`,
+  `explorer` and `deep-reasoner` (owner decisions M37, M39 and M40). The
+  writers `fast-worker`, `deep-worker` and `root-cause-prover` and the Codex
+  cross-review run only in Herdr seats. The Seats page and
+  `POST /api/v1/settings/seats` refuse every other orchestrator fleet role
+  with `seat_fleet_not_allowed`. With `gatekeeper` in the fleet, the seat
+  brief says that an independent `gatekeeper` sub-agent may review a PR that
+  the orchestrator dispatched. The default orchestrator fleet stays empty.
+  (#1630, #1636)
+- The board accepts a PR head only when a record on that head is `PASS` and
+  no record on that head is `FAIL`. A truncated comment page with a `PASS`
+  on the head is `unknown` (`comments_truncated`). An unparsed record is
+  `unknown` (`acceptance_record_unparsed`). (#1578)
+- `circuit_breakers` is removed from the harness policy seed. It had no
+  reader. The adoption apply (`repo-harness init`) removes it from
+  `.ai/harness/policy.json` and reports it under `retired-policy-keys`.
+  (#1599)
+- `archctx` and `archctx-contracts` are pinned to exact 0.11.2. (#1616)
+- CI: a documentation-only PR runs no build or test job, and
+  `Required / CI` still reports. The path reference parse is cached, and
+  `check:state-boundaries` runs in its own job. (#1603)
+- Operator reads go through owned modules: the task session records through
+  `task-session-record.ts` (#1605, #1617), the notify files through
+  `notify-read.ts` (#1638), and the architecture views through
+  `architecture-read.ts` (#1639). Behavior does not change.
+- Dead readers and stale comments that the old board deletion left are
+  removed. (#1606)
+
+### Fixed
+
+- The task inbox reader returns the newest records within its budget. A
+  budget stop in the receipt reads keeps the complete records already read
+  and marks the view `complete: false`. (#1612)
+- The task inbox orders messages by parsed time, not by text, so
+  `…00.500Z` is later than `…00Z`. It reads receipts only for the returned
+  page. (#1618)
+- A task inbox walk that stops at a budget returns no records and keeps the
+  first stop reason. Before, it returned a partial page. (#1620)
+- Ship closeout elects the claim owner with an exclusive create of
+  `owner.json`, not with `mkdir`. On Ubuntu 26.04, uutils `mkdir` could
+  report success to two racing callers, so two ship calls could own one
+  worktree closeout. (#1637)
+- The attention watcher logs a seat whose program ended as
+  `terminal_ended`. The watcher doctor check is `na` in a checkout with no
+  GitHub remote. (#1589)
+
+### Tests
+
+- The closeout hard-timeout test stops the supervisor process itself, so the
+  stop lands inside the target window. (#1581)
+- No test starts `hc` or `herdr-app` from the process PATH without a fake
+  first on PATH. (#1589)
+
+### Documentation
+
+- Issue-flow review rounds converge (owner decision M33), and reviewers read
+  CI and the recorded evidence instead of rerunning passing checks (owner
+  decision M32). `acceptor.md` §2.2 is the one authority for the round
+  rules. (#1608, #1614)
+- The herdr skill context starts a reviewer or worker with
+  `hc run --bg --no-parent`, so it keeps running when the orchestrator
+  restarts or its pane closes. (#1632)
+- The architecture model gives the hc client, the notify secret keys and the
+  global configuration owners outside plugin internals. (#1633)
+- Publication records for 0.25.2 and 0.25.3, with the real 0.25.3 upload
+  method and the 0.25.1 npm base. (#1584, #1591)
+
+## [0.25.3] - 2026-11-03
+
+This release has breaking changes. It completes the herdr-core migration
+(G37, #1474): task sessions, review hosts, notify, the operator console,
+readiness and the herdr skill use `hc` and Herdr.app, and repo-harness no
+longer calls the classic `herdr` CLI.
+
+### Upgrade
+
+- Install herdr-core `hc` 0.1.17 or later before you upgrade, and check it
+  with `hc --version`. Readiness requires `hc` at or above
+  `external_tooling.herdr_core.min_version`. The classic `external_tooling.herdr`
+  pin is removed; delete that key from a downstream policy. (#1492, #1555)
+- Run `repo-harness update`, then `repo-harness doctor`. The update builds the
+  herdr skill from `hc --skill` and refreshes the managed Global Working Rules
+  blocks, which now name only herdr-core. Until the update, readiness shows
+  `global-rules.claude` and `global-rules.codex` as stale. (#1559, #1560)
+- Herdr notify: run `repo-harness herdr notify install` again. Remove the old
+  classic plugin with `herdr plugin unlink aimpact.webhook-notify` while
+  classic Herdr is still installed. (#1494)
+- A task session that started on classic Herdr fails with
+  `task_agent_classic_herdr_record_retired`. Archive the record and start the
+  session again. (#1499)
+- The operator runtime config needs `"kind": "herdr-core"`. Update the
+  browser and the server together. (#1529)
+
+### Breaking
+
+- Task sessions run in herdr-core terminals, not in classic Herdr panes.
+  `hc run --no-parent` starts each session with the `repo-harness.role=task-session`
+  labels. hc `get`, `send`, `kill` and `rm` observe, message and end it. An
+  endpoint is now `{"socket":"<hc core socket>","home":"<review credential home>"}`.
+  `contract-worktree start --herdr-endpoint` takes `{"endpoint":...}` only, and
+  `review round --herdr-endpoint` takes `{"endpoint":...,"parent_pane":"<owner hc terminal>"}`.
+  `contract-worktree notify-merged` reaches only an owner terminal with a
+  repo-harness label; it reports `owner_unowned` for any other owner. A
+  classic task binding, start intent, workspace record or endpoint file
+  fails with `task_agent_classic_herdr_record_retired`.
+  Archive the record and start the session again. No migration command
+  exists. (#1499)
+- `review round --launch herdr` is now `--launch herdr-app`, and
+  `herdr-app` is the default. The value `herdr` fails with
+  `review_launch_unsupported`; no alias exists. The OAR review host reports
+  its idle or working status to hc with OSC 7501 (`app=repo-harness`).
+  (#1525)
+- The operator console reads herdr-core, not classic Herdr. A runtime config
+  with `"kind": "herdr"` fails with `runtime_config_classic_herdr_retired`;
+  write `{"protocol":"repo-harness.runtime-config.v2","kind":"herdr-core","source_host":"<host>","deadline_ms":<ms>}`.
+  The core must answer at or above the highest
+  `external_tooling.herdr_core.min_version` of the registered repositories;
+  otherwise the console shows the expected and the actual version. The
+  runtime overlay is `repo-harness.runtime-overlay.v7` and its identity is
+  the hc `core.id`. Bot access is protocol 2: its `herdr` section is now
+  `hc`, with the core version, the task-session terminals and Herdr.app as
+  `not_pinned`. The Task drawer shows the hc terminal and the
+  `herdr-app do terminal.keep` command that opens it in Herdr.app. Update the
+  browser and the server together. (#1529)
+- MCP `latest_checks` returns the typed check records
+  `{"protocol":1,"kind":"repo-harness.check-records","records":[...]}`, not
+  a list of files ordered by modification time. The one record is the Change
+  Assessment, with `state` `present`, `absent` or `invalid`. An invalid record
+  carries `check_record_invalid` and the decoder message. A record that is a
+  link, is not a regular file, is too large or resolves outside the
+  repository is `invalid`. On win32 there is no `O_NOFOLLOW`, so a record
+  that is a link to another file in the repository is read. The `message` of
+  a `fail` record is redacted. The planner profile can no longer list or
+  read `.ai/harness/handoff/**` and `.ai/harness/checks/**` through
+  `list_workflow_files` and `read_workflow_file`; `read_workflow_file` returns `POLICY_DENIED` for them.
+  `harness_status` adds `protocol: 1` and
+  `kind: "repo-harness.mcp-harness-status"`, and `workflowRoots` lists only
+  `docs/spec.md` and `docs/prds`. (#1548)
+- The MCP executor profile no longer grants writes under
+  `.ai/harness/checks/**` or `.ai/harness/handoff/**`. No MCP tool writes
+  those files. (#1562)
+- Readiness requires herdr-core, not classic Herdr. `check-agent-tooling.sh
+  --strict-readiness` fails when `hc` is missing, unusable or below
+  `external_tooling.herdr_core.min_version`; a missing or malformed pin is a
+  `configuration-error`. `setup check` reports `runtime.herdr_core` as
+  required. The `external_tooling.herdr` pin, `runtime.herdr` and the
+  doctor check `pi-herdr-integration` are removed, and CI no longer
+  installs classic Herdr. Pi reports its status to hc natively. An
+  `external_tooling.herdr` key in a downstream policy has no reader;
+  delete it. Herdr.app is not a readiness requirement. (#1555)
+- Herdr notify runs on herdr-core. `repo-harness herdr notify install` takes
+  no `--session` and installs no classic Herdr plugin. It writes the config to
+  `~/.repo-harness/herdr/notify.env` and starts the relay in an hc terminal
+  named `rh-notify-relay`. The relay follows `hc events --json --label
+  repo-harness.notify=on` and sends the same `repo-harness.bot-event/v1`
+  envelope protocol on each blocked or done turn. The envelope `data` drops
+  `session`, `pane_id`, `workspace_id`, `display_agent`, `title`,
+  `state_labels`, `workspace_label` and `tab_label`, and adds `terminal`,
+  `name` and `blocked_kind`. Each hc turn is sent once per channel; the 120 s
+  debounce is removed. The relay does not restart itself;
+  `repo-harness herdr notify start` starts it again, and `repo-harness doctor`
+  reports a stopped relay. `repo-harness herdr notify
+  uninstall` stops the relay and removes its files. A classic notify install
+  record fails closed as `notify_session_invalid`: run install again. Remove
+  the old plugin with `herdr plugin unlink aimpact.webhook-notify` before
+  classic Herdr is removed. (#1494)
+- The operator notify status is protocol 2: `relay: 'live'` replaces
+  `plugin_id`, `linked` and `enabled`. A relay that is not live is
+  `relay_stopped`, and an hc that does not answer is `hc_unavailable`. The
+  delivery state `unsupported` is removed. (#1494)
+- The Clef shadow decision is removed: `repo-harness herdr decision label`,
+  the `CLEF_MODE` and Cloudflare install options, and the shadow records. It
+  read the pane tail through classic Herdr and had no recorded use. (#1494)
+- `repo-harness install` and `update` build the herdr skill from
+  `hc --skill`, not `herdr --skill`. Without a working `hc`, the step fails
+  with `hc --skill failed: <reason>`. The installed skill is the
+  repo-harness hc context, then the hc manual verbatim. The readiness row
+  `tools.herdr_skill` reads `hc --skill` too. (#1559)
+
+### Added
+
+- `repo-harness board --parent <n> --json` prints the board of one parent
+  issue (`repo-harness.board` protocol 1). `repo-harness board attention`
+  prints the attention findings. The board reads the `repo-harness plan`
+  block, the acceptance records, the linked PRs, the daily CI run and the
+  labelled hc seat terminals. (#1518)
+- `GET /api/v1/repositories/<id>/board?parent=<n>` serves that board. The
+  console Main board and the Task drawer read it. The Dev Activity board and
+  its drawer are removed. (#1536)
+- `repo-harness publication batch build` builds an integration batch branch
+  from 1 to 6 accepted PRs and opens the batch PR. A batch number is never
+  reused. (#1515)
+- The `seats` section of `~/.repo-harness/config.json`,
+  `GET` and `POST /api/v1/settings/seats`, and the Settings Seats page. (#1513)
+- `repo-harness seats argv <seat> [--json]` prints the argv that starts the
+  orchestrator, advisor or worker seat, with the seat brief and the level of
+  each tool and fleet limit. `--repository-id` adds the `hc label` pairs.
+  (#1521)
+- The Seats page shows the `repo-harness seats argv` launch command and the
+  limit level of each tool group and fleet. (#1547)
+- Seat pane and tab names come from the `panePrefix` of the registry entry:
+  `<prefix>-<role>[-<item>][-<qualifier>]`. `seats argv --repository-id`
+  fails with `pane_name_invalid` until `panePrefix` is set. (#1554)
+
+### Changed
+
+- Every repo-harness call to herdr-core goes through one typed transport.
+  It refuses a nested multiplexer (`nested`) and a terminal without a
+  repo-harness label (`unowned`) before any write. (#1491)
+- The herdr-core pin is `min_version` 0.1.17 with checksum-pinned
+  `release_assets`. CI installs that exact `hc`. The downstream seed has the
+  same block. (#1492)
+- The orchestrator fleet role runs at Opus high effort. (#1513)
+- The daily CI run starts at 19:17 UTC, not at minute 0. (#1545)
+
+### Fixed
+
+- MCP path policy also applies to the path that a link resolves to. A link
+  inside an allowed root that points into a denied or unlisted root, for
+  example `.ai/context/link.md -> ../harness/handoff/secret.md`, is not listed
+  by `list_workflow_files`, and `read_workflow_file` returns `POLICY_DENIED`
+  for it. (#1562)
+- `repo-harness update` refuses a relative `XDG_STATE_HOME` before it takes
+  the runtime lock. Before, the refused update created `~/.repo-harness`.
+  (#1526)
+- MCP path policy refuses a write path whose parent is a dangling link or a
+  link loop. (#1566)
+- A failed `repo-harness update` restores the hoisted `archctx` and
+  `archctx-contracts` packages too. Before, the restored CLI failed every
+  command with `mandatory dependency mismatch`. (#1522)
+- No notify secret key reaches an `hc` or `herdr-app` child process. A core
+  that is already running keeps its old environment; restart it to drop old
+  values. (#1524)
+- `repo-harness operator capture` adds its SIGINT and SIGTERM listeners
+  before it starts the provider child. Before, a signal in that gap left an
+  orphan child and a `connected` snapshot. (#1551)
+- `seatPaneName` refuses a pane prefix outside the registry format
+  `[a-z][a-z0-9]{1,5}`. (#1567)
+- CI selects `tests/unit/herdr-peer-harness.test.ts` when only the global
+  working rules change. (#1520)
+- The README describes `hc` readiness. With a missing herdr-core pin, the
+  Herdr skill hint says "fix the herdr-core pin first", not "install hc
+  first". (#1574)
+
+### Tests
+
+- The task-inbox staging marker is published atomically. (#1528)
+- The fleet-board fake `gh` lock is atomic on uutils `mkdir`
+  (Ubuntu 26.04). (#1569)
+- The operator herdr-core runtime tests wait on service signals, and the fake
+  `hc events` subscribes before it prints the snapshot. (#1572)
+
+### Documentation
+
+- The distributed skills, the fleet orchestrator and the reference configs
+  name only herdr-core. The herdr-portal skill starts and reuses its worker
+  in an hc terminal (portal record v2); reuse needs a `claude` foreground
+  process. (#1560, #1563)
+- The architecture model shows herdr-core and Herdr.app, with no classic
+  Herdr node, and gives one owner to each contested `src/core/operator`
+  file. `evals-checks.md` cites current owners. (#1530, #1557, #1570)
+
+## [0.25.2] - 2026-11-03
+
+### Upgrade
+
+- The managed Global Working Rules name only herdr-core (`hc` and
+  `herdr-app`) in the Peer Harness Collaboration rules. The classic `herdr`
+  commands and the runtime selection rule are removed. After the update,
+  readiness shows the `global-rules.claude` and `global-rules.codex` blocks
+  as stale. Run `repo-harness update` to refresh them; repo-harness keeps a
+  copy of each changed file first. (#1462)
+- `repo-harness install` and `uninstall` refuse a relative `XDG_STATE_HOME`
+  with `XDG_STATE_HOME must be an absolute path: <value>`, before any write.
+  `repo-harness update` also refuses it, after it takes the runtime lock
+  (#1502). Set `XDG_STATE_HOME` to an absolute path or unset it, then run
+  the command again. (#1465)
+
+### Added
+
+- `operator serve` reads the Dot review threads of one Slack channel and
+  serves them read-only at `GET /api/v1/bot-reviews`. The config is
+  `~/.repo-harness/slack.local.json` with mode `0600`. The secret rules
+  include Slack tokens. (#1469)
+- The Bots page has a "Dot reviews" section with the state, finding count,
+  PR, head and age of each review thread. (#1467)
+
+### Fixed
+
+- After `install --target claude`, `doctor` gives `na`, not `missing`, for
+  the codex and pi skill paths that the install ledger does not own. (#1464)
+- Operator worktree cleanup observation works on Apple arm64. Before, each
+  observation failed with `cleanup_observation_unavailable`. (#1468)
+- For a provider 5xx on the initial run read, the CI report records
+  `attention_owner: external` in `pending.json`. The run opens no repair
+  issue. (#1495)
+- Install and uninstall snapshot and edit the Skills CLI lock at
+  `$XDG_STATE_HOME/skills/.skill-lock.json` when `XDG_STATE_HOME` is set.
+  Before, a failed install left lock entries for removed skills. (#1465)
+- A fresh `repo-harness install --profile full` installs and owns the four
+  Waza shared rules in each selected host rule root. Before, readiness
+  reported them as `missing_shared_rules`. (#1470)
+
+### Tests
+
+- The peer rule test checks the herdr-core rule text of #1462. (#1500)
+
+## [0.25.1] - 2026-11-03
+
+This release has breaking changes. #1354 deletes the ChatGPT, HTTP, OAuth,
+coding and orchestrator MCP surface. #1345 deletes the engineer, integration
+and agent-runtime clusters. #1292 retires the manual handoff helpers.
+`archctx` and `archctx-contracts` go to exact 0.11.1.
+
+### Upgrade
+
+- Run `repo-harness doctor`. It lists each retired ChatGPT file, host skill
+  link and `[mcp_servers.repo_harness]` block as `retired_chatgpt_state`,
+  with a removal command. It deletes nothing. (#1354)
+- `mcp.local.json` with `server`, `auth`, `chatgpt`, `coding`,
+  `authorizationRevision`, a retired capability or the `orchestrator` or
+  `coding` profile fails with `MCP_CONFIG_RETIRED_FIELD`. Remove the listed
+  keys. (#1354)
+- A bot record with `mcp_client_id` fails with `BOT_RECORD_RETIRED_FIELD`.
+  Remove the key from the named file. (#1354)
+- A task `binding.json` with `engineer_profile`, or an inbox receipt with
+  the `agent_runtime_effect` channel, fails with a message that names the
+  path. Remove or archive the record by hand. (#1345)
+- `repo-harness upgrade --apply --include-state-artifacts` removes retired
+  `~/.repo-harness/gates/*/merge-gate.latest.json` files and 0.10.0 package
+  archives. (#1410)
+- If `repo-harness install` reports "refusing to refresh unowned host
+  skill" for a Waza skill, move the named directory out of the host skill
+  root. Then run `repo-harness install --profile full --target <host>`.
+  (#1442)
+
+### Breaking
+
+- `repo-harness mcp serve` keeps only stdio and the planner and executor
+  profiles. The ChatGPT browser, HTTP transport, OAuth, coding runtime, task
+  dispatch and merge tools are removed, and the Bots page has no OAuth
+  clients. (#1354)
+- Remove `repo-harness integration`, `repo-harness operator planning`, and
+  the `review --engineer-id` and `--engineer-contract-revision` options. The
+  Operator web app has two observation tabs, Attention and Delivery. Adoption
+  removes the `agent_runtime` policy key. (#1345)
+- Remove the `prepare-handoff`, `prepare-codex-handoff`,
+  `codex-handoff-resume` and `recovery-view-cli` helpers and the MCP
+  `latest_handoff` tool. The issue, its claims and the PR are the only
+  session handoff. (#1292)
+
+### Added
+
+- The Operator Architecture workspace has a History tab with each
+  `archctx history` milestone. (#1300)
+- A Cloudflare Worker receives the webhooks of one GitHub App, filters them
+  and sends a bot event to the Bot routine webhook. (#1283)
+- Herdr notify sends one versioned `repo-harness.bot-event/v1` envelope.
+  (#1310)
+- A new Pi review in a Herdr pane fails with `review_pi_launch_not_ready`
+  when the installed Pi is below `MIN_PI_VERSION`. (#1100)
+- A DSH sidebar tab lists the guard denials of the session. (#1299)
+- Readiness reports herdr-core (`hc`, minimum 0.1.16) as an optional runtime
+  capability. (#1413)
+- Before a refresh changes `~/.claude/CLAUDE.md` or `~/.codex/AGENTS.md`,
+  repo-harness keeps a copy in `~/.repo-harness/global-context-backups/` and
+  prints the restore command. Init prints the backup of each replaced project
+  file. (#1302)
+- `publication merge --batch` merges a batch integration PR with a merge
+  commit, so each member PR shows Merged and can be reverted alone. (#1329)
+
+### Changed
+
+- `archctx` and `archctx-contracts` are exact 0.11.1. This version fixes the
+  `AC_UNCLASSIFIED_FAILURE` crash on a workspace `exports` condition object.
+  (#1339, #1430)
+- `check:state-boundaries` rejects a core file that imports a plugin file or
+  the composition root. The ArchContext model gives the tier of each file.
+  (#1357)
+- The merge gate treats unresolved review threads that a GitHub App bot
+  started as advisory. Human threads still block. (#1396)
+- The Waza sync and upgrade commands run `repo-harness install --target
+  <host>` to project the host links. The rsync and cp loops are removed.
+  (#1442)
+
+### Fixed
+
+- `repo-harness update` prints the leftover summary line that the installed
+  package writes with the new `repo-harness upgrade --summary-line`. The
+  updater no longer parses the `upgrade --json` result, so a later change of
+  that shape does not cause a false "Leftover check failed" line. (#1301)
+- Version checks follow semver precedence: a pre-release such as
+  `0.26.0-rc.1` is older than `0.26.0`. Before, the suffix was ignored, so
+  `doctor` reported `ok` for an installed release candidate after the release
+  was published. A Bun canary of the minimum version (`1.4.0-canary.*`) is now
+  below `MIN_BUN_VERSION=1.4.0`. (#1322)
+- `repo-harness update` resolves `repo-harness@latest` from any working
+  directory. Before, a directory without `package.json` stopped the update.
+  (#1409)
+- External skills with an integrity pin install with the `owner/repo#<sha>`
+  ref form. The `@` form let the provider ignore the pin. (#1445)
+- External skills stage through the `codex` provider agent for every target.
+  Before, `--target claude` did not write the staging copy. (#1425)
+- The daily CI report opens no false repair issue for a provider 5xx. A 5xx
+  in the merge section makes that section unavailable for the run, with one
+  external error and no rollback boundary. A 5xx on another read is recorded
+  with `attention_owner: external`. (#1452, #1463)
+- The daily CI report lists batch member PRs under their batch boundary and
+  opens no repair issue for each member. (#1360)
+- `publication merge` and `publication readiness` accept a batch merge
+  commit as the rollback boundary. (#1373)
+- `publication merge --batch` reads only commits and parents for the batch
+  proof, so a large member diff no longer overflows the output buffer.
+  (#1383)
+- MCP reader tools never run a CodeGraph binary from the inspected
+  repository. (#1380)
+- A failed archctx resolve gives a fix for its cause: a timeout, a package
+  fault (`repo-harness update`) or another error (`repo-harness doctor`).
+  (#1429)
+- The Bash guard allows writes below the system temp roots and the managed
+  worktree root, as Edit and Write do. (#1303)
+- Init keeps a retired runtime ignore rule while a file that it matches
+  exists. The scan does not follow a symlinked ancestor, and the handoff
+  marker matches only `codex-handoff-resume`. (#1307, #1335)
+- `upgrade decide` records each valid path of a batch, and `decide --remove`
+  accepts a retired generated handoff packet. (#1308)
+- Upgrade reports `package.json` scripts that call a retired helper or a
+  missing script key. Init keeps the `package.json` format. (#1305)
+- `upgrade --registered` previews the managed worktree sweep, and `--apply`
+  does only the previewed steps. (#1304)
+- The tarball smoke checks the current Fleet inbox fields, not the retired
+  `delivery_evidence`. (#1381)
+
+### Documentation
+
+- The issue-flow skill adds batch integration, the replan reference, the
+  land-path norms, the orchestrator triage queue, the Low-tier accept rule
+  and the Herdr orchestrator topology. (#1327, #1391, #1394, #1418, #1431, #1437)
+- The Dot Slack review protocol is added. (#1440, #1446)
+- Generated architecture outputs, the archimap and the ownership of moved
+  files are refreshed. Native OAR CI runs one leg per test file. (#1296,
+  #1352, #1393, #1441)
+
+## [0.25.0] - 2026-10-31
+
+### Upgrade
+
+- `repo-harness update` from 0.24.3 always ends with "Leftover check failed:
+  upgrade --json returned no leftover list. Run: repo-harness upgrade". This
+  line is expected, and the update is complete. The 0.24.3 updater cannot
+  read the `upgrade --json` object of 0.25.0 (#983). Ignore the line, and run
+  `repo-harness upgrade --json` to see the leftovers. (#1301)
+
+### Breaking
+
+- Remove the local plan, sprint, contract, review, notes and workstream flow.
+  Issue and PR state are the only task source; init and upgrade stop seeding
+  `plans/`, `tasks/todos.md`, `tasks/current.md`, `check:task-*` scripts and
+  the retired policy keys. Existing PRDs move to `docs/prds/`. (#1177-#1184,
+  #1225)
+- Remove `docs/issue-flow.md`. The `repo-harness-issue-flow` skill is the only
+  flow source. (#1223)
+- Remove the duplicated flow reference docs from `docs/reference-configs/`.
+  (#1227)
+- Add the issue/PR architecture map (`docs/architecture/archimap.html`) and
+  refresh the generated architecture outputs. (#1184, #1209)
+
+- Remove the MCP and ChatGPT bridge plan and sprint tools:
+  `write_sprint`, `write_checklist_sprint`, `write_plan`, `list_sprints` and
+  `prepare_task_goal_from_sprint`. The old names now return the MCP
+  unknown-tool error. `repo-harness mcp prepare-goal` accepts only
+  `--issue <n>`, reads that OPEN GitHub issue, and prints a Goal prompt.
+  `--prd`, `--sprint`, `--reference-repo`, `--extra-instructions` and
+  `--expected-sha256` are removed. (#1181)
+- `write_prd`, `write_prd_from_idea` and `list_prds` use `docs/prds/`.
+- The MCP and ChatGPT browser allowlists allow `tasks/lessons.md` and
+  `docs/prds/**` only. `plans/**`, `tasks/**`, `tasks/notes/**`,
+  `tasks/reviews/**` and `tasks/contracts/**` are no longer readable or
+  writable through those surfaces. Existing PRD files are not moved here.
+  (#1181, #1184)
+- Remove the MCP `run_workflow_check` tool. Its `check-task-workflow`
+  helper is retired, so the tool would fail as an unknown helper. The old
+  name now returns the MCP unknown-tool error. (#1182)
+- The Stop hook no longer writes, and Effective State no longer reads,
+  `.ai/harness/handoff/current.md` and `resume.md`. Resume from Git state,
+  the GitHub issue and the PR. (#1228)
+
+### Added
+
+- `repo-harness init` writes `CLAUDE.md` and `AGENTS.md` from one root-context
+  template, `assets/templates/root-context.md`. (#1229)
+- `repo-harness update` refreshes the global runtime and skills. It prints a
+  read-only registered-upgrade preview and does not change project files.
+- `repo-harness upgrade --registered --apply` removes the six retired flow
+  reference docs (`contract-brief-example.md`,
+  `contract-brief-example-bugfix.md`, `development-protocol.md`,
+  `handoff-protocol.md`, `sprint-contracts.md` and
+  `workflow-orchestration.md`) and the empty `docs/architecture/domains` and
+  `docs/architecture/snapshots` placeholders. A modified file is kept and
+  reported. (#1229)
+- The DSH host plugin ships in the npm package. `prepack` builds
+  `dist/dsh-plugin.js`, and the package includes `cordis.patch.yml`. Registry
+  install verification and release-note claims are deferred. (#1206)
+
+### Changed
+
+- Root `CLAUDE.md` and `AGENTS.md` carry cross-layer invariants only. The
+  issue-flow skill owns the multi-agent flow, and the archimap owns the
+  architecture view. (#1226)
+- Only the coordinator posts `issue claim`. A worker starts from the claim
+  that names it and does not claim its own seat. (#1278)
+- One change hazard list sets the High review tier. A hit covers CI workflows,
+  release and install scripts, a network address or telemetry, credential
+  reads, a dependency or lockfile change, and binaries or opaque blobs.
+  (#1274)
+- A CI repair issue is keyed by the failing test identity. A repair session
+  finds the issue by test name and reads its evidence first. (#1275)
+- Research findings live in `docs/researches/`. Durable decisions live in
+  `docs/adr/`. `docs/plans/` is banned. (#1250)
+- The fleet known-gaps table records a named review check for each producer.
+  The check adds evidence and does not change the review tier. (#1272)
+- Publication readiness regenerates declared generated artifacts on the merge
+  tree. A generator input change must commit the regenerated output on the PR
+  head. (#1257, #1288)
+- The architecture map and the root-router projection are refreshed. (#1291)
+
+### Fixed
+
+- `contract-worktree start` writes one branch metadata source and `cleanup`
+  reads only that source; missing metadata or a missing branch exits 2. (#1230)
+- A lessons consolidation keeps every `Triggered by correction` reference of
+  the entries it replaces and keeps `Seen` as their sum. Maintenance triage
+  fails an entry that cites only a consolidation commit. (#1273)
+
+## [0.24.3] - 2026-10-26
+
+This patch fixes `repo-harness update` from 0.24.1. In 0.24.2 that update
+failed at candidate reconciliation and rolled back to 0.24.1. If you upgrade
+from 0.24.1, read the [0.24.2](#0242---2026-10-26) section first and do its
+upgrade steps; this release has no new ones.
+
+### Fixed
+
+- `repo-harness update` from 0.24.1 completes. A 0.24.1 parent publishes its
+  global runtime lock owner record without `start_time`, and the 0.24.2
+  candidate refused it as "parent does not own the active global runtime
+  lock". The lock owner read now reports identity only, with a null start
+  time for such a record. A pid or token mismatch is still refused. A record
+  without a start time is never reclaimed as stale. Its liveness is `dead`
+  when its PID is free and `unverified` otherwise. (#974, #973)
+
+### Documentation
+
+- Record the 0.24.2 publication. (#972)
+- Refresh generated architecture outputs through the archctx rolling writer
+  for main `7310993bc` (#969) and main `882817207` (#975).
+
+## [0.24.2] - 2026-10-26
+
+This release has breaking changes. #959 moves review and task authority from
+task contracts and leases to approved admission. `src/` no longer reads the
+retired lease, publication, engineer binding and sprint claim stores.
+`archctx` and `archctx-contracts` go to exact 0.9.3. Most other changes close
+the 22 remarks of the #900 architecture review (#901 to #922). If you upgrade
+from 0.23.1, also do the steps in [0.24.1](#0241---2026-10-23) and
+[0.24.0](#0240---2026-10-21).
+
+### Upgrade
+
+- Run `repo-harness update` after the upgrade. `repo-harness init` no longer
+  installs the Herdr skill or writes the account architecture defaults. When
+  the Herdr skill is missing, `init` names the `update` command. (#930, #904)
+- Record each acceptance again. An acceptance receipt from an older release
+  has no stored copy. Until a new acceptance is recorded, product and
+  waived-module dependencies on that receipt report `authority_unavailable`.
+  There is no migration. (#959)
+- Run `repo-harness external-source refresh` once. A store from an older
+  release has no receipt head, so the agent board slice stays empty until the
+  next refresh. (#959)
+- Change your review and task callers to the approved admission inputs. See
+  "Breaking". The approval expiry must cover the campaign through the merge.
+  A renewal after a PASS starts a new round and counts against the limit of 3
+  rounds. (#959)
+- Check `information_lifecycle.retention.archive_days` in
+  `.ai/harness/policy.json` before `repo-harness retention --apply`. Retention
+  now deletes archived entries older than `archive_days`. The default is
+  `days` plus 60, which is 90. (#941, #918)
+- Read the new workflow rules with
+  `repo-harness docs show agentic-development-flow`. They change merge
+  sequencing, review reuse and slice size. (#962, #961)
+- When `update` reports "Daemon readiness pending; verified packages
+  retained.", authorize the archctx `daemon upgrade` as in 0.24.0. (#951)
+
+### Breaking
+
+- `repo-harness review round|status|close|cancel` drop `--contract <path>`.
+  They require `--repository-id`, `--issue-id`, `--campaign-id`,
+  `--grant-sha256`, `--policy-sha256`, `--actor`, `--claim-ref` and
+  `--claim-revision`. The new `review admit --request <file>` applies an
+  upstream-authorized control Bot request. The new
+  `review revoke --request <file>` revokes the active grant with a check of
+  the revision and the grant digest. It is the only revoke path. Neither
+  command authenticates its caller; the control Bot owns authentication.
+  (#959, #903)
+- `fleet ready` takes `--selections <path>` and prints FleetReadinessV2.
+  `fleet board` prints FleetBoardSnapshotV2. `fleet feedback
+  intake|offers|ack|show`, `fleet message send` and `fleet inbox list|ack`
+  require `--context <file>`. (#959)
+- `publication readiness` requires `--repository`, `--repository-id`,
+  `--pr`, `--head` and `--base`, and prints PullRequestReadinessV2.
+  `--publication-id` is removed. The MCP tool `publication_readiness` requires
+  `repository`, `provider_repository_id`, `pr_number`, `expected_head_sha` and
+  `expected_base_sha`; `publication_id` is removed. Merge readiness compares
+  the PR base with the repository default branch, not with `main`. (#959)
+- `state board` requires `--repository-id` and reads provider issues and
+  admitted sessions. `--sprint` and `--target-ref` are removed. It prints
+  ProviderBoardV2, which replaces BoardDocumentV1. (#959)
+- `integration envelope` requires `--tree`. `integration accept` drops
+  `--workflow-contract` and requires `--repository-id`, `--issue-id`,
+  `--campaign-id`, `--grant-sha256`, `--policy-sha256` and `--actor`. The
+  integration commands print IntegrationContractV2, IntegrationEnvelopeV2,
+  AcceptanceMatrixV2 and ProductAcceptanceProjectionV2, which replace the V1
+  documents. (#959)
+- `external-source bind` replaces `--sprint`, `--task-id` and `--target-ref`
+  with `--session <file>`, and prints ExternalSourceBindingReceiptV2.
+  `external-source bindings` prints ExternalSourceBindingProjectionV2. The
+  new `external-source historical-bindings` reads retired V1 binding
+  receipts as history. (#959)
+- The `repo-harness run` helpers `verification-plan
+  validate|evaluate|execute` and `change-assessment
+  prepare|escalate-disagreement|validate` drop `--contract`. They require
+  `--repository-id`, `--issue-id`, `--campaign-id`, `--grant-sha256`,
+  `--policy-sha256` and `--actor`. A Completed `archive-workflow` run passes
+  these six flags. It no longer promotes the contract to Fulfilled and no
+  longer runs the sealed-terminal contract and review gate. The
+  sealed-terminal mode uses the same live acceptance gate as the current
+  mode. Historical contract and review files are archived as data. (#959)
+- No code in `src/` reads the retired stores: leases (`coordination/v1`),
+  publications (`publications/v1`), engineer bindings (`engineers/v1`) and
+  sprint claims (`.ai/harness/sprint/claims`). The per-task lock keeps its
+  path under `coordination/v1/locks/tasks/`. Historical sprint and task inbox
+  reply readers stay read-only. Disk history is not removed. (#959, #917)
+- `repo-harness init` no longer runs the coordination cutover check and no
+  longer writes `coordination/v1/protocol.json`. Worktree cleanup no longer
+  reads lease records. Board cards lose the `lease_liveness` field.
+  (#936, #917)
+- Remove the `run-bounded-verifier-command` helper. `repo-harness run
+  run-bounded-verifier-command` fails closed and names
+  `repo-harness run verification-plan execute`. Since #959 that helper
+  requires `--repository-id`, `--issue-id`, `--campaign-id`,
+  `--grant-sha256`, `--policy-sha256` and `--actor`. The process-group
+  supervisor accepts an absolute deadline. (#933, #914)
+- The package no longer ships `dist/oar-coding-host.js`. PM was its only
+  production caller, and 0.23.1 removed PM. (#932, #911)
+
+### Changed
+
+- Upgrade `archctx` and `archctx-contracts` from 0.9.1 to exact 0.9.3. Four
+  contract tests cover paired topology stamps. CI admits the upgrade only
+  through the exact reviewed blob transitions and the real clean-room
+  receipt. (#951, #952, #955)
+- Agent spawn prompts show only the issue reference, state and execution
+  status of a board card. Provider titles do not render. (#959)
+- SessionStart, SubagentStart and the MCP state summary resolve Effective
+  State read-only. They take no lock and write nothing. They report the last
+  published `state_version`. `repo-harness state resolve` is the only
+  publisher. The MCP state summary declares `readOnlyHint: true`.
+  `.ai/harness/state/effective.json` is no longer written. (#931, #901)
+- The edit guard caches archctx owner answers per worktree. The cache key is
+  the archctx version, the checkout, HEAD and a digest of the archcontext
+  model. (#940, #905)
+- Every `src/` git call goes through one runner. It uses
+  `REPO_HARNESS_GIT_BIN` and a default timeout of 120 s. An absolute git path
+  in a call wins over the variable. (#938, #921)
+- Retention gives each storage root a rule. `repo-harness retention --json`
+  lists every root with its rule. MCP logs rotate in segments like hook
+  telemetry. `install` removes older release tarballs from
+  `~/.repo-harness/packages/`. The upgrade audit log keeps the newest 100
+  records. (#941, #918)
+- One primitive terminates a process group. It replaces 7 POSIX copies and 3
+  Windows `taskkill /T` copies. (#929, #913)
+- One TypeScript rule resolves the host skill roots. The shell sync reads the
+  roots from it. (#946, #920)
+- Name the repo id and the worktree id. Each stored identifier has one
+  projection function. No stored record moves. (#943, #919)
+- Hook events that no route serves (`PostToolUse`, `SubagentStop`) leave the
+  hook event type. One function makes the opt-in decision. (#944, #909)
+- `src/` no longer imports `scripts/`. The acceptance receipt and capability
+  resolver libraries move into `src/`. `check:state-boundaries` reports
+  `SRC_SCRIPT_IMPORT`. (#939, #906)
+- `src/core` passes the core purity check with no exemption. Adoption,
+  projection and legacy inventory I/O moves to `src/effects`.
+  (#928, #908, #942, #924)
+- `check:state-boundaries` reports directory cycles inside one layer. 10
+  cycles are removed. 2 stay in the allow table with a reason. (#945, #907)
+- Delete modules with no production caller, and the tests that covered only
+  them. (#925, #910)
+- Delete the product projection lister. No production code lists the store
+  after #959. (#963)
+- Workflow rules: a merge needs the branch to contain the current main tip
+  and green required checks on that head. The next merge does not wait for
+  main push CI. A coordinator reuses a recorded review of the same diff when
+  it meets the diff's tier. Slices that write the same files in sequence go
+  into one PR. (#962, #961)
+
+### Fixed
+
+- Make adoption apply stop at the first failed operation and roll back from
+  the manifest. A target lock from a dead writer is reclaimed. (#923, #902)
+- Give `REPO_HARNESS_HOME` one resolver. Gate readers use the OS account
+  home. Before, with `REPO_HARNESS_HOME` set, the module-accepted dependency
+  check looked for receipts in a gates directory that no writer used.
+  (#926, #912)
+- Keep `repo-harness init` repo-local. It writes no install-managed host
+  files. (#930, #904)
+- Give runtime transaction locks an explicit scope. MCP project setup no
+  longer creates `.repo-harness/transactions/global-runtime.lock` inside the
+  repository. (#937, #922)
+- Judge a lock owner as stale by its PID and OS start time. Registry, MCP
+  path and Herdr decision label locks use the shared lock primitive.
+  (#934, #915)
+- Register detached process groups. At start, the MCP process manager and
+  the operator server reap the groups of an owner that no longer runs.
+  (#935, #916)
+- Require a checkout-local `.codegraph` directory for CodeGraph readiness. A
+  nested worktree no longer reports its parent's index as ready. (#899, #888)
+- Recovery at Stop no longer reads task contracts or the sprint marker. The
+  handoff and resume views drop the contract lines. (#927, #903)
+- Keep the evidence quarantine before the log truncation. Flush the
+  quarantine, then truncate and flush the log. A name collision fails before
+  the truncation. (#949, #947)
+- Add `--timeout-ms` to `refactor recommendations` and `refactor decide`. A
+  timeout reports `refactor_provider_timeout` with a remedy that names the
+  flag. (#892, #891)
+- `architecture-projection` prints one next step on stderr for each human
+  action. `check-context-map` skips nested checkouts. (#893, #890)
+- Point the acceptance-review flow sink to the effects implementation. With
+  a ready CodeGraph index, the flows check proves 108 of 108 selectors.
+  (#957, #956)
+- Isolate the clean-room runtime and confirm its shutdown before cleanup.
+  (#953)
+- Publish the PID files of a closeout test fixture atomically. This removes
+  a CI race. (#894)
+- Fix the Windows regressions from #959. The admission store applies its
+  owner and mode checks only on POSIX. The external-source store uses the
+  shared directory sync, which skips directory fsync on Windows. Admitted
+  task sessions start only in a Herdr pane, so they and their Task Inbox and
+  operator diff consumers are POSIX-only. On Windows, session start fails
+  closed with `herdr_endpoint_platform_unsupported`. (#968, #967)
+- Split the Codex credential copy cleanup test into one test per scenario.
+  The six fixtures in one test passed the 60 s limit on loaded CI runners.
+  (#971, #970)
+
+### Documentation
+
+- Refresh generated architecture outputs through the archctx rolling writer
+  for main `c21aa3079` (#887), main `bbf18043e`, with the observed major
+  change that the owner accepted (#895, #898), and main `f7f502792` (#966).
+- Add layered, process and namespace topology views with 22 remarks. Each
+  remark has a tracking issue, #901 to #922. (#900)
+- Separate current architecture authority from historical views.
+  (#950, #948)
+- Add rules for boundary validation and test authority to the global
+  working rules and the root agent context. (#896)
+- Add CI cost guidance for diff-sized PR checks. (#897)
+- Record the 0.24.1 publication (#889) and the 0.24.2 release holds
+  (#954, #958).
+- Fix 11 stale code citations in the architecture module docs. Delete two
+  archctx manifest keys that archctx does not enforce: `content.practices`
+  and `review.failOn`. `.archcontext/policies/review.yaml` stays the review
+  policy source. (#964)
+
+## [0.24.1] - 2026-10-23
+
+0.24.1 is the first npm release after 0.23.1. v0.24.0 exists only as a Git
+tag and a GitHub Release; npm never published it. If you upgrade from 0.23.1,
+also read [0.24.0](#0240---2026-10-21) and do its upgrade steps. That section
+has the archctx daemon upgrade, the report-language step for legacy global
+rules and the breaking removals in #834. This release fixes the evidence log
+and the attempt ledger after a torn write, and ships the architecture rolling
+writer as a repo-harness command.
+
+### Changed
+
+- The architecture rolling writer accepts proven observed major changes. The
+  merge of its rolling PR is the acceptance. archctx still declines an
+  unprovable change with `unprovable-required-flow`, and the run then needs a
+  model PR. This replaces the #864 rule "No automatic major-change
+  acceptance". (#879, #871)
+
+### Fixed
+
+- Ship the rolling writer as `repo-harness architecture-projection publish
+  <status|once|follow>`. It runs archctx in the git top level of the current
+  directory. Before, the writer ran archctx in the package root, so a global
+  install could not publish for a downstream repo. The source-repo script
+  `bun run architecture:writer` is removed with no alias. It is not a
+  breaking change: the script was never a CLI command, MCP tool or JSON field,
+  and no npm release had it. (#884, #873)
+- Name repo-harness commands in the declined major-change hint of
+  `architecture-projection apply|adopt` and in the PR architecture advisory.
+  A global install has no `archctx` on PATH. The hint now prints
+  `repo-harness architecture-debt --json`. (#878, #875)
+- Refuse an evidence log append when the log ends with an unterminated
+  record. Recovery reads mark that record as corrupt and quarantine its exact
+  text. Attested import reports `unterminated_log_tail`. A recovery read, for
+  example `repo-harness run decision-trail render`, repairs the log. (#863,
+  #862)
+- Refuse an evidence log append when any record does not parse, not only the
+  last one. Before, the next read dropped the acknowledged append. The tail
+  repair now truncates at the exact byte offset and keeps the raw removed
+  bytes. Attested import reports `corrupt_log_tail`. (#883, #880)
+- Refuse an attempt ledger append onto a torn last line. A final line without
+  `"\n"` now reads as `unreadable`. The new `repo-harness state attempt-repair
+  --json` moves the torn bytes to `attempts.torn-<ms>` and truncates the
+  ledger to its last complete receipt. (#882, #881)
+
+### Documentation
+
+- Refresh generated architecture outputs for main `3a2124341` through the
+  archctx rolling writer. This is the first rolling PR after the writer
+  started to run as a service. (#886, #871)
+- Keep the rolling writer checkout and `ARCHCONTEXT_STATE_DIR` in one stable
+  path that survives a reboot. The guidance no longer puts them under
+  `/tmp/`, which the OS can clear.
+
+## [0.24.0] - 2026-10-21
+
+This minor release includes the archctx 0.9.1 upgrade, hook and task plane
+changes, Clef shadow records (#860), and setup CI scope (#854). It expands
+the unpublished #847 and #865 preparation with work merged through #874.
+It has breaking removals in #834. Run `repo-harness update` after the upgrade.
+For legacy global rules without a recorded language, run
+`repo-harness update --report-language <x>` once.
+
+### Upgrade
+
+- `repo-harness update` does not replace a running archctx background daemon.
+  The daemon stays on the old version until you authorize `daemon upgrade`.
+- When the daemon version does not match, `update` still exits 0 and keeps
+  the verified packages. The update output shows "Daemon readiness pending;
+  verified packages retained." with the version difference, the
+  authorization reminder and `action: upgrade-archctx-runtime`. This text is
+  in the successful `reconcile installed candidate runtime` step on stdout.
+  It is not on the stderr of `update`.
+- Until the upgrade, `repo-harness architecture-projection status --json`
+  in an adopted repository shows `mismatch` in `projectionProvider.state`
+  and `daemonRuntime.state`, and `next` is `upgrade-archctx-runtime`.
+- To finish, tell the agent that it can run `daemon upgrade` through the
+  managed package-local archctx and its Node runtime. A global install has no
+  `archctx` on PATH. The upgrade replaces the shared daemon and interrupts
+  other clients. Then the agent verifies the daemon status and checks this
+  repository's CodeGraph index. It asks again before a rebuild, and only when
+  the index is missing or stale.
+
+### Added
+
+- Add the `repo-harness-setup` ci-scope mode. It sets up impact-scoped PR CI
+  in a target repo: family owners select platform jobs, an owner drift test
+  checks the workflow, and only an exact-SHA dispatch on an allowlisted release
+  ref runs the complete matrix. Repository settings stay with the user. (#854)
+- Add Clef shadow records and blind Bot labels for Herdr pane status events.
+  Shadow mode records observations without taking control of dispatch.
+  The default stays off. (#860)
+- Add the `repo-harness-herdr-portal` Skill for the Claude host in the `full`
+  profile. On explicit invoke, it starts or reuses a named Claude CLI worker
+  in a visible Herdr pane. Task traffic then uses Claude Code messaging.
+  Codex placements do not change. (#869)
+
+### Changed
+
+- Upgrade `archctx` and `archctx-contracts` from 0.8.1 to exact 0.9.1.
+  Complete the R3 single-writer cutover: the archctx rolling writer owns
+  generated architecture regions and the projection manifest. Feature PRs
+  change the model and human prose. Refresh the clean-room evidence and
+  current version labels. CodeGraph stays at 1.6.2. (#846, #864, #736)
+- Replace owed hook text with one architecture debt notice at SessionStart,
+  Claude Stop and Codex UserPromptSubmit. Include worker sessions. Use archctx
+  checkpoint for changed owned paths with a 3 s deadline. Share id-based
+  dedupe and a three-item, 800-byte limit. Keep Claude human messages and
+  silent Codex Stop. Keep full dependency and flow debt in CI. (#837, #737)
+- Retire the task contract, publication and Sprint lifecycle writers. Remove
+  Fleet feedback repair mutations, lease writers and archived acceptance.
+  Keep provider observation, historical readers and worktree deletion guards.
+  Removed CLI commands, MCP tools and JSON fields are breaking changes.
+  Retention removes expired tracked archive records; Git history keeps them.
+  (#834, #773)
+
+### Fixed
+
+- Name a repo-harness command in architecture debt notice rows. A global
+  install has no `archctx` on PATH. A stale-anchor row now prints
+  `repo-harness architecture-projection anchors --json`. Other archctx
+  actions print `repo-harness architecture-debt --json`. (#874)
+- Give the first Windows Job controller response in the daily MCP path
+  matrix a 30 s deadline. A cold `powershell.exe` start took up to 13.9 s.
+  Warm steps keep 15 s. Product code does not change. (#870, #867)
+- Preserve literal custom reporting instructions during managed global rule
+  updates. (#843)
+- Repair Waza install receipts when upstream bytes already match the local
+  files. (#845)
+- Make an inactive architecture loop visible in hooks. Report missing setup,
+  registry unowned paths and notice failures with separate status dedupe.
+  (#852, #850)
+- State the edit guard limit and report Bash changes under `_ops/` and `_ref/`
+  at Stop. Persist an empty baseline so the first new file is visible.
+  (#853, #851)
+- Scope unowned notice paths to the branch changes. Report when Git does not
+  ignore the harness state directory. (#855)
+- Guard literal Bash writes and protected Git paths. Keep quoted examples,
+  file descriptor redirects and heredoc boundaries distinct. (#861)
+- Keep proven absolute launcher targets rooted when child CWD is unknown.
+  This removes false CI test selections from suffix collisions. The replay
+  code median is 225; the target of 200 remains unmet. (#841, #761)
+- Install cancellation handlers before bounded verifier startup. Register
+  child listeners immediately after spawn. Preserve result files and process
+  cleanup for startup SIGINT, SIGTERM and SIGHUP. (#840, #839)
+- Refresh managed global working rules during update. Preserve user sections
+  outside the managed block. Report legacy or unrecorded files that need an
+  explicit report language. (#830, #829)
+- Report owed capabilities on clean main from the last projection boundary.
+  Keep risk inputs separate from historical owed paths. #837 later replaces
+  this in-session owed notice with architecture debt notices. (#825, #803)
+- Fetch the four Waza shared rules from upstream before host writes. Share
+  the upstream source with drift checks. Preserve host edits and track
+  managed copies with install receipts. (#827, #822)
+
+### Documentation
+
+- Refresh generated architecture outputs for main `eea1f1d26` through the
+  archctx rolling writer. This clears the daily architecture freshness
+  failure. (#872, #866)
+- Refresh architecture source stamps and daily freshness evidence.
+  (#849, #859, #856)
+- Add a UI rule against extra helper text. (#857)
+- Record the Cloudflare Clef decision layer plan, starting with pane status.
+  (#858)
+- Assign the remaining 27 unowned paths and clear the last model drift.
+  (#838, #824)
+- Correct remaining architecture citations and selectors. (#836, #824)
+- Add claude-quickstarts as a recommended agent reference. (#835)
+- Reduce architecture model drift on main. (#833, #824)
+- Refresh architecture projection source stamps. (#832, #831)
+- Record the verified 0.23.1 npm and GitHub publication. (#828)
+
+## [0.23.1] - 2026-10-17
+
+This release has breaking changes. It retires the in-repo task plane: the
+GitHub issue and pull request are the only task, claim, status and dependency
+authority. After the update, run `repo-harness update`. Remove the `engineer`
+and `pm` profiles from any `mcp.local.json`.
+
+### Breaking
+
+- Remove the PM and task-acquisition surface: the `pm`, `engineer` and
+  `delegation` CLI commands, `fleet offers` and `fleet acquire`,
+  `sprint graph|migrate-schema|identify|claim|bind|write-claim-token|steal`,
+  `mcp pm-preflight`, `run new-sprint`, `run contract-run` and
+  `sprint-backlog init|start-task`. Remove the `fleet_offers`, `fleet_acquire`
+  and `engineer_*` MCP tools and the `engineer` and `pm` MCP profiles. A server
+  whose `mcp.local.json` names one of these profiles fails at startup.
+  `assets/hermes` is removed. PM and Bot dispatch are not rebuilt. (#773, #820)
+- Remove the stateless Engineer stores: work demand, interface change, task
+  freeze, module messages and inbox, and verified context, with the
+  `interface-change` and `verified-context` commands, `engineer message` and
+  seven MCP tools. The operator console and Dev Activity no longer show the
+  verified-context Decision source. Profiles drop `cross_capability_change`;
+  existing Bindings with the old contract revision become stale, and a
+  downstream Profile that still has the field fails validation. (#773, #807)
+- Effective State JSON drops `contract`, `task_profile`, `allowed_paths`,
+  `review`, `external_acceptance`, `verification`, `checks`, `readiness`,
+  `active_sprint` and `evidence_revision`. The continuation routes
+  `advance_sprint` and `complete` are removed. The policy and the init
+  templates drop `contracts_dir` and the `sprints.rule` text. `actions.steal`
+  leaves the board and hook-slice JSON. `UserPromptSubmit.inbox` prints
+  nothing. (#770, #820)
+- Architecture model readers read only through `archctx export native`. The
+  local YAML reader, the markdown section parsers and the node-kind enum are
+  removed. The standalone capability-resolver helper refuses commands under
+  `capability_source: archcontext`. `validate --format json` exits 2 for a model
+  that archctx accepts and repo-harness rejects. (#739, #797, #800, #801)
+
+### Added
+
+- `repo-harness catch-up` prints one read-only brief of every registered
+  repository and what needs you. (#813, #817)
+- `repo-harness run decision-trail record` appends a decision to the evidence
+  ledger. The checkpoint and the handoff show the latest decisions. (#812, #819)
+- Docs: the catch-up reply contract, the parked-gate rule, the issue pipeline
+  stage contract and review depth by diff risk tier. (#811, #815, #816, #821)
+- Sub-agent spawns on Claude and Codex receive the repo-local standing-orders
+  register `.ai/harness/standing-orders.md`, capped at 1500 bytes. The
+  delegation brief lists its full field set. (#814, #818)
+
+### Changed
+
+- `repo-harness init` is the only writer of downstream root context. The
+  partials assembler and the shell brain scripts are removed;
+  `repo-harness brain` is the only brain export. (#772, #791)
+- The PR affected-test selection keeps every consumer that it cannot prove
+  absent. Every removed consumer edge is classified with a source citation.
+  The median selection rises from 230 to 241 test files. (#761, #805)
+- The edit guard skips ownership resolution for changed paths, and hooks reuse
+  the porcelain parser. (#766, #795, #796)
+- The managed global rules limit a Herdr tab to 3 side-by-side panes. (#799)
+- The `[ArchitectureOwed]` notice now also shows a person one sentence at
+  SessionStart and on the first Stop for a branch. Codex output is unchanged.
+  (#802, #808)
+- The daily CI job now runs the expensive real pack/install benchmark cases in `tests/harness-benchmark-matrix.test.ts`. (#794)
+- `archctx` and `archctx-contracts` are now 0.8.1. The pre-edit hook and
+  `state resolve` now report `capability_registry:invalid` for a node that
+  breaks the node schema, and for an `archcontext` capability source without
+  `.archcontext/manifest.yaml`. archctx task commands refuse a CodeGraph index
+  that another version built; rebuild the index once. (#823)
+
+### Fixed
+
+- The `release` lane builds `dist/` before the benchmark cases. The benchmark
+  artifact packs with `--ignore-scripts`, so a checkout without `dist/` failed
+  at the `repo-harness-hook` bin.
+- The bundled hook entry no longer crashes at start after the task-plane
+  deletions changed the Bun bundle initialization order. (#820)
+- Shipped guidance no longer shows a bare `archctx` command. (#806)
+- `repo-harness architecture-debt` reads `archctx doctor` code facts first.
+  When CodeGraph facts are not ready it fails with
+  `RH_ARCHCTX_CODE_FACTS_NOT_READY` and names the fix command. (#804, #809)
+- The tarball smoke runs the retained coding OAuth E2E test against the
+  installed package. The removed engineer OAuth E2E made `check:release` fail.
+
+## [0.23.0] - 2026-10-17
+
+This release has breaking changes. After the update, run `repo-harness update`,
+reinstall the hook adapters, and review the Codex hooks with `/hooks`.
+
+### Breaking
+
+- The `repo-harness task-agent` CLI, the native Herdr TUI start path and the
+  `run_agent_goal` MCP tool are removed. The `--enable-dev-runner`,
+  `--dev-runner-agents` and `--dev-runner-timeout-ms` flags and the
+  `devMode`, `agentRunner`, `codexRunner`, `allowedAgents` and
+  `runnerTimeoutMs` policy fields are gone. Cross-model peers run in Herdr
+  panes through the herdr skill. The `orchestrator` MCP profile denies all
+  tools. (#771, #792)
+- `repo-harness state owed` is removed. Use `repo-harness architecture-debt
+  --json` for architecture debt. The SessionStart owed section names
+  `repo-harness state resolve --json` as its source. (#735, #784)
+- Remove the collaboration commands, Engineer collaboration tools and pipeline
+  observer. `/api/v1/pipelines` now returns 404. Herdr v2 runtime config files
+  must remove `bindings_path` and `pipeline_snapshot`, even when both are null.
+  Startup rejects either key and names both keys in the repair error. Native v2
+  config files keep their shape. Manifest-based task badge binding is removed.
+  Herdr observations remain unbound. See [runtime status](kanban-runtime-status.md). (#769, #785)
+- Advance the dev-activity response to `repo-harness.dev-activity.v2`. Remove
+  ledger facts, task-level agent bindings and ledger-derived attention. Old
+  snapshots fail closed. Update clients with the server. Git, GitHub, Human
+  Decision and runtime source-health observations remain. (#769, #785)
+- Managed hook blocks now run before user blocks for each event. (#742)
+  After the update, start interactive `codex`, enter `/hooks` and review the hooks. (#766)
+- Codex no longer installs `UserPromptSubmit.delegation`. No hook answers
+  `/delegate` or `/parallel`. The `delegation.rule` and
+  `delegation.runner_rule` policy keys are removed from the policy template
+  and from this repository policy. Codex installs 5 routes. The minimal
+  profile no longer lists `PostToolUse.bash`. (#766)
+- Pi support is removed. The Pi extension (`src/pi/`), the
+  `PostToolUse.bash` route, `command-observed.ts` and the `repair` circuit
+  kind are gone. `HOOK_HOST` accepts only `claude` and `codex`. A circuit
+  state file with a `repair` entry fails closed. Run
+  `repo-harness run evidence-gc --repo <path>` once to remove it. (#766)
+- The package no longer declares a Pi package (`package.json` `pi`) or the
+  optional `@earendil-works/pi-coding-agent` peer. `check:pi-package`,
+  `sync:pi-package`, `scripts/sync-pi-package.ts` and
+  `scripts/check-pi-package-smoke.ts` are gone. (#766)
+- Hook install and uninstall now accept only `--location global`.
+  `--location local` exits with code 2 before configuration reads or writes.
+  The installer no longer writes project-level Claude adapters. (#698)
+- Downstream contract change: the shell operator library is gone. The package
+  no longer ships `assets/hooks/` or `workflow-state.sh`, and the
+  `repo-harness hook-lib path` command is removed. Helpers no longer source a
+  library, and nothing sets or reads `REPO_HARNESS_WORKFLOW_STATE_LIB`. Change
+  any script that sources `$(repo-harness hook-lib path)` to
+  `repo-harness run <helper>`. `repo-harness doctor` and `repo-harness upgrade`
+  still report an old `.ai/hooks/lib/workflow-state.sh` copy and keep its
+  bytes. The same release removes `PostToolUse.edit`, `PostToolUse.always`,
+  `UserPromptSubmit.default` and `SubagentStop.quality`, with their handlers.
+  `PreToolUse.subagent` stays on Claude only, with the verified `Agent`
+  matcher. Claude installs 5 routes. `repo-harness hook` and the managed full-CLI fallback are
+  removed. Managed commands skip non-opt-in repositories and require
+  `repo-harness-hook` on PATH for opted-in repositories. All managed entries
+  use 30 seconds, including Stop. Update the package and
+  reinstall hooks once; trust the new Codex tuples once. Old adapters get
+  exit 2 for removed or unsupported host routes until reinstall. Doctor reports projection
+  mismatch and a missing hook bin. Keep the package and adapters on the same
+  release (#680). Publication-command architecture and `[PostBash]` advisories
+  are no longer delivered. Claude and Codex still get owed context at
+  SessionStart; Claude also gets it at Stop. (#696, #705)
+- `prepare-handoff` runs only `recovery-view-cli.ts`, for both the write and
+  `--status`. It no longer appends `handoff_refresh` events to
+  `.ai/harness/events.jsonl` or writes run summaries under
+  `.ai/harness/runs/`; no code read them. A transient plan slug
+  (`think-plan-*`, `codex-plan-*`, `approved-plan-*`) now names the contract,
+  review and notes of the plan title, as Effective State does. The review and
+  notes paths honor `tasks.reviews_dir` and `tasks.notes_dir`. A marker that
+  another worktree owns names no active plan, as Stop does. (#696)
+- One reader, `resolveHarnessPaths`, resolves the policy paths for handoff,
+  resume, runs, context map, todo, reviews and notes. A policy path outside
+  its root now fails closed. Before, the recovery views silently used the
+  default. On Stop the failure is a non-blocking diagnostic. (#696)
+- `prepare-handoff` and `summarize-failures` need Bun. The node fallback of
+  `summarize-failures` is removed. It reads the same `FAILURE_LOG_FILE` that
+  the edit guard writes. (#696)
+- `contract-worktree.sh` loses its scope check, which had no caller since the
+  gate audit (#483) made contract scope record-only. (#696)
+- The edit guard fails closed. A crash in `PreToolUse.edit` now exits 2 on
+  Claude and Codex and returns `decision: block` on Pi. Other routes keep
+  exit 1 for a crash. (#691)
+- `repo-harness-hook` requires `HOOK_HOST`. A missing host, a malformed
+  payload and a route that is not installed for the host now stop before a
+  handler runs. A host that does not support a current route gets exit 2 with
+  `unsupported-host-route`. (#691)
+- Hook identity comes only from the payload `session_id`, `run_id` and
+  `turn_id`. Handlers no longer read `HOOK_SESSION_ID`, `HOOK_RUN_ID`,
+  `CLAUDE_*` or `CODEX_*` session, run or turn variables, `SESSION_KEY`,
+  `PROMPT`, `CLAUDE_FILE_PATH` or `HOOK_TOOL_NAME`. (#691)
+- Hook telemetry moves to `loop-engine-hook-event/v2`. A record has the
+  identity, `exit_code`, `blocked`, `reason`, `elapsed_ms` and
+  `fingerprint`. It has no step, metric, measurement or effect observation
+  fields. A policy block and a crash have different reasons. (#691)
+- The `review-subject`, `review-rubric`, `prompt-guard-decide`,
+  `prompt-route`, `minimal-change` and `circuit-breaker-record` hook
+  subcommands are removed. (#691)
+- `PreToolUse.edit` keeps only the path checks that block: repository scope,
+  `_ref/`, `_ops/` and a parseable `apply_patch` target. A new
+  `EditScopeGuard` blocks an `Edit` or `Write` call that has no
+  `tool_input.file_path`. The guard no longer resolves state, checks the task
+  lease, runs a circuit breaker or prints advisories. It no longer reads the
+  `harness.failure_log_file` override and always writes
+  `.ai/harness/failures/latest.jsonl`. (#692)
+- A `minimal_change.mode` other than `off` or `advice` now fails policy
+  validation, so state resolution fails until the operator sets `advice` or
+  `off`. The mode `enforce` is retired. No code reads the `minimal_change`
+  policy, so Stop never blocks on a minimal-change finding. The block now has
+  only the `mode` key. This repository uses `mode: "advice"`. (#692, #695)
+- The unread `delegation` keys `max_agents`, `strict_max_agents`, `max_depth`,
+  `allow_parallel_writers` and `preferred_runners` are removed from the policy
+  template and from this repository policy. The delegation advisor keeps its
+  caps in code.
+- The circuit breaker keeps the `repair` and `semantic-review` kinds only. A
+  `.ai/harness/state/circuit-breaker.json` with protocol 1 or a retired kind
+  (`guard`, `review`, `subagent`, `cross-model-consult` or `minimal-change`)
+  fails closed. Run `repo-harness run evidence-gc --repo <path>` (or
+  `bun scripts/evidence-gc.ts --repo <path>` in the source checkout) once after the upgrade. The
+  cleanup ships for one release. (#692, #694)
+- Claude and Codex send no exit status in a Bash payload. `PostToolUse.bash`
+  now records no status for them and does not feed the repair circuit.
+  RepairLimit works only on Pi. Before, a missing status counted as exit 0.
+  (#695)
+- Stop is silent on every host. The one exception is the Claude
+  owed-architecture line, once per branch and owed set. Stop no longer prints
+  `[StopReadiness]`, `[ReadinessGate]` or minimal-change lines. (#695)
+- No hook mints a run id. `.ai/harness/state/session-run-identity.json` is no
+  longer written. A missing payload `run_id` stays null, and the handoff shows
+  `Parent Run ID: (unresolved)`. (#693, #695)
+- `repo-harness state migrate-post-edit-journal-v1` is removed with the
+  post-edit journal. (#692)
+- `policy.delegation.state_file` is removed. The delegation advisor renders
+  `delegation.rule` and `delegation.runner_rule` word for word. Its caps are
+  fixed: 2 agents, 3 for a high-risk workflow profile, spawn depth 1. Missing
+  rule text exits 1 with the reason `delegation-policy-invalid`. (#694)
+
+### Removed
+
+- The source checkout no longer keeps a `.ai/hooks/` mirror of the hook
+  assets. `scripts/sync-hook-sources.ts`, `assets/hooks/projection.json`,
+  and the `sync:hooks` and `check:hooks` scripts are gone. Every runtime
+  path already read `assets/hooks/lib/`. The package no longer ships
+  `projection.json`. (#696)
+- 65 shell functions in `assets/hooks/lib/workflow-state.sh` had no
+  shipped caller. They are deleted. The 34 functions that
+  `summarize-failures`, `prepare-handoff` and `contract-worktree` reach are
+  unchanged. (#696)
+- `archive-workflow.sh` and `ship-worktrees.sh` no longer require
+  `workflow-state.sh`. They never called it. (#696)
+- The post-edit journal is gone: `mutation-observed.ts`, the minimal-change
+  signal, CLI, policy and context modules, the SessionStart pending section,
+  and the Stop journal pass and minimal-change review. (#692)
+- SessionStart no longer runs the security sentinel
+  (`REPO_HARNESS_SESSION_SECURITY_SCAN`), the tooling update advisory and its
+  detached child, the worktree backlog notice, the minimal-change text, the
+  current-status section or the `events.jsonl` rotation. The
+  `session-context-budget.json` evidence file is gone. Run
+  `repo-harness security scan --json` and
+  `repo-harness setup check --check-updates --json` when a task needs them.
+  (#693)
+- `prompt-intents.ts`, the prompt word lists and the active-task branch are
+  gone. The prompt handler no longer classifies intent, checks contracts or
+  receipts, or routes to `/think`. (#694)
+- `delegation-state.ts` is gone, with `.ai/harness/delegation/latest.json` and
+  `.ai/harness/delegation/turns/`. SubagentStart no longer records a circuit
+  attempt. `.ai/harness/delegation/` keeps the native-role evidence and
+  `subagent-stop-quality.json`. (#694)
+- Stop no longer appends `handoff_refresh` to `events.jsonl`, writes or sweeps
+  run summaries, resolves state, or runs under a 140-second deadline.
+  `src/core/hook-work-budget.ts` is deleted. The handoff and resume views have
+  no "## Commands Run" section. (#695)
+- `post-bash-importer.ts`, `.ai/harness/checks/post-bash-latest.json`, the
+  `.ai/harness/runs/bash-output/` capture, the observed ledger events and the
+  rtk, broad-command and verbosity classifiers are gone. (#695)
+- `trace-observer.ts` and AnnotationGuard are gone. Hooks no longer write
+  `.claude/.trace.jsonl`, `.claude/.session-id` or `.claude/.codegraph-state/`.
+  The workflow contract and the gitignore template no longer list them. (#695)
+- After the upgrade, nothing reads these local files. Operators can delete
+  them: `.claude/.trace.jsonl`, `.claude/.session-id`,
+  `.claude/.codegraph-state/`, `.ai/harness/checks/post-bash-latest.json`,
+  `.ai/harness/runs/bash-output/`, `.ai/harness/delegation/latest.json`,
+  `.ai/harness/delegation/turns/`,
+  `.ai/harness/state/session-run-identity.json` and
+  `.ai/harness/state/session-context-budget.json`. (#692, #693, #694, #695)
+
+### Changed
+
+- `bun run check:release` runs only the test files that hold
+  `REPO_HARNESS_TEST_EXPENSIVE` cases and the tarball smoke. It no longer runs
+  typecheck, governance or the full suite, so a release needs green CI on the
+  release commit. The tarball smoke uses a temporary `HOME`. A failed CI job
+  reuses one open repair issue per job name. (#767)
+- The generated functional-block `AGENTS.md` and `CLAUDE.md` record only
+  ownership, entrypoints and local verification commands. The Herdr Dispatch
+  rule moved out of `external-tooling.md`. Boilerplate agent-context files
+  and unused reference documents are deleted. (#768)
+- SessionStart no longer injects the resume file or the active sprint.
+  `[HarnessState]` points to both with `references.resume` and
+  `references.sprint`. The commit confirm of a state resolution reuses the Git
+  review subject of the confirmed pass, and the review subject skips Git diffs
+  that are empty by identity. One idle resolution runs 7 `git` processes
+  instead of 19. (#770)
+- Every hook handler returns a typed result. One host table renders it for
+  Claude, Codex and Pi. Prompt advice now reaches Codex as
+  `additionalContext`. (#691)
+- A managed hook call uses `HOOK_REPO_ROOT` as the root and runs one git
+  process at most to resolve it. Effective State is resolved at most once
+  per event with one retry policy. (#691)
+- `assets/reference-configs/hook-operations.md` holds the one route table.
+  It has 12 routes and a Host column. The five READMEs and
+  `docs/architecture/global-hook-runtime.md` link to it. (#696)
+- `bun run test:files` builds `dist/hook-entry.js` before it runs a test file
+  that spawns it, such as `tests/pi-extension.test.ts`. Other selections do
+  not build. (#696)
+- SessionStart is one read-mostly handler. `[HarnessState]`, or
+  `[HarnessStateUnavailable]`, comes first and always. The optional sections
+  follow by priority: `architecture-owed`, `pending-plan-capture`,
+  `active-sprint` and `resume`. A provider that throws becomes one
+  `[SessionContextProviderFailed] <id>` line. The 1,500-token budget keeps the
+  mandatory sections and turns an overflow section into a
+  `[ContextRef:<id>] <source>` pointer. (#693)
+- The managed worktree sweep moves from SessionStart to
+  `contract-worktree start`. It runs under the topology lock and never blocks
+  start. `ship-worktrees --cleanup-merged` stays the manual path. SessionStart
+  prints no `[WorktreeSweep]` line. (#693)
+- The three subagent routes have one handler each: `return-channel`,
+  `delegation-advisor` and `subagent-context`. The runtime checks the host. (#694)
+- Stop renders `handoff.md` and `resume.md` from `recovery-materializer` and
+  publishes the evidence checkpoint. Pi gives Stop 30 seconds. The recovery
+  helper in `assets/templates/helpers/` is a generated projection; the hand
+  copy is gone. (#695)
+- `scripts/evidence-gc.ts` adds two one-release cleanups. It deletes the old
+  Stop run summaries by their shape and removes retired circuit-breaker state.
+  Both cleanups go away in the next release. (#692, #695)
+- No hook appends to or rotates `.ai/harness/events.jsonl`. Only
+  `prepare-handoff` still appends to it. (#693, #695)
+
+### Fixed
+
+- `sprint-backlog.sh`, `contract-worktree.sh` and `ship-worktrees.sh` run the
+  source CLI only when the root `package.json` names `repo-harness`. A
+  downstream repository with its own `src/cli/index.ts` now uses the global
+  CLI. (#767)
+- `minimal-change-hooks.md` no longer describes hooks that no code runs. It
+  says that no hook reads the `minimal_change` policy and that only `off` and
+  `advice` are valid modes. (#692, #696)
+- SessionStart shows the resume section when the resume file has content.
+  Before, it depended on Bash telemetry that filled the evidence ledger.
+  (#693, #695)
+- A SessionStart payload over the budget no longer drops all session
+  providers at once. Each section that does not fit becomes a pointer to its
+  source. (#693)
+- The Bash observer can no longer write a raw output log outside the
+  repository through a `harness.runs_dir` value with `..`. The capture is
+  gone. (#695)
+
+### Added
+
+- `repo-harness architecture-debt --json [--base <ref>]` reports the
+  architecture debt that archctx 0.8.0 `complete` finds. With `--base`, it also
+  measures the base in a temporary checkout and reports the items that HEAD
+  adds and the ids that it resolves. The PR architecture lane uses it and
+  stays advisory. The projection manifest declares the renderer floor
+  `archcontext.docs-renderer/v6`. (#735, #784)
+- `repo-harness retention` moves closed artifacts older than 30 days to a
+  gitignored local archive root. It is a dry run unless `--apply` is given,
+  and it never deletes. Closed plans stay committed for the window, which
+  counts from their last commit. After the window, they move out and leave
+  Git; the operator commits the removal. Closed task records, check logs and
+  run records that no code reads back (verification failure logs, heartbeat
+  triage snapshots and finished `contract-run-*` directories) move only when
+  no file in them is tracked. Plans with uncommitted changes and the `keep`
+  list are skipped. `information_lifecycle.retention` in
+  `.ai/harness/policy.json` overrides the window, the archive root and the
+  `keep` list. The harness overview documents the ignore patterns for task
+  records and run evidence; `plans/` stays tracked. (#697)
+
+## [0.22.1] - 2026-10-13
+
+0.22.0 was tagged but not published to npm. 0.22.1 contains all of 0.22.0
+and the changes below.
+
+### Added
+
+- `repo-harness review round --launch app-terminal` runs acceptance review
+  in the Claude desktop app without Herdr. The first call returns the exact
+  OAR host command and sends no request. Claude runs the command once in an
+  app Terminal tab. The next call binds the host by its claim, process
+  identity and exact argv, then sends the round. The OAR host, the Seatbelt
+  profile and the Receipt do not change. (#657)
+
+### Breaking
+
+- The Pi host extension now requires Pi `1.2.0` exactly. Pi `1.1.0` fails
+  with `PI_HOOK_UNSUPPORTED_VERSION`. Upgrade Pi to `1.2.0` with the
+  package. A Pi run started by a custom message gets its own run ID and
+  Stop check. It is not a `UserPromptSubmit`. (#683)
+
+### Changed
+
+- Pin `archctx` and `archctx-contracts` to exact version `0.7.2`. A busy
+  archctx daemon now keeps its connection file after a timed-out health
+  check. The CLI then fails with `AC_RUNTIME_UNAVAILABLE` and names the
+  daemon pid. The contract schemas do not change. (#659)
+
+### Fixed
+
+- Merge-gate provider reads use the shared trusted host `gh` resolver. An
+  empty CLI review decision is normalized to null. The standard native
+  Windows `gh.exe` installation is supported. (#654)
+- A lock acquire retries the single-owner election after a slow
+  stale-owner reclaim, so a free lock is no longer reported as a timeout.
+  (#656)
+- Sprint lease reconcile no longer keeps the lease token file because of a
+  `printf | grep -q` SIGPIPE race under `pipefail`. (#661)
+- The Pi hook bridge classifies a hook result after the child exits. A
+  child that closes stdin early no longer changes the error code. Every
+  rejection after the child starts includes the bounded child stderr.
+  (#673)
+
+## [0.22.0] - 2026-10-13
+
+### Changed
+
+- **Breaking:** repo-harness supplies tools and evidence, and the Bot
+  schedules work. The projection job queue, the hook architecture cascade
+  and the in-CLI automation scheduler are removed. Global
+  `projection_apply` accepts only `manual` or `disabled`.
+  `projection_failure_gate` is removed. `update` and `init` migrate a
+  retired section once (`automatic` becomes `manual`); readers refuse it
+  until then. (#617)
+- Pin `archctx` and `archctx-contracts` to exact version `0.7.1`. The
+  architecture docs use renderer `archcontext.docs-renderer/v5` and
+  projection manifest v2. Manifest provenance records only the CodeGraph
+  package and version. Module pages show component entrypoints, sizes and
+  outbound relations. Mermaid labels keep the model text. Path ownership
+  uses the archctx parent-chain rule. (#629, #647)
+- Use Bun 1.4.3 in CI and in the Bun type definitions. (#620)
+- A PR runs typecheck and affected tests once. The full suite runs once a
+  day on `main`. (#625)
+- Implementation sub-agents do not run checks. The parent agent owns build,
+  typecheck, tests and integration. Committing workers use separate
+  worktrees. Evidence roles run their named check and do not commit.
+  (#626, #638)
+- SessionStart host configuration scans need explicit per-session scope.
+  Findings contain no repeat-scan command. (#642)
+- The daily governance lane and `check:release` run the read-only
+  architecture projection check. A result other than `noop` fails the lane,
+  and the daily CI report opens a repair issue. The worker and Bot guidance
+  build CodeGraph code facts first. (#648)
+- Under `capability_source: archcontext`, ArchContext is the only path
+  ownership authority. The resolver and the pre-edit hook call
+  `archctx resolve --paths-from` in one batch. Node `source.exclude` and glob
+  includes are accepted. An archctx failure fails closed with the
+  `capability_registry:invalid` blocker. Registry mode keeps longest-prefix
+  matching. (#649)
+- The architecture model owns directories with globs and excludes instead
+  of explicit file lists. Each of the 45 multiply-owned files now has one
+  owner. (#653)
+
+### Added
+
+- Rebuild the operator console on Kumo with a development progress board.
+  Add read-only Agents, Skills and Hooks pages. (#609, #611)
+- Read back a saved worker request after a lost response. The read path
+  never resends a request or starts a worker. (#610)
+- Add the `windows-python-first` Skill to the `minimal` and `full`
+  profiles. It applies only on native Windows. (#614)
+- Document the product architecture: one overview and one page for each of
+  37 capabilities in 6 domains. (#632)
+- Tell the Bot when to read architecture evidence: after a worker reports
+  `done` with source changes, and before review. Scan added and renamed
+  paths for ownership first, then run the projection check. (#635)
+
+### Fixed
+
+- A second accepted major change in one workspace is no longer refused with
+  `AC_PROJECTION_APPLY_COMMITTED`. Each accepted change gets its own
+  request id. (#634)
+- `update` runs the leftover check in the package that owns the runtime. An
+  older running CLI no longer fails on a newer skill catalog. (#628)
+- The macOS pipeline ledger identifies local filesystems by name, not by
+  `statfs` index. Local APFS and HFS+ volumes are accepted. (#621)
+- PM HTTP effects are fenced after disable. Accepted delivery receipts are
+  kept after a guard denial. Public errors are redacted. (#619)
+- Development activity sends SIGTERM on timeout, masks absolute paths and
+  marks a truncated PR list as partial. (#623)
+- Setup snapshot composition moves into the CLI layer. The state boundary
+  check passes. (#643)
+- Remove retired drift request wording from the routing corpus. (#633)
+- Stabilize timing-sensitive test fixtures. (#639, #645, #646)
+
+## [0.21.2] - 2026-10-10
+
+### Added
+
+- Add native Pi 1.1.0 host support. The Pi package provides the
+  `repo-harness` router, the `repo-harness-check` skill and an extension. In
+  opted-in repositories the extension runs typed hook checks on native
+  `edit` and `write`, direct or nested in codemode. The peer dependency is
+  pinned to exactly Pi `1.1.0`; other versions are unavailable. Hook
+  telemetry records host `pi`. (#607)
+- Show read-only Kanban runtime status from native capture sources or the
+  optional Herdr 0.9.3 / protocol 22 adapter. Codex capture needs no Python.
+  Claude and Pi capture use a bundled PTY relay that needs Python 3.9 or
+  later. PTY capture runs on macOS and Linux only. Claude lifecycle status is
+  not yet accepted. Status never advances tasks or accepts results. (#606)
+- Add default-off strategy context and proposal validation. Human-owned project
+  documents remain canonical. Context reads do not dispatch agents or edit memory.
+  The optional Skill requires an explicit install. (#599)
+- Add the export-only wake contract and explicit repository pilot. The pilot
+  keeps its 128 KiB file and 4 MiB request limits. Global limits stay at
+  64 KiB and 1 MiB. Proposals grant no execution authority. (#601)
+- Add five closed PM Bot operations: capabilities, status, dispatch,
+  follow-up and collect. They reject caller-supplied commands, paths, runtime
+  flags and permission changes. Dispatch needs operator approval for the exact
+  worker scope and runs a fixed OAR coding host in Herdr. Existing task,
+  claim, worktree and result records stay authoritative. Add a Hermes PM
+  profile adapter that exposes only these five tools. Only macOS Codex
+  workers are conditionally supported. Live Hermes configuration and a real
+  coding-provider task are not yet verified. The Hermes restriction is a tool
+  boundary, not an OS sandbox. (#608)
+- Add a scoped PM MCP server for Bot controllers. It exposes the same bounded
+  PM operations over MCP with server-owned repository and action scope. It
+  keeps task IDs, atomic claims, fencing and operation receipts. It adds no
+  shell tool, ledger, approval identity or credentials. Dot hosts, live
+  providers and event wake are not yet verified. (#615)
+
+### Changed
+
+- Upgrade OAR to `0.45.1`. (#607)
+- macOS native CI installs the pinned Herdr 0.9.3 binary and verifies its
+  checksum before Herdr-dependent tests. (#612)
+- CI pins Bun 1.4.3. (#616)
+- New task worktrees default to `/tmp/<repo>-wt-<slug>`, and MCP coding
+  workspaces default to `/tmp/repo-harness-mcp-worktrees`. Native Windows
+  uses its system temp directory instead of `/tmp`. New policies store the
+  portable value `{{system_tmp}}/{{repo}}-wt-{{slug}}`, and each host
+  resolves `{{system_tmp}}` at run time. Older repo-harness versions do not
+  understand this token. `contract-worktree` now reads the stored
+  `worktree_dir_template`, so existing downstream policies keep their value. (#600)
+- `start` refuses an existing target path. It reuses the path only when this
+  clone registers it on the expected branch, unlocked, with no other owner,
+  and it matches the identity that `start` recorded at creation. The
+  checkout directory must be yours and not group or other writable. Its
+  `.git` file and Git metadata must be yours and not other-writable. A
+  replaced directory with a copied `.git` file is refused. An older worktree
+  without that record is refused with a recovery instruction. This works
+  with umask 002 and shared Git metadata. On a platform without a user id,
+  `start` still creates worktrees but cannot reuse them. A failed
+  `git worktree add` releases only the empty path that it claimed. Removal
+  also deletes the identity record. (#600)
+- Closeout removes a merged, clean worktree and its branch through the exact
+  cleanup checks. It releases only that worktree's own marker. MCP cleanup now
+  also refuses marked worktrees and retained verification evidence. Cleanup of
+  a registered worktree whose branch is missing is refused. (#600)
+- Each SessionStart removes left-behind worktrees under the managed root that
+  are merged, clean and unowned and whose reflog shows a commit made on the
+  branch. A fast-forward, reset or rebase entry alone does not count. It keeps
+  untouched new branches, unreadable reflogs and worktrees with submodules.
+  The sweep has a time limit and reports processed paths and deferred counts.
+  The next session resumes an interrupted removal. Removal also deletes
+  Git-ignored files in that worktree. A reboot or an age-based `/tmp` cleaner
+  can remove worktrees; commit or push work first. When more worktrees are
+  missing than one sweep can handle, the sweep records them first, and later
+  sessions finish the merged branches. (#600)
+- The Herdr webhook notifier sends `done` and `blocked` notifications for a
+  registered task worktree under the system temp directory. Other temporary
+  paths stay filtered. An installed notifier that points to its own source
+  directory must be updated there. (#600)
+- `test:files` and `check-ci.sh` now run each test file in its own Bun
+  process and fail a file that leaves a new `/tmp/*-wt-*` path owned by the
+  current user. The check never deletes the path. A directory argument runs
+  only its own test files, and `--coverage` keeps one combined summary.
+  (#600)
+
+## [0.21.1] - 2026-10-08
+
+### Added
+
+- Add a read-only Architecture workspace to the operator board. It groups
+  modules by domain and shows model validity, generated summary and §3 state
+  separately. A module page shows a one-hop graph, model facts, flows, §3 text
+  and the review prompt, with a copy button for the exact Bot command. The
+  board serves three new GET/HEAD architecture routes with ETag support. (#590)
+- Add the operator capability to the architecture model. (#590)
+- Add a typed document handoff envelope, its validation and canonical
+  rendering, and a short SOP. (#587)
+
+### Changed
+
+- Pin `archctx` and `archctx-contracts` to exact version `0.6.3`.
+  Align architecture and refactor policies, init defaults, and clean-room
+  verification with these dependencies. (#586)
+- Upgrade `@botiverse/oar` from `0.18.0` to `0.37.0`. The Generic review
+  host keeps its API surface, provider defaults and Seatbelt isolation. OAR
+  now stops a provider turn within 10 seconds after an abort and cleans up
+  the provider process tree. The lockfile no longer installs the Cursor SDK.
+  (#595, #598)
+- The prompt hook boundary text now says that a main merge needs explicit
+  current-task authorization. (#596)
+- `repo-harness module review-prompt` now fails with `secret_detected` when
+  the prompt contains a URL with a filled `token`, `key`, `auth`, `code`,
+  `sig` or `signature` query field. MCP redaction uses the same patterns. (#590)
+- Operator API requests with a `Sec-Fetch-Site` value other than
+  `same-origin` or `none` now get 403. (#590)
+
+### Fixed
+
+- Restore the collaboration flow proof after a removed source symbol. The
+  architecture projection no longer reports unrelated drift. (#589)
+- Remove stale `.herdr-stage-*` and `.herdr-stage-*-backup` directories that
+  an interrupted Herdr skill install left in the host skill roots. Only old,
+  provably owned entries are removed; every removal and skip is reported.
+  (#593)
+- Find a compatible Node runtime in Homebrew versioned kegs
+  (`/opt/homebrew/opt/node@N` and `/usr/local/opt/node@N`). A host with
+  Homebrew `node` 26 and keg-only `node@24` no longer fails
+  `repo-harness init` at architecture projection readiness. (#594)
+
+## [0.21.0] - 2026-10-06
+
+### Breaking changes
+
+- `init --apply` and global runtime setup now require the release-matched
+  `herdr --skill` output. Hosts without that binary fail setup.
+  Managed skill writes preserve user edits and refuse unowned targets. (#582)
+
+- MCP `engineer_acquire` now acquires one offer from a trusted
+  `engineer_prepare` observation. It requires `idempotency_key` and
+  `observation_ref`. It no longer accepts `max_attempts`.
+  Call `engineer_prepare` first. Then call `engineer_acquire` with the
+  observation ref, one stable idempotency key, and all 13 fields of one offer
+  from that observation. The same key returns the stored result.
+- The first acquisition on a store requires the protocol 2 acquisition cutover
+  seal. A store with pre-existing receipts but no seal fails with
+  `engineer_acquisition_ledger_cutover_required`. A new empty store
+  initializes the seal itself.
+- A selected or automatic acquisition that is not an idle poll writes a
+  ledger receipt. The same key replays that stored result.
+- MCP acquisition now surfaces the typed `engineer_observation_*` and
+  `engineer_acquire_next_*` codes.
+
+### Added
+
+- Export committed architecture module facts and bounded review prompts with
+  `repo-harness module`. Reads do not run configured Git helpers. (#536)
+- Read immutable Docs graph snapshots and compute Agent-config rule and policy
+  projections. These are backend foundations. New frontend views are deferred.
+  (#579, #580)
+- Read publication health with `repo-harness pipeline health --json`.
+  Writers save publication intent before commit. A later writer or matching
+  replay can repair a failed snapshot export without repeating the mutation.
+  Unsynced-command replay, Mini setup and a real Bot pilot are deferred. (#581)
+
+- Add `repo-harness engineer acquire` to acquire one exact observed Work Package.
+  The command checks the full assertion and uses a durable transaction key.
+- Add the `claim_actor_lease_unavailable` error code. Live Claim listing now
+  refuses a receipt whose Lease state is unknown. The receipt store stays valid.
+  Operators repair the Lease, not the receipt store.
+
+### Changed
+
+- Unknown Leases now occupy a concurrency group. Only a proven-free Lease is
+  free capacity. The unknown reason is part of the concurrency revision.
+- Engineer acquisition reloads the Profile limit and counts live Claims under
+  the Engineer Binding lock before the Fleet mutation. A full Profile refuses
+  with `fleet_acquire_failed`.
+
+- Stop copying `workflow-state.sh` into consumer repositories during adoption.
+  Use `repo-harness hook-lib path` to source the installed package library.
+  Packaged workflow helpers use that library. Init and upgrade preserve legacy
+  repo copies and user edits. Doctor reports copies with migration steps.
+  Upgrade no longer refreshes the legacy library. It reports consumer copies
+  with manual migration steps. Upgrade check exits 1 while a copy remains.
+- `prepare-handoff` and `summarize-failures` now exit 1 if the workflow-state
+  library is missing. They no longer write a substitute handoff or fall back to
+  the default failure log.
+- `repo-harness run archive-workflow` and `repo-harness run summarize-failures`
+  now use the package library. Edits in a repo-local `workflow-state.sh` copy
+  no longer affect these commands.
+
+### Fixed
+
+- Save the complete review packet before launch preparation or reviewer start.
+  A failed start preserves the packet. A changed retry fails before another
+  launch and reports how to inspect the saved subject. (#578)
+- Refuse invalid principals, incomplete collaboration reads and unknown Lease
+  capacity. Protect state locks, hook ownership and observation revisions.
+  (#551, #552, #553, #554, #556, #558, #562)
+- Bind pipeline gates and architecture publication to current evidence.
+  Keep committed publication receipts available after repair. (#547, #555, #559)
+- Use revision-bound MCP codes, recoverable OAuth consent retries and one doctor
+  client. Protect adoption rollback and exact index state. (#544, #550, #564)
+- Report stale operator panes, keep disclosure focus and refresh panel state.
+  Pause Organization-only readers while another tab is active. (#568, #570)
+- Reduce repeated log, lease, inbox and runtime probes without changing their
+  source authority. (#569, #571, #572, #573)
+- Resolve Windows Git installation roots and recover midnight CI observations.
+  Run native macOS review fixtures in the required HOME-isolation job.
+  (#566, #577, #578)
+
+- Managed Draft publication no longer needs a host merge seal. The publication
+  receipt moves to protocol 3 and records PR, head, base and candidate diff
+  identity only. Merge readiness still blocks a moved base. Receipt protocols 1
+  and 2 are retired and fail closed without migration.
+- Publication reopen, takeover and abandon now check historical publication
+  identity. A target base advance no longer blocks these repair transitions.
+
+## [0.20.0] - 2026-10-05
+
+This preparation covers `v0.19.5..ffe70133`.
+Additional merged changes through `363009be` are included below.
+
+The earlier `281e6555` commit was a preparation draft; the release was cut from `0482c621`.
+`v0.20.0` is tagged on `0482c621` and was published to npm on 2026-10-05.
+
+### Added
+
+- Document a safe worktree lifecycle and a dated checkout inventory.
+  Garbage collection and migration remain unimplemented. (#480)
+
+- Persistent Herdr task-agent lifecycle and CLI commands for task-scoped execution,
+  protected result collection, and repository-scoped workspace cleanup.
+- Trusted engineer observation preparation and first-offer staleness checks.
+- Managed updates detect stale ArchContext daemons and request user authorization
+  for maintenance. Runtime verification rejects unhealthy connections; a pending
+  daemon replacement preserves the verified CLI and its dependency closure.
+
+- Add persistent domain review through `repo-harness review` and OAR.
+  Isolate macOS reviewers with Seatbelt. (#476)
+- Add Herdr notifications for a required Bot webhook and optional Slack,
+  Discord, and Telegram channels. Select `blocked` and optional `done` per channel.
+  The Kanban shows read-only plugin and delivery status. (#500, #509)
+- Add the phase 1 R1-R4 pipeline observer ledger and read-only board projection.
+  Bind observations to source evidence. Record facts without automatic dispatch,
+  merge, or cleanup. Mini deployment and live cross-machine acceptance remain
+  outside this release preparation. (#519)
+
+- Add `upgrade` to check retired project and home files without writes.
+  `--apply` backs up targets and removes only unchanged owned bytes.
+  Changed and unowned items remain in the report.
+- Show the same leftover count in setup checks and after successful updates.
+  Update does not apply cleanup.
+- Add historical fingerprints and release-byte fixtures with provenance.
+- Refresh unchanged owned skill copies and two stale project assets with apply.
+  Report old state artifacts. Require `--include-state-artifacts` and ownership
+  proof for state removal. Keep third-party plugins and user rule lines.
+
+### Changed
+
+- Require explicit Change Assessment preparation after native verification
+  and before review or acceptance. Missing or stale evidence still fails closed.
+  Empty or missing Verification Plans cannot pass. (#523)
+- Align the Herdr 0.9.3 floor, current reference commands, coding MCP tool counts,
+  and generated task-flow guidance with their owning runtime surfaces. (#521)
+
+- Keep user global hook commands that only contain a retired hook path during upgrade cleanup.
+
+- Replace the old Codex goal MCP names with task-goal commands.
+- Retire the Codex plugin review provider, App-thread execution backend, and
+  headless Claude planning surface. Codex review uses the explicit Codex provider;
+  Claude acceptance retains its persistent Herdr domain reviewer.
+
+- Publish host-invariant guidance through the reference-document reader.
+
+- Pin `@botiverse/oar` to exact version `0.18.0`. Require Node `>=24 <26`.
+  ArchContext and its contracts remain pinned to `0.6.1`. (#481, #507)
+- Keep the whole runtime checks cache directory private in Git and installed copies. Keep legacy cache bytes in place without restoring a reader.
+- Make Kanban read-only. Use CLI or MCP for task messages. (#482)
+- Split Bot decisions from worker execution. Restore P1/P2/P3 due diligence
+  and standalone host instructions. Limit plans to the requested scope.
+  Keep four operation boundaries and explicit owner approval for merge.
+  Use `gh`, `git`, or the GitHub API for GitHub operations.
+  (#483, #486, #487, #488, #489, #491, #495, #515)
+- Run the full union of core and integration tests in isolated file workers.
+  Start tests and child tools with temporary HOME and tool roots under `/tmp`.
+  Limit Herdr layouts to three panes per tab. (#504, #518, #496)
+- Deduplicate historical upgrade fixtures through verified Git blobs. Preserve
+  every release file byte, mode, path, and provenance check. (#525)
+- Record scheduler retirement guidance and OAR session resume ownership.
+  These documents do not establish live provider or deployment acceptance.
+  (#478, #479, #485)
+
+- Migrate pending post-edit journal v1 events with
+  `repo-harness state migrate-post-edit-journal-v1 --json`. Hooks keep v1 files
+  until this explicit migration runs.
+
+- Remove empty skill lifecycle hooks, `assets/skill-hooks.json`, and `scripts/run-skill-hook.ts`. Scaffold and template assembly call their tasks directly.
+- Remove `scripts/setup-plugins.sh`. Use `repo-harness install`.
+- Remove initializer question packs v2 and v3. The loader accepts v4 only.
+- Remove `state migrate-legacy-active-plan`. Repository adoption keeps its transactional marker migration.
+- Remove `engineer runtime-effect migrate-v1`. An unmigrated provider-thread V1 store stays blocked. This version has no path to unblock it. Migrate with v0.19.0 through v0.19.5 before upgrading.
+- Remove the full-disk MCP policy option. Setup still detects and disables old full-disk settings.
+- Remove init flags `--configure-codegraph`, `--brain-root`, `--brain-mode`, and `--interactive`. Remove update flags `--repo`, `--dry-run`, and `--interactive`. The CLI uses its standard unknown-option error.
+- Remove the `context-contract-sync` helper and script. Remove the no-op `capability-config --no-sync-contracts` option.
+- Remove `check-task-sync --validate-waivers-only` and `check-task-workflow --strict`. Use `check-task-workflow` for read-only diagnostics. Old downstream strict calls fail with exit 2. Adoption or init removes only the exact `repo-harness run check-task-workflow --strict` package entry. Other forms need an explicit user edit. Custom commands stay unchanged.
+
+### Fixed
+
+- Match complete historical installer hook commands during upgrade cleanup.
+  Keep user commands that only mention retired paths. Reject existing directories
+  and dangling symlinks in stage-owned-copy. Keep retained backups. (#520)
+- Check notify plugin inventory before config directory creation. Refuse invalid
+  or non-local sources. Stop foreign local ownership before link or enable.
+  Keep Herdr as the config-path authority. (#521)
+- Isolate the CI governance preflight fixture from shared-checkout context files.
+  Keep the real context scanner and the intended failure boundary. (#526)
+- Read exact legacy hashed check IDs at immutable validation and provenance
+  boundaries. Keep current plain-ID writes and all execution bindings. Historical
+  evidence does not bypass a current toolchain mismatch. (#527)
+
+- Sample the MCP working baseline after request delivery before accepting an idle
+  observation, and keep observation cancellation separate from result collection.
+- Reap owned review providers after post-spawn setup failures and preserve CLI
+  help section spacing.
+
+- Recognize owned task-session process exit states and release the automation
+  planning lock before final settlement. (#471, #475)
+- Remove only owned dangling skill links during install. (#501)
+- Reuse PR CI repair issues and retain report errors. (#502)
+- Escape Slack control text. Reject temporary paths through symlink aliases.
+  Replace notify source files through exclusive temporary copies. Repair damaged
+  debounce state and reject future timestamps. (#508)
+- Stabilize six load-sensitive checks without removing their coverage. (#516)
+- Keep Herdr test socket paths within native limits. Prevent the run-identity
+  fixture from leaving unrelated detached tooling work after teardown. (#524)
+
+- Keep and report a modified retired facade while selected runtime sync continues.
+
+### Removed
+
+- Remove `scripts/emit-verify-evidence.ts`, `verify-producer.ts`, and `checks-materializer.ts`. Remove the `.ai/harness/checks/latest.json` chain and `state repair-artifact`. Keep other check caches.
+- Acceptance, review, and current archive require an explicit native report under `.ai/harness/runs/`. State and task freeze evaluate the owning execution records. Empty or missing Verification Plans cannot pass.
+- Keep long Verification Plan check IDs intact. Old records that hashed an ID now read as missing. Execute that plan again to write an exact record. Keep the old ledger bytes.
+- Writing an acceptance projection to a tracked file changes the native source tree and makes its prior execution proof stale. Generic review uses an ignored session projection.
+- Publication receipts and PR receipt markers use V2. Old finalized V1 receipts, markers, and digests fail closed. This release has no automatic upgrade. Publication identity, create intent, and prepare remain V1.
+
+- Retire direct cross-review. Use `repo-harness review` in Herdr.
+  Drain old reviewer sessions with the previous package before update. (#484)
+
+- Remove unused AXR6/AXR7 proposal scripts and the global-hook canary script.
+- Remove the v1 initializer question pack and the unused v1/v3 schemas.
+- Remove unused scripts/lib context files, Operator Task Message modules,
+  and the old workflow contract install planner.
+- Remove the campaign CLI, engineer acquisition-cutover commands, auto-campaign Skill, container scripts, and Docker sources. Remove campaign fields from the Operator API and UI.
+- Budget board no longer counts campaign grants.
+- Remove campaign execution types and parsers. ProgramAuthorizationV2 uses protocol 2. Old grants require a new operator mint.
+
+Campaign execution moved to the existing [repo-harness](../SKILL.md), [repo-harness-product](../assets/skills/repo-harness-product/SKILL.md), and [repo-harness-check](../assets/skill-commands/repo-harness-check/SKILL.md) Bot skills. They use Herdr/OAR to dispatch and collect work.
+
+- Remove shipped research scripts: `axr7-consumer-e2e.ts`, `session-context-packet-panel.ts`, `benchmark-general-repo-reader.ts`, `run-bdd2-evals.ts`, `c9-collaboration-canary.ts`, `hook-dispatch-diet-report.ts`, `route-nl-vs-ts-eval.ts`, `loop-engine-cutover-gate.ts`, `run-debug-ground-truth-eval.ts`, `mcp-observability-report.ts`, and `akn00-native-execution-admission.ts`.
+- Remove `benchmark:mcp-reader`, `benchmark:debug`, and `check:route-eval`. Retire the BDD2, BDD3, and debug ground-truth data. Keep the hook telemetry reader, CI full-history check, scaffold loader, ME2B, and shared collaboration test dependencies.
+- Remove the six hidden hook commands from `repo-harness`: `circuit-breaker-record`,
+  `prompt-route`, `prompt-guard-decide`, `minimal-change`, `review-rubric`, and
+  `review-subject`. Use `repo-harness-hook` for these commands.
+
+### Upgrade limits
+
+- The removed provider-thread V1 migration has no replacement in this version.
+  Migrate that store with `0.19.0` through `0.19.5` before upgrade.
+- ProgramAuthorizationV2 uses protocol 2. Mint new operator grants for old grants.
+- `upgrade` reports leftovers by default. `--apply` changes files only after
+  ownership and byte checks. Normal update reports leftovers and does not clean.
+- Pipeline phase 1 records observations. Automatic dispatch, merge, cleanup,
+  test-slot control, and plugin delivery governance remain deferred.
+
+- The earlier long-ID restriction above describes the initial cutover.
+  Exact legacy-ID reads now supersede that restriction. Current execution,
+  snapshot, contract, and toolchain checks still apply. (#527)
+
+### Earlier merged work covered by this release
+
+- Persistent Herdr task-agent, task-goal, and protected result cutover. (#464)
+- Corrected 0.19.5 release history and the 0.20.0 preparation filing. (#465, #522)
+- Canonical host invariants, Pi extraction research, and fleet responsibility trace. (#466)
+- First-offer staleness coverage and trusted server-time observation preparation. (#467, #468)
+- Request-delivery working baselines and observed-idle completion checks. (#469)
+- Durable selected-acquisition receipts and earlier R2 campaign membership guards.
+  Campaign execution is retired in this release. (#470, #472)
+- Verified leftover inventory, proof-bound refresh, and explicit backup transactions. (#511)
+- Unused surfaces, research tools, hooks, migrations, flags, and campaign retirement.
+  Keep explicit post-edit migration and the published research archive.
+  (#510, #512, #513, #514, #517)
+
+## [0.19.5] - 2026-09-30
+
+### Fixed
+
+- Fleet install now records verified ownership on every update path and adopts
+  verified pristine agent fleet files into the ownership manifest.
+- `allowed_paths` items in contracts drop YAML inline comments in every reader.
+
+### Changed
+
+- Pin `archctx` and `archctx-contracts` to `0.6.1` and
+  `@colbymchenry/codegraph` to `1.6.1`. The projection request, refresh signal
+  and capabilities protocol ids are unchanged; the only schema change is
+  `accepted-committed-change` v2, which repo-harness does not use.
+- `publishCoordinationSignal` and `publishWorkStateHandoff` call their builders
+  directly so archctx can prove the collaboration flow.
+- Refresh dev dependencies: `@modelcontextprotocol/sdk` 1.31.0, `vite` 8.3.1,
+  `react` 19.3.0, `happy-dom` 20.14.5, `@types/*`.
+- Remap agent fleet model/effort tiers and move the Sol workers to
+  `gpt-6.1-sol` with retuned effort.
+- Refresh the AXR5 clean-room readback (stale since `0.5.7`) against `arch-context`
+  tag `v0.6.1`, and update the test that pinned its contracts version.
+
+## [0.19.4] - 2026-09-28
+
+### Fixed
+
+- The agent fleet installer receives the runtime's already-validated Bun
+  executable through `REPO_HARNESS_BUN_BIN` instead of re-discovering `bun`
+  by name on `PATH`; a handed-off Bun below the version floor now fails the
+  whole helper closed instead of silently falling back to `PATH`/HOME
+  discovery.
+
+### Added
+
+- Isolated the two fleet Bun-handoff version tests from the invoking shell's
+  own `REPO_HARNESS_BUN_BIN`, and added a fail-closed regression test proving
+  a handed-off Bun below the version floor cannot fall back to `PATH`/HOME
+  discovery.
+
+### Changed
+
+- Pin `archctx` and `archctx-contracts` to `0.5.13`, moving through `0.5.12`
+  since `0.19.3`. Capabilities are unchanged across `0.5.11` through `0.5.13`,
+  confirmed against each installed package, so `ARCHCTX_REQUIRED_FEATURES`
+  needs no companion change.
+
+## [0.19.3] - 2026-09-24
+
+### Added
+
+- The operator board reads canonical Task context, activity, history, placement,
+  repository snapshots, automation and supervision evidence. Planning, formal
+  Human Decisions and organization observations use bounded read paths; task
+  links retain historical context and completed observations refresh in view.
+- Task reply intent and commit integrity are persisted through the Engineer MCP
+  with protected reads and canonical reply-size limits.
+- Architecture acceptance supports `accept --recover` for an exact interrupted
+  approval. A durable intent and result preserve the original provider proof;
+  retries use non-consuming readback and resume the existing refresh checkpoints.
+
+### Fixed
+
+- Fleet installation keeps the Bun executable already validated by the CLI,
+  including launcher filenames such as `bun.exe`; an invalid explicit runtime
+  fails without selecting a different PATH executable.
+
+- Task Inbox migration uses portable storage paths, preserves record protocols
+  and file identities, and reflushes recovered files through fresh inodes before
+  publishing its receipt. Rollback permits a later fresh upgrade.
+- Task observation recovery is bound to its service epoch, and read capacity
+  remains held until worker retirement. Publication readiness rejects stale
+  acceptance authority. Architecture projection continues after a Stop budget
+  yield while strict Stop stays blocked until the continuation completes.
+- `sprint-backlog status`, `next` and `start-task` drain their row selectors
+  instead of exiting early, so long backlogs no longer fail with SIGPIPE (141)
+  under `pipefail`; the heartbeat triage summary read has the same repair.
+- Installed-copy sync hashes managed copies through the installer's TypeScript
+  tree hash instead of spawning a process per file, so copy-mode sync of a large
+  source tree stays within its time budget on macOS; existing ownership markers
+  still verify. The copy also skips `.codegraph/`, whose daemon socket macOS
+  rsync cannot recreate.
+- `architecture-projection accept --adoption-plan-id` no longer rejects outright
+  when an earlier apply attempt left an uncommitted intent: once the provider
+  proves that exact apply absent, the adoption request is sent. A committed or
+  unprovable apply still refuses the switch.
+
+### Changed
+
+- Pin `archctx` and `archctx-contracts` to `0.5.12`, including architecture and
+  refactor admission, generated policy defaults and verification fixtures.
+- Route Codex agents by responsibility across GPT-6 Luna, Sol and Astra; worker
+  execution uses Sol at medium and xhigh reasoning for its two execution roles.
+
+### Limits
+
+- Native automatic execution remains subject to Host admission. These operator
+  observations and reply protocols do not establish an admitted Host or complete
+  the AKN automatic-delivery acceptance criteria.
+- Publication does not update an existing global installation or a persistent
+  `REPO_HARNESS_SOURCE_ROOT` override. Recovery still requires the exact original
+  candidate, approval reference and provider-owned fixed-point proof.
+- An interrupted refresh is not auto-resumed after a refresh action changed
+  repository inputs (for example the context map). Acceptance fails closed; commit
+  the refresh output and retire the candidate with `architecture-projection
+  retire-stale` before re-approval. A provider-side recovery proof is planned.
+- Adoption-mode acceptance still cannot complete: the provider adapter rejects an
+  apply receipt for non-apply requests while acceptance requires one. This
+  receipt-contract mismatch predates 0.19.3 and is scheduled with the
+  provider-side recovery work.
+
+## [0.19.2] - 2026-09-13
+
+### Fixed
+
+- Keep architecture queue first-detection metadata valid when concurrent events
+  arrive out of timestamp order.
+
+- Resolve archctx from the running repo-harness package. A target repository's
+  stale or independently installed copy no longer overrides the updated runtime.
+  Exact provider-version and executable-identity checks remain enforced.
+- When task-sync cannot resolve a workflow profile, report the exact current
+  diff binding needed to recover through canonical workflow evidence. Failed
+  resolution still fails closed; source changes invalidate previous bindings.
+
+### Added
+
+- SessionStart gives the Agent architecture coverage observations when the global
+  provider is enabled: empty capability models, missing module documents, and
+  tracked package roots with no match or a shared ancestor capability. The Agent
+  inspects source evidence and decides boundaries using the architecture skill;
+  hooks do not generate semantic nodes. New nodes use archctx ChangeSets.
+
+### Limits
+
+- Package observations cover Git-tracked package.json paths, not a complete
+  semantic inventory of every language. Public archctx 0.5.10 plan creates new
+  entities; updating existing nodes needs a supported typed ChangeSet surface.
+
+
+## [0.19.1] - 2026-09-13
+
+A maintenance release that gives three unbounded or unreachable surfaces an
+explicit operator exit: stale fleet registrations, accumulated harness evidence,
+and a campaign preparation record that could strand a worker between its own
+write and the runtime effect it was about to cause. Alongside those, the
+architecture projection and refactor-recommendation settings move to one
+per-user configuration document, the operator board scopes to the repository you
+selected, and installs stop overwriting content you edited yourself.
+
+### Added
+
+- **`repo-harness-test` guides testing in the source checkout.** The full-profile
+  skill covers fixtures, test execution, refactor evidence and Verification
+  Plans, while downstream projects use their own test commands and CI.
+
+- **`repo-harness fleet prune` removes stale repository registrations.** The
+  default run previews confirmed-absent registry rows; `--apply` removes them
+  under the registry mutation lock and requires `--expected-revision <digest>`
+  taken from that preview, so a registry that moved between preview and apply is
+  refused rather than pruned against a stale view. `--repo-id <id...>` limits
+  both inspection and removal. Registry rows only; nothing on disk is touched
+  and no backup is written.
+- **`repo-harness run evidence-gc` reclaims harness evidence on demand.**
+  Evidence checkpoint retention has shipped since 0.19.0 but only ran inside a
+  successful publish, so a repository whose ledger was reset, or that no longer
+  runs the harness, kept its whole backlog with no way to reclaim it: 9.7 GB in
+  one repository measured here. `run evidence-gc` applies both existing
+  retention policies on demand and `--dry-run` reports reclaimable bytes before
+  anything is removed.
+- **Stop run summaries are bounded.** Stop wrote one run summary per session and
+  nothing removed them (5931 files in this repository, back to 2026-05-25).
+  Retention now keeps the newest `RUN_SUMMARY_RETENTION_COUNT` entries and Stop
+  applies it after its own write. Records are selected by Stop's own shape: a
+  `run_id` plus `checks_file`, `handoff_file`, `policy_file`, and
+  `context_map_file`, every one a pointer the next Stop recomputes. This means the
+  immutable `verification-<executionId>.json` records the evidence ledger binds
+  by sha256, acceptance snapshots, and any shape a future writer adds are left to
+  their owners. `reason` is deliberately not the discriminator: it is free-form
+  operator text with about 190 distinct values here.
+- **`auto-campaign` bundled skill facade.** One user invocation authorizes one
+  bounded conversational campaign turn over the existing `repo-harness campaign`
+  commands, then reports and returns control. No daemon, cron, hook-triggered
+  execution, automatic next turn, or automatic merge; token and monetary caps
+  stay null rather than being claimed as a hard budget.
+- **`repo-harness refactor recommendations` surfaces measured refactor
+  opportunities for user approval.** It reads measured opportunities for an agent
+  to raise with you and never executes one; `--json` prints the recommendations
+  together with readiness. The user decision stays the gate.
+- **The operator board shows a fenced read-only task worktree diff.** The diff
+  carries explicit target and head identity, the tracked patch, and untracked
+  filenames. Git reads are bounded and cancellable, external filters and hidden
+  index changes are refused, lazy fetch and fsmonitor are disabled, and physical
+  directory identities are compared across Windows short and long aliases.
+
+### Changed
+
+- **CI selects coverage from the actual changed paths.** Documentation-only
+  changes use the documentation lane, draft PRs defer expensive testing, and
+  other changes keep full coverage; independent test files run in a bounded
+  worker pool.
+- **Source tests reuse isolated fixture templates and proven in-process CLI
+  seams.** Templates restore their original paths so repository-bound receipts
+  remain valid; real package-install and Herdr cases run in the explicit
+  release lane.
+
+- **Architecture projection is configured once per user, not once per
+  repository.** `projection_provider`, `projection_apply`,
+  `projection_failure_gate`, `projection_timeout_ms`, and the retired
+  `projection_version` no longer live in
+  `.ai/harness/policy.json#architecture`; the host-wide authority is
+  `~/.repo-harness/config.json#architecture`, seeded by the global runtime step
+  on install and update. Run `repo-harness update` once for the account, then
+  `repo-harness init --repo .` in each repository. Adoption strips the retired
+  repository keys rather than copying repository preferences into the host
+  configuration, and `init` reports an `architecture projection readiness` step
+  naming the exact repair when the global document is missing.
+- **The operator board is scoped to the selected repository** and the operator
+  browser payload moves to protocol 5, versioned separately from
+  `FLEET_BOARD_PROTOCOL`. The tarball smoke now imports
+  `OPERATOR_FLEET_PAYLOAD_PROTOCOL` from the installed package instead of
+  restating the number, so the next bump cannot pass its own tests while failing
+  the smoke.
+- **A repository that never opted in starts projecting after `update`.** The
+  retired repository defaults were `provider: disabled` and `apply: disabled`,
+  while the host defaults are `projection_provider: archctx` and
+  `projection_apply: automatic`, and adoption deletes the repository keys without
+  a warning. A repository that had projection off (deliberately or by never
+  having touched it) therefore projects automatically once the account runs
+  `update`, and one that set
+  `projection_failure_gate: strict` drops to `advisory`. Assert the `architecture`
+  block you want in `~/.repo-harness/config.json` before running `init`: the
+  repository keys are gone by the time `init` returns and the setting is no longer
+  representable at repository scope.
+
+### Fixed
+
+- **`init` establishes global automation defaults after successful adoption.**
+  Account configuration writes use the shared host transaction lock so init,
+  install and update cannot race the same configuration document.
+- **Issue observation and external-source refresh forward injected clocks.**
+  GitHub fetch deadlines use the caller's clock, avoiding mixed-clock failures
+  exposed by parallel test execution.
+
+- **Install honors ownership receipts on upgrade.** Unchanged files recorded in
+  the installation manifest can now upgrade to a newer package, while unowned or
+  user-modified content stays protected. Bundled skills synchronize their entire
+  trees, including updated and retired references, with rollback on copy
+  failure. `deep-worker` is included in installation transaction capture and
+  fleet completeness checks.
+- **Herdr repository configuration is seeded and diagnosed correctly.**
+  TypeScript repository adoption now supplies the canonical Herdr version pin.
+  A missing or malformed `external_tooling.herdr.min_version` reports
+  `configuration-error` instead of runtime `unavailable`, while strict readiness
+  still fails closed. After upgrading, run `repo-harness init --repo .` in an
+  affected repository to fill missing defaults; explicit malformed values must be
+  corrected deliberately. A global runtime refresh alone does not update
+  repository policy.
+- **Campaign preparation retries when the prior attempt produced no runtime
+  effect.** A preparation record was admitted once and any second call threw
+  `campaign preparation already admitted`, so a worker interrupted between
+  persisting the record and creating the container had no way forward: the record
+  blocked the retry and no container journal existed to reconcile. `prepareChild`
+  now reads the prior record and retries against it for the worker role only (no launch, final, child, verifier preparation, downstream phase record, or
+  attempt reservation), and only on an identical identity whose bound neither
+  replaces nor extends the original deadline, so the immutable effect window is
+  preserved rather than renewed. `assertCampaignPreparationRetryable` is the
+  exclusive fence before the container create request: an existing container
+  journal for either the version probe or the workload identity means the attempt
+  already reached the runtime, and reconciliation is the only exit.
+- **`workflow_write_run_summary` emits the full record on jq-less hosts.** The
+  shell writer in `assets/hooks/lib/workflow-state.sh` produces the same shape as
+  `stop-handler.ts` and is the larger producer by volume, but its jq-less branch
+  emitted 5 of the 11 fields. Now that retention identifies a deletable record by
+  that shape, the short branch would have made every jq-less host's summaries
+  permanently unreclaimable. Both branches now emit the same fields, under tests
+  that prove which branch ran.
+- **`check:reference-configs` is listed with its family in the root required
+  checks.** It is the third member of the `check:hooks` / `check:helpers` family
+  and was missing, which is how a release note authored directly in the
+  `docs/reference-configs/` projection (instead of its `assets/reference-configs/`
+  source) reached CI before the next sync would have deleted it silently.
+
+## [0.19.0] - 2026-09-10
+
+The release grows a second layer on top of the file-backed session contract:
+authorized programs that hold their own budget, task offers, leases, and
+evidence, so a Sprint can advance without a human driving each step. The
+session layer is unchanged in shape — plans, contracts, checks, and handoffs
+remain the durable authority — and every program surface below sits on top of
+it rather than beside it.
+
+### Breaking
+
+- Repositories that explicitly pin ArchContext must update
+  `.ai/harness/policy.json` fields `architecture.projection_version`,
+  `refactor.stages.scan.provider_version`, and
+  `refactor.stages.verify.provider_version` to `0.5.10`, together with their
+  package-local `archctx` and `archctx-contracts` dependencies. `init` preserves
+  explicit repository settings; the runtime rejects older refactor pins.
+
+- **`herdr` >= 0.9.0 replaces `tmux` as the peer-terminal runtime.** tmux
+  support and its readiness probes are removed from
+  `scripts/check-agent-tooling.sh`; the pin lives in
+  `.ai/harness/policy.json#external_tooling.herdr` and is checksum-verified.
+  A host with only tmux installed fails strict readiness after upgrading.
+  Drain reviewers hosted by the previous runtime and rebind terminal endpoints
+  before the upgrade — see
+  [`20260909-herdr-runtime-cutover.md`](https://github.com/Ancienttwo/repo-harness/blob/archive/docs-researches-20261004/docs/researches/20260909-herdr-runtime-cutover.md).
+- **`tasks/current.md` is no longer a tracked file.** It was tracked but derived
+  entirely from untracked local markers, so one session's snapshot could
+  misrepresent itself as mainline truth. It is now untracked and gitignored, the
+  adoption template ignores it from `init`, and `check-task-workflow` /
+  `check-task-sync` no longer require it. An already-adopted repo must run
+  `git rm --cached tasks/current.md` and pick up the new `.gitignore` entry.
+- **Sprint backlogs require schema v2.** Sprint task IDs are now persisted as
+  immutable identities, which the scheduler treats as authority. Run
+  `repo-harness sprint migrate-schema` — atomic, fail-closed, with pre-write
+  restore on refusal — before `engineer acquire-next` can trust task identity.
+- **The `provider-thread-effects` architecture capability is retired** and
+  replaced by `agent-runtime-effects`. Generated `CLAUDE.md` / `AGENTS.md`
+  capability blocks still naming the old identity are stale and need
+  regeneration.
+- **The Oracle exact pin moves 0.14.1 -> 0.20.0** and the ChatGPT browser cookie-path
+  transport is removed. `--copy-profile <user-data-dir>
+  --browser-chrome-profile <profile-dir>` is the only supported bound-profile
+  transport; `browser-doctor` fails closed with `ORACLE_INCOMPATIBLE` or
+  `ORACLE_RUNTIME_FLAGS_UNSUPPORTED` and points at `--oracle-bin` /
+  `REPO_HARNESS_ORACLE_BIN` instead of retrying a pinned install.
+- **`campaign close-not-planned` enforces the canonical acceptance vocabulary.**
+  Only `external_pass` and `user_waiver` are accepted; the generic `pass` status
+  from the unrelated status vocabulary is rejected rather than aliased.
+- **Fleet acquisition's plan-to-todo projection is initialize-only.** It fills a
+  missing contract and can no longer overwrite an authored one.
+
+### Added
+
+- **Authorized programs.** `repo-harness automation grant mint` stores
+  one operator-minted `ProgramAuthorizationV1` in the harness home gate store,
+  and `authorization list` prints the digests held for a repository. Every
+  program surface below — automation, refactor, campaign, collaboration — starts
+  from a stored authorization digest; there is no unauthenticated start path.
+- **A per-goal budget ledger.** `repo-harness automation budget show|list`
+  reads the enforceable budget projection for an automation run. Provider calls,
+  campaign steps, shadow adoption observations, heartbeat execution, and worker
+  acquisition all reserve against it before the work is recorded.
+  `automation budget repair` is an operator drift-repair verb: it re-runs the
+  locked reconciliation so a stopped or expired run seals its exhaustion
+  receipt, and never reserves, charges, or changes a cap.
+- **A bounded unattended controller.** `repo-harness automation controller
+  start|step|status|stop|reconcile` runs one Engineer dispatch loop under hard
+  caps — `--maximum-steps`, `--maximum-duration-ms`,
+  `--maximum-transient-retries`, deterministic backoff — reserving budget before
+  each attempt and validating projected outcomes against a bounded attempt-retry
+  ledger.
+- **Renewable Lease liveness.** A Lease carries `renewal_interval_ms`,
+  `maximum_ttl_ms`, and a closed set of evidence sources (`controller`,
+  `runtime_effect`, `publication`, `binding`); `automation controller start`
+  configures it with `--lease-renewal-interval-ms` and
+  `--lease-maximum-ttl-ms`. An unproven liveness state requires attention rather
+  than reclaiming silently.
+- **An Engineer scheduling core.** `repo-harness engineer acquire-next
+  --authorization-id <id> --idempotency-key <key>` selects and claims the first
+  canonical offer for an enrolled principal. Dependency edges
+  (`canonical_done`, `module_accepted`, `publication_integrated`,
+  `product_accepted`) resolve from receipt authorities instead of inference,
+  `engineer principal enroll|list|status|revoke` maps an OAuth authorization to
+  a Binding, `engineer message send|receive|ack` gives each claim an immutable
+  inbox that supersedes on takeover, `engineer task-freeze` freezes a bound task
+  without transferring execution, and `engineer board` projects read-only
+  organization attention.
+- **A typed WorkDemand lifecycle.** `repo-harness engineer work-demand
+  propose|transition|materialize|status` drives agent-proposed work through
+  `proposed -> under_review -> accepted -> materializing -> materialized ->
+  integrated`, with digest-guarded transitions and an atomic materialization
+  receipt when an accepted projection becomes a canonical Sprint task.
+- **Development campaigns.** `repo-harness campaign` runs an authorized campaign
+  state machine over a seeded repair program: `audit` takes a budgeted
+  read-only group audit, `author` persists an `IssueBatchIntentV1` and opens the
+  GPT Pro authoring lane, `author-followup` reuses that session for missing
+  slots or one explicit edit, `adopt` verifies exact-SHA readback and publishes
+  an atomic repair batch candidate, `step` hands one adopted task to its local
+  planning session, and `start`/`transition`/`status`/`closeout` move and read
+  the machine. `prepare-resume` emits a zero-provider resume request and its
+  preflight from stored adoption, continuation, and budget evidence, and can
+  replace a stopped-but-never-adopted successor through a typed
+  `superseded-<hex>` record without rewriting the original continuation
+  artifact. Resuming an adopted campaign requires a formally stopped
+  predecessor whose budget evidence is fully settled — no open reservation, no
+  active ledger step, no reserved provider call, and the authorization digest
+  still matching the grant. A stopped grant is never made executable again.
+- **Refactor Mode.** `repo-harness refactor` operates an ArchContext-backed
+  refactor program: `discover` scans and assesses one local agent proposal
+  inside shadow boundaries, `materialize` turns an authorized recommendation
+  into multiple Work Packages against a single canonical Sprint task authority,
+  `verify-candidate` chains contract, cutover closure, provider measurement and
+  acceptance receipt, and `architecture-request`, `bind-execution`,
+  `resolve-post-merge`, `board`, `canary-record`, `activation-promote`, and
+  `activation-status` cover the rest of the state machine. Activation remains
+  off in this release: the canary set and rung-promotion evidence must be
+  refreshed against the installed provider before it turns on.
+- **A collaboration plane.** `repo-harness collaboration` reads the Work
+  Exchange for one authenticated Module Engineer — `exchange` for the snapshot,
+  `threads` for lanes, hotspot scores and contribution opportunities, `signals`
+  and `post` for the append-only `CoordinationSignalV1` store, `handoff
+  publish|list|adopt` for `WorkStateHandoffV1` (adoption is non-exclusive and
+  grants no Task, Claim, or Lease), and `packet build|read` for bounded
+  context packets. The author is always derived from `--authorization-id`; a
+  payload cannot declare its own actor.
+- **External source intake.** `repo-harness external-source
+  refresh|list|bind|bindings|context` observes provider Issues and binds one
+  immutable source revision to one exact pending canonical task and its approved
+  plan/contract. Intake is inert: an observed Issue mints no execution
+  authority and does not become a runnable task on its own.
+- **Persistent Claude acceptance review.** `repo-harness claude-review
+  round|status|close|cancel` hosts a read-only Claude reviewer in an owned herdr
+  session that survives up to three repair rounds against prepared
+  `verify-sprint` evidence. `round` accepts `--timeout-ms` up to 1,800,000, and
+  a repeat session past the round budget is refused with
+  `claude_review_session_budget_exhausted`.
+- **Offline uninstall.** `repo-harness uninstall --target codex|claude|both
+  [--dry-run] [--recover-interrupted]` removes only owned managed configuration
+  — hooks, managed context blocks, receipts — and preserves user edits and
+  static history. `repo-harness mcp uninstall` does the matching cleanup for
+  local MCP registration and credentials, refusing ChatGPT credential deletion
+  until `--services-stopped` confirms every MCP HTTP service is down.
+- **Real multi-agent collaboration canary.** A source-checkout canary runs three
+  isolated baseline/treatment protocol traces with three concurrent read-only
+  Codex Workers plus one real successor run, exact usage metrics, bounded
+  context injection, source-signal reuse, handoff adoption, persisted
+  writer-lineage checks and delivery-authority digests. C9-A and C9-B pass;
+  persistent `EngineerSeatV2`, Phase 5 Review and Phase 6 Merge remain inactive.
+- **Context-map drift check.** `bun run check:context-map` validates
+  `.ai/context/context-map.json` against ArchContext capability nodes and disk,
+  rejecting duplicate paths and dangling capability ids. `--write` performs a
+  one-shot repair.
+- **Route-eval coverage gate and a split CI.** `check:route-eval
+  --check-ts-arm` replays 31 route scenarios covering every
+  `PROMPT_GUARD_INTENTS` and `PROMPT_GUARD_ACTIONS` entry and fails below a
+  pinned coverage floor, running ahead of the test step. Governance and
+  functional checks now run as independent CI jobs.
+
+### Changed
+
+- **Verification and acceptance are separate authorities.** Execution facts
+  (test and `verify-contract` runs) no longer double as semantic acceptance;
+  active contracts are migrated onto the split and execution identity is
+  preserved across the migration rather than re-derived.
+- **ArchContext moves 0.4.7 -> 0.5.8** as the Refactor Mode provider contract,
+  with discovery and resolution bound to the pinned version.
+- **Campaign acquisition consumes contract authority from the canonical plan
+  proof.** Workers read `acquired.envelope.plan.contract_sha256` directly
+  instead of keeping a competing digest.
+- **Fleet worktree acquisition resolves `contract-worktree` and `plan-to-todo`
+  from the packaged trusted-runtime helpers**, not repository-local `scripts/`,
+  so a downstream repo without those helper scripts can complete acquisition
+  instead of failing on a valid execution-ready offer.
+- **Shipped agent-facing surfaces are English-only.** Six orphan Chinese
+  templates and their dead advisories are deleted; the design-brief template and
+  the TDD/BDD/AssetLayer advisories are English-only. Hook intent regexes, skill
+  trigger phrases, and the operator board's i18n stay bilingual because they
+  match user input rather than instruct an agent.
+
+### Fixed
+
+- **ArchContext 0.5.10 avoids workspace scans during projection retries.** The
+  pinned provider reads prior committed writes directly from its journal, so
+  large ignored runtime caches do not delay that lookup.
+- **Recovery checkpoints keep only the current snapshot.** Repeated Stop events
+  no longer accumulate full-history copies; publication preserves the current
+  checkpoint before collecting old cache directories, while the raw evidence
+  ledger and blobs remain intact. Concurrent recovery reads follow a changed
+  publication marker, and interrupted collection can resume.
+- **Task Message drafts survive refresh and browser restarts.** The operator
+  board restores browser-local text with its original message ID and fence;
+  stale drafts still require the existing explicit rebind before sending.
+
+- **Delegated Codex output now follows its actual JSONL wire.** Contribution
+  collection decodes one complete `codex exec --json` turn and parses only its
+  final agent message. Test shims emit the same JSONL shape, raw-marker output is
+  rejected, provider usage is retained, and the delegated capture ceiling is 1
+  MiB so tool events cannot erase the terminal message at the old 64 KiB cap.
+- **Lease reclaim no longer races observation time.** Reclaim eligibility and
+  reclaim-receipt acceptance are revalidated across the actual observation
+  window, and reclaim additionally requires proof that the claiming command's
+  process tree still contains the original descendant.
+- **The `@github` connector is activated by exact prompt text.** `campaign
+  author` and `step` verify the tool call was captured instead of assuming
+  activation from prompt intent, so an activation prompt can no longer silently
+  no-op.
+- **Docker-supervised workers cannot grant themselves supervision authority.**
+  Renewal, liveness, and namespace-exit cleanup are isolated from the worker
+  process they supervise, and the namespace-exit cleanup race is closed.
+- **Attempt accounting is closed.** A repair attempt can no longer be recorded
+  without a matching budget reservation, an outcome outside the closed enum
+  cannot be projected as satisfied, and unobserved provider event types are
+  rejected during campaign provider-lifecycle recovery.
+- **ChatGPT browser and MCP races are closed.** The stale cookie-database
+  transport and its `browserCookiePath` capability are removed rather than
+  falling back to an anonymous session, and a same-prompt-already-running
+  refusal maps to `ORACLE_SESSION_ALREADY_RUNNING` with reattach guidance
+  instead of an automatic `--force`.
+- **Architecture projection reclaim is bound to the attempt's own timeout**, so
+  a long-running projection job is no longer reclaimed against a stale window.
+
+## [0.18.0] - 2026-08-29
+
+### Added
+
+- **Attention-first operator worklist.** The `operator serve` board replaces the
+  five-column kanban with a single prioritized worklist — needs you, mergeable,
+  unreadable repo, agent in progress, external, done — with the last three
+  groups collapsed by default. The rail anchors and the separate Repositories
+  section are gone.
+- **Resident detail pane.** The board keeps a detail pane open at all times;
+  with nothing selected it shows the repo × stage matrix and repo health. A
+  persistent status bar reports relative data age, `seq`, and consistency,
+  desaturating the surface when the snapshot is stale and marking
+  `changed_during_read` on the status bar and the affected rows without
+  replacing their stage labels.
+- **Human task labels in the board contract.** `FleetBoardCardV1` carries
+  `task_label` and `task_index`, projected from `row.task` and `row.index` as
+  preimages of the same authority. The digest basis changes with them, so
+  `FLEET_BOARD_PROTOCOL` moves from `1` to `2`.
+- **Task message write channel.** `POST
+  /api/v1/fleet/tasks/{repository_id}/{task_id}/messages` exposes the existing
+  `fleet message` effect as the board's one write action, under `sender_kind:
+  'operator'` with a fixed `control-board` sender id. The endpoint requires an
+  `Origin` header, resolves `repository_id` through the registry, enforces
+  `read_write` access, and mirrors the 8 KiB body limit at the HTTP layer. The
+  composer sits collapsed at the foot of the detail pane, treats its fence as
+  the confirmation, refuses to send under `read_only`, `changed_during_read`,
+  `stale`, or `degraded`, and drives delivery feedback from the authoritative
+  `unread_count` rather than a local sent list.
+- **Board internationalization.** A single in-repo dictionary module
+  (`src/operator-web/i18n.ts`) provides zh/en strings with no third-party
+  dependency. The language switch lives in the status bar, persists through
+  `localStorage`, and initializes from `navigator.language` with `en` as the
+  default. Blocker codes are translated in both languages with the raw code
+  shown alongside; task labels, repo names, ids, and SHAs are never translated.
+- **Canonical brand marks.** The board adopts the canonical pixel logo,
+  favicon, and mascots.
+
+### Changed
+
+- **The board's footer contract now reads `observe-only · one write: task
+  message`** instead of `read-only / localhost`, and the negative test is
+  upgraded from "no writes" to an "exactly one write" invariant guarded on both
+  the server and the client.
+- **Accent color discipline.** Carrot accent as a UI affordance means human
+  write and nothing else, a constraint carried by the `--carrot-*` CSS tokens;
+  brand identity art is the documented exception, where orange is a brand color
+  and carries no interaction semantics. Attention semantics are recolored: user
+  amber, agent neutral blue, external purple, and danger reserved for real
+  errors.
+- **Documentation is aligned** with the rebuilt board across the README and the
+  local human control board design note.
+
+## [0.17.1] - 2026-08-28
+
+### Added
+
+- **Persistent module engineers.** `repo-harness engineer` owns a durable
+  module-engineer control plane: `create`/`enroll`/`bind`/`retire` maintain
+  persistent engineer records and their capability bindings, `offers` and
+  `acquire` hand a bound work envelope to an authenticated engineer principal,
+  and `board`/`status`/`inspect`/`show`/`list` project read-only state. Claims
+  carry an authenticated principal actor, so a claim identifies which engineer
+  holds it rather than only which worktree does. `send`/`receive`/`ack` back a
+  durable task- and claim-scoped engineer inbox whose messages are immutable
+  and supersede on takeover.
+- **Engineering overlay control board and local operator UI.** `repo-harness
+  operator serve` runs a loopback-authenticated human control board over the
+  engineer fleet, backed by a bundled web client built through
+  `build:operator-web`. Request authority is pinned to loopback; the board is a
+  projection surface and never a second mutation authority.
+- **Read-only delegation admission.** `repo-harness delegation` compiles a
+  delegation profile and capability set, admits a delegated run, dispatches it
+  from a frozen argv template, and collects its observations. Admission is
+  fail-closed: a run that cannot be bound to an admitted profile and a
+  writability-checked contract is rejected instead of downgraded.
+- **Verified evidence context.** `repo-harness verified-context` compiles a
+  catalog of verified evidence, binds a decision to it, and persists the
+  resulting receipt. Catalog entries and receipts are validated on write, so a
+  decision cannot cite evidence that was never verified.
+- **Interface change authority.** `repo-harness interface-change` records
+  interface-change proposals against the scheduler projection authority and
+  drives their human transition, with `lookup`/`read` exposing the bound
+  record.
+- **Integration acceptance surface.** `repo-harness integration` reads the
+  acceptance envelope, contract, and matrix and records product acceptance
+  against them.
+- **Engineer MCP profile.** The MCP `engineer` profile exposes
+  `engineer_offers`, `engineer_acquire`, `engineer_status`,
+  `engineer_messages`, `engineer_message_send`, `engineer_message_ack`,
+  `engineer_interface_change_propose`,
+  `engineer_interface_change_transition`, `engineer_thread_effect_capability`,
+  and `engineer_thread_effect_status`. The profile is exclusive: a non-engineer
+  tool called under it returns `TOOL_NOT_AVAILABLE` rather than falling through
+  to the coding profile.
+- **Provider thread effect adapter.** Engineer dispatch resolves provider
+  thread effects through a dedicated adapter, and the thread-effect status read
+  is pure — reading status never mutates thread state.
+- **Official Codex plugin for review on Codex hosts.** Cross-review on a Codex
+  host uses the official Codex plugin and binds the review to an immutable
+  subject.
+- **Incremental sprint verification retry.** `verify-sprint` retries
+  incrementally instead of restarting the whole verification pass.
+
+### Changed
+
+- **ArchContext is pinned to 0.4.7.** Architecture projection acceptance runs
+  against that provider version, and the projection manifest carries explicit
+  provenance for each restamp.
+- **Module engineers are documented as a control plane**, not an execution
+  tier: they schedule, admit, and accept work; they do not hold mutation
+  authority that the contract worktree owns.
+
+### Fixed
+
+- **Engineer CLI errors are layered and typed.** Engineer command failures
+  carry layered error codes, `FleetOffersError` routes through the domain error
+  whitelist, and profile resolution errors stay inside the work-graph domain
+  instead of surfacing as generic runtime faults. Binding comparison is
+  canonical, so an equivalent binding no longer compares unequal.
+- **N-way engineer election proves mutual exclusion.** Concurrent claim
+  election is covered by a test that asserts exactly one winner rather than
+  asserting only that a winner exists.
+- **Header projection into generated helper templates is unconditional.**
+  Generated helpers and acceptance-projection review headers always receive the
+  synced header, so a stale template no longer produces a header that drifts
+  from its source.
+- **Architecture restamp commits are exempt from task sync.** A restamp no
+  longer trips the task-sync gate, and archived acceptance authority survives
+  archival instead of being dropped.
+- **Fixture HOME stays outside the repo under test.** Test fixtures allocate
+  HOME through `mkdtemp` outside the working tree, so a fixture run can no
+  longer write cache state into the repo it is exercising. Install
+  compensation, interactive init, and official Codex plugin fixtures are
+  isolated from each other.
+- **Provider concurrency deadline in fleet tests is stabilized**, removing a
+  timing-dependent failure in the board stability probe.
+
+## [0.17.0] - 2026-08-23
+
+### Added
+
+- **Git-backed publication identity and recovery.** Successful PR publication
+  now produces a deterministic immutable `PublicationReceiptV1` that binds the
+  canonical task revision, claim/generation, verified candidate, provider repo,
+  PR, and exact Head SHA. A bounded PR marker carries the complete canonical
+  receipt for cross-clone rebuild, while the git-common-dir copy remains a
+  local recovery cache. Ship retries converge on the same publication ID;
+  incomplete receipt/marker writes return typed `publication_incomplete`
+  failures instead of reporting success.
+- **Lease protocol 2 PR review lifecycle.** Leases can move from the short
+  `completing` transaction window into `reviewing` with one task-lock-protected
+  `current_publication` pointer. Same-owner reopen revalidates the existing
+  worktree binding; takeover creates a new reserving generation that must pass
+  normal bind before becoming bound; raw sprint steal rejects reviewing leases.
+  Legacy protocol-1 owner records remain readable and upgrade only at the
+  reviewing boundary, while older clients fail closed on protocol 2.
+- **Publication recovery, integration reconcile, and merge readiness.** New
+  publication commands inspect and retry crash-window state, rebuild missing
+  receipts, and reconcile merged/ancestor/absorbed candidates only after
+  fetching the provider target to an isolated observation ref and proving the
+  canonical task row complete. `publication readiness` and `fleet ready`
+  double-read live provider facts and fence PR draft state, Head SHA, base
+  movement, local verification evidence, current publication, and Lease claim.
+- **Deterministic Fleet offer and acquisition protocol.** `fleet offers` scans
+  the adopted repo registry for stable `execution_ready` tasks. `fleet acquire`
+  revalidates registry authorization, task/offer revisions, races the canonical
+  Lease claim, creates a fresh contract worktree, binds it, and returns a
+  `WorkEnvelopeV1`. Claim-race losers retry deterministically and never receive
+  a partially bound envelope.
+- **Cross-repository Fleet Board.** `fleet board --json` emits the versioned
+  `FleetBoardSnapshotV1` projection across registered repositories, including
+  repository health, execution readiness, Lease/publication state, exact merge
+  blockers, feedback, task inbox, no-progress, and orthogonal
+  `attention_owner`. `fleet watch --format jsonl` emits immediate,
+  non-overlapping snapshots with bounded provider concurrency and collection
+  deadlines. Both surfaces remain read-only projections.
+- **Immutable provider feedback and repair redispatch.** GitHub check failures
+  and review threads are stored as idempotent `FeedbackEventV1` observations;
+  mutable delivery state lives in separate `FeedbackDeliveryReceiptV1`
+  records. Repair offers preserve the original task/publication lineage,
+  reopen or take over through fenced lifecycle commands, and use durable
+  reaction receipts to escalate two completed same-token attempts as
+  `no_progress` without treating polling as progress.
+- **Task-addressed cross-agent inbox.** `fleet message send` creates immutable
+  task- or claim-scoped messages, and inbox list/ack tracks per-recipient
+  delivery without mutating Lease authority. Claude and Codex turn hooks inject
+  only bounded untrusted messages for the current owner; stale claim-scoped
+  messages become superseded after takeover.
+- **Fleet MCP mirrors.** The coding MCP profile exposes fenced
+  `fleet_offers`, `fleet_acquire`, `publication_readiness`,
+  `publication_reopen`, and `publication_takeover` tools. Mutation calls require
+  an adopted `read_write` repository and the current registry authorization
+  revision before entering the same core/effects paths as the CLI.
+- **GPT Pro advisory orchestration mode.** The ChatGPT browser skill can prepare
+  a commit-bound planning or review bundle for GPT Pro, while local Codex keeps
+  execution, evidence, commit, push, merge, and deployment authority. Returned
+  prose is advisory and cannot expand contracts or attest to local checks.
+
+### Changed
+
+- **ArchContext 0.4.7 is the exact managed projection runtime.** The package,
+  contracts package, policy/template defaults, provider handshake, and clean-room
+  evidence now pin `0.4.7`. The shared managed Node range is
+  `>=22.22 <26`, matching the published ArchContext engine contract instead of
+  retaining the former Node 24-only floor.
+- **Bun 1.4 is the package runtime floor.** Package engines, installers, global
+  runtime checks, and helper bootstrap diagnostics now require Bun `>=1.4.0`
+  so candidate and installed runtimes use the tested process and test-runner
+  behavior.
+- **Contract worktrees use package-owned execution dependencies.** Verification
+  resolves the declared task test runner and packaged helper siblings from the
+  contract worktree/package instead of silently relying on a source checkout or
+  ambient global install. Gatekeeper acceptance also adds structural-quality
+  hard stops for duplication, placement, and boundary regressions.
+- **Human control and Agent factory direction is documented.** The stable
+  Fleet JSON/JSONL read model is the future Web/TUI component boundary; UI and
+  optional operators remain projections and command routers, never workflow
+  state owners.
+
+### Fixed
+
+- **Tagged ArchContext releases are valid AXR7 producer inputs.** The consumer
+  E2E release preparation is idempotent when the producer already declares the
+  target version, and links producer workspaces from the archived checkout's
+  own manifest instead of the sibling checkout's currently installed scope.
+- **Fleet acquire no longer leaks source-worktree workflow state.** Acquire
+  passes the task identity into contract-worktree start and writes active plan,
+  contract, and claim-token state only inside the newly created execution
+  worktree, preserving isolation between the dispatcher checkout and worker.
+- **Packaged handoff and contract test-runner resolution.** Installed helpers
+  now resolve their package-owned siblings and declared runner paths correctly
+  when downstream repositories do not vendor the source tree.
+
+## [0.16.2] - 2026-08-21
+
+### Fixed
+
+- **MCP runtime fixes for issue #204 (#207).** The initialize session
+  reservation releases on transport/server construction failure instead of
+  leaking a session slot until SESSION_LIMIT_REACHED, and one stale recorded
+  workspace no longer aborts the whole workspace listing — stale rows carry an
+  explicit `stale_reason` with an unknown dirty state.
+- **MCP HTTP sessions bind to the startup profile and fail closed on a config
+  flip (#210).** An HTTP session created under one profile can no longer keep
+  serving after the server's configuration changes underneath it.
+- **Architecture queue lock owner record publishes atomically (#211).**
+  `acquireQueueLock` used to publish the lock with `openSync(..., "wx")` and
+  write the owner JSON afterwards, so a contender that read the lock in that
+  interval saw an empty record, classified it as malformed after two seconds,
+  and could delete a live owner's lock. The complete owner record is now staged
+  under a sibling temp name and published with same-directory hard-link
+  creation, so a parseable authority path never exists before its bytes are
+  complete. The concurrent-queue test now captures child stderr and attaches
+  it to failed status assertions.
+
+### Changed
+
+- **Artifact-hygiene rules land in the global working rules and generated
+  agent contracts.** Comments, commit messages, and PR text must be written
+  from the final diff only: comments carry only the non-obvious reason at the
+  owning boundary, PR text carries final behavior plus only rationale a
+  reviewer cannot recover from the diff, and discarded intermediate attempts,
+  reverted work, and never-merged states are never mentioned. The rule ships
+  in `assets/reference-configs/global-working-rules.md`, the generated
+  `AGENTS.md` Safety Rules, and the generated `CLAUDE.md` Development
+  Protocol.
+- Collapses the stray blank line the template engine left around the
+  `FACTOR_FACTORY` conditional in the generated `AGENTS.md` task-protocol
+  section.
+
+## [0.16.1] - 2026-08-20
+
+### Changed (recorded belatedly; shipped in this release)
+
+- Requires `sandbox_mode` in every Codex custom-agent TOML and validates it
+  fail-closed. A hand-written `~/.codex/agents/*.toml` that omits
+  `sandbox_mode`, or declares anything other than `read-only` or
+  `workspace-write`, now routes the child to native-role-routing `invalid`
+  instead of inheriting a default; writability is never inferred from the agent
+  name.
+- Removes the EXECUTION_BOUNDARY anti-extras clause from generated personas'
+  `developer_instructions`, leaving the role body only. On the native-child path
+  `SubagentStart.context` is the single injection owner, so the clause reaches
+  each rendered task packet exactly once.
+
+Closes ESA-06, the last direct-`writeFileSync` write path on the MCP server.
+The seven workflow-artifact write tools stop being last-writer-wins: a caller
+that wants to replace an artifact must first read the revision it is replacing.
+
+### Removed
+
+- **`overwrite` on the MCP workflow-artifact write tools (breaking MCP surface
+  change).** The boolean `overwrite` flag is deleted from all seven tool
+  schemas and replaced by the optional `expected_sha256` revision
+  precondition. `overwrite` was a caller-supplied assertion about a file the
+  caller had never read, so two sessions targeting one repo through
+  `repo_path` could silently destroy each other's content; `expected_sha256`
+  is an assertion about content, which the server can check. There is no
+  compatibility mode, no dual authority, and no shim — a request carrying
+  `overwrite` is rejected, never reinterpreted:
+
+  | Retired parameter | Replacement |
+  |---|---|
+  | `write_prd` `overwrite` | `write_prd` `expected_sha256` |
+  | `write_prd_from_idea` `overwrite` | `write_prd_from_idea` `expected_sha256` |
+  | `write_sprint` `overwrite` | `write_sprint` `expected_sha256` |
+  | `write_checklist_sprint` `overwrite` | `write_checklist_sprint` `expected_sha256` |
+  | `write_plan` `overwrite` | `write_plan` `expected_sha256` |
+  | `prepare_codex_goal_from_sprint` `overwrite` | `prepare_codex_goal_from_sprint` `expected_sha256` |
+  | `write_codex_goal` `overwrite` | `write_codex_goal` `expected_sha256` |
+
+  Migration: omit the field to create a new artifact (an existing target now
+  returns `WOULD_OVERWRITE`); to replace an existing one, call
+  `read_workflow_file` and pass the `sha256` it returns as `expected_sha256`.
+  A stale hash returns `REVISION_CONFLICT` and the file is left byte-unchanged.
+  Conflict errors deliberately do not echo the current hash: echoing it would
+  let a caller lift the hash and rewrite blindly, which is the clobbering this
+  release removes.
+
+  Migration window: `overwrite` is rejected with `RETIRED_PARAMETER` naming
+  `expected_sha256` throughout `0.16.x`; the retired-parameter table is deleted
+  at `0.17.0`, after which the same request returns `UNKNOWN_PARAMETER`.
+  `append_handoff_note` is unchanged — it still appends without a precondition,
+  because append concurrency is a separate design.
+
+### Changed
+
+- Routes every workflow-artifact write through the new
+  `src/cli/mcp/guarded-write.ts` primitive. The old path was check-then-write
+  with a raw `writeFileSync`; the new one evaluates the revision precondition
+  and then commits durably (temp file in the target directory, `fsync`,
+  `rename`, parent-directory `fsync`). A failed write leaves the previous
+  revision intact and no `.tmp` residue, and the file's mode survives
+  replacement. `paths.ts` remains the sole containment and policy authority.
+- Adds `sha256` and `previousSha256` to every successful write payload
+  (`previousSha256` is `null` on create). Both are bare hex and
+  byte-comparable with `read_workflow_file`'s `sha256`, so a read result feeds
+  straight back into the next write without reshaping.
+- Rejects undeclared parameters on the seven write tools with
+  `UNKNOWN_PARAMETER` and details naming the unknown keys and the allowed set.
+  The MCP server dispatches through the low-level SDK path, which does not
+  enforce per-tool `inputSchema`, so a misspelled or invented key was
+  previously accepted and silently ignored.
+
+### Fixed
+
+- Workflow-artifact writes no longer follow a symlink at the target. A symlink
+  inside the repo (for example `plans/prds/x.prd.md` pointing at
+  `docs/spec.md`) passes the path policy, and the previous writer followed it
+  and overwrote the link target. The target is now `lstat`-checked and any
+  symlink is refused with `SYMLINK_ESCAPE`; a target that exists but is not a
+  regular file is refused with `NOT_A_REGULAR_FILE`.
+
+## [0.16.0] - 2026-08-20
+
+Completes the kanban coordination program that `0.15.3` opened. `0.15.3` shipped
+the lease plane's correctness (WP1 plus its hardening pass); `0.16.0` adds the
+board that makes ownership observable (WP2) and the hook surfaces that put it in
+front of agents at the two moments it matters (WP3).
+
+### Added
+
+- Adds `repo-harness state board --json [--sprint <path>] [--target-ref <ref>]`,
+  emitting the frozen `BoardDocumentV1`: four columns with precedence
+  `done > blocked > doing > todo`, three separated dimensions (task, lease,
+  progress), per-dimension and composite input revisions, and a
+  `snapshot_consistency` verdict of `stable` or `changed_during_read` produced by
+  a collect-project-collect pass with one full-round retry. The board reads
+  canonical sprint bytes through `git show`, this sprint's leases, raw
+  `git worktree list --porcelain`, owner-worktree attempt ledgers, and
+  read-only progress tokens; it never reads worktree metadata and never takes a
+  task lock.
+- Passes the lease vocabulary through the board unchanged
+  (`available | reserving | bound | completing | released | unknown`), derives
+  `orphaned` into diagnostics, keeps residual `released` rows in `blocked`, and
+  marks any `done` row still holding a non-available lease with
+  `lease_cleanup_required` plus an executable reconcile action.
+- Injects a byte-identical read-only `BoardSliceV1` into Codex
+  `SubagentStart.context` and the Claude `PreToolUse.subagent` `Task|Agent`
+  branch, so a freshly spawned subagent starts with peer claims in view instead
+  of blind. One pure projector and one shared renderer produce the slice; the
+  hosts only wrap it, and an `env.HOOK_HOST` guard keeps injection
+  exactly-once. The slice structurally omits `progress_state`, `column`, and all
+  conflict fields, and its collector never resolves effective state or reads
+  attempt ledgers.
+- Adds a `PreToolUse.edit` lease gate that fires only when a unique claim token
+  whose `unit_ref` matches the active-plan marker coexists with a linked
+  worktree. Once armed it runs five checks, each failing closed with its own
+  reason token; an IO failure before arming degrades to an advisory and passes.
+  Non-sprint execution is unaffected, so a stale write-only claim token cannot
+  permanently arm a tree.
+- Adds the shared coordination plane architecture document at
+  `docs/architecture/shared-coordination-plane.md` and a hook route-table
+  annotation in `docs/architecture/global-hook-runtime.md`.
+
+### Changed
+
+- Appends a bind-time `resumed` receipt before the owner record is written, so a
+  steal-then-rebind no longer inherits the previous claim's no-progress receipts
+  and reports a false `stalled` to the first board reader.
+- Extracts the shared task, lease, and diagnostics derivation out of
+  `project-board.ts` so the full board and the hook slice project from one
+  source rather than two parallel readings.
+
+### Fixed
+
+- Retires the merged worktree at the tail of `contract-worktree finish --merge`
+  instead of leaving it behind for a later manual cleanup.
+
+## [0.15.3] - 2026-08-19
+
+### Added
+
+- Adds the shared coordination plane WP1: sprint rows are claimed and completed
+  through a git common-dir lease store behind `sprint claim`, `bind`, `release`,
+  `steal`, `reconcile`, `identify`, and `begin-completion`. The cutover is
+  quiescent and fail-closed rather than dual-authority.
+- Adds a SubagentStart long-command guardrail advisory so delegated runners are
+  warned about output-swallowing pipes before a long command stalls a watchdog.
+- Adds a SessionStart notice for cleanable contract worktrees.
+- Adds `minimal_change` enforce mode: `mode: "enforce"` arms a Stop gate that
+  blocks a `review` verdict until a fingerprint-matching audit receipt at
+  `.ai/harness/checks/minimal-change-audit.latest.json` releases it, bounded by
+  the shared circuit breaker at two blocks per report fingerprint. Defaults stay
+  `advice` with the post-edit observer opt-in; enforce is per-repo opt-in.
+- Adds a Stop advisory when implementation changes carry no active plan.
+- Adds the `debug-ground-truth-eval-v1` benchmark and reports the uncommitted
+  architecture projection backlog from `check-architecture-sync`.
+- Adds a stable aggregate CI context so branch protection has one required
+  check to bind.
+
+### Changed
+
+- Hardens the coordination lease protocol: the owner record carries three
+  explicit fields, a `completing` guard blocks concurrent completion, inline
+  `complete` passes through the same gate, legacy lease shapes are rejected
+  fail-closed instead of being upgraded, and marker writes have a fixed order.
+- Pins `archctx` to 0.4.4 and migrates architecture projections to the
+  `archcontext.docs-renderer/v4` contract.
+- Makes CodeGraph enablement purely explicit. `profileEnablesCodegraph` no
+  longer auto-enables CodeGraph for repositories with at least 2000 tracked
+  files; the only true paths are the `full` profile and an explicit
+  `tooling.codegraph.enabled: true` in the target repo's
+  `.ai/harness/policy.json`. Downstream repos on the minimal profile without
+  that opt-in no longer gain CodeGraph, and policy read or parse failures fail
+  closed to disabled. This repo's own policy carries the explicit opt-in, so
+  self-host behavior is unchanged.
+- Collapses worktree base metadata onto one typed selector in `verify-sprint`,
+  classified fail-closed, and unifies the `.ai` memory layers.
+
+### Fixed
+
+- Guards the `setup-plugins.sh` shift overrun on final-position retired options
+  and the empty-args expansion that preceded it.
+- Guards the empty untracked array in `ship-worktrees` scaffold discard on
+  bash 3.2.
+- Collapses worktree merge determination to one authority.
+- Runs the `minimal_change` enforce gate before the Stop handler's lite early
+  return.
+- Restores machine-owned projection output before the merge gate, and restores
+  the lite-enforce-gap closeout content that a typed-lock publication
+  overwrote.
+
+## [0.15.2] - 2026-08-16
+
+### Added
+
+- Adds `obsidian-memory` as a repo-owned dual-host skill-surface facade, with
+  the official Obsidian skills declared as runtime-referenced tooling in
+  `check-agent-tooling` and authority-boundary tests pinning the facade
+  contract.
+
+### Changed
+
+- Syncs the archctx dependency line to 0.4.3 with docs-renderer v3 and moves
+  the three version anchors, adopting the upstream canonical-body-digest fix
+  that stops projection restamp churn.
+- Strips machine node-runtime authority from faked PATH environments in the CLI
+  tests so local and CI runs agree.
+
+### Fixed
+
+- Resolves archctx from the target repository before the CLI root, closing the
+  window where a freshly refreshed global CLI blocked the Stop-gate
+  architecture projection drain of an unrelated repo.
+
+## [0.15.1] - 2026-08-15
+
+### Added
+
+- Adds a contract-first Change Assessment and typed AcceptanceReceipt path that
+  binds verification, review selection, final subject, and explicit user
+  waivers before a work package can close.
+- Adds durable hook-effect failure semantics with stop, retry, recovery, and
+  event telemetry, plus a Goal Calibration Gate that asks at most one
+  highest-information-gain planning question.
+
+### Changed
+
+- Publishes one commit per contract worktree and makes nested capability
+  architecture routing resolve arbitrary workspace `src/**` depth through the
+  canonical capability registry.
+- Records research on composable agent-harness boundaries without adopting a
+  second runtime authority.
+
+### Fixed
+
+- Makes architecture queue events semantically idempotent per changed file,
+  including mixed severity and alternating capability prefixes, while keeping
+  unchanged requests eligible for index self-healing.
+- Serializes record/archive writers with a rollback-safe queue lock outside the
+  architecture snapshot tree, adds crash recovery and recurrence handling, and
+  rejects forged cards, unsafe symlink targets, and stale migration authority
+  before mutation.
+- Preserves committed Change Assessment oracle IDs through evidence
+  redaction/materialization so assessment, selection-packet, and envelope
+  fingerprints remain verifiable without exempting unrelated IDs or known
+  secrets.
+
+## [0.15.0] - 2026-08-12
+
+### Added
+
+- Adds a repo-level architecture-drift changed-set cursor as the single
+  mutation authority used by Stop and manual drain paths. Multi-file patches
+  and shell-written files now reach the same deterministic projection instead
+  of depending on a single tool-reported path.
+
+### Changed
+
+- Cuts architecture cascade discovery over to the frozen Stop diff and retires
+  the journal's architecture dirty bit, removing the duplicate authoring path
+  while preserving cursor acknowledgement only after the cascade succeeds.
+- Aligns the Claude planning brief with the architect-consultation packet and
+  refreshes generated architecture projections against the 0.14.2 baseline.
+- Clarifies the Codex native fleet contract against the 0.147 model catalog:
+  Sol/Terra roots use the repository's v2 packet shape, while Luna-rooted v1
+  sessions still discover custom agent roles through their distinct lifecycle
+  surface.
+
+### Fixed
+
+- Keeps the architecture-drift cursor pending when the legacy cascade runner is
+  unavailable, when the follow-up fails, or when manual drain cannot complete.
+  A later Stop can therefore retry the same changed set instead of silently
+  acknowledging lost work.
+
+## [0.14.2] - 2026-08-11
+
+### Added
+
+- Registers `zhaoxuya520/reverse-skill`'s `reverse-skill-router` as a recommended
+  explicit-only external Skill for Claude and Codex, installed through
+  `--with-reverse-skill`. It is deliberately excluded from both profiles
+  because its upstream target-mention authorization assumption is not a valid
+  repo-harness authority boundary. External provider projection is now
+  catalog- and host-driven; the provider is commit-pinned and its selected tree
+  is integrity-checked before host projection. Optional toolchains remain
+  on-demand.
+
+### Changed
+
+- Makes native Codex `spawn_agent` with the exact installed `agent_type` the
+  sole fleet identity/lifecycle authority. Official `SubagentStart` role/model
+  evidence is now persisted even without advisor state; reasoning effort stays
+  explicitly `configured_unverified`.
+- Removes the Codex delegation-mode installer/config surface, SessionStart
+  standing authorization, natural-language delegation inference, and
+  App-thread/`codex-exec`/main-thread fleet fallbacks. `/delegate` and
+  `/parallel` remain prompt-start typed commands. New contract templates select
+  only `subagent` and declare no fallback; Stop no longer synthesizes a second
+  dispatch instruction.
+- Syncs the mandatory `archctx` / `archctx-contracts` closure to 0.4.2 across
+  package pins, policy `projection_version`, `ARCHCTX_REQUIRED_VERSION`, the
+  downstream policy templates, and eval fixtures.
+- Bounds cross-review retries and adds an advisory skipped status.
+
+### Fixed
+
+- Reclaims the least-recently-used idle Streamable HTTP MCP session when a new
+  `initialize` request reaches the configured session cap, while preserving
+  sessions with in-flight requests. This prevents abandoned ChatGPT Connector
+  reconnect sessions from accumulating until `SESSION_LIMIT_REACHED` (#174).
+  `/health` now reports cumulative created, closed, expired, and evicted session
+  counters for lifecycle diagnosis.
+- Modernizes the axr5 clean-room integration proof for bun 1.3 install layouts:
+  workspace packages link from the checkout's declared workspace list, consumer
+  `file:` dependencies probe both install roots, and `prepareReleaseVersion`
+  accepts an already-at-version source while still failing closed on a missing
+  declaration. The proof is regenerated against the published archctx 0.4.2.
+- Makes `repo-harness update` reconcile and read back its mandatory
+  `archctx@0.4.2` and `archctx-contracts@0.4.2` dependency closure instead of
+  trusting a successful Bun global install. A stale global dependency tree is
+  reported with an explicit operator repair command; update never removes the
+  working CLI before a replacement is known-good, and unresolved mismatches
+  fail closed before host configuration is mutated.
+- Propagates ArchContext's exact Node `>=24 <26` runtime contract, invokes the
+  package-local ArchContext binary with a compatible PATH-owned Node, and
+  reports a hard readiness error when that runtime is unavailable.
+- Refreshes the exact CodeGraph CLI during update. Mutable third-party Waza and
+  Mermaid providers remain behind explicit `--with-external-skills`; the
+  ArchContext package-local CodeGraph and user-level CodeGraph MCP remain
+  independently versioned and independently verified.
+- Requires the complete ArchContext base model (`manifest.yaml`,
+  `product.yaml`, and model nodes) before projection apply is reported as
+  enabled.
+
+## [0.14.1] - 2026-08-10
+
+### Fixed
+
+- Makes Markdown Mermaid the single architecture diagram artifact across the
+  `repo-harness-architecture` skill, architecture queue follow-up prompt,
+  generated architecture indexes, capability contract projections, and
+  reference docs. Standalone HTML generation and discovery are removed;
+  the external `mermaid` skill remains authoring/review-only.
+- Adds regression coverage that renders a real architecture request and proves
+  it contains the Mermaid-only instruction with no HTML artifact route, while
+  preserving the existing consumer E2E invariant of zero architecture HTML.
+
+## [0.14.0] - 2026-08-09
+
+### Added
+
+- Makes the public `archctx@0.4.0` runtime and
+  `archctx-contracts@0.4.0` schema surface exact production dependencies when
+  the ArchContext projection provider is enabled. The release keeps the
+  package boundary fail-closed: no checkout overlay, global PATH fallback, or
+  vendored diagram runtime is used.
+
+### Changed
+
+- Promotes this self-host repository's projection failure and architecture
+  freshness gates from advisory to strict after AXR1-AXR7 proved the complete
+  producer-to-consumer flow. Major module changes now enqueue an architecture
+  refresh signal, the runtime drains the typed request through `archctx`, and
+  Stop/readiness cannot report clean while a projection failure, dead letter,
+  or qualifying stale request remains.
+- Architecture documents remain Markdown with Mermaid `flowchart` and
+  `sequenceDiagram` sources only. Mermaid validation stays an authoring-time
+  skill/dev concern; the npm package contains no HTML or browser runtime.
+
+## [0.13.2] - 2026-08-07
+
+### Security
+
+- Collapses every authored `.repo-harness/` gitignore projection to a single
+  directory-level rule (#164). The generated managed block
+  (`src/core/adoption/gitignore-plan.ts`) and the shell scaffold heredoc
+  (`scripts/lib/project-init-lib.sh`) previously listed only two dead
+  per-file entries, so the four files the MCP server actually writes under
+  `<repo>/.repo-harness/` — including `mcp.oauth-tokens.json` holding OAuth
+  access and refresh tokens — stayed NOT-IGNORED for any user who started
+  `repo-harness mcp serve --transport http` without first running
+  `mcp setup chatgpt` with repo scope. Nothing under `.repo-harness/` is
+  intentionally tracked and `.repo-harness-owner.json` is not caught by the
+  new rule. Retiring the repo config scope and the setup-time per-file
+  compensation stays a separate slice.
+
+## [0.13.1] - 2026-08-07
+
+### Changed
+
+- Ships the `repo-harness-hook` bin as a prepack-built single-file bundle
+  `dist/hook-entry.js` instead of the live multi-file TypeScript tree. A
+  registry reinstall now replaces one file atomically, so a hook firing inside
+  the reinstall window can no longer resolve a half-replaced import graph and
+  hang until the host's 30s adapter timeout. Two bounded source changes keep
+  the bundle behavior-preserving: `src/cli/hook-entry.ts` gains an explicit
+  `--detached-tooling-populate` dispatch branch, because `bun build` folds
+  `session-context.ts`'s own `import.meta.main` bootstrap to `false` while
+  `import.meta.url` retargets the respawn at the bundle, and both surfaces call
+  the same exported `runDetachedToolingPopulate`; and
+  `src/effects/evidence/post-bash-importer.ts` reads a build-time version
+  literal injected by `bun build --define`, so the bundled provider id never
+  emits the invented `0.0.0` that its `import.meta.url` path walk would produce
+  once bundled. Managed adapter command strings, `timeout: 30`, and the
+  `repo-harness` main bin mapping are byte-identical. Local symlink installs
+  (`bun link`, `bun install -g <dir>`) bypass the packed bundle and need
+  `bun run build:hook-bundle` once in the checkout; registry installs are the
+  covered path.
+
+### Fixed
+
+- Keeps dynamic MCP OAuth clients alive past the absolute 30-day TTL while
+  they still hold an unexpired access or refresh token (#161, #162). The
+  cleanup predicate previously used registration time alone, so an actively
+  refreshing ChatGPT connector was deleted at day 30 and its next refresh
+  failed with `invalid_client`, forcing periodic re-authorization even under
+  continuous use. Liveness is derived from existing token state — no new
+  persisted field — so spam registrations that never completed authorization
+  are still cleaned at 30 days, and a connector idle past 30 days still
+  expires end to end.
+- Raises the whole-round verification budget in `scripts/verify-contract.sh`
+  from 600s to 1200s. The repo's own required `bun test` had outgrown the
+  budget, so any contract listing it under `commands_succeed` deadlocked at the
+  gate. The constant stays a fixed policy line; no environment override was
+  added.
+- Raises `VERIFIER_HELPER_TIMEOUT_MS` in `src/cli/runtime/helper-runner.ts`
+  from 720s to 1260s so the outer process wrapper sits strictly above the inner
+  whole-round budget plus a 60s margin. Previously a 720-1200s round died as a
+  mute process kill with no run snapshot and no `budget_ms`, which made the
+  evidence-emitting inner gate unreachable for long rounds.
+- Retains a failing criterion's runner log at
+  `.ai/harness/runs/<run-id>-<criterion-slug>.log` instead of destroying it
+  with the round's temp directory. Run reports previously recorded only
+  `exit_code`, so a failing `bun test` criterion could not be attributed to a
+  test at all. Passing criteria retain nothing, and a retention failure warns
+  without changing the round's verdict.
+- Makes five load-sensitive tests robust under machine load. Three
+  subprocess-heavy `tests/continuation-attempt.test.ts` cases now carry
+  explicit 30s timeouts instead of dying at bun's default 5000ms; the bounded
+  spawn-error ceiling in `tests/unit/closeout-runner-guardrails.test.ts` widens
+  to 5s with its `timedOut === false` fence unchanged; and a `Bun.sleep(100)`
+  race there becomes an event race on the production drain-then-release
+  ordering, which also gains a vacuity guard the sleep version lacked.
+
+
+## [0.13.0] - 2026-08-04
+
+### Added
+
+- Adds the long-run continuation protocol, which moves "what runs next" out of
+  chat context and into durable repository state. `repo-harness state next
+  --json` emits a `ContinuationEnvelopeV1` carrying one of six routes —
+  `continue_active_plan`, `advance_sprint`, `verify_or_finish`, `halt`,
+  `complete`, `idle` — plus the command the host should run and a
+  `progress_token`. The command is read-only and deterministic: identical
+  repository bytes and identical receipt-ledger bytes yield byte-identical
+  JSON, and it never creates a plan, contract, or worktree, never advances the
+  sprint, and never authorizes more than one bounded unit or one halt per call.
+  Row selection stays with `sprint-backlog`; the envelope only names the
+  command. `halt` reuses the existing Effective State and sprint vocabularies
+  rather than inventing its own, and there is no `ask` or `wait` route — a
+  needs-user state is a halt whose reason points at the blocker.
+- Adds `repo-harness state attempt`, which records one `AttemptReceiptV1` per
+  bounded turn — `unit_ref`, outcome, and the before/after envelope
+  `progress_token` pair — to the ignored ledger at
+  `.ai/harness/runs/continuation/attempts.jsonl`. Receipts are liveness
+  evidence, never authority: they answer only "did this turn move anything".
+  Two consecutive `completed` receipts on the same `unit_ref` with an unchanged
+  token trip a no-progress circuit breaker, so the next envelope returns
+  `halt:no_progress`; a token change clears it, and `--outcome resumed` is the
+  operator's only explicit override. An unreadable ledger fails closed as
+  `halt:attempt_ledger_unreadable` instead of being treated as an empty
+  history. Two independent mechanisms — the gitignore rule and
+  `isOperationalReviewPath`'s `.ai/harness/runs/` prefix — keep the ledger out
+  of `progress_token`, and either alone suffices, so writing a receipt can
+  never look like the progress that would clear the breaker.
+- Makes contract closeout crash-durable. `contract-worktree finish` and
+  `ship-worktrees` now run as an exclusively owned, journalled transaction:
+  before any journal, lifecycle write, commit, push, or PR, the caller
+  atomically creates a worktree-scoped claim directory under
+  `<git-common-dir>/repo-harness/transactions/claims/`, so simultaneous callers
+  contend on `mkdir` and every loser fails closed before the first side effect.
+  The owner then writes a `CloseoutJournalV1` with one fsync'd record per phase
+  (`prepared` through `complete`) via temp file plus atomic rename, and
+  releases its claim only on a terminal status. Claims and journals live under
+  the git common dir, outside every working tree, so they survive worktree
+  removal. An interrupted closeout fails closed — a plain rerun refuses while
+  an `in_progress` journal or a claim exists — and recovery is explicit:
+  `recover inspect` reports the claim, owner PID liveness, and recorded phases;
+  `recover abort` restores the pre-closeout snapshot and is the only way to
+  clear a dead pre-journal orphan claim; `recover reconcile` completes the
+  missing steps after an external effect landed, never re-merging, re-pushing,
+  or duplicating a PR. A mutating recovery first proves the recorded owner PID
+  is dead, then takes the claim's nested `recovery.lock` lane; it never steals
+  from a live owner, and nothing reclaims a stale claim automatically.
+  Per-phase `SIGKILL` fault injection and concurrent double-start race tests
+  cover the transaction.
+- Publishes the host conformance contract at
+  `docs/reference-configs/long-run-continuation.md`: the seven-step tick, the
+  per-route host action table, the halt vocabulary, the crash-recovery
+  semantics, and the operator remedy for each halt reason. A conformance suite
+  runs the whole tick — opening envelope, one bounded unit, closing envelope,
+  attempt receipt, post-receipt envelope — inside a disposable repository,
+  selecting routes and commands only from the envelope it just read, and binds
+  both arms of the receipt-invisibility invariant.
+- Adds a sprint-backlog grammar drift check that binds the TypeScript backlog
+  reader to `sprint-backlog.sh` over shared fixtures covering statuses, row
+  shapes, section bounds, and CRLF input, so the two readers cannot diverge on
+  the grammar they both parse.
+
+## [0.12.3] - 2026-08-03
+
+### Added
+
+- Adds `MainLoopDispatchGuard`, an opt-in Claude-host edit boundary that
+  separates orchestrator edits from subagent edits. Armed only by
+  `REPO_HARNESS_MAIN_LOOP_EDIT_GUARD=1|true` together with
+  `HOOK_HOST=claude`, it denies main-loop `Edit`/`Write` on code-extension
+  files and returns a dispatch-to-subagent instruction; Claude Code stamps
+  `agent_id`/`agent_type` onto the payload only inside a subagent, so an
+  absent pair identifies the orchestrator thread. Subagent edits and
+  non-code paths such as plans, docs, and config pass through unchanged.
+  The check is a strong boundary, evaluated per path and independent of
+  plan state, spec presence, and workflow-profile resolution, so the
+  dispatch instruction lands before any plan advisory. The product default
+  is off; unsetting the variable is the operator off-switch.
+
+### Fixed
+
+- Hook fixtures that pin `HOOK_HOST=claude` now strip or neutralize
+  `REPO_HARNESS_MAIN_LOOP_EDIT_GUARD` at the fixture boundary, so an armed
+  operator shell can no longer arm the new guard inside frozen
+  characterization runs and flip their recorded goldens.
+
+## [0.12.2] - 2026-08-02
+
+### Changed
+
+- Makes Codex App Threads the preferred delegation runner. The orchestrator
+  reads each role's exact model and reasoning effort from the installed
+  `~/.codex/agents/<role>.toml`; native `spawn_agent` is now a fail-closed
+  fallback only when its live schema can carry the same tuple. The canonical
+  policy, hook advice, standing authorization, downstream initializer seeds,
+  and helper mirror all carry the same routing contract.
+- Converges packaged fleet authorship on `agents/fleet/`: tracked repo-level
+  Claude agent copies are removed, Codex TOMLs remain generated installer
+  fixtures, and gatekeeper maps to the Terra/xhigh Codex profile through the
+  existing role mapping authority.
+- Records the live App Thread canary and its version-bound readiness limit:
+  Codex CLI `0.146.0-alpha.9.2` honored the requested fast-worker tuple, while
+  the public materialized-thread readback still omits model and effort. That
+  result remains unverified at the portable orchestrator contract and selects
+  the declared fallback instead of inferring readiness from private host data.
+
+### Fixed
+
+- Agent-fleet health checks now honor hash-bound user-managed receipts, so an
+  accepted local role override reports as user-managed instead of permanent
+  drift; absent, malformed, or stale receipts still fail closed.
+- Receipt update-check tests now stub their upstream fetches, removing eight
+  real network calls per affected path and the resulting deterministic timeout
+  on slower networks.
+- Bounded verifier children now remove every inherited
+  `REPO_HARNESS_*` variable at the spawn boundary, preventing helper routing
+  metadata from overriding fixture isolation inside nested test commands.
+- Acceptance finalization strips materializer-owned `provenance` before
+  re-emitting its run trace, so the published checks projection's recorded
+  content hash is self-consistent with its own bytes.
+
+## [0.12.1] - 2026-08-01
+
+### Changed
+
+- Restructures the five-language README suite into a get-started-first
+  layout (centered header, TOC, Get Started section, key-features table),
+  cutting the English `README.md` from 872 to 451 lines; deep-dive content
+  (install profiles, General Repo MCP, harness overview, hook operations)
+  moves into `docs/reference-configs` before deletion so nothing is lost,
+  and the four translations (zh-CN, ja, fr, es) are rewritten against the
+  new section structure.
+- Bumps the `@colbymchenry/codegraph` dev dependency from `1.4.1` to
+  `1.5.0`.
+
+### Fixed
+
+- `hook-events.jsonl`'s `run_id` was always empty and each evidence writer
+  minted its own `run-${Date.now()}` on demand, so hook telemetry never
+  joined evidence `correlation_run_id`. A new `run-identity.ts` module is
+  now the single SessionStart-only mint and resolution authority (payload
+  -> `HOOK_RUN_ID` -> `CODEX_RUN_ID` -> `CLAUDE_RUN_ID` -> session-state
+  lookup -> null), storing one bounded `session-run-identity.json` slot;
+  `event-telemetry.ts` and `command-observed.ts` now wire to this unified
+  resolver instead of independent chains or self-minted fallbacks.
+
+## [0.12.0] - 2026-07-31
+
+### Added
+
+- Adds `deep-worker` to the managed agent fleet (`.claude/agents/`,
+  `.codex/agents/`, `agents/fleet/`): an Opus/high-effort heavy execution
+  worker for cross-module refactors, tricky concurrency or state fixes, and
+  other hard changes that must land right in one pass.
+
+### Changed
+
+- Breaking: `repo-harness adopt` is removed with no alias or compatibility
+  stub (`repo-harness adopt` now fails closed with commander's
+  `unknown command 'adopt'`). `repo-harness init` takes over repo-local
+  adoption byte-for-byte (same flags and rollback positional). The former
+  duplicate global-bootstrap `repo-harness init` block, including its
+  `--refresh` compatibility no-op, is removed; `repo-harness install` is now
+  the sole global/host-level bootstrap entrypoint. Pre-cutover transaction
+  manifests keep rolling back unmodified: their frozen protocol-1
+  `"command": "adopt"` literal is unchanged on disk, so
+  `repo-harness init rollback --transaction <path>` still accepts them.
+- `fast-worker` moves from Sonnet at max effort to Opus at medium effort
+  with an explicit max-target override; the default Codex model projection
+  for the `opus` family is respecified accordingly, and pinned model
+  versions are dropped in favor of the effort-tier projection.
+- `docs/reference-configs/` is now a generated projection of the shipped
+  `assets/reference-configs/` source. `scripts/sync-reference-configs.ts
+  --check/--write` keeps all 23 mirrored pairs in sync and is wired into
+  `check-ci`; the README and reference-config test suites also drop
+  scattered duplicate assertions that never caught a regression, in favor
+  of one inventory-driven projection guard.
+
+### Fixed
+
+- MCP allowed-root policy no longer denies roots under an OS realpath
+  canonicalization prefix such as `/private/tmp` on macOS; only that
+  prefix is stripped before the `private/**` deny glob runs, so a genuine
+  `private`/`secrets`/`node_modules` segment elsewhere in the path still
+  denies.
+- `ensure-task-workflow`'s bootstrap now writes the resume packet after the
+  current-status snapshot instead of before, closing a same-second
+  write-order race that made `check-task-workflow --strict`'s whole-second
+  mtime comparison fail nondeterministically (1 of 12 idle runs before the
+  fix).
+- `acceptance-receipt`'s verification-evidence fingerprint now hashes
+  through the existing `stableJson()` canonicalizer instead of raw
+  `JSON.stringify`, so a semantics-preserving key-order difference between
+  the evidence ledger's inline (under the 8192-byte cap) and blob storage
+  paths for `checks/latest.json` no longer flips
+  `verification_evidence_sha256` and fails acceptance closed as stale.
+- `contract-worktree` cleanup now recognizes a squash-merged branch as
+  absorbed via an exact `git merge-tree` tree-equality fallback instead of
+  ancestry alone, and deletes absorbed branches with `git branch -D` while
+  still using `-d` for plain ancestor merges — closing the half-completed
+  cleanup (worktree removed, branch left behind) that unconditional `-d`
+  caused on every squash-absorbed package.
+
+## [0.11.3] - 2026-07-29
+
+### Added
+
+- Adds ChatGPT delegate mode: a repo-owned, transport-agnostic dual-agent GPT
+  Pro protocol (task brief with `EXECUTION_BOUNDARY`, a sentinel envelope
+  bound to baseline/bundle SHA-256, a baseline snapshot including WIP diff,
+  isolated-worktree acceptance with no 3-way merge rescue, and bounded
+  2-round escalation) over two explicit host transports: Claude through the
+  existing Oracle consult/continue chain, and Codex through its built-in
+  browser with visible-completion and sentinel authority.
+
+### Fixed
+
+- The ChatGPT delegate engine now runs a mandatory Gitleaks scan over the
+  exact rendered PromptBundle bytes (prompt, inline files, and followups)
+  before any session-store write or provider spawn, failing closed on a
+  missing binary, an incompatible version, unparsable output, or findings;
+  followup consults inherit the scan requirement from session metadata and
+  cannot opt out.
+- Added explicit, opt-in `install-skill`/`uninstall-skill` host projection
+  commands for the previously undiscoverable `repo-harness-chatgpt` package,
+  using realpath-validated symlinks that fail closed on unowned destinations
+  and roll back idempotently.
+- Updated the skill-surface pin to cover the new `references/delegate.md`
+  reference (6 references total) and raised the router byte limit from 2048
+  to 2560.
+
+## [0.11.2] - 2026-07-26
+
+### Fixed
+
+- Hook command context no longer emits a per-call `[ChecksFile]` line, removing
+  repeated static noise while retaining the canonical checks artifact as
+  queryable workflow state.
+- Capability and TDD jurisdiction now classify paths outside the repository as
+  out of scope without weakening traversal, NUL-byte, or Win32 path validation.
+- `SessionStart` now resolves Effective State in process instead of spawning the
+  repo's own CLI. The shared bounded transient retry path preserves host-hook
+  liveness, distinguishes resolved blockers from unavailable authority, and
+  persists only normalized, redaction-safe unavailable diagnostics.
+
+## [0.11.1] - 2026-07-24
+
+### Changed
+
+- Host install profiles are now exactly `minimal` and `full`: minimal projects
+  7 Codex hooks, full projects all 11 and is the default for fresh and
+  adapter-only installs. The former 5-hook tier and the steady-state
+  `standard`/`product-planning`/`strict` install names are retired. Installed
+  state is protocol 2; protocol-1 state fails closed on normal reads and moves
+  only through `repo-harness install --migrate-profile-state --profile
+  minimal|full`, with transaction-owned removal and compensation.
+- Workflow status and archive closeout now converge on the same typed acceptance
+  authority: historical terminal classification requires a fulfilled contract,
+  passing review projection, and typed receipt, while archive prediction binds
+  the scratch candidate before attaching acceptance dependencies.
+
+### Fixed
+
+- User-managed agent-fleet installs can now be explicitly accepted without
+  overwriting local role definitions; the acceptance stays bound to validated
+  role identity and exact installed bytes.
+- Evidence materialization now honors immutable genesis authority instead of
+  allowing a later projection to substitute a new ledger origin.
+- Contract verification canonicalizes human scorecard labels to the machine
+  criterion keys, preventing valid QA evidence from failing on display names.
+- Effective State concurrency tests now publish mutator readiness only after
+  counter initialization, closing the pre-initialization observation race.
+- Claude skill-routing provider subprocesses now isolate setting sources to the
+  case project instead of inheriting unrelated host configuration.
+- Primary-worktree shipping now forwards an empty optional child-argument list
+  without triggering `unbound variable` under macOS system Bash 3.2, while
+  preserving exact `--dry-run` and `--ready` argument values.
+- Newly adopted repos now ignore `.ai/harness/evidence/`, and review-subject
+  normalization classifies the ledger as operational state, so authoritative
+  evidence emission cannot make its own acceptance subject stale.
+
+## [0.11.0] - 2026-07-23
+
+### Changed
+
+- `checks/latest.json` is now materialized exclusively from the
+  `EvidenceEvent` ledger (D7 selection predicate: exact worktree + subject +
+  admitted trust class, last accepted event wins). Every prior direct
+  authoring path is deleted in the same package that replaced it:
+  `verify-sprint.sh`'s `cp` onto `checks/latest.json`, the
+  `workflow_ensure_harness_surface` `{}` bootstrap, and
+  `mutation-observed.ts`'s continuous contract-verification cascade (now
+  redirected to a dedicated `.ai/harness/checks/contract-verify.latest.json`,
+  never the acceptance-evidence path).
+- Recovery views (`handoff/current.md`, `handoff/resume.md`) render from one
+  standalone materializer, single-hop from the EPC-06 checkpoint plus
+  minimal live workflow context. The independent bash `workflow_write_handoff`
+  content assembly, `codex-handoff-resume.sh`'s elaborate-resume assembly,
+  `prepare-codex-handoff.sh`'s Node/Python global-packet splice, and
+  `workflow_ensure_harness_surface`'s handoff/resume placeholder bootstrap
+  are all retired same-package; the three bash entrypoints are now thin
+  invokers of one standalone CLI (`scripts/recovery-view-cli.ts`).
+- The SessionStart Context Packet's resume-availability check
+  (`resumeAvailable()`) now resolves from the canonical checkpoint-backed
+  evidence reader (`resolveRecoveryEvidence`) instead of re-deriving
+  availability by string-scanning `resume.md` for a legacy marker/header.
+- Evidence-ledger redaction gained a typed-field exemption: a whole-value
+  declared hash (`sha256:`-prefixed or bare 40/64-hex) or a declared/inferred
+  safe repo-relative path is exempt from high-entropy redaction, so a
+  realistic long contract slug or a `sha256:`-prefixed field now survives
+  materialization byte-identical instead of being partially hash-mangled.
+  The secret-value denylist still runs unconditionally over every field,
+  exempted or not.
+- PostBash-observed command results and manual/external attested acceptance
+  receipts now import into the same `EvidenceEvent` ledger (`observed` and
+  `external_attested`/`human_acceptance` trust classes respectively),
+  feeding the materializers above under the frozen D4 trust matrix.
+
+### Removed
+
+- **Skill surface discovery convergence (public cutover, next-minor breaking
+  change).** `assets/skill-commands/manifest.json` v2 is now the runtime
+  discovery authority for Skill package classification and host/profile
+  projection. Rule owners converge from 25 Skill-like sources to 10 canonical
+  packages (`repo-harness`, `repo-harness-setup`, `repo-harness-plan`,
+  `repo-harness-product`, `repo-harness-check`, `repo-harness-ship`,
+  `repo-harness-architecture`, `repo-harness-cross-review`, `merge-gate`
+  classification-only, `repo-harness-chatgpt`); the 19 retired names below are
+  deleted (no directories, no generated aliases, no compatibility shims) and
+  recorded only as migration metadata in the manifest's `retiredPackages`
+  array:
+
+  | Retired name | Replacement |
+  |---|---|
+  | `repo-harness-init` | `repo-harness-setup` (adopt-init mode) |
+  | `repo-harness-migrate` | `repo-harness-setup` (migrate mode) |
+  | `repo-harness-upgrade` | `repo-harness-setup` (upgrade mode) |
+  | `repo-harness-repair` | `repo-harness-setup` (repair mode) |
+  | `repo-harness-scaffold` | `repo-harness-setup` (scaffold mode) |
+  | `repo-harness-capability` | `repo-harness-setup` (capability mode) |
+  | `repo-harness-review` | `repo-harness-plan` (review mode) |
+  | `repo-harness-prd` | `repo-harness-product` (PRD mode) |
+  | `repo-harness-sprint` | `repo-harness-product` (Sprint mode) |
+  | `repo-harness-goal` | `repo-harness-product` (Goal mode) |
+  | `repo-harness-handoff` | root `repo-harness` (handoff action + `references/handoff.md`) |
+  | `repo-harness-deploy` | `repo-harness-check` (deploy-readiness reference) |
+  | `repo-harness-autoplan` | retired, no successor; root `execute` already follows Effective State through the existing plan -> contract -> worktree -> verify -> ship chain. Its Reusable Workflow Packaging Rubric survives alone as `references/workflow-packaging-rubric.md` |
+  | `repo-harness-gptpro` | `repo-harness-chatgpt` (consult/continue modes) |
+  | `repo-harness-gptpro-setup` | `repo-harness-chatgpt` (setup mode) |
+  | `codex-review` | `repo-harness-cross-review` (Codex provider mode) |
+  | `claude-review` | `repo-harness-cross-review` (Claude provider mode) |
+  | `repo-harness-chatgpt-bridge` (static `.agents/skills/` copy) | `repo-harness-chatgpt` (bridge reference); the generated runtime projection identity `repo-harness-chatgpt-bridge` is unchanged |
+  | `repo-harness-chatgpt-browser` (static `.agents/skills/` copy) | `repo-harness-chatgpt` (continue reference); the underlying `src/cli/chatgpt-browser` CLI engine is unaffected |
+
+  Target discovery matrix: `minimal` -> `repo-harness` only; `standard` ->
+  adds `repo-harness-plan` and `repo-harness-check`; `product-planning` ->
+  adds `repo-harness-product`; `strict` -> `repo-harness-plan`,
+  `repo-harness-check`, `repo-harness-ship`, host-aware
+  `repo-harness-cross-review` on both hosts, and `merge-gate` only on its
+  gatekeeper host. `repo-harness-chatgpt` is explicit-setup only and never
+  implied by `product-planning` or any other profile.
+
+### Notes (accepted intermediate states -- operator guidance)
+
+- Downstream adopters that installed via the packaged CLI (not this source
+  checkout) do not yet receive the ledger/materializer tooling
+  (`emit-verify-evidence.ts` and friends are source-repo-only, never
+  registered in the distributed helper manifest); `checks/latest.json` stays
+  structurally absent in those repos until the next release ships this
+  cutover. This is a pre-existing condition, not a regression introduced
+  here.
+- A globally installed `repo-harness` CLI published before this cutover is a
+  live legacy writer until refreshed. Operator guidance: refresh with the
+  standard install profile (`repo-harness update --profile standard`, or
+  `install --profile standard` for a fresh install) to pick up the
+  materializer-only behavior; until then, invoke `bash scripts/verify-sprint.sh`
+  directly in a self-hosted worktree rather than `repo-harness run
+  verify-sprint`, so the stale global binary's own retired `cp` path cannot
+  silently re-clobber `checks/latest.json` with old-schema content.
+- The guarded, only-if-absent `{}` seeds in `scripts/plan-to-todo.sh` and
+  `scripts/ensure-task-workflow.sh` (project-genesis scaffolding for a
+  brand-new adopted repo, gated `if [[ ! -f ... ]]`) remain non-ledger
+  first-writers by design -- fail-closed, never overwriting real
+  materialized content, and out of scope for this cutover.
+
+### Verification
+
+- Added a cross-package projection-drift suite
+  (`tests/evidence-projection-drift.test.ts`): the checkpoint machine/human
+  views, the recovery views, materialized `checks/latest`, and tracked
+  `tasks/current.md` all recompute byte/hash-identically from their declared
+  sources, both on a fixture ledger and (where live state exists) against
+  this worktree's own published evidence.
+- Added a deprecation-residue scan (`tests/evidence-residue-scan.test.ts`)
+  consuming a checked-in retired-surfaces list
+  (`evals/harness/epc-retired-surfaces.json`, the union of every EPC-05/07/08
+  deletion) -- zero unexcepted hits across `src/`, `scripts/`, `.ai/hooks/`,
+  `assets/`.
+- A matched post-EPC benchmark run was attempted at the post-EPC-08 subject
+  under the frozen VGBR-R protocol (one authoritative invocation, no
+  `--profile`/`--scenario`/`--regrade-existing`). The attempt
+  (`post-epc-196e787a-20260723-a01`) self-classified `failed_during_run`:
+  two `adaptive-lite` arms failed inside the runner's own isolated per-arm
+  sandboxes (a provider tool-exec fault and a harness-guard-blocked agent
+  turn -- see `docs/researches/20260723-epc-program-closeout.research.md`
+  for the full evidence). No report was produced and none was promoted. Per
+  the sprint's own frozen attempt discipline, one protocol-clean failed
+  attempt is sufficient to trigger row 13's cannot-execute fallback -- no
+  second attempt was made, and no automatic rerun or `--regrade-existing`
+  backfill occurred. **Fallback applied**: the pre-EPC baseline triplet
+  (27/27 arms, `evals/harness/reports/profile-comparison.*`, bytes
+  untouched) is now designated **"descriptive pre-EPC baseline only"**.
+  This release closeout claims no benchmark improvement over the pre-EPC
+  baseline.
+
+## [0.10.1] - 2026-07-15
+
+### Changed
+
+- Moved Effective State v1 policy and projection into pure `src/core` modules,
+  isolated repository/Git/lock/cache work under `src/effects`, and kept CLI and
+  hook entrypoints as adapters without changing protocol `1`, public command
+  names, field ordering, or exit semantics.
+- Made `summarize_repo_harness_state` derive its compact state from the same
+  canonical resolver as CLI and hooks. `tasks/current.md` remains an explicitly
+  non-authoritative projection and is no longer parsed as MCP state authority.
+- Replaced the handwritten capability-registry shadow validator with one pure
+  parser/validator/longest-prefix matcher. The adopted-repository helper is now
+  a deterministic standalone Bun projection bound to the canonical source hash.
+
+### Fixed
+
+- Made authoritative plan, policy, and capability-registry reads fail closed:
+  only `ENOENT` means absent, and malformed or unreadable state-influencing
+  policy metadata now aborts before cache or version publication. Policy paths
+  are contained under both POSIX and Win32 grammars, and worktree/common-dir
+  canonicalization faults no longer degrade to raw paths or version `0`.
+- Hardened repository and Git-common-dir locks against symlink ancestors and
+  pathname token races. Unique token files are reclaimed by exact name, empty
+  pre-token directories and live/unknown PID identities stay fail closed, and
+  linked worktrees serialize through the Git common-dir.
+- Made Effective State publication one cache-first/version-owner-last
+  transaction with exact cache rollback, so cache or owner faults cannot expose
+  a consumed version or half-published authoritative state. Removed the unused
+  standalone cache-writer export that could bypass that transaction.
+
+### Verification
+
+- Added 12-scenario public-path goldens: CLI matches requested-risk resolution,
+  hook and MCP match direct `inspect`, and repository authority fields remain
+  identical across that intentional policy delta. Lock/cache/source-mutation
+  fault coverage, a state-boundary gate, and packed-artifact state/helper smokes
+  cover the converged boundary.
+- Kept ESA-06 workflow-artifact writer semantics deferred; this release adds no
+  overwrite compatibility mode or alternate authority.
+
+## [0.10.0] - 2026-07-14
+
+### Added
+
+- Added optional `.ai/harness/policy.json#operations.deploy_sql` authority for established alternate SQL roots, naming modes, and invariant files. Generated policies keep the existing `deploy/sql/` plus `ordered4` default when the object is absent, and hooks, deploy guidance, and scaffolds now describe the same precedence.
+- Replaced global Strict cognitive choreography with a risk-aware harness
+  kernel. Deterministic `lite`/`standard`/`strict` workflow profiles are now
+  computed from a single risk floor (target-path scope, cross-capability
+  signals, and strict-category path tokens); explicit-first prompt routing
+  lets ordinary prompts bypass workflow classification entirely, while only
+  explicit or active-task requests route through a workflow action. A single
+  global SessionStart context budget (<=1,500 estimated tokens) applies
+  deterministic critical-field compaction and structured fail-closed
+  overflow instead of per-producer truncation. One effective-state resolver
+  — `repo-harness state resolve --json` — carries task, profile, version,
+  authority, hashes, freshness, next-action, and blockers, and is injected
+  into sessions as the `[HarnessState]` block. Five categories of circuit
+  breakers (guard repeat, review, subagent, repair, and cross-model) now
+  bound orchestration loops with fail-closed limits. Host runtime install is
+  now transactional, with `minimal`/`standard`/`product-planning`/`strict`
+  install profiles (`repo-harness install --profile <profile>`) each
+  carrying a deterministic plan/apply, idempotent switching, rollback, and
+  installed-state status.
+- Added `repo-harness state resolve --field <name>` to project a single
+  resolved field from the effective-state resolver in one call, removing a
+  redundant parse subprocess from the PreToolUse edit guard. The profile
+  benchmark report now records per-run `artifact_files` paths alongside the
+  existing artifact count, and SessionStart guidance binds ceremony
+  expectations (authoring plan/contract/notes files) to the resolved
+  workflow profile: lite sessions get zero ceremony, standard sessions get
+  at most the single active-plan artifact, and strict is unchanged.
+
+### Fixed
+
+- Preserved the recorded install profile during ordinary `repo-harness update`
+  instead of silently projecting `minimal`, and rejected persisted ownership
+  paths outside the exact managed-surface allowlist before profile-switch
+  deletion.
+- Made the packaged root Skill resolve detailed guidance through
+  `repo-harness docs show <id>` and added installed-tarball smoke coverage for
+  both referenced documents.
+- Hardened the unshipped coding MCP surface: setup now validates every grant
+  and fallible option before committing `read_write`; OAuth rate limits use
+  direct-socket, canonical-route identities with bounded buckets; dynamic
+  clients have fixed expiry/capacity; and the unreachable Bun PTY schema and
+  `node-pty` dependency were removed while pipe stdin, polling, SIGINT, and
+  process-tree cleanup remain supported.
+- Removed the external `gbrain` tooling dependency from setup/adoption policy,
+  install choices, readiness detection, generated guidance, and migration
+  routing. Brain-vault export remains an explicit operator command, while
+  PostEdit, sprint verification, and strict workflow checks no longer sync or
+  gate on external vault state.
+- Closed a guard gap where a batched `apply_patch` never showed the
+  deterministic risk floor its full pending scope: each recursive per-file
+  check now resolves against every path in the batch, so a medium-scope
+  batch (four or more implementation paths) or a batch containing one
+  strict-category path promotes standard/strict for every path in the same
+  atomic action, instead of the bypass where sequential per-file checks
+  never saw siblings not yet on disk. Hardened the capability-registry and
+  implementation-surface inputs that feed the same risk floor: an absent,
+  corrupt, or non-array capability registry now returns a structured,
+  fail-closed reason instead of silently collapsing to zero capabilities,
+  and one implementation-surface predicate now owns medium-scope path
+  counting (shared by the TS resolver and a projected shell case list) so a
+  docs-only batch can no longer inflate the internally resolved profile.
+- Fixed skill-facade retirement to remove an owner-marked host copy whose
+  canonical package source is gone, instead of refusing the whole sync when
+  any single facade was dropped from the package; `repo-harness-gptpro` now
+  installs under the `product-planning` and `strict` profiles.
+- Isolated workflow gate test fixtures from the host repo-harness environment:
+  fixture subprocesses strip `REPO_HARNESS_*`/`HOOK_REPO_ROOT` so a fixture
+  `verify-sprint.sh` can no longer follow an inherited
+  `REPO_HARNESS_TARGET_REPO_ROOT` back into the real repository and
+  recursively execute the real contract gate.
+
+### Changed
+
+- Decoupled benchmark evidence production from contract verification. Verify
+  gates now consume tracked report bytes plus provenance instead of
+  live-running the authoritative 3x9 matrix (a full matrix run stays a
+  one-shot, author-run evidence step before merge), review fingerprints bind
+  acceptance to implementation content — `base_ref`/`base_rev` are demoted to
+  non-hashed metadata, so unrelated target advances, clean rebases, and
+  acceptance-recording commits no longer stale a recorded acceptance while
+  same-file target changes still do — and the Human Review Card
+  external-acceptance fallback is removed: canonical `## External Acceptance
+  Advice` is the sole authority and the gate accepts only `pass` or
+  `manual_override`. Benchmark arms delete their disposable host toolchain
+  root after result extraction, bounding temporary-space growth without
+  touching arm timing or the retained regrade workspaces.
+- Removed gstack from active planning routes, generated policy, readiness
+  detection, and install/update guidance. Product discovery and complex/design
+  planning now stay with the parent agent: `geju` opens the pre-contract frame,
+  the parent completes P1/P2/P3, and the accepted result is frozen directly
+  into the plan and contract without an alias, fallback, or compatibility path.
+- Expanded the repo-owned agent fleet from four to six roles with
+  `root-cause-prover` for bounded pre-fix bug evidence and
+  `harness-evaluator` for existing skill/adoption evaluation in disposable
+  state. Migration auditing is an evaluator profile, BDD2 remains an explicit
+  forbidden authority, and native Explore stays an informal host capability
+  rather than a prompt-inheritance or alias surface.
+- Replaced the remote `Fable-agents` fleet dependency with the npm-packaged
+  `agents/fleet/*.md` authority. The installer now operates offline, validates
+  all six sources before mutation, projects the managed fleet to both hosts,
+  preserves effort strings across the Sol/Luna family map,
+  and keeps gatekeeper read-only in both sandbox and prompt semantics.
+- Kept native MultiAgentV2 role selection behind a runtime canary instead of
+  treating installed TOML as runtime proof. Role identity checks remain
+  structure-aware, and a valid packaged source can repair a stale installed
+  target whose declared identity belongs to another managed role. The package
+  and installer require Bun >=
+  1.1.35, the first supported runtime boundary for stdin execution plus semantic
+  parsing of the generated multiline TOML agents, and reject older runtimes
+  before creating user-level state. The Unix and Windows bootstrap installers
+  now upgrade older Bun runtimes instead of trusting unenforced engine metadata,
+  and incomplete source validation fails before any installed target mutation.
+  The CLI's global
+  `install`, `init`, and mutating `update` paths bind setup subprocesses to the
+  exact Bun executable they validate and enforce the same floor, closing direct
+  `bunx`/`bun add`/`npx` entrypoints that bypass the top-level bootstrap scripts.
+  Self-installer-owned Bun can upgrade in place; package-manager-owned Bun fails
+  closed with its manager command instead of overwriting manager state. Read-only
+  update checks remain mutation-free.
+
+## [0.9.2] - 2026-07-10
+
+### Changed
+
+- Updated the generated Codex agent fleet so `deep-reasoner` and `gatekeeper`
+  use GPT-5.6 Sol with `xhigh` reasoning, while `fast-worker` uses GPT-5.6
+  Terra with `medium` reasoning; generated descriptions now fail closed when the
+  upstream provider label does not match the declared model mapping.
+- Added the shared Rule 0, first-principles reasoning, and generality guidance
+  to global working-rule distribution and newly scaffolded root agent context.
+
+### Fixed
+
+- Pinned the documented `bunx`/`npx` bootstrap and prompt-guard recovery paths
+  to `repo-harness@latest`, and made an already-installed Bun global runtime
+  surface an opt-in, repository-isolated update hint instead of silently
+  perpetuating a stale version.
+- Made `repo-harness doctor` run Bun registry lookup from the package root,
+  require the stable PATH-visible Codex CLI to be at least `0.144.0`, and keep
+  Claude-only setup free of irrelevant Codex warnings.
+- Made explicit direct-change-and-commit requests enter hook execution while
+  generic change language, questions, quoted text, negation, and contractions
+  remain non-execution intent.
+
+## [0.9.1] - 2026-07-06
+
+### Added
+
+- Added `repo-harness install --target codex|both --location global
+  --delegation-mode auto|explicit`, plus the matching interactive TTY prompt,
+  so users can persist the global Codex delegation mode in
+  `~/.repo-harness/config.json` without clobbering existing config keys.
+- Added an exact `archctx-contracts@0.2.1` devDependency and moved
+  `archcontext-boundaries-v1` export tests from a vendored schema fixture to
+  the package's authoritative schema/validator surface.
+- Added a read-only `repo.adopt-refresh` setup-check advisory: with
+  `--check-updates`, adopted repos now surface an Agent action when the
+  `repo-harness adopt` dry-run plan has pending operations.
+
+### Changed
+
+- Updated the shell and PowerShell install scripts to point new users at
+  `repo-harness install` instead of the compatibility `init` alias, and to
+  print a PATH hint when Bun's bin directory was not already visible in the
+  original shell.
+- Moved Waza and Geju setup-check probes and docs from `npx -y skills ...` to
+  `bunx skills ...`, keeping the release line Bun-first.
+- Made the Codex delegation advisor honor `delegation.mode=auto` from either
+  the global user config or repo policy, while keeping discussion prompts quiet
+  and disabling stop-fallback for implicit auto-mode injections.
+- Added `.archcontext/` to the self-host and generated-repo ignore surfaces so
+  local arch-context model scaffolds stay out of commits by default.
+- Removed the local `tests/fixtures/archcontext/architecture-node.subset.schema.json`
+  fixture now that `archctx-contracts@0.2.1` publishes the required schemas.
+
+## [0.9.0] - 2026-07-06
+
+### Added
+
+- Added a `bugfix` task profile with a first-class Root Cause Evidence gate:
+  `contract-run.ts` and `verify-contract.sh` independently evaluate the same
+  `## Root Cause Evidence` section against shared fixtures, matching a
+  pre-fix failure artifact by its captured `PRE_FIX_EXIT` recipe; added the
+  bugfix golden example `docs/reference-configs/contract-brief-example-bugfix.md`.
+- Declared file-coupled delegation policy (`delegation.preferred_runners` /
+  `fallback_runner` / `runner_rule`) that makes the task contract the
+  authoritative execution brief and the native subagent an optional
+  accelerator; slimmed `codex-delegation-advisor` to point at the contract
+  instead of commanding native spawn limits; `plan-to-todo` now prints a
+  non-blocking `[BriefPreflight]` advisory right after contract projection,
+  while `contract-run.ts run` keeps the fail-closed brief-completeness gate.
+- Added an optional `## Falsifier` section to the contract template and
+  aligned all five template/helper-mirror copies, backfilling the
+  Why/Stop-Conditions/Exemplar sections seeded for prompt distillation.
+  Distilled the contract-run prompts on top of that: `writePrompt()` folds
+  self-verify/notes/stop duties and Intent into the worker/verifier prompts,
+  `runBriefPreflight()` requires a concrete `## Why`, a golden contract-brief
+  example ships with a preflight guard test, `verify-sprint` prints
+  promotion/triage advisories at finish without changing its exit code,
+  `contract-run.ts` gained a `--runner` option with manifest `runner_usage`
+  recording, and the workflow is taught across the repo's `SKILL.md` docs.
+- Added geju (`hylarucoder/hai-stack`) as an `external_tooling` dependency;
+  `plan-to-todo` prints a `[Geju]` artifact-freeze advisory after rendering a
+  contract.
+- Made the agent fleet a first-class dependency: a `fable_agents` policy
+  entry (self-host `auto-install-on-init`, downstream `advisory`), the
+  `install-agent-fleet` helper (direct-installs upstream `.md` agent
+  definitions and generates matching Codex `.toml` mappings, never-clobber by
+  default with `--force` to override, `REPO_HARNESS_FLEET_SOURCE_DIR`
+  override), `check-agent-tooling`'s `detectAgentFleet()` with
+  strict-readiness (`missing`/`partial`), and tiered init/migrate policy
+  assembly where dry-run never writes to `$HOME`.
+- Added the `codex-subagent` runner label and committed this repo's own
+  fleet: three `.claude/agents/` definitions (`deep-reasoner`, `fast-worker`,
+  `gatekeeper`) with symmetric `.codex/agents/*.toml` mappings.
+- Made the `install`/`init` global bootstrap prompt Y/n in interactive
+  terminals before installing the optional external-skills and CodeGraph
+  pieces (Enter keeps the default-on behavior; non-TTY and `--json` runs stay
+  unprompted; explicit `--no-*` flags are honored without prompting), moved
+  the skills bootstrap from `npx -y skills` to `bunx skills`, and pinned the
+  CodeGraph install to `@colbymchenry/codegraph@latest`.
+- Added a `frontend` task profile with a design-brief gate, intake
+  prior-art/negative-scenario/canonical-term trigger rules with recorded
+  acceptance evidence, and a capability/archcontext boundary bridge exposing
+  a read-only `archcontext-boundaries-v1` export with export tests.
+- Mechanically landed the `EXECUTION_BOUNDARY` anti-extras clause on every
+  delegated runner surface, with a canonical-sentence parity test; contracts
+  now project the plan's Non-scope section, and In-scope/Out-of-scope get an
+  independent preflight check.
+
+### Changed
+
+- Renamed the dead `bun run typecheck` exit-criteria command to the real
+  `bun run check:type` script across every contract template/helper-mirror
+  surface; explicitly revised `sprint-contracts.md`'s exit-criteria-only
+  promise to scope the new Root Cause Evidence check to `bugfix`-profile
+  contracts only. Bumped the review rubric from v1 to v2 so external
+  acceptance must carry its own current Reviewed Diff Fingerprint and scope
+  instead of a stale one, and added a bounded P1-escalation Scope Fidelity
+  rubric dimension.
+
+### Fixed
+
+- Worked around a bash 3.2 parser trap where a `$(cat <<'EOF' ... EOF)`-wrapped
+  heredoc with a quoted delimiter is still scanned for quote parity: an odd
+  apostrophe count inside embedded template prose broke
+  `scripts/lib/project-init-lib.sh` under `bash -n`. Switched to `mktemp`
+  file indirection.
+
+## [0.8.5] - 2026-07-04
+
+### Fixed
+
+- Repaired workspace-source `repo-harness install` when Bun reports a
+  `DependencyLoop` by packing the source tree into `~/.repo-harness/packages/`
+  and reinstalling the global CLI from that tarball.
+- Added tarball smoke coverage for packaged `sprint-backlog` target-root
+  resolution, so release gates exercise the installed helper path instead of
+  only the source checkout.
+
+## [0.8.4] - 2026-06-30
+
+### Fixed
+
+- Fixed package-dispatched `repo-harness run workstream-sync ensure` so it can
+  resolve bundled `capability-resolver.ts` and `context-contract-sync.sh`
+  helpers when a downstream repo no longer vendors legacy `scripts/` wrappers.
+
+## [0.8.3] - 2026-06-29
+
+### Changed
+
+- Kept downstream adopt and migration helper execution on the package/global
+  runtime path through `repo-harness run`, without generating repo-local helper
+  wrapper scripts.
+- Refreshed the current dependency lines so `commander` and the CodeGraph dev
+  dependency resolve to the latest accepted release lines.
+
+### Fixed
+
+- Removed the compatibility-wrapper adoption path so package-managed helpers do
+  not pollute target repository `scripts/` directories.
+- Added the missing packaged factor-lab helper templates so package helper
+  parity matches the source `scripts/` runtime surface.
+- Ignored local GPT Pro, Oracle, and MCP runtime evidence under `.ai/harness/`
+  so self-host release gates do not treat operator state as source changes.
+
+## [0.8.2] - 2026-06-29
+
+### Changed
+
+- Updated the repo-local CodeGraph dev dependency to `@colbymchenry/codegraph@latest`
+  so self-hosted tooling checks stay on the current bundle line; the release
+  lockfile resolves this to `1.1.2`.
+
+### Fixed
+
+- Fixed repo alias discovery for registered repo resolution so MCP/workspace
+  reader flows can resolve configured repository aliases consistently.
+- Reduced completed workflow artifact noise by keeping fulfilled plan,
+  contract, review, notes, and runtime-evidence surfaces out of active grep and
+  root workflow projections after closeout.
+- Hardened plan artifact gates so `work-package` remains the only durable
+  plan -> contract/review/notes projection boundary, while `checklist-row`
+  work stays inside the active plan `## Task Breakdown`.
+- Rejected placeholder `--promotion-reason` values before `capture-plan
+  --execute` writes durable state, and blocked transient or inline sprint plans
+  from being projected into contract/review/notes artifacts.
+
+## [0.8.1] - 2026-06-24
+
+### Fixed
+
+- Suppressed Codex `Stop.default` decision stdout so the Desktop app no longer
+  turns one-shot planning/delegation guard output into
+  `{"detail":"Unsupported content type"}` at turn finalization. Claude keeps
+  the direct Stop decision JSON path.
+- Skipped global runtime self-install when `repo-harness` is already running
+  from Bun's global install prefix, so `repo-harness global-runtime init` does
+  not try to install the package into itself.
+
+### Removed
+
+- Removed the experimental ChatGPT Chrome extension provider, including
+  `browser-bind`, `--provider bridge`, generated extension code, and scaffolded
+  `.ai/harness/chatgpt/bridge-extension/` ignore entries. Oracle remains the
+  supported GPT Pro browser consult path; native is deprecated diagnostics only.
+
+### Added
+
+- Added the General Repo MCP reference covering tool JSON examples, repo
+  administration, privacy/audit boundaries, migration from workflow-artifact
+  reads, rollout flags, and known limitations.
+- Added the General Repo MCP CodeGraph rollout runbook for index stale,
+  CodeGraph down, incomplete manifest, mutation conflict, reindex dead-letter,
+  and rollback operations.
+- Added the Sprint 4 release filing for the CodeGraph general repo rollout
+  module, including local and hosted verification evidence.
+
+## [0.8.0] - 2026-06-22
+
+### Added
+
+- Added `assets/hooks/projection.json` plus `bun run sync:hooks` and
+  `bun run check:hooks`, making `assets/hooks/` the canonical hook source and
+  `.ai/hooks/` the generated self-host projection.
+- Added Review Rubric v1 and implementation diff fingerprints to review,
+  release, and peer-acceptance prompts.
+- Added review freshness validation for Done claims: fresh fingerprints pass,
+  legacy missing fingerprints warn, and stale or malformed fingerprints block
+  closeout until `/check` and peer acceptance are refreshed.
+- Added tarball and central-install parity checks so packaged hook assets and
+  installed `~/.repo-harness/hooks/` copies match the canonical managed file
+  set.
+
+### Changed
+
+- Updated hook operations and README release docs to use the generated
+  self-host hook projection contract instead of manual generated/self-host
+  parity edits.
+- Expanded repo-pinned hook install and migration paths to copy the managed hook
+  runtime file set, not only shell scripts.
+- Raised the migration idempotency integration test timeout to the suite-level
+  budget now that repo-pinned hook projection copies a larger managed file set.
+
+## [0.7.5] - 2026-06-21
+
+### Added
+
+- Added advisory minimal-change hooks across `SessionStart`,
+  `UserPromptSubmit`, `PostToolUse.edit`, and `Stop`, with deterministic
+  `.ai/harness/checks/minimal-change.latest.json` evidence, handoff summaries,
+  explicit opt-in policy, scaffold/migration adoption, and reference-config
+  docs.
+- Added ChatGPT MCP `workspaceReader` capability on the default `planner`
+  profile, with registered-repo workspaces and `reader_status`,
+  `list_allowed_roots`, `open_workspace`, `tree`, `search_text`, and
+  `read_text` tools for read-only local repo access.
+- Added global `~/.repo-harness/registered-repos.json` discovery for repos
+  registered by `repo-harness adopt`, `repo-harness init`, or user-scope MCP
+  setup, plus `repo_path` targeting for workflow reads and writers.
+- Added HTTP MCP `url-token` compatibility auth mode, structured session health
+  metadata, OAuth `offline_access` discovery, and refresh-token rotation that
+  replaces both access and refresh tokens.
+
+### Fixed
+
+- Kept MCP broad-read/user-scope deny globs active for `.env`, private keys,
+  SSH keys, credentials, secrets, `.git`, and dependency/build output instead
+  of clearing deny rules when broad reads are enabled.
+- Made legacy MCP `fullDiskRead: true` configurations fail closed instead of
+  auto-migrating to `/`; users must explicitly choose registered adopted repos
+  or add extra non-repo directories with `--allow-root`.
+
+- Bound managed Codex and Claude hook adapters to the current git repository
+  before dispatching user-level hooks, so global hook commands cannot
+  accidentally run against a sibling repository.
+- Made the hook runtime silently skip execution when an explicit
+  `HOOK_REPO_ROOT` conflicts with the hook process git root.
+- Stopped prompt-guard from creating or capturing repo-local plan artifacts when
+  a planning prompt references a different git repository by absolute path.
+
+## [0.7.4] - 2026-06-20
+
+### Added
+
+- Added user-scope ChatGPT MCP setup for Developer Mode deployments, storing
+  local MCP config and auth under `~/.repo-harness/`; broad full-disk read is now
+  deprecated in favor of registered adopted repos plus explicit `--allow-root`
+  entries for extra non-repo roots.
+- Added `discover_harness_repos` plus `repo_path` targeting for MCP read tools,
+  so a single ChatGPT Connector can find registered adopted repos before reading
+  workflow state.
+- Added explicit ChatGPT app preselection for Oracle browser consults via
+  `--chatgpt-app`, so GPT Pro MCP read-back prompts can select the recorded
+  Connector app before submitting instead of relying on prompt text mentions.
+- Added ChatGPT Connector invocation-evidence metadata to `mcp doctor`, making
+  local setup readiness distinct from per-chat/model tool invocation proof.
+
+### Fixed
+
+- Stopped `repo-harness adopt --compact --dry-run --json` from planning retired
+  root helper compatibility wrappers after helper runtime has moved to the
+  user-level/package surface.
+- Kept ChatGPT MCP writes scoped to workflow artifacts while widening only the
+  authorized read boundary, so absolute writes and runner execution remain
+  blocked under the planner profile.
+- Let package-dispatched architecture helpers find their sibling
+  `architecture-event` and `capability-resolver` helpers without requiring
+  repo-local `scripts/*` copies.
+- Kept context scans focused on active repo context by skipping local backup and
+  harness archive directories, while preserving negative safety guidance such as
+  `Never print credentials.`
+
+## [0.7.3] - 2026-06-20
+
+### Fixed
+
+- Preserved imperative Codex delegation prompts whose investigation target uses
+  `why` or `how`, while keeping mechanism/design questions non-authorizing.
+- Scoped `SubagentStop.quality` retry state by session/run identity, subagent
+  identity, and message hash so different subagents or sessions do not inherit a
+  prior thin-report retry allowance.
+- Kept existing ChatGPT MCP bind host and port when rerunning
+  `repo-harness mcp setup chatgpt --server-name` through the real CLI.
+- Made `repo-harness adopt --compact` reclaim generated root helper wrappers and
+  copied helper implementations while preserving app-owned `scripts/*` files and
+  rollback archives.
+- Allowed strict workflow checks to pass when package-dispatched helpers replace
+  repo-local root compatibility wrappers.
+
+## [0.7.2] - 2026-06-19
+
+### Added
+
+- Added ChatGPT native browser product-session binding for user-selected Chrome
+  profiles, with printed bind-page URLs, Chrome profile-directory support,
+  doctor session validation, and fail-closed native consults when no ChatGPT
+  profile is bound.
+- Added Oracle browser-provider heartbeat support. GPT Pro / ChatGPT browser
+  consults now pass `--heartbeat`, defaulting to 59 seconds, so long-running GPT
+  analysis stays observable through Cloudflare and local process boundaries.
+
+### Fixed
+
+- Corrected gbrain remediation guidance to install the official GitHub GBrain
+  CLI instead of the unrelated npm registry `gbrain` package.
+- Fail closed when native ChatGPT browser setup targets the default Chrome data
+  directory, because Chrome 136+ blocks remote debugging there; doctor now
+  reports `blocked_default_profile` instead of opening Chrome and timing out.
+- Removed the static `file://` ChatGPT bind page path. Product-session binding
+  now goes through `repo-harness chatgpt browser-bind`, whose **Bind ChatGPT**
+  action calls a local authorization endpoint instead of linking directly to
+  ChatGPT.
+- Added the ChatGPT bridge provider for existing signed-in Chrome profiles. It
+  generates a product-scoped unpacked extension for ChatGPT domains plus
+  localhost, validates composer readiness through extension heartbeat, and
+  supports `browser-consult --provider bridge` without copying cookies or
+  browser storage.
+- Hardened ChatGPT bridge authorization diagnostics for unpacked extensions
+  recorded in Chrome `Secure Preferences`, and isolated bridge-provider tests
+  from user-installed extensions polling the default local port.
+- Excluded `gbrain` from setup readiness dependencies: missing or stale gbrain
+  stays visible as advisory tooling state without creating Agent actions.
+- Kept ChatGPT MCP stable endpoints out of tracked generated guides, storing
+  real Connector URLs only in ignored local config while public docs remain
+  placeholder-only.
+- Preserved existing ChatGPT MCP endpoint, auth, transport, profile, and dev-mode
+  settings when rerunning `repo-harness mcp setup chatgpt --server-name`.
+- Made `repo-harness mcp doctor --profile chatgpt` report whether the ChatGPT
+  server name is actually configured instead of masking missing local state with
+  the default `repo-harness` name.
+- Made Oracle doctor repair actions source-aware, so explicit `--oracle-bin`,
+  `REPO_HARNESS_ORACLE_BIN`, and repo-local Oracle installs get actionable repair
+  guidance instead of a generic global install suggestion.
+- Limited SessionStart tooling update advisories to one render per cached
+  report, so weekly Waza/CodeGraph update checks do not re-inject stale
+  update instructions on every new agent turn.
+
+### Release Notes
+
+- Prepared the `repo-harness@0.7.2` patch line for npm publish, registry
+  readback, clean-room install smoke, Git tag, and GitHub release creation.
+
+## [0.7.1] - 2026-06-18
+
+### Added
+
+- Added `repo-harness-gptpro-setup` / `repo-harness:gptpro_setup` to guide
+  local `gptpro_browser` browser/session setup and `gptpro_mcp` ChatGPT
+  Connector MCP setup without treating ChatGPT Pro as API quota.
+- Added `repo-harness-gptpro` / `repo-harness:gptpro` as the local consult
+  skill for GPT Pro browser-session assistance, using `gptpro
+  consult/read/continue/open` language over the existing ChatGPT Web browser
+  session engine.
+
+### Fixed
+
+- Preserved `.ai/harness/checks/latest.json` for authoritative
+  `repo-harness-run-trace.v1` evidence by writing PostBash advisory metadata to
+  `.ai/harness/checks/post-bash-latest.json`.
+
+### Release Notes
+
+- Prepared the `repo-harness@0.7.1` patch line for npm publish, registry
+  readback, clean-room `npx` smoke, Git tag, and GitHub release creation.
+
+## [0.7.0] - 2026-06-18
+
+### Added
+
+- Added `repo-harness chatgpt browser-*`, a policy-checked ChatGPT Web browser
+  session engine with dry-run prompt assembly, repo-local session records,
+  linked follow-ups, output copying, session read/list/open, and dry-run-first
+  cleanup.
+- Added optional MCP ChatGPT browser tools behind
+  `repo-harness mcp serve --enable-chatgpt-browser`, keeping browser consults
+  out of the default MCP surface.
+- Added an Oracle provider wrapper for `oracle --engine browser` and a native
+  installed-Google-Chrome CDP provider spike for logged-in ChatGPT Web sessions.
+- Added a bundled `repo-harness-chatgpt-browser` skill and user guide at
+  `docs/repo-harness-chatgpt-browser-engine.md`.
+- Added a hosted GitHub CI gate for pull requests and pushes to `main` /
+  `codex/**`.
+- Added the Harness Engineering Optimization sprint closeout surface, including
+  task profiles, Human Review Card enforcement, trace/eval evidence grading,
+  handoff UX, delegation contract roles, and compressed spec/onboarding paths.
+- Added `repo-harness uninstall` to remove repo-harness managed Codex/Claude
+  hook adapters while preserving sibling user hooks and Codex trust-state
+  residue.
+- Added fs-transaction manifests for `repo-harness adopt --experimental-ts-apply`
+  and `repo-harness adopt rollback --transaction <manifest>` so the safe
+  TypeScript applicator has an executable recovery path.
+- Added `scripts/check-release-published.sh` for post-publish npm registry,
+  dist-tag, tarball integrity, Git tag, and local version readback.
+- Added `scripts/check-tarball-install-smoke.sh` and wired it into the CI gate
+  so release checks install the packed tarball in a temporary project and start
+  the packaged `repo-harness` and `repo-harness-hook` bins.
+
+### Changed
+
+- Made `repo-harness install` the primary first-run global runtime bootstrap
+  command, while preserving `repo-harness init` as a compatibility alias and
+  keeping `repo-harness install --target <host> --location <scope>` as the
+  adapter-only path.
+
+### Fixed
+
+- Made generated ChatGPT Connector `/goal` prompts and `repo-harness-goal`
+  reporting guidance language-neutral, so installed skills and MCP goal handoff
+  output follow the user's language or repo-local instructions instead of
+  hard-coding Chinese prompt lines.
+- Made non-standard `repo-harness adopt --mode minimal|self-host` fail closed
+  unless it routes to ordinary TypeScript `--dry-run` or
+  `--experimental-ts-apply`,
+  avoiding a mismatch where dry-run showed a TypeScript mode plan but apply
+  still used the standard shell migrator.
+- Made minimal TypeScript adoption install
+  `.ai/harness/workflow-contract.json`, preserving the hook opt-in marker for
+  all adoption modes.
+- Normalized protocol v1 JSON error output for adoption target validation
+  failures.
+- Added safe-applicator preflight inside `applyAdoptionPlan()` so exported
+  callers cannot partially write a plan before encountering an unsupported
+  operation.
+- Preserved CRLF `.gitignore` managed blocks without duplicate insertion and
+  added planned/skipped/failed summary counts to adoption plan output.
+- Added a bounded CLI process runner for init/adopt/global-runtime, CodeGraph
+  setup, and `repo-harness run` helper dispatch, with default timeout, output
+  cap, and common secret redaction.
+
+### Release Notes
+
+- Prepared the `repo-harness@0.7.0` minor release line for npm publish,
+  registry readback, clean-room `npx` smoke, Git tag, and GitHub release
+  creation.
+
+## [0.6.0] - 2026-06-16
+
+### Added
+
+- Added the Transactional Adoption Planner foundation for
+  `repo-harness adopt --dry-run --json`, including protocol v1 operation plans,
+  redacted JSON rendering, fixture-backed planner tests, and a safe applicator
+  subset for `mkdir`, `writeFile ifMissing`, and managed `.gitignore` blocks.
+- Added workflow-contract manifest planning to the TypeScript adoption plan so
+  `standard` and `self-host` dry-run JSON now report installation of
+  `.ai/harness/workflow-contract.json` from the canonical tracked asset.
+- Added workflow-contract-backed adoption templates for `docs/spec.md` and
+  `tasks/current.md`, keeping their `writeFile ifMissing` planner behavior while
+  moving the file body and reason out of `plan.ts`.
+- Added standard-mode helper wrapper planning to the TypeScript adoption plan so
+  downstream dry-run JSON reports generated `scripts/<helper>` compatibility
+  wrappers from the workflow contract helper manifest.
+- Added an atomic safe-applicator writer with target locks, temp-file fsync,
+  parent-directory fsync, and backup metadata for existing targets.
+- Routed human-readable `repo-harness adopt --dry-run` output through the
+  TypeScript adoption planner text renderer, matching the JSON dry-run source of
+  truth without writing repo files.
+- Added `repo-harness adopt --experimental-ts-apply` as an opt-in TypeScript
+  safe-applicator path, with preflight rejection for plans containing
+  unsupported operations.
+- Added rollback metadata to adoption operation plans so dry-run JSON and
+  experimental apply reports expose the planned recovery strategy per operation.
+- Added workflow-contract install support to the experimental TypeScript
+  adoption applicator, including atomic replacement backups for stale manifests.
+- Added workflow-contract-backed adoption templates for `tasks/todos.md` and
+  `tasks/lessons.md`, completing manifest ownership of the initial bootstrap
+  ledger file bodies.
+
+### Release Notes
+
+- Prepared the `repo-harness@0.6.0` minor release line for npm publish,
+  registry readback, clean-room `npx` smoke, Git tag, and GitHub release
+  creation.
+
+## [0.5.3] - 2026-06-15
+
+### Fixed
+
+- Fixed `repo-harness update --version <version>` so the update subcommand can
+  install an explicit `repo-harness@<version>` package. The top-level
+  `repo-harness --version` / `repo-harness -V` shortcut still prints the CLI
+  version, but it no longer intercepts the update command's package-version
+  option.
+
+### Release Notes
+
+- Prepared the `repo-harness@0.5.3` patch line for npm publish, registry
+  readback, clean-room `npx` smoke, Git tag, and GitHub release creation.
+
+## [0.5.2] - 2026-06-15
+
+### Added
+
+- Added a weekly timestamp cache for SessionStart tooling-update advisories so
+  Waza and CodeGraph update checks run at most once per week by default unless
+  `REPO_HARNESS_TOOLING_ADVISORY_TTL_SECONDS` overrides the TTL.
+- Added reviewed security exceptions to `repo-harness security scan` so
+  user-level warning-only hook findings can be accepted through exact
+  `filePath` + `ruleId` + `command` matches while high/fail findings stay
+  active.
+- Added transcript recovery to the bundled `claude-review` cross-review skill
+  for Claude Code print-mode runs that write the final assistant message to the
+  session transcript but produce empty stdout.
+
+### Changed
+
+- Treated `gbrain doctor --json --fast` connection warnings that only report
+  skipped DB checks as an accepted fast-mode readiness state, while preserving
+  real gbrain warnings such as freshness drift.
+- Pinned the repo-local CodeGraph dev dependency to `1.0.1` so local-first
+  readiness checks do not float across patch releases.
+
+### Fixed
+
+- `repo-harness setup check --target codex --check-updates --json` now reports
+  a fully green setup on this machine after Waza and CodeGraph are up to date,
+  reviewed user-level safety hooks are recorded, and gbrain fast-mode DB checks
+  are treated as intentionally skipped.
+
+### Release Notes
+
+- Prepared the `repo-harness@0.5.2` package line for npm publish, registry
+  readback, clean-room `npx` smoke, Git tag, and GitHub release creation.
+
+## [0.5.1] - 2026-06-14
+
+### Fixed
+
+- Fixed CodeGraph readiness detection so repo-local checks prefer the installed
+  platform bundle before the npm shim. This prevents a broken `.bin/codegraph`
+  shim from turning a ready local index into `project_index=unavailable`.
+- Synced the same CodeGraph resolver into the generated-project helper template.
+
+### Release Notes
+
+- Prepared the `repo-harness@0.5.1` package line for publish; npm publish,
+  registry readback, and GitHub release creation remain explicit release
+  actions.
+
+## [0.5.0] - 2026-06-14
+
+### Added
+
+- Added README release art from `docs/images/image.png` and documented the
+  install/refresh split for first-run bootstrap, user-level runtime updates,
+  read-only setup audit, and repo-local adoption.
+- Documented the eight managed hook routes installed by the Claude/Codex
+  adapters: `SessionStart.default`, `PreToolUse.edit`,
+  `PreToolUse.subagent`, `PostToolUse.edit`, `PostToolUse.bash`,
+  `PostToolUse.always`, `UserPromptSubmit.default`, and `Stop.default`.
+
+### Changed
+
+- Breaking: `repo-harness update` now owns CLI/user-level runtime refresh only;
+  use `repo-harness adopt` for repo-local workflow install, refresh, and
+  migration.
+- `repo-harness update --check` / `--no-runtime-refresh` now route to the
+  read-only setup checklist, and third-party skill/CodeGraph refreshes require
+  explicit opt-in.
+- Added `repo-harness setup check` as the productized read-only readiness
+  command while keeping `repo-harness init-hook` as a compatibility alias.
+
+### Fixed
+
+- Refused `$HOME` as a repo adoption target before any mutation and hardened
+  legacy context discovery so vendored/cache trees such as `go/pkg/mod`,
+  nested `node_modules`, and `vendor` are not mirrored into.
+
+### Release Notes
+
+- Prepared the `repo-harness@0.5.0` package line for publish; npm publish,
+  registry readback, and GitHub release creation remain explicit release
+  actions.
+
+## [0.4.3] - 2026-06-13
+
+### Added
+
+- Added `repo-harness docs list|path|show` so bundled runtime/reference docs
+  resolve from the user-level/package install instead of copied repo prose.
+- Added `repo-harness init-hook --json` bootstrap audit guidance for working
+  rules, adapter drift, stale CLI installs, and tooling readiness.
+- Added first-principles edit guard coverage to the managed hook route set as
+  advisory anti-overengineering guidance.
+
+### Changed
+
+- Generated and migrated repos now write deterministic
+  `docs/reference-configs/*.md` pointer stubs while keeping `.ai/harness/*` and
+  `.ai/context/*` as repo-local runtime artifacts.
+- Retired `AGENTS.md` and `CLAUDE.md` from the reference-doc asset surface and
+  stopped publishing duplicate `docs/reference-configs/` runtime docs in the
+  npm package file list.
+
+### Fixed
+
+- Clarified plan-completeness capture wording so release/readiness checks do
+  not mistake a Draft scan plan for executable implementation state.
+- Made `scripts/check-npm-release.sh` refresh the current handoff before the
+  Codex resume packet so the release gate works from a clean checkout without
+  ignored runtime handoff files.
+
+### Release Notes
+
+- Prepared the `repo-harness@0.4.3` package line for publish; npm publish,
+  registry readback, and GitHub release creation remain explicit release
+  actions.
+
+## [0.4.2] - 2026-06-13
+
+### Added
+
+- Added the `repo-harness-prd` command facade, PRD template, and PRD eval
+  fixtures for generating upper-layer PRDs under `plans/prds/`.
+- Added a subagent return-channel guard to the managed Claude/Codex hook routes
+  so delegated runs are nudged back through the parent session instead of
+  leaking completion claims through the wrong channel.
+
+### Changed
+
+- Split upper-layer PRDs from Sprint backlogs: PRDs stay in `plans/prds/`,
+  Sprint backlogs move to `plans/sprints/*.sprint.md`, and `repo-harness-sprint`
+  now supports PRD-to-Sprint planning without re-deciding product intent.
+- Isolated generated-project helper implementations under `.ai/harness/scripts/`
+  while keeping `scripts/*` as compatibility command wrappers.
+- Updated skill eval 24 and added evals for PRD generation and PRD-to-Sprint
+  backlog creation so the public command surface covers the new hierarchy.
+- Aligned the `repo-harness-prd` command guidance with the installed
+  `.ai/harness/scripts/check-task-workflow.sh` runtime path.
+
+### Release Notes
+
+- Prepared the `repo-harness@0.4.2` package line for publish; npm publish,
+  registry readback, and GitHub release creation remain explicit release
+  actions.
+
+## [0.4.1] - 2026-06-12
+
+### Fixed
+
+- Scoped the CodeGraph route nudge to the real hook stdin `session_id` by
+  exporting `HOOK_SESSION_ID` from the shared hook input parser and preferring
+  it in `session_state_resolve_key`. CodeGraph one-shot state is now per
+  Claude/Codex session instead of being pinned to a stale `.claude/.session-id`
+  fallback.
+- Prevented stale repo-local hook scripts from racing user-level host adapters:
+  generated and migrated repos now prune top-level `.ai/hooks/*.sh` unless
+  `.ai/harness/policy.json` explicitly pins `"hook_source": "repo"`.
+- Treated a missing `post-tool-observer.sh` on `PostToolUse.always` as a
+  soft-missing advisory route with an update hint, instead of hard-failing the
+  hook runtime when a copied repo-local hook set is stale.
+
+### Changed
+
+- Kept non-pinned downstream repos on the user-level hook runtime by retaining
+  only `.ai/hooks/lib/` helper fallbacks plus a README tombstone; this self-host
+  repo can still pin live hook development to `.ai/hooks`.
+- Normalized active workflow documentation to `tasks/todos.md` for the deferred
+  ledger and topic-scoped `docs/researches/*.md` for durable research reports.
+- Added `tasks/.current.md.tmp.*` and `.claude/.plan-state/` to the managed
+  runtime ignore block, and gave plain `bun test` the same 60s per-test timeout
+  used by the release gate.
+
+### Release Notes
+
+- Prepared the `repo-harness@0.4.1` package line for publish; npm publish,
+  registry readback, and GitHub release creation remain explicit release
+  actions.
+
+## [0.4.0] - 2026-06-12
+
+### Added
+
+- Added a loop-engine evidence surface: `repo-harness-hook state-snapshot
+  --json`, an NL decision-table reference, route NL-vs-TS benchmark fixtures,
+  and a cutover gate that keeps TypeScript routing authoritative unless
+  measured evidence passes.
+- Added `scripts/architecture-queue.sh` plus
+  `scripts/check-architecture-sync.sh` for derived architecture request indexes,
+  stale-index detection, and strict/advisory finish gates.
+- Added contract delegation metadata (`budget`, `permission_scope`, and
+  `roles`) to contract templates and generated workflow contracts.
+- Added `scripts/contract-run.ts`, a repo-local pilot runner that executes
+  explicit worker/verifier child commands and validates the verifier output
+  against contract exit criteria.
+- Added `scripts/heartbeat-triage.sh` and the `.ai/harness/triage/` surface for
+  scheduled workflow, sprint-next, and architecture-request triage.
+
+### Changed
+
+- Productized architecture queue assets into both self-host scripts and
+  generated-repo templates, including workflow contract inventory, reference
+  docs, migration handling, and scaffold parity tests.
+- Updated session-start/current-status projection and task workflow checks to
+  account for archived sprint plans, archived notes, contract delegation fields,
+  and the completed loop-engine sprint.
+- Retired the separate generated workflow compatibility `5.x` line; package,
+  skill, and template stamps now share the `repo-harness@0.4.0` release line.
+- Added `check:architecture-sync` to the npm scripts and release verification
+  surface.
+
+### Removed
+
+- Retired `scripts/architecture-drift.sh` and its helper-template copy in favor
+  of `architecture-queue.sh`; migrations remove legacy copies from downstream
+  repos.
+
+## [0.3.0] - 2026-06-11
+
+### Added
+
+- Added the sprint program layer: `plans/sprints/`, sprint templates,
+  `scripts/sprint-backlog.sh`, the `repo-harness-sprint` command facade, active
+  sprint markers, current-status projection, session-start projection, workflow
+  validation, and generated-repo parity copies.
+- Added `src/cli/hook/prompt-intents.ts`: every prompt-text intent classifier
+  now lives in TypeScript with real Unicode semantics, fixing
+  locale-dependent Chinese misclassification (UTF-8 continuation bytes
+  matching `[[:punct:]]` under `LC_ALL=C` grep, e.g. "实现会在这个 worktree
+  里完成。" misread as a done declaration on GNU grep).
+- Added an edit-layer plan gate to `pre-edit-guard.sh`: implementation edits
+  (paths outside plans/tasks/docs/deploy/harness/markdown surfaces) block
+  unless the active plan is Approved/Executing and `docs/spec.md` exists.
+  Modes `enforce` (default) | `advice` | `off` via policy
+  `.guards.edit_plan_gate` or `REPO_HARNESS_EDIT_PLAN_GATE`.
+- Added the `prompt-guard-decide` prompt protocol: the shell hook pipes
+  `{"prompt": ...}` on stdin and receives one verdict JSON line (action,
+  intent facts, derived strings). Legacy copied hooks that send env facts
+  still receive the bare action enum.
+
+### Changed
+
+- Hook runtime resolution is now central-first: user-level adapters dispatch
+  into `repo-harness-hook`, central packaged hooks are the default runtime, and
+  repo policy can pin self-host development back to the repo copy without
+  changing downstream user adapters.
+- Prompt-layer plan/spec/contract gates became advisory routing; hard
+  enforcement moved to the PreToolUse edit layer where it keys off path +
+  plan state instead of natural-language guessing. Done-claim gates keep
+  blocking because they verify file-backed completion evidence.
+- Merged the PostToolUse always-route observers (`trace-event.sh` +
+  `context-pressure-hook.sh`) into one `post-tool-observer.sh`: one dispatch,
+  one stdin parse, and one library load per tool call. `.claude/.trace.jsonl`
+  is now the single tool-trace record (handoff "Commands Run" reads it
+  directly), and context-budget bun probes are sampled every 5th call. The
+  route tuple (PostToolUse, always) is unchanged; a workflow-contract
+  upgrade entry prunes the retired split hooks from migrated repos.
+- Unified `run-hook.sh`'s two Codex stdout-filter branches into one
+  parameterized path.
+
+### Removed
+
+- Removed the duplicated shell fallback decision table from
+  `prompt-guard.sh` (the 0.2.4 copied-hook fallback). Without a reachable
+  TypeScript engine the prompt layer now degrades to a one-shot advisory and
+  defers enforcement to the edit layer.
+- Removed the orphan `scripts/check-versions.ts` and its test, and the
+  hidden `prompt-guard-decision` CLI alias (use `prompt-guard-decide`).
+- Retired the `project-initializer` legacy name, `PROJECT_INITIALIZER_*`
+  environment fallbacks, and the `repo-harness-skill` compatibility alias;
+  installed-copy sync now deletes both retired skill directories.
+
+## [0.2.4] - 2026-06-07
+
+### Added
+
+- Added shell fallback routing for copied prompt hooks when the TypeScript
+  decision engine is unavailable, preserving PlanCaptureGate guidance instead
+  of failing closed on installed hook copies.
+- Added workflow readiness checks for stale handoff/resume plan references and
+  action-command skill quality gates.
+- Added benchmark quality metrics so release evidence distinguishes
+  authoritative non-dry-run skill evals from dry-run smoke output.
+
+### Fixed
+
+- Treated plan/workflow consultation prompts as advisory text instead of
+  sending them into `PlanStatusGuard`, so questions that mention `new plan`,
+  `方案`, hooks, or workflow routing no longer create plan files or block with
+  "No active plan found" unless they explicitly start execution.
+
+### Changed
+
+- Updated the self-host CodeGraph development dependency to `0.9.9` and made
+  gbrain readiness probe `doctor --json --fast` before falling back to the full
+  doctor command.
+- Updated maintainer release docs and README verification guidance to require
+  non-dry-run skill eval evidence when claiming skill effectiveness.
+- Refreshed the ignored Codex resume packet inside the npm release gate before
+  strict workflow validation, so release tests that update handoff runtime state
+  cannot leave the gate failing its own stale-resume invariant.
+
+### Removed
+
+- Retired the self-host-only `autoresearch-advisory.sh` hook from `.ai/hooks`,
+  the generated hook adapter installer, and hook parity exceptions. Autoresearch
+  now stays an explicit agent-run workflow instead of a user-level background
+  hook route.
+
+## [0.2.3] - 2026-06-05
+
+### Changed
+
+- Replaced the public `repo-harness init` path with a typed global bootstrap
+  that installs the current package as the global CLI, refreshes repo-harness
+  skill aliases, installs user-level hook adapters, configures Waza
+  `think`/`hunt`/`check`/`health`, persists the brain root, and configures
+  CodeGraph MCP without applying repo-local workflow files to the current
+  directory.
+
+### Removed
+
+- Removed the Superpowers Claude marketplace installer path entirely from the
+  active `repo-harness init` flow and from `scripts/setup-plugins.sh`.
+
+## [0.2.2] - 2026-06-04
+
+### Fixed
+
+- Streamed `repo-harness init` setup output directly to the terminal so the
+  first-run `npx -y repo-harness init` path no longer looks hung while
+  `setup-plugins.sh` clones skills or runs Claude plugin setup.
+- Made the Superpowers Claude marketplace plugin opt-in via
+  `repo-harness init --with-superpowers` instead of installing it by default.
+
+## [0.2.1] - 2026-06-02
+
+### Added
+
+- Added `repo-harness init` as a thin npm CLI wrapper around
+  `scripts/setup-plugins.sh`, so users can run
+  `npx -y repo-harness init` for first-run global Claude plugin and hook-profile
+  bootstrap without cloning the source repository.
+- Added a prompt-guard CodeGraph self-heal path: before emitting the first
+  structural code-navigation hint in a session, a missing `.codegraph` index is
+  initialized with the local or PATH-visible CodeGraph binary without running the
+  heavier readiness probe.
+
+### Changed
+
+- Moved the existing repo-local harness install/refresh CLI surface to
+  `repo-harness update`, keeping `repo-harness init` focused on global runtime
+  initialization.
+- Updated the English, Chinese, Japanese, French, and Spanish READMEs for the
+  `0.2.1` npm release line and the split `init` / `update` lifecycle.
+
+### Fixed
+
+- Kept automatic hook-side CodeGraph initialization non-blocking and cleaned up
+  the Cursor rule file if current CodeGraph created it only as a side effect of
+  this automatic init.
+
+## [0.2.0] - 2026-06-02
+
+### Added
+
+- Added a read-only config security scan (`repo-harness security scan [--json]`) that checks high-value hook and editor-task config (`~/.claude/settings.json`, `~/.codex/hooks.json`, repo-local `.vscode/tasks.json`, and legacy project-level `.claude`/`.codex` adapters) for suspicious command patterns — remote-shell pipes, base64-decode-to-exec, `osascript`, `launchctl`/`crontab` persistence, netcat, and inline interpreter execution — plus unmanaged hook commands and auto-run `folderOpen` tasks. It reports findings only and never mutates config.
+- Added a low-frequency `SessionStart` sentinel (`.ai/hooks/security-sentinel.sh`, wired into the `SessionStart.default` route) that fingerprints the config set and re-scans only when a fingerprint changes, surfacing a one-line `[SecurityConfig]` reminder when findings appear.
+- Added a `security-config` check to `repo-harness doctor` backed by the same read-only scan.
+
+### Changed
+
+- Bumped the npm package release line from `0.1.5` to `0.2.0`; generated workflow compatibility stays on the `5.2.3` model line, and `repo-harness --version` / `repo-harness status` now report `0.2.0`.
+- Added `Why repo-harness` and `What's New in 0.2.0` sections to the English, Chinese, Japanese, French, and Spanish READMEs, promoting file-backed cross-session coordination, CodeGraph-plus-progressive-context token savings, the `scripts/setup-plugins.sh` installer, the config security sentinel, and the Claude/Codex draft-plan lifecycle.
+- Added the README hero image to the npm package allowlist so package consumers get the same visual surface as the source checkout.
+- Fixed the Chinese README, which still referenced `0.1.4`, to track the current release version.
+
+## [0.1.5] - 2026-06-01
+
+### Changed
+
+- Added `REPO_HARNESS_*` environment variable aliases for scaffold, migration, context-block selection, external-tooling checks, and contract-worktree controls while preserving `PROJECT_INITIALIZER_*` as legacy fallbacks.
+- Switched new runtime `.gitignore` and Codex resume generated markers to `repo-harness` while keeping dual-read compatibility for legacy `project-initializer` markers.
+- Added a dirty merged linked-worktree closeout guard to `ship-worktrees.sh --cleanup-merged`, requiring useful deltas to be committed, picked, or applied before cleanup and allowing only explicit scaffold-only discard.
+- Made `prepare-codex-handoff.sh` prefer Node for global handoff file updates, with Python retained as a fallback, so release verification does not depend on the local `python3 -` execution path.
+
+## [0.1.4] - 2026-05-31
+
+### Changed
+
+- Switched generated plan task artifacts from slug-only names to the active plan stem (`YYYYMMDD-HHMM-<slug>`) for `tasks/contracts/`, `tasks/reviews/`, and `tasks/notes/`.
+
+### Fixed
+
+- Kept workflow-state, handoff, archive, and contract-worktree helpers compatible with existing slug-only task artifacts while preferring the new plan-stem paths.
+
+## [0.1.3] - 2026-05-31
+
+### Added
+
+- Added AI-native scaffold profiles as overlays on the existing A-K plan catalog, including runtime-console, product-copilot, and sidecar-kernel project structures without introducing new public plan codes.
+- Added AI-native template variables so selected profiles can project focused project structures, runtime-console defaults, and tech-stack guidance while ordinary A-K scaffolds stay unchanged.
+- Added a typed prompt-guard decision engine behind `repo-harness-hook prompt-guard-decide`, keeping host adapters stable while making `intent x plan state` routing table-driven and testable.
+- Added CLI and route-level regression coverage for the internal prompt-guard decision command, the lightweight hook entrypoint, and the public `UserPromptSubmit --route default` path through real hook assets.
+- Added an optional deploy SQL invariant coverage check: when `tests/sql/control_plane_invariants.sql` exists, `check-deploy-sql-order.sh` now verifies every `deploy/sql/*.sql` migration is referenced by full path or basename.
+- Added a dated release filing under `deploy/release-checklists/260531-repo-harness-0.1.3.md` and documented the `YYMMDD-<package>-<version>.md` filing rule.
+
+### Changed
+
+- Split prompt-guard responsibilities so shell continues to parse hook JSON, read workflow files, perform capture side effects, and render host-safe output while TypeScript owns the explicit decision table.
+- Documented the 0.1.x release surface as `repo-harness@0.1.3`, still separate from the generated workflow compatibility line (`5.2.3`).
+- Expanded the English and Chinese README plus the hook operations reference to show the current host adapter -> CLI route registry -> shell hook -> TypeScript decision table architecture.
+
+### Fixed
+
+- Routed active Draft plan prompts such as `implement this plan` and `执行这个方案` to the non-blocking PlanCaptureGate instead of hard-blocking under PlanStatusGuard.
+- Routed no-active-plan and Approved-plan execution projection prompts through the appropriate capture/projection advice instead of collapsing them into generic PlanStatusGuard or ContractGuard failures.
+- Treated copied worktree status, retrospective completion reports, and next-slice planning summaries as passive context so they do not start implementation gates merely because they quote implementation vocabulary.
+- Ensured linked contract worktrees include `.ai/harness/planning/` before pending orchestration cleanup, preserving strict workflow verification in generated worktrees.
+- Filtered `tasks/.current.md.tmp.*` refresh scratch files out of generated `tasks/current.md` snapshots, including generated repo helper parity.
+- Aligned `repo-harness --version` and `repo-harness status` with the `package.json` release version for `0.1.3`.
+
+## [0.1.2] - 2026-05-30
+
+### Added
+
+- Added `repo-harness init` as a one-shot existing-repo bootstrap that defaults `--repo` to the current working directory, refreshes host adapters, applies the harness, installs Waza runtime skills, syncs `diagram-design`, and verifies the repo-local workflow.
+- Added `repo-harness init --no-codegraph` and `--configure-codegraph` so existing-repo bootstrap can either skip CodeGraph readiness or explicitly register CodeGraph MCP after building the index.
+- Added `check:release` / `prepublishOnly` npm release gates that check the official npm registry and reject already-published package versions before running tests, workflow checks, migration dry-run, and pack dry-run.
+- Added a GitHub-facing bilingual README path with `README.zh-CN.md` and a Mermaid task workflow from plan to contract worktree checkout, guarded implementation, verification, review, external acceptance, finish, merge, and cleanup.
+
+### Changed
+
+- Retired `project-initializer` as a Codex/Claude installed skill path and upstream resolver fallback; installed-copy sync now removes those directories instead of maintaining them.
+- Switched generated footer stamps to `repo-harness@...` while keeping `.claude/.skill-version` semantic version fields stable.
+- Prepared npm publishing under the unscoped `repo-harness` package name, made `repo-harness` the primary installed command, and kept `repo-harness-skill` as a compatibility alias.
+- Split the npm/CLI package release line (`0.1.x`) from the generated workflow compatibility line (`5.2.3`).
+- Updated GitHub repository metadata and source checkout docs for the `Ancienttwo/repo-harness` rename.
+- Forced copy-based installed-skill sync when `repo-harness init` runs from an npm `_npx` cache source, avoiding symlinks to temporary npx cache directories.
+- Clarified the product boundary, three-layer operating model, and task lifecycle on the README landing page.
+
+### Fixed
+
+- Rebuilt Claude skill aliases during installed-copy sync so `~/.claude/skills/project-initializer` cannot remain on a stale legacy repo while Codex runtime aliases are current.
+- Reduced full-suite release flakiness by giving `doctor` environment-probe tests a wider timeout budget.
+
+## [5.2.3] - 2026-05-27
+
+### Fixed
+
+- Expanded anchored approval intent variants such as `go ahead with it`, `please proceed`, and `可以干了` so post-plan approvals reach `PlanCaptureGate` / `PlanExecutionGate` without treating broad bug-fix wording as approval capture.
+
+## [5.2.2] - 2026-05-27
+
+### Fixed
+
+- Started a Draft `plans/` artifact as soon as explicit Codex Plan mode or Waza `/think` planning begins, so plan lifecycle state exists before approval and execution gates run.
+- Let terse approval prompts such as `GO` and `可以干` reach the approved-plan capture/projection path instead of being blocked before the agent can run `capture-plan.sh` or `plan-to-todo.sh`.
+
+## [5.2.1] - 2026-05-27
+
+### Fixed
+
+- Fixed terse `GO` approval prompts after Codex Plan mode or Waza `/think` so they trigger `PlanStatusGuard` and route execution through captured `plans/` artifacts instead of bypassing the workflow gate.
+
+## [5.2.0] - 2026-05-27
+
+### Changed
+
+- Added passive plan capture so Codex Plan mode, Waza `/think`, and `repo-harness-plan` outputs can become file-backed `plans/plan-*.md` artifacts through `scripts/capture-plan.sh`, with approved captures able to project directly through `plan-to-todo.sh`.
+- Added opt-in default-brain document mirroring through `scripts/sync-brain-docs.sh`, manifest `sync.direction=repo-to-brain` entries, and PostEdit hook integration for registered valuable docs.
+- Promoted CodeGraph from advisory setup guidance to required Codex agent readiness for code navigation, with read-only detector support, strict readiness checks, generated repo `.codegraph/` ignores, and non-vendored host install guidance.
+
+## [5.1.2] - 2026-05-27
+
+### Added
+
+- Added generated Codex hook adapter support through `.codex/hooks.json` while keeping `.ai/hooks/` as the shared hook implementation layer.
+- Updated init, scaffold, migration, workflow contract, docs, and tests so generated repos install both Claude and Codex hook adapters.
+
+## [5.1.1] - 2026-05-26
+
+### Fixed
+
+- Refreshed stale `references/` docs for the current `repo-harness` hook, migration, eval, plugin, and minimal-documentation contracts.
+- Updated public-surface spec and architecture docs to reflect the full 13-command `agentic-dev-*` facade inventory.
+- Removed empty optional doc placeholders so generated/self-hosted docs match the `minimal-agentic` profile.
+
+## [5.1.0] - 2026-05-26
+
+### Added
+
+- Added filesystem-owned Evidence Contract fields and guards so approved plan execution must name state/progress path, verification evidence, evaluator rubric, stop condition, and rollback surface before implementation or completion.
+
+### Changed
+
+- Made broad research delegation a main-agent spawn decision based on context impact and callable runners, with bounded main-thread fallback when spawning is not useful or available.
+- Hardened Waza external-tooling checks to compare whole skill directories and shared `rules/` files instead of only `SKILL.md`, catching broken `references/`, `scripts/`, `agents/`, and cross-skill rule links.
+
+## [5.0.2] - 2026-05-25
+
+### Fixed
+
+- Excluded ignored repo-local runtime state from Codex installed-copy sync outputs.
+
+## [5.0.1] - 2026-05-25
+
+### Added
+
+- Added the repo-harness plugin architecture map, domain/module docs, and capability-indexed local context contracts for Claude and Codex.
+
+### Fixed
+
+- Fixed Codex installed-copy sync for symlinked legacy `project-initializer` fallback paths.
+- Removed tracked Claude trace state from the release surface and ignored repo-local Codex/runtime logs.
+
+## [5.0.0] - 2026-05-25
+
+### Fixed
+
+- Made repeated `migrate-project-template.sh --apply` idempotent after a clean migration commit by normalizing first-write JSON output and preserving unchanged version stamps.
+- Removed stale `3.1 guidance` wording from migration dry-run output.
+
+### Changed
+
+- Added `deploy/sql/` as the tracked deployment SQL surface and wired a filename-order check for `0001_name.sql` style files.
+- Split deployable operations assets into tracked `deploy/` while keeping `_ops/` fully ignored for local private operations state and secrets.
+- Externalized long-form optional reference configs into the default brain file vault while keeping repo-local runtime contracts, hooks, scripts, and required minimal docs authoritative.
+- Added a repo-local brain manifest and workflow check for default brain pointers without making hooks depend on gbrain or iCloud.
+- Renamed the skill/package/repo display surface to `repo-harness` while keeping `repo-harness-skill` and `project-initializer` as legacy aliases, install paths, and generated stamp compatibility surfaces.
+- Added action-style `agentic-dev-*` command skill facades for plan, review, autoplan, init, scaffold, migrate, upgrade, repair, and check while keeping hooks/docs initialization internal.
+- Added advisory prompt-hook route hints for reusable-workflow packaging, with `repo-harness-autoplan` handling evidence-first plans only after user authorization.
+- Added a Codex installed-copy sync helper that keeps command facades only in the canonical `repo-harness` copy while legacy directories remain runtime fallback bundles.
+
+## [4.0.2] - 2026-05-20
+
+### Fixed
+
+- Installed `inspect-project-state.ts`, `migrate-workflow-docs.ts`, `workflow-contract.ts`, `check-skill-version.ts`, and a delegating `migrate-project-template.sh` wrapper into generated repos so the router verification path is not left stale.
+- Made generated capability discovery ignore `.worktrees/` and `_ref/` caches, preventing local worktree contracts from polluting `.ai/context/capabilities.json`.
+
+## [4.0.1] - 2026-05-20
+
+### Added
+
+- Added a versioned upgrade strategy to the workflow contract, inspector output, harness policy, and migration cleanup path so legacy reconfiguration, archives, preserves, and removals are auditable.
+- Added `docs/reference-configs/global-working-rules.md` as the user-level Claude/Codex rule template with enforceable P1/P2/P3 due diligence.
+
+## [4.0.0] - 2026-05-20
+
+### Changed
+
+- Removed `docs/PROGRESS.md` from default generated and required workflow surfaces; legacy progress files are now archived during migration instead of normalized in place.
+- Replaced default root `specs/` scaffolding with `docs/spec.md`, `interfaces/`, and tests as the stable product/runtime truth surfaces.
+- Promoted `_ops/` as the trackable operations workspace for runbooks, submission materials, release checklists, and helper scripts, while keeping `_ops/secrets/` and `_ops/env/.env*` ignored.
+- Made `_ref/` an ignored external comparison cache and added hook guards that block product edits under `_ref/` and sensitive `_ops` env/secret paths.
+- Updated workflow contracts, generated templates, reference docs, architecture index, and tests to use `tasks/workstreams/` for durable progress and `docs/CHANGELOG.md` for release history.
+
+## [3.6.0] - 2026-05-19
+
+### Added
+
+- Added `minimal-agentic` documentation generation so default scaffolds keep only required docs plus a small reference-config set, with `PROJECT_INITIALIZER_DOCUMENTATION_PROFILE=full` preserving the previous full docs surface.
+- Added `docs/reference-configs/document-generation.md` to document required docs, on-demand docs, and the Agent-owned decision boundary.
+- Added `lsp_profiles` metadata to policy and context maps so selected functional blocks can carry lightweight tooling hints without expanding root prompt context.
+- Added `worktree_strategy` policy for conflict-triggered `codex/<task-slug>` worktrees, Waza `/check`-style validation, and merge-back to `main` without absorbing unrelated dirty changes.
+- Added implementation notes as a task-local workflow artifact under `tasks/notes/`, with plan, contract, review, handoff, and archive integration.
+- Added raw verification run snapshots under `.ai/harness/runs/` so `checks/latest.json` remains a pointer while durable evidence stays inspectable.
+
+### Changed
+
+- Updated scaffold, migration, init, ensure, workflow contract, and tests to install reference configs through the documentation profile instead of copying every reference doc by default.
+- Changed init/migration external-tooling reports to skip update checks by default; set `PROJECT_INITIALIZER_CHECK_TOOLING_UPDATES=1` when an advisory run should also check upstream versions.
+- Updated harness policy and reference docs to distinguish notes, evidence, promoted assets, and advisory memory instead of collapsing task-local decisions into long-term memory.
+
+## [3.5.0] - 2026-05-11
+
+### Added
+
+- Added machine-readable `agentic_development` routing so product discovery uses gstack `office-hours`, complex engineering plans use gstack `plan-eng-review`, design plans use gstack `plan-design-review`, and daily small/medium work uses Waza `/think`, `/hunt`, and `/check`.
+- Added `docs/reference-configs/agentic-development-flow.md` to keep detailed gstack/Waza routing and P1/P2/P3 due-diligence triggers out of root prompts.
+- Added plan and review template sections for selected route, routing reason, and P1/P2/P3 evidence.
+- Added `scripts/select-agent-context-blocks.sh` as the functional-block selector hook for paired `CLAUDE.md` and `AGENTS.md` generation, so Claude Code and Codex receive the same local module contract without inferring boundaries from broad layout globs.
+
+### Changed
+
+- Stopped generating repo-local `.claude/hooks/` shim scripts by default; `.ai/hooks/` is now the shared hook implementation layer and `.claude/settings.json` is the Claude adapter.
+- Updated scaffold, migration, workflow contract, policy defaults, reference configs, and tests to keep self-host and generated repos aligned.
+- Hardened workflow verification and legacy task migration around runtime contract parsing and partially migrated `tasks/todo.md` files.
+
+## [3.4.0] - 2026-05-06
+
+### Added
+
+- Added Codex-first Waza policy metadata to the harness contract and generated repo policy defaults.
+- Added host-aware Waza detection for real Claude/Codex skill paths, per-skill versions, symlink targets, staging drift, and upstream stale status.
+- Added tests covering Claude staging symlinks, Codex independent runtime copies, read-only update checks, and Codex stale drift reporting.
+
+### Changed
+
+- Changed Waza `--check-updates` handling to compare upstream `tw93/Waza` raw `SKILL.md` hashes without running mutating `npx skills check`.
+- Documented the Waza stage -> copy into Codex -> `cmp` verification workflow for generated and self-hosted harnesses.
+
+## [3.3.0] - 2026-04-19
+
+### Changed
+
+- Removed repo-local Skill Factory and Claude auto-memory surfaces from the shared harness, migration path, and self-hosted repo.
+- Added `scripts/check-agent-tooling.sh` plus generated `docs/reference-configs/external-tooling.md` so init and migrate flows can report gstack, Waza, and gbrain advisory status safely.
+- Merged guidance-only `external_tooling` defaults into `.ai/harness/policy.json` during scaffold and migration without overwriting explicit repo overrides.
+
+## [3.2.1] - 2026-04-19
+
+### Fixed
+
+- Added progressive context and harness policy surfaces alongside the workflow contract manifest so generated repos keep root context stable while exposing deeper context on demand.
+- Wrote directory-level `AGENTS.md` files to discoverable module paths like `apps/*/AGENTS.md` instead of the container roots.
+- Stopped custom plan `K` from creating `apps/`, `packages/`, and `services/` unless the target repo already has real module directories there.
+- Corrected `scripts/inspect-project-state.ts` routing so initialized repos with bundled Skill Factory assets still classify as `audit` instead of collapsing to `skill-factory`.
+- Tightened `scripts/check-task-workflow.sh` so strict workflow verification now fails explicitly when no `node`, `bun`, or `python3` runtime is available to read the workflow contract.
+- Extended `scripts/migrate-workflow-docs.ts` to normalize legacy `tasks/todo.md` content in partially migrated repos and preserve the prior checklist in `tasks/archive/legacy-tasks-todo.md`.
+
+## [3.2.0] - 2026-04-08
+
+### Changed
+
+- Added `assets/workflow-contract.v1.json` as the single machine-readable workflow contract and installed `.ai/harness/workflow-contract.json` in generated and self-hosted repos.
+- Introduced `scripts/inspect-project-state.ts` so routing starts from structured repo inspection instead of prompt-only branching.
+- Added `scripts/migrate-workflow-docs.ts` to preserve and migrate legacy `docs/plan.md`, `docs/TODO.md`, and execution-log style `docs/PROGRESS.md`.
+- Updated migration, scaffold, and workflow verification paths to consume the shared contract manifest and verify it after migration.
+
+## [3.1.0] - 2026-03-29
+
+### Changed
+
+- Added `run_id` to trace events, verification reports, and task-state snapshots for tighter report correlation.
+- Expanded harness defaults to five dimensions by adding recovery and state profiles to the initializer question pack and plan map.
+- Added structured `failure_class` logging plus `scripts/summarize-failures.sh` for guard failure aggregation.
+
+## [3.0.0] - 2026-03-25
+
+### Changed
+
+- Upgraded generated repositories from a tasks-first scaffold to a shared long-running harness model.
+- Added `docs/spec.md`, `tasks/reviews/`, and `.ai/harness/{checks,handoff}` as first-class generated artifacts.
+- Reworked hook behavior around artifact-aware execution gates, contract scope enforcement, structured checks, and mandatory handoff generation.
+- Upgraded the initializer question pack to `v2` and added stack-aware orchestration, evaluation, and handoff defaults.
+- Updated helper scripts, templates, CLAUDE/AGENTS routing output, and tests to the shared harness model.

@@ -1,0 +1,60 @@
+schemaVersion: archcontext.flow/v1
+id: flow.inspection-migration.primary
+capabilityId: capability.workflow-engine.inspection-migration
+name: "Inspect before migration"
+applicability: required
+participants:
+  - id: capability
+    nodeId: capability.workflow-engine.inspection-migration
+  - id: inspector
+    nodeId: component.inspection-migration.primary
+  - id: contract
+    nodeId: capability.workflow-engine.contract-assets
+steps:
+  - id: load-contract
+    from: inspector
+    to: contract
+    label: "Load legacy paths and upgrade actions from the package workflow contract"
+    evidence:
+      entrypointId: entrypoint.inspection-migration.primary
+      sourceSymbol: "inspectRepo"
+      sinkId: sink.inspection-migration.contract
+  - id: detect-mode
+    from: capability
+    to: inspector
+    label: "Detect the repository mode without writes"
+    evidence:
+      entrypointId: entrypoint.inspection-migration.primary
+      sourceSymbol: "inspectRepo"
+      sinkId: sink.inspection-migration.primary
+outcomes:
+  - id: success
+    kind: success
+    label: "Inspection completes"
+    steps:
+      - id: record-drift
+        from: capability
+        to: inspector
+        label: "Record drift signals and required decisions"
+        evidence:
+          entrypointId: entrypoint.inspection-migration.primary
+          sourceSymbol: "inspectRepo"
+          sinkId: sink.inspection-migration.hook-drift
+    terminal:
+      participant: inspector
+      label: "Return the read-only inspection result"
+  - id: error
+    kind: error
+    label: "The package contract is missing or malformed"
+    steps:
+      - id: contract-fails
+        from: inspector
+        to: contract
+        label: "Fail closed on an unreadable contract inventory"
+        evidence:
+          entrypointId: entrypoint.inspection-migration.primary
+          sourceSymbol: "inspectRepo"
+          sinkId: sink.inspection-migration.contract
+    terminal:
+      participant: capability
+      label: "Exit non-zero without writes"

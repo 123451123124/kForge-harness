@@ -1,0 +1,54 @@
+{
+  "schemaVersion": "archcontext.node/v2",
+  "id": "capability.runtime-harness.mcp-sidecar",
+  "kind": "capability",
+  "name": "MCP Sidecar",
+  "status": "active",
+  "layer": "cli",
+  "summary": "Provides the local MCP sidecar and its repository access policy boundary.",
+  "responsibilities": [
+    "Own the stdio MCP server lifecycle, the mcp doctor, workspace registration and access policy.",
+    "Serve the planner and executor profiles and fail closed on a config that keeps a retired ChatGPT, HTTP, OAuth, coding or orchestrator key."
+  ],
+  "source": {
+    "include": [
+      "src/cli/mcp/**"
+    ],
+    "exclude": [
+      "src/cli/mcp/general-repo-access.ts",
+      "src/cli/mcp/general-repo-access/**"
+    ],
+    "entrypoints": [
+      {
+        "id": "entrypoint.mcp-sidecar.primary",
+        "path": "src/cli/mcp/server.ts",
+        "symbols": [
+          {
+            "name": "createRepoHarnessMcpServer",
+            "sinks": [
+              {
+                "id": "sink.mcp-sidecar.primary",
+                "path": "src/cli/mcp/tools.ts",
+                "symbol": "callMcpTool"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "extensions": {
+    "harnessTier": "plugin",
+    "harnessContract": "Surface",
+    "contractFiles": {
+      "agents": "AGENTS.md",
+      "claude": "CLAUDE.md"
+    },
+    "lspProfile": "typescript-lsp",
+    "verification": [
+      "bun test tests/cli/mcp*.test.ts",
+      "bun run check:type",
+      "rh mcp doctor --repo ."
+    ]
+  }
+}

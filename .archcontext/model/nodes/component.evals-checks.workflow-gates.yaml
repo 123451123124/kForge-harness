@@ -1,0 +1,14 @@
+schemaVersion: archcontext.node/v2
+id: component.evals-checks.workflow-gates
+kind: component
+name: "Workflow Gates"
+status: active
+parent: capability.verification.evals-checks
+layer: "scripts"
+summary: "Shell gates for the workflow contract files and agent tooling."
+responsibilities:
+  - Check the workflow contract files and their required runtime surfaces.
+  - Check agent tooling readiness.
+source:
+  include:
+    - "scripts/check-agent-tooling.sh"

@@ -1,0 +1,151 @@
+import { dirname, isAbsolute, resolve, join } from 'node:path';
+import { isBinaryExpression, isConditionalExpression, isArrowFunction, isFunctionExpression, isTemplateExpression, isArrayLiteralExpression, isCallExpression, isForOfStatement, isFunctionDeclaration, isIdentifier, isImportDeclaration, isNewExpression, isPropertyAccessExpression, isStringLiteralLikeNode, isVariableDeclaration, NodeFlags, SyntaxKind, type Node, type SourceFile } from 'typescript/unstable/ast';
+
+const nameOf = (node: Node): string => isIdentifier(node) ? node.text : isPropertyAccessExpression(node) ? node.name.text : '';
+export function walk(node: Node, visit: (node: Node) => void) { visit(node); node.forEachChild(child => { walk(child, visit); }); }
+
+/** Bounded lexical evaluation. The caller supplies the meaning of process.cwd(). */
+export function createPathEvaluator(source: SourceFile, repoRoot: string, file: string, cwdRoot = repoRoot) {
+  const nodes: Node[] = [];
+  walk(source, node => nodes.push(node));
+  const declarations = nodes.filter(isVariableDeclaration);
+  const calls = nodes.filter(isCallExpression);
+  const functions = nodes.filter(node => isFunctionDeclaration(node) || isArrowFunction(node) || isFunctionExpression(node));
+  const aliases = new Map<string, string>();
+  for (const node of nodes) {
+    if (isImportDeclaration(node)) {
+      // Imported read/path aliases retain their operation name; namespace calls already use the property name.
+      for (const match of node.getText().matchAll(/\b(readFileSync|readFile|writeFileSync|writeFile|readdirSync|readdir|existsSync|copyFileSync|cpSync|spawn|spawnSync|execFile|execFileSync|execSync|exec|join|resolve|dirname|fileURLToPath)\s+as\s+(\w+)/g)) aliases.set(match[2]!, match[1]!);
+    }
+  }
+  const op = (node: Node) => aliases.get(nameOf(node)) ?? nameOf(node);
+  const scope = (node: Node): Node => {
+    let current = node.parent;
+    while (current && current.kind !== SyntaxKind.Block && current.kind !== SyntaxKind.SourceFile && !functions.includes(current as any)) current = current.parent;
+    return current ?? source;
+  };
+  const ancestor = (outer: Node, inner: Node): boolean => { for (let node: Node | undefined = inner; node; node = node.parent) if (node === outer) return true; return false; };
+  const bindingFor = (node: Node) => {
+    if (!isIdentifier(node)) return undefined;
+    return declarations.filter(decl => isIdentifier(decl.name) && decl.name.text === node.text && ancestor(scope(decl), node))
+      .sort((a, b) => ancestor(scope(a), scope(b)) ? 1 : -1)[0];
+  };
+  const cwdCertain = file.startsWith('tests/') && !calls.some(call => call.expression.getText() === 'process.chdir');
+  // An unknown working directory can have any parent. Keep the known suffix
+  // without manufacturing an absolute path in the analyzer's own process.
+  const unresolvedPath = (parts: string[]): string => {
+    const suffix = join(...parts).replace(/^(?:\.\.\/|\.\/|\*\/)+/, '');
+    return ['.', '..', '*'].includes(suffix) ? '*' : suffix;
+  };
+  const values = (node: Node | undefined, depth = 0, seen = new Set<Node>()): string[] => {
+    if (!node || depth > 18 || seen.has(node)) return ['*'];
+    const next = new Set(seen).add(node);
+    const recur = (child: Node | undefined) => values(child, depth + 1, next);
+    if (isStringLiteralLikeNode(node)) return [node.text];
+    if (node.getText() === 'import.meta.dir' || node.getText() === '__dirname') return [dirname(resolve(repoRoot, file))];
+    if (node.getText() === 'import.meta.url') return [resolve(repoRoot, file)];
+    if (isArrayLiteralExpression(node)) return node.elements.flatMap(recur);
+    if (isIdentifier(node)) {
+      const binding = bindingFor(node);
+      if (binding?.initializer) return recur(binding.initializer);
+      if (binding) {
+        let parent: Node | undefined = binding.parent;
+        while (parent && !isForOfStatement(parent) && parent !== source) parent = parent.parent;
+        if (parent && isForOfStatement(parent)) return recur(parent.expression);
+      }
+      for (const fn of functions) {
+        const index = fn.parameters.findIndex(param => isIdentifier(param.name) && param.name.text === node.text);
+        const functionName = isFunctionDeclaration(fn) ? fn.name?.text : isVariableDeclaration(fn.parent) && isIdentifier(fn.parent.name) ? fn.parent.name.text : undefined;
+        if (index >= 0 && ancestor(fn, node)) {
+          const fallback = fn.parameters[index]!.initializer;
+          // A function without a call site in this file gets its arguments from callers outside it.
+          const callSites = functionName ? calls.filter(call => nameOf(call.expression) === functionName) : [];
+          const supplied = callSites.length ? callSites.flatMap(call => recur(call.arguments[index])) : ['*'];
+          return [...new Set([...supplied, ...(fallback ? recur(fallback) : [])])];
+        }
+      }
+      return ['*'];
+    }
+    if (isCallExpression(node) || isNewExpression(node)) {
+      const args = node.arguments ?? [];
+      const operation = op(node.expression);
+      if (operation === 'cwd' && node.expression.getText() === 'process.cwd') {
+        if (!file.startsWith('tests/')) return ['*'];
+        return cwdCertain ? [cwdRoot] : [cwdRoot, '*'];
+      }
+      if (operation === 'dirname') return recur(args[0]).map(value => value === '*' ? '*' : dirname(value));
+      if (operation === 'fileURLToPath') return recur(args[0]);
+      if (operation === 'URL') return recur(args[0]).flatMap(value => recur(args[1]).map(base =>
+        isAbsolute(base) ? resolve(dirname(base), value) : unresolvedPath([value])));
+      if (operation === 'join' || operation === 'resolve') {
+        let combinations: string[][] = [[]];
+        for (const arg of args) {
+          combinations = combinations.flatMap(parts => [...new Set(recur(arg))].map(value => [...parts, value]));
+          if (combinations.length > 4096) throw new Error(`Path expansion exceeds bounded analysis in ${file}: ${node.getText().slice(0, 160)}`);
+        }
+        return combinations.flatMap(parts => {
+          if (operation === 'join') return [join(...parts)];
+          if (cwdCertain || parts.some(isAbsolute)) return [resolve(cwdRoot, ...parts)];
+          // The checkout is one possible CWD. Keep its existing consumer edges,
+          // plus an unresolved suffix, without claiming either root is certain.
+          return [...new Set([resolve(repoRoot, ...parts), unresolvedPath(parts)])];
+        });
+      }
+      // Unknown wrappers can forward an argument or return a different path.
+      // Filesystem temporaries do not inherit a caller's path argument.
+      if (/^(?:mkdtemp|tmpdir|createTemp|withTemp)/i.test(operation)) return ['*'];
+      return [...new Set(['*', ...args.flatMap(recur)])];
+    }
+    if (isConditionalExpression(node)) return [...new Set([...recur(node.whenTrue), ...recur(node.whenFalse)])];
+    if (isBinaryExpression(node) && node.operatorToken.kind === SyntaxKind.PlusToken) {
+      const left = recur(node.left), right = recur(node.right);
+      if (left.length * right.length > 4096) throw new Error(`Path expansion exceeds bounded analysis in ${file}: ${node.getText().slice(0, 160)}`);
+      return left.flatMap(prefix => right.map(suffix => prefix + suffix));
+    }
+    if (isTemplateExpression(node)) {
+      let paths = [node.head.text];
+      for (const span of node.templateSpans) {
+        paths = paths.flatMap(prefix => recur(span.expression).map(value => prefix + value + span.literal.text));
+        if (paths.length > 4096) throw new Error(`Path expansion exceeds bounded analysis in ${file}: ${node.getText().slice(0, 160)}`);
+      }
+      return paths;
+    }
+    // Unwrap assertions and parentheses.
+    const children: Node[] = [];
+    node.forEachChild(child => { children.push(child); });
+    return children.length === 1 ? recur(children[0]) : ['*'];
+  };
+  const memo = new Map<Node, string[]>();
+  const evaluate = (node: Node | undefined): string[] => {
+    if (!node) return ['*'];
+    if (!memo.has(node)) memo.set(node, values(node));
+    return memo.get(node)!;
+  };
+  /** Unknown wrappers can forward candidates, but cannot prove a path root. */
+  const certain = (node: Node | undefined, seen = new Set<Node>()): boolean => {
+    if (!node || seen.has(node)) return false;
+    const next = new Set(seen).add(node);
+    const recur = (child: Node | undefined) => certain(child, next);
+    if (isStringLiteralLikeNode(node) || ['import.meta.dir', 'import.meta.url', '__dirname'].includes(node.getText())) return true;
+    if (isIdentifier(node)) {
+      const declaration = bindingFor(node);
+      return !!declaration && !!(declaration.parent.flags & NodeFlags.Const) && recur(declaration.initializer);
+    }
+    if (isArrayLiteralExpression(node)) return node.elements.every(recur);
+    if (isConditionalExpression(node)) return recur(node.whenTrue) && recur(node.whenFalse);
+    if (isTemplateExpression(node)) return node.templateSpans.every(span => recur(span.expression));
+    if (isBinaryExpression(node) && node.operatorToken.kind === SyntaxKind.PlusToken) return recur(node.left) && recur(node.right);
+    if (isCallExpression(node) || isNewExpression(node)) {
+      if (node.expression.getText() === 'process.cwd') return cwdCertain;
+      const operation = op(node.expression), args = node.arguments ?? [];
+      if (!args.every(recur)) return false;
+      if (operation === 'resolve') return cwdCertain || args.some(arg => evaluate(arg).length > 0 && evaluate(arg).every(isAbsolute));
+      if (operation === 'URL') return !!args[1] && evaluate(args[1]).every(isAbsolute);
+      return ['join', 'dirname', 'fileURLToPath'].includes(operation);
+    }
+    const children: Node[] = [];
+    node.forEachChild(child => { children.push(child); });
+    return children.length === 1 && recur(children[0]);
+  };
+  return { nodes, calls, declarations, bindingFor, op, values: evaluate, certain };
+}

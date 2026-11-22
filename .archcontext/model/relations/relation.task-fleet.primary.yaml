@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "archcontext.relation/v1",
+  "id": "relation.task-fleet.primary",
+  "kind": "calls",
+  "source": "capability.organization.task-fleet",
+  "target": "component.task-fleet.primary",
+  "intent": "Run the fleet command group for task messages, inbox, provider feedback and repository registration"
+}

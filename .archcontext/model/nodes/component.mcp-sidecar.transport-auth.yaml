@@ -1,0 +1,22 @@
+schemaVersion: archcontext.node/v2
+id: component.mcp-sidecar.transport-auth
+kind: component
+name: "Stdio Transport"
+status: active
+parent: capability.runtime-harness.mcp-sidecar
+layer: "cli"
+summary: "Serves MCP over stdio for the startup profile."
+responsibilities:
+  - Start the stdio transport and connect one MCP server for the startup profile.
+source:
+  include:
+    - src/cli/mcp/transports/**
+  entrypoints:
+    - id: entrypoint.mcp-sidecar.stdio-transport
+      path: src/cli/mcp/transports/stdio.ts
+      symbols:
+        - name: startMcpStdio
+          sinks:
+            - id: sink.mcp-sidecar.session-server
+              path: src/cli/mcp/server.ts
+              symbol: createRepoHarnessMcpServer

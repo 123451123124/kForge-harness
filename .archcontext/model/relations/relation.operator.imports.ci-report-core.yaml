@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "archcontext.relation/v1",
+  "id": "relation.operator.imports.ci-report-core",
+  "kind": "depends-on",
+  "source": "capability.runtime-harness.operator",
+  "target": "component.evals-checks.ci-report-core",
+  "intent": "Read the test result types, the test projection parser and the run command for the tests board and its snapshot decoder."
+}

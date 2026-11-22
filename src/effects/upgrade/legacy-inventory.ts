@@ -1,0 +1,848 @@
+import { isRecord } from '../../core/evidence/is-record';
+import type { PathRecord } from '../../core/host-config/types';
+import { SHA256_PREFIXED_PATTERN } from '../../core/evidence/sha256-pattern';
+import { sha256Prefixed } from '../../core/evidence/sha256';
+import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync } from 'fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
+import { hashManagedTree, installedCopyTreeOptions, OWNER_MARKER } from '../managed-tree';
+import { isRepoHarnessLegacyTypedHookCommand, isRepoHarnessManagedHookCommand, retiredHookCommands } from '../../core/adoption/managed-hook-config';
+import { hookRenderingKey, removeJsonHookCommand, type HookCommandPosition } from '../../core/host-config/json-fragment';
+import { releasedHookRenderings } from './released-values';
+import { HostConfigError } from '../../core/host-config/types';
+import { decode as decodeHostFile } from '../host-config/gate';
+import { isRepoHarnessSourceCheckout } from '../source-checkout';
+import { loadWorkflowContractAsset } from '../../core/adoption/workflow-contract-asset';
+import { CLI_NAME, namesRetiredCli, RETIRED_CLI_NAME } from '../../core/skill-surface/cli-name';
+import { MANAGED_PACKAGE_SCRIPTS, RETIRED_PACKAGE_SCRIPT_KEYS } from '../../core/adoption/package-scripts';
+import { isReleasedPackageScript } from './released-values';
+import { parseSkillSurfaceCatalog, type SkillSurfacePackage } from '../../core/skill-surface/catalog';
+
+export interface LeftoverItem {
+  readonly location: 'project' | 'global';
+  readonly surface: 'file' | 'directory' | 'skill' | 'symlink' | 'hook-entry';
+  readonly path: string;
+  readonly retiredBy: string;
+  readonly ownership: 'owned-clean' | 'owned-modified' | 'unowned';
+  readonly proof: 'manifest' | 'owner-marker' | 'historical-fingerprint' | 'managed-hook' | 'state-root-retired-path' | null;
+  readonly action: 'remove' | 'strip-entry' | 'refresh' | 'report';
+  readonly sourcePath?: string;
+  readonly expectedSourceHash?: string;
+  readonly sourceSurface?: 'canonical-skill' | 'command-facade';
+  readonly stateArtifact?: boolean;
+  readonly expectedContentHash?: string;
+  readonly expectedSymlinkTarget?: string;
+  readonly hookEvent?: string;
+  readonly hookCommand?: string;
+  readonly reason?: string;
+  /** A notice only: the preview exit code and the pending state leave it out. */
+  readonly advisory?: true;
+  /** Set only by upgrade operator decisions; the inventory itself never writes it. */
+  readonly operatorDecision?: { readonly decision: 'keep' | 'remove'; readonly status: 'applied' | 'stale' | 'rejected' };
+}
+
+export interface LegacyInventoryOptions {
+  readonly scope: 'project' | 'global' | 'all';
+  readonly cwd: string;
+  readonly home: string;
+  readonly repoHarnessHome?: string;
+  readonly packageRoot: string;
+  readonly includeStateArtifacts?: boolean;
+  /**
+   * The ledger's path records as a lookup by path, read at the CLI boundary.
+   * It is a function because an upgrade run refreshes records between its plans.
+   */
+  readonly installOwnership: () => OwnedPathLookup;
+}
+
+interface RetirementAction {
+  readonly id?: string;
+  readonly action?: string;
+  readonly ownership?: string;
+  readonly location?: 'project' | 'global';
+  readonly surface?: LeftoverItem['surface'];
+  readonly retiredBy?: string;
+  readonly cleanupMode?: string;
+  readonly paths?: readonly string[];
+  /** Exact-fingerprint removals that are skipped when the directory holds other entries. */
+  readonly onlyWhenSoleEntry?: readonly string[];
+  readonly fingerprints?: Readonly<Record<string, string>>;
+  readonly historicalFingerprints?: Readonly<Record<string, readonly string[]>>;
+  readonly commands?: readonly string[];
+  readonly sourcePaths?: Readonly<Record<string, string>>;
+}
+interface Contract { readonly installedCopyIncludes?: readonly string[]; readonly installedCopyExcludes?: readonly string[]; readonly helpers?: { readonly scripts?: readonly string[]; readonly internal?: readonly string[] }; readonly migrations?: { readonly upgrade?: { readonly actions?: readonly RetirementAction[] } } }
+/** The path record of a host path, or null when the install owns no record of it. */
+export type OwnedPathLookup = (path: string) => PathRecord | null;
+
+const NONE_OWNED: OwnedPathLookup = () => null;
+
+function stat(path: string): ReturnType<typeof lstatSync> | null {
+  try { return lstatSync(path); } catch (error) {
+    if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) return null;
+    throw error;
+  }
+}
+
+/**
+ * Check the authority and all descendants without resolving a symlink. An
+ * entry that rh cannot inspect (EACCES, EPERM, ELOOP) is not safe, so the
+ * caller reports or skips that path and the inventory goes on.
+ */
+export function isLegacyPathSafe(root: string, path: string, allowLeafSymlink = true): boolean {
+  const authority = resolve(root);
+  const target = resolve(path);
+  const rel = relative(authority, target);
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return false;
+  try {
+    const rootStat = stat(authority);
+    if (rootStat?.isSymbolicLink() || (rootStat && !rootStat.isDirectory())) return false;
+    let current = authority;
+    const parts = rel.split(sep);
+    for (let index = 0; index < parts.length; index++) {
+      current = join(current, parts[index]!);
+      const entry = stat(current);
+      if (entry?.isSymbolicLink() && !(allowLeafSymlink && index === parts.length - 1)) return false;
+      if (entry && index < parts.length - 1 && !entry.isDirectory()) return false;
+    }
+  } catch (error) {
+    if (inaccessible(error)) return false;
+    throw error;
+  }
+  return true;
+}
+
+/** An error that keeps rh from inspecting or reading one path: the inventory reports that path and goes on. */
+function inaccessible(error: unknown): boolean {
+  return ['EACCES', 'EPERM', 'ELOOP'].includes((error as NodeJS.ErrnoException).code ?? '');
+}
+
+export interface LegacyPathSnapshot {
+  readonly kind: 'file' | 'directory' | 'symlink';
+  readonly contentHash?: string;
+  readonly symlinkTarget?: string;
+}
+/** Call only after checking the selected root with isLegacyPathSafe. */
+export function legacyPathSnapshot(path: string): LegacyPathSnapshot | null {
+  const entry = stat(path);
+  if (!entry) return null;
+  if (entry.isSymbolicLink()) return { kind: 'symlink', symlinkTarget: readlinkSync(path) };
+  if (entry.isFile()) return { kind: 'file', contentHash: sha256Prefixed(readFileSync(path)) };
+  if (entry.isDirectory()) return { kind: 'directory', contentHash: hashManagedTree(path) };
+  return null;
+}
+
+function actionsOf(): readonly RetirementAction[] {
+  const contract = loadWorkflowContractAsset<Contract>();
+  const actions = [...(contract.migrations?.upgrade?.actions ?? [])];
+  const packageRoot = resolve(import.meta.dir, '..', '..', '..');
+  const catalogPath = join(packageRoot, 'assets', 'skill-commands', 'manifest.json');
+  const catalog = parseSkillSurfaceCatalog(readFileSync(catalogPath, 'utf8'), { declared: true });
+  if (catalog.status !== 'valid') throw new Error('retirement inventory requires a valid skill catalog');
+  for (const pkg of catalog.catalog.retiredPackages) {
+    for (const cleanup of pkg.cleanup ?? []) {
+      const action = actions.find((entry) => entry.id === cleanup.actionId);
+      if (!action || action.location !== 'global' || action.surface !== 'skill'
+        || action.action !== 'remove' || action.ownership !== 'known_generated') {
+        throw new Error(`retired package cleanup action is missing or unsafe: ${cleanup.actionId}`);
+      }
+      const paths = ['.claude', '.codex', '.agents'].map((host) => `${host}/skills/${pkg.name}`);
+      actions.push({ ...action, paths, fingerprints: undefined,
+        historicalFingerprints: Object.fromEntries(paths.map((path) => [path, cleanup.historicalFingerprints])) });
+    }
+  }
+  for (const action of actions) {
+    if (!['remove', 'refresh'].includes(action.action ?? '') || action.ownership !== 'known_generated') continue;
+    const paths = action.paths ?? [];
+    if (action.cleanupMode === 'exact_fingerprint') {
+      if (new Set(paths).size !== paths.length) throw new Error(`duplicate path in exact-fingerprint migration action ${action.id ?? '<unnamed>'}`);
+      for (const path of paths) {
+        if (path.includes('*')) throw new Error(`wildcard is not allowed in exact-fingerprint migration action: ${path}`);
+        if (action.fingerprints?.[path] === undefined) throw new Error(`missing exact fingerprint for ${path} in migration action ${action.id ?? '<unnamed>'}`);
+      }
+      for (const path of Object.keys(action.fingerprints ?? {})) {
+        if (!paths.includes(path)) throw new Error(`fingerprint declared for undeclared migration path ${path}`);
+      }
+      for (const path of action.onlyWhenSoleEntry ?? []) {
+        if (!paths.includes(path)) throw new Error(`sole-entry path ${path} is not declared in migration action ${action.id ?? '<unnamed>'}`);
+      }
+    }
+    if ((action.onlyWhenSoleEntry?.length ?? 0) > 0 && (action.action !== 'remove' || action.cleanupMode !== 'exact_fingerprint')) {
+      throw new Error(`sole-entry guard requires an exact-fingerprint remove action: ${action.id ?? '<unnamed>'}`);
+    }
+    for (const digest of [...Object.values(action.fingerprints ?? {}), ...Object.values(action.historicalFingerprints ?? {}).flat()]) {
+      if (!SHA256_PREFIXED_PATTERN.test(digest)) throw new Error(`invalid known-generated fingerprint in ${action.id ?? '<unnamed>'}`);
+    }
+  }
+  return actions.map((action) => {
+    if (action.action !== 'remove' || action.ownership !== 'known_generated' || action.surface === 'hook-entry') return action;
+    const paths = new Set(action.paths ?? []);
+    // Historical proof names retired candidates even after the runtime registry drops them.
+    for (const [path, hashes] of Object.entries(action.historicalFingerprints ?? {})) {
+      if (hashes.length === 0) continue;
+      if (isAbsolute(path) || path.includes('\\') || path.includes('*') || path.split('/').some((part) => ['', '.', '..'].includes(part))) {
+        throw new Error(`unsafe historical retirement path: ${path}`);
+      }
+      if (action.cleanupMode === 'exact_fingerprint' && !paths.has(path)) {
+        throw new Error(`historical fingerprint declared for undeclared exact migration path ${path}`);
+      }
+      paths.add(path);
+    }
+    const fingerprints = { ...action.fingerprints };
+    if (action.cleanupMode === 'generated_helper' && (action.location ?? 'project') === 'project' && (action.surface ?? 'file') === 'file') {
+      if (!contract.helpers?.scripts) throw new Error('generated helper retirement requires the helper registry');
+      for (const path of action.paths ?? []) {
+        if (!path.startsWith('scripts/')) continue;
+        const name = path.slice('scripts/'.length);
+        if (!contract.helpers.scripts.includes(name)) continue;
+        if (!/^[a-z0-9][a-z0-9._-]*$/.test(name)) throw new Error(`unsafe declared helper name: ${name}`);
+        const source = join(packageRoot, 'scripts', name);
+        if (!isLegacyPathSafe(packageRoot, source, false) || !stat(source)?.isFile()) {
+          throw new Error(`declared helper source is missing or unsafe: ${name}`);
+        }
+        const digest = sha256Prefixed(readFileSync(source));
+        if (fingerprints[path] !== undefined && fingerprints[path] !== digest) {
+          throw new Error(`declared helper fingerprint differs from its package source: ${path}`);
+        }
+        fingerprints[path] = digest;
+      }
+    }
+    return { ...action, paths: [...paths], fingerprints };
+  });
+}
+
+function historicalCommands(actions: readonly RetirementAction[], shimPaths: readonly string[]): Set<string> {
+  const commands = new Set(retiredHookCommands());
+  const prefix = '.repo-harness/hooks/';
+  for (const shim of shimPaths) {
+    commands.add(shim);
+    // v0.1.2-v0.2.4 installers used these names before the central bundle.
+    for (const name of ['trace-event.sh', 'context-pressure-hook.sh', 'autoresearch-advisory.sh', 'finalize-handoff.sh']) {
+      commands.add(`bash ${shim} ${name}`);
+    }
+    for (const action of actions) {
+      if (action.location !== 'global') continue;
+      for (const path of action.paths ?? []) {
+        if (!path.startsWith(prefix)) continue;
+        const name = path.slice(prefix.length);
+        if (name.endsWith('.sh') && !name.includes('/')) commands.add(`bash ${shim} ${name}`);
+      }
+    }
+  }
+  return commands;
+}
+
+type HookLocationOptions = { readonly location?: 'project' } | { readonly location: 'global'; readonly home: string; readonly repoHarnessHome?: string };
+
+/**
+ * The hook commands that rh owns at a location, and the keys of the renderings
+ * that a release wrote. A command that rh owns is removed only when it equals
+ * one of those renderings; any other form of it keeps the whole file.
+ */
+function hookRules(options: HookLocationOptions): { readonly owned: (command: string) => boolean; readonly released: ReadonlySet<string> } {
+  const shimPaths = options.location === 'global' ? [
+    join(resolve(options.home), '.repo-harness/hook-shim.sh'),
+    // The retired installer wrote this configured root verbatim.
+    ...(options.repoHarnessHome ? [`${options.repoHarnessHome}/hook-shim.sh`] : []),
+  ] : [];
+  const released = releasedHookRenderings(shimPaths);
+  const commands = historicalCommands(actionsOf(), shimPaths);
+  // Global ownership needs a full historical command, never a path substring; a project file also holds rh's managed commands.
+  const owned = options.location === 'global'
+    ? (command: string) => released.commands.has(command) || commands.has(command) || isRepoHarnessLegacyTypedHookCommand(command)
+    : (command: string) => released.commands.has(command) || commands.has(command) || isRepoHarnessManagedHookCommand(command);
+  return { owned, released: released.keys };
+}
+
+const INVALID_HOOK_SETTINGS = 'Invalid hook settings; preserve current bytes.';
+const CUSTOMIZED_HOOK = 'A repo-harness hook differs from every hook that a release wrote; preserve current bytes.';
+
+/**
+ * The legacy hook commands of a hook file, in the order that removes them one
+ * by one: a removal moves only the positions after it in its event, so each
+ * event lists its commands last first. Null when a command that rh owns is not
+ * a released rendering, matcher and timeout included.
+ */
+function legacyHookRemovals(value: Record<string, unknown>, options: HookLocationOptions): HookCommandPosition[] | null {
+  if (!isRecord(value.hooks)) return [];
+  const { owned, released } = hookRules(options);
+  const removals: HookCommandPosition[] = [];
+  for (const [event, blocks] of Object.entries(value.hooks)) {
+    if (!Array.isArray(blocks)) continue;
+    const found: HookCommandPosition[] = [];
+    for (const [blockIndex, block] of blocks.entries()) {
+      if (!isRecord(block) || !Array.isArray(block.hooks)) continue;
+      const { hooks, ...rest } = block;
+      for (const [index, hook] of (hooks as unknown[]).entries()) {
+        const command = isRecord(hook) ? hook.command : undefined;
+        if (typeof command !== 'string' || !owned(command)) continue;
+        const rendering = hookRenderingKey({ event, block: rest, hook: hook as Record<string, unknown> });
+        if (!released.has(rendering)) return null;
+        found.push({ event, block: blockIndex, index, command, rendering });
+      }
+    }
+    removals.push(...found.reverse());
+  }
+  return removals;
+}
+
+/** The legacy hook rule options of a hook file at a location. */
+export function hookLocation(location: 'project' | 'global', options: { readonly home: string; readonly repoHarnessHome?: string }): HookLocationOptions {
+  return location === 'global' ? { location, home: options.home, repoHarnessHome: options.repoHarnessHome } : { location };
+}
+
+/** The hook file text after the removals, by text edits: the bytes outside them stay. */
+export function removeLegacyHookCommands(content: string, removals: readonly HookCommandPosition[]): string {
+  return removals.reduce((text, position) => {
+    const edit = removeJsonHookCommand(text, position);
+    return text.slice(0, edit.at) + edit.inserted + text.slice(edit.at + edit.removed.length);
+  }, content);
+}
+
+/**
+ * The text of a hook file and its legacy hook commands, which the planner
+ * reports and apply removes. The bytes are read as the gate reads them. A
+ * file that is not UTF-8 hook settings that the text edits can change, or
+ * that holds a customized repo-harness hook, is refused with the report
+ * reason; the planner then reports the file and keeps its bytes.
+ */
+export function hookFileRemovals(bytes: Buffer, path: string, options: HookLocationOptions): { content: string; removals: HookCommandPosition[] } | { refused: string } {
+  try {
+    const content = decodeHostFile(bytes, path);
+    const value = JSON.parse(content) as unknown;
+    if (!isRecord(value) || (value.hooks !== undefined && !isRecord(value.hooks))) return { refused: INVALID_HOOK_SETTINGS };
+    const removals = legacyHookRemovals(value, options);
+    if (!removals) return { refused: CUSTOMIZED_HOOK };
+    removeLegacyHookCommands(content, removals);
+    return { content, removals };
+  } catch (error) {
+    if (error instanceof HostConfigError || error instanceof SyntaxError) return { refused: INVALID_HOOK_SETTINGS };
+    throw error;
+  }
+}
+
+function readJson(path: string): unknown {
+  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return undefined; }
+}
+
+function classify(
+  path: string, snapshot: LegacyPathSnapshot, action: RetirementAction, contractPath: string,
+  owned: OwnedPathLookup,
+): Pick<LeftoverItem, 'ownership' | 'proof' | 'reason'> {
+  const declared = owned(path)?.committed;
+  if (declared) {
+    const matches = snapshot.kind === 'symlink'
+      ? declared.type === 'symlink' && declared.target === snapshot.symlinkTarget
+      : 'sha256' in declared && declared.sha256 === snapshot.contentHash;
+    return { ownership: matches ? 'owned-clean' : 'owned-modified', proof: 'manifest', reason: matches ? undefined : 'The path record does not match current bytes.' };
+  }
+  if (snapshot.kind === 'directory') {
+    const markerPath = join(path, OWNER_MARKER);
+    const markerEntry = stat(markerPath);
+    const marker = markerEntry?.isFile() ? readJson(markerPath) : undefined;
+    if (isRecord(marker) && marker.owner === 'repo-harness' && ['canonical-skill', 'command-facade'].includes(String(marker.surface)) && typeof marker.content_hash === 'string') {
+      const matches = marker.content_hash === snapshot.contentHash;
+      return { ownership: matches ? 'owned-clean' : 'owned-modified', proof: 'owner-marker', reason: matches ? undefined : 'Owner marker does not match current tree.' };
+    }
+    // Tree hashes omit this marker. Unknown marker bytes cannot use a historical proof.
+    if (markerEntry) return { ownership: 'unowned', proof: null, reason: 'Owner marker is invalid; preserve the tree.' };
+  }
+  const fingerprints = [...(action.historicalFingerprints?.[contractPath] ?? []), ...(action.fingerprints?.[contractPath] ? [action.fingerprints[contractPath]!] : [])];
+  if (snapshot.contentHash && fingerprints.includes(snapshot.contentHash)) return { ownership: 'owned-clean', proof: 'historical-fingerprint' };
+  return { ownership: 'unowned', proof: null, reason: fingerprints.length > 0 ? 'Current bytes do not match the declared retired generated asset.' : 'No ownership proof.' };
+}
+
+/** Revalidate a refresh source against the same copy projection used by staging. */
+export function hashUpgradeSource(
+  sourcePath: string, packageRoot: string, sourceSurface: LeftoverItem['sourceSurface'],
+): string | null {
+  const root = resolve(packageRoot);
+  const path = resolve(sourcePath);
+  if (path === root ? !stat(root)?.isDirectory() : !isLegacyPathSafe(root, path, false)) return null;
+  const entry = stat(path);
+  if (entry?.isFile()) return sha256Prefixed(readFileSync(path));
+  if (entry?.isDirectory()) {
+    if (sourceSurface !== 'canonical-skill' && sourceSurface !== 'command-facade') {
+      throw new Error('Directory refresh source surface is missing or invalid.');
+    }
+    return hashManagedTree(path, installedCopyTreeOptions(sourceSurface, loadWorkflowContractAsset<Contract>()));
+  }
+  return null;
+}
+
+type AddItem = (item: LeftoverItem) => void;
+
+function refreshItem(
+  options: LegacyInventoryOptions, location: LeftoverItem['location'], path: string, sourcePath: string,
+  action: RetirementAction, contractPath: string, owned: OwnedPathLookup, surface: LeftoverItem['surface'],
+  sourceSurface?: LeftoverItem['sourceSurface'],
+): LeftoverItem | null {
+  const root = location === 'project' ? options.cwd : options.home;
+  const base = { location, surface, path, retiredBy: surface === 'skill' ? 'current-package-skill' : action.id ?? 'stale-project-copy' };
+  if (!isLegacyPathSafe(root, path)) return { ...base, ownership: 'unowned', proof: null, action: 'report', reason: 'Copy path has a protected symlink, a non-directory ancestor or an entry that rh cannot inspect.' };
+  const snapshot = legacyPathSnapshot(path);
+  if (!snapshot) return null;
+  const expectedSourceHash = hashUpgradeSource(sourcePath, options.packageRoot, sourceSurface);
+  if (expectedSourceHash === null || (surface === 'skill' && !stat(sourcePath)?.isDirectory())) return { ...base, ownership: 'unowned', proof: null, action: 'report', reason: 'Package source has a protected symlink or is missing.' };
+  // A current source link needs no refresh. No link target is opened here.
+  if (snapshot.kind === 'symlink' && resolve(dirname(path), snapshot.symlinkTarget!) === resolve(sourcePath)) return null;
+  const ownership = classify(path, snapshot, action, contractPath, owned);
+  if (snapshot.contentHash === expectedSourceHash) {
+    // This item also prevents a retired-facade action from removing a current package copy.
+    return { ...base, ...ownership, action: 'report',
+      reason: ownership.ownership === 'owned-modified' ? ownership.reason : 'Installed copy already matches the current package.' };
+  }
+  return { ...base, ...ownership,
+    action: ownership.ownership === 'owned-clean' ? 'refresh' : 'report',
+    sourcePath, sourceSurface, expectedSourceHash,
+    expectedContentHash: snapshot.contentHash, expectedSymlinkTarget: snapshot.symlinkTarget,
+    reason: ownership.ownership === 'owned-clean' ? 'Refresh an unchanged owned copy from the current package.' : ownership.reason,
+  };
+}
+
+function currentCatalogPackages(packageRoot: string): readonly SkillSurfacePackage[] {
+  const path = join(packageRoot, 'assets/skill-commands/manifest.json');
+  if (!isLegacyPathSafe(packageRoot, path, false) || !stat(path)?.isFile()) throw new Error('current package skill catalog is missing or has a protected symlink');
+  const parsed = parseSkillSurfaceCatalog(readFileSync(path, 'utf8'), { declared: true });
+  if (parsed.status !== 'valid') throw new Error('current package skill catalog is invalid');
+  return parsed.catalog.packages.filter((pkg) => pkg.source !== null && pkg.provider === null && pkg.kind !== 'external');
+}
+
+function scanInstalledSkills(options: LegacyInventoryOptions, actions: readonly RetirementAction[], owned: OwnedPathLookup, add: AddItem, packages: readonly SkillSurfacePackage[]): void {
+  for (const pkg of packages) {
+    const sourcePath = resolve(options.packageRoot, pkg.source!);
+    for (const host of ['.claude', '.codex', '.agents']) {
+      const contractPath = `${host}/skills/${pkg.name}`;
+      const path = join(options.home, contractPath);
+      const historicalFingerprints = actions.reduce<Record<string, readonly string[]>>((values, action) => {
+        if (action.location === 'global' && action.paths?.includes(contractPath)) values[contractPath] = [
+          ...(values[contractPath] ?? []), ...(action.historicalFingerprints?.[contractPath] ?? []),
+          ...(action.fingerprints?.[contractPath] ? [action.fingerprints[contractPath]!] : []),
+        ];
+        return values;
+      }, {});
+      const item = refreshItem(options, 'global', path, sourcePath,
+        { id: 'stale-installed-skills', historicalFingerprints }, contractPath, owned, 'skill',
+        pkg.kind === 'router' ? 'canonical-skill' : 'command-facade');
+      if (item && item.reason !== 'Installed copy already matches the current package.') add(item);
+    }
+  }
+}
+
+function scanProjectRefresh(options: LegacyInventoryOptions, actions: readonly RetirementAction[], owned: OwnedPathLookup, add: AddItem): void {
+  for (const action of actions) {
+    if (action.action !== 'refresh' || action.location !== 'project' || action.ownership !== 'known_generated') continue;
+    for (const contractPath of action.paths ?? []) {
+      const source = action.sourcePaths?.[contractPath];
+      if (!source || isAbsolute(contractPath) || contractPath.split('/').includes('..') || isAbsolute(source) || source.split('/').includes('..')) throw new Error(`unsafe or missing refresh source for ${contractPath}`);
+      const item = refreshItem(options, 'project', resolve(options.cwd, contractPath), resolve(options.packageRoot, source), action, contractPath, owned, 'file');
+      if (item && item.reason !== 'Installed copy already matches the current package.') add(item);
+    }
+  }
+}
+
+function scanGlobalDocuments(options: LegacyInventoryOptions, actions: readonly RetirementAction[], add: AddItem, packages: readonly SkillSurfacePackage[]): void {
+  const retired = actions.filter((action) => action.action === 'remove');
+  const liveNames = new Set(packages.map((pkg) => pkg.name));
+  const tokens = [
+    ...retired.filter((action) => action.location !== 'global').flatMap((action) => [...(action.paths ?? [])]),
+    ...historicalCommands(actions, []), 'codex@openai-codex',
+    ...retired.filter((action) => action.surface === 'skill').flatMap((action) => [...(action.paths ?? [])]).map((path) => path.split('/').at(-1)!).filter((name) => !liveNames.has(name)),
+  ].filter((token) => token.length > 0 && !token.includes('*'));
+  for (const name of ['.claude/CLAUDE.md', '.codex/AGENTS.md']) {
+    const path = join(options.home, name);
+    if (!isLegacyPathSafe(options.home, path, false) || !stat(path)?.isFile()) continue;
+    const content = readFileSync(path, 'utf8');
+    if (tokens.some((token) => content.includes(token))) add({ location: 'global', surface: 'file', path,
+      retiredBy: 'retired-global-instructions', ownership: 'unowned', proof: null, action: 'report',
+      reason: 'Document contains a retired instruction. Review the lines without automatic edits.' });
+  }
+}
+
+function scanCodexPlugin(options: LegacyInventoryOptions, add: AddItem): void {
+  const id = 'codex@openai-codex';
+  const report = (path: string, reason: string): void => add({ location: 'global', surface: 'directory', path,
+    retiredBy: id, ownership: 'unowned', proof: null, action: 'report', reason });
+  const registryPath = join(options.home, '.claude/plugins/installed_plugins.json');
+  if (isLegacyPathSafe(options.home, registryPath, false) && stat(registryPath)?.isFile()) {
+    const registry = readJson(registryPath);
+    const registrations = isRecord(registry) && isRecord(registry.plugins) ? registry.plugins[id] : undefined;
+    if (Array.isArray(registrations)) for (const entry of registrations) {
+      if (!isRecord(entry) || typeof entry.installPath !== 'string') continue;
+      const path = resolve(entry.installPath);
+      report(path, 'Third-party Codex plugin registration. Disable or remove it with the plugin manager.');
+    }
+  }
+  const cache = join(options.home, '.claude/plugins/cache/openai-codex/codex');
+  if (isLegacyPathSafe(options.home, cache, false) && stat(cache)?.isDirectory()) {
+    for (const version of readdirSync(cache).sort()) {
+      const path = join(cache, version);
+      if (stat(path)) report(path, 'Third-party Codex plugin cache. Keep it outside owned cleanup.');
+    }
+  }
+  const settings = join(options.home, '.claude/settings.json');
+  if (isLegacyPathSafe(options.home, settings, false) && stat(settings)?.isFile()) {
+    const value = readJson(settings);
+    if (isRecord(value) && isRecord(value.enabledPlugins) && Object.hasOwn(value.enabledPlugins, id)) add({ location: 'global', surface: 'file', path: settings,
+      retiredBy: id, ownership: 'unowned', proof: null, action: 'report', reason: 'Third-party Codex plugin has a settings registration. Review it with the plugin manager.' });
+  }
+}
+
+function versionBefore(value: string, current: string): boolean {
+  const parse = (version: string): number[] | null => /^\d+\.\d+\.\d+$/.test(version) ? version.split('.').map(Number) : null;
+  const left = parse(value); const right = parse(current);
+  if (!left || !right) return false;
+  for (let index = 0; index < 3; index++) {
+    if (left[index] !== right[index]) return left[index]! < right[index]!;
+  }
+  return false;
+}
+
+function scanStateArtifacts(options: LegacyInventoryOptions, owned: OwnedPathLookup, add: AddItem): void {
+  const stateRoot = join(options.home, '.repo-harness');
+  const packagePath = join(options.packageRoot, 'package.json');
+  const pkg = isLegacyPathSafe(options.packageRoot, packagePath, false) ? readJson(packagePath) : undefined;
+  const currentVersion = isRecord(pkg) && typeof pkg.version === 'string' ? pkg.version : '';
+  // Only repo-harness writes a retired path, and the path predates the install manifest, so its location proves ownership.
+  const report = (path: string, removableByVersion: boolean, reason: string, retiredPath = false): void => {
+    if (!isLegacyPathSafe(options.home, path)) return;
+    const snapshot = legacyPathSnapshot(path);
+    if (!snapshot) return;
+    const ownership: Pick<LeftoverItem, 'ownership' | 'proof' | 'reason'> = !retiredPath
+      ? classify(path, snapshot, { id: 'legacy-state-artifacts' }, '', owned)
+      : snapshot.kind === 'file'
+        ? { ownership: 'owned-clean', proof: 'state-root-retired-path' }
+        : { ownership: 'unowned', proof: null, reason: 'Retired state path is not a regular file. Preserve it.' };
+    const remove = options.includeStateArtifacts === true && removableByVersion && ownership.ownership === 'owned-clean';
+    add({ location: 'global', surface: snapshot.kind, path, retiredBy: 'legacy-state-artifacts', ...ownership,
+      action: remove ? 'remove' : 'report', stateArtifact: true,
+      expectedContentHash: snapshot.contentHash, expectedSymlinkTarget: snapshot.symlinkTarget,
+      reason: remove ? undefined : ownership.ownership === 'owned-clean' && removableByVersion ? 'State artifact cleanup needs --include-state-artifacts.' : retiredPath ? ownership.reason ?? reason : reason });
+  };
+  const directories = (path: string): readonly string[] => isLegacyPathSafe(options.home, path, false) && stat(path)?.isDirectory() ? readdirSync(path).sort() : [];
+  const gates = join(stateRoot, 'gates');
+  for (const name of directories(gates)) report(join(gates, name, 'merge-gate.latest.json'), true, 'Retired merge-gate state.', true);
+  const packages = join(stateRoot, 'packages');
+  for (const name of directories(packages)) if (/^repo-harness-0\.10\.0-.+\.tgz$/.test(name)) report(join(packages, name), versionBefore('0.10.0', currentVersion), 'Old package archive. The current package version is not after 0.10.0.', true);
+  const backups = join(stateRoot, 'backups');
+  for (const name of directories(backups)) {
+    const path = join(backups, name);
+    if (!isLegacyPathSafe(options.home, path, false)) { report(path, false, 'Backup has a protected symlink.'); continue; }
+    let version = /^pre-(\d+\.\d+\.\d+)-/.exec(name)?.[1];
+    if (!version && stat(path)?.isDirectory()) {
+      const versionPath = join(path, '.version');
+      if (isLegacyPathSafe(options.home, versionPath, false) && stat(versionPath)?.isFile()) version = readFileSync(versionPath, 'utf8').trim();
+      const manifestPath = join(path, 'package.json');
+      const value = isLegacyPathSafe(options.home, manifestPath, false) && stat(manifestPath)?.isFile() ? readJson(manifestPath) : undefined;
+      if (!version && isRecord(value) && typeof value.version === 'string') version = value.version;
+    }
+    if (!version || versionBefore(version, currentVersion)) report(path, Boolean(version), version ? 'Backup belongs to an older package version. Preserve it without verified ownership.' : 'Backup package version is unknown. Preserve it.');
+  }
+}
+
+// These flags run a script in another package or directory, or allow a missing script.
+const RUN_SCOPE_FLAGS = new Set(['--filter', '-F', '-w', '--workspace', '--workspaces', '-ws', '--cwd', '--prefix', '-C', '--if-present']);
+const RUN_SWITCHES = new Set(['-s', '--silent', '--bun']);
+
+/**
+ * Return the root script that one `bun run` / `npm run` invocation names, or
+ * null when the invocation does not name a root script unambiguously. A flag
+ * that may take a separate value makes the target unknown.
+ */
+function rootRunTarget(args: string): string | null {
+  const tokens = args.split(/&&|\|\||[;|&()`\n]/)[0]!.trim().split(/\s+/).map((token) => token.replace(/^(['"])(.*)\1$/, '$2'));
+  if (tokens.some((token) => RUN_SCOPE_FLAGS.has(token.split('=')[0]!))) return null;
+  for (const token of tokens) {
+    if (!token.startsWith('-')) return token || null;
+    if (token === '--' || (!token.includes('=') && !RUN_SWITCHES.has(token))) return null;
+  }
+  return null;
+}
+
+/**
+ * `rh run` resolves only the public helpers in the shipped registry, init deletes
+ * generated script keys that other scripts may still run, and the
+ * `repo-harness` command is retired. Each fails at run time. User scripts stay
+ * as they are; the report lists each key and command. A managed key whose
+ * value is neither current nor released is the user's: init keeps it, and the
+ * report names it whatever command it runs.
+ */
+function scanPackageScripts(root: string, add: AddItem): void {
+  const path = join(root, 'package.json');
+  if (!isLegacyPathSafe(root, path, false) || !stat(path)?.isFile()) return;
+  const value = readJson(path);
+  if (!isRecord(value) || !isRecord(value.scripts)) return;
+  const scripts = value.scripts;
+  const helpers = loadWorkflowContractAsset<Contract>().helpers;
+  if (!helpers?.scripts) throw new Error('package script inventory requires the helper registry');
+  const internal = new Set(helpers.internal);
+  const runnable = new Set(helpers.scripts.flatMap((name) => {
+    const id = name.replace(/\.[^.]+$/, '');
+    return internal.has(id) ? [] : [name, id];
+  }));
+  // `bun run` falls back to a file or a local binary; `npm run` runs only script keys.
+  const resolves = (runner: string, target: string): boolean => Object.hasOwn(scripts, target)
+    || (runner === 'bun' && (stat(join(root, target)) !== null || stat(join(root, 'node_modules/.bin', target)) !== null));
+  const customized = Object.entries(scripts).flatMap(([key, command]) =>
+    (Object.hasOwn(MANAGED_PACKAGE_SCRIPTS, key) && MANAGED_PACKAGE_SCRIPTS[key] !== command || RETIRED_PACKAGE_SCRIPT_KEYS.includes(key))
+      && !isReleasedPackageScript(key, command) ? [`${key}: ${JSON.stringify(command)}`] : []);
+  const findings = Object.entries(scripts).flatMap(([key, command]) => {
+    // init replaces a managed key whose value is current or released, so only an edited value is the user's.
+    if (typeof command !== 'string' || MANAGED_PACKAGE_SCRIPTS[key] === command || isReleasedPackageScript(key, command)) return [];
+    const retired = [...command.matchAll(/(?<![\w./@-])(?:rh|repo-harness) run ([^\s;&|'"`)]+)/g)]
+      .map((match) => match[1]!).filter((helper) => !runnable.has(helper));
+    const replacement = retired.some((helper) => ['contract-worktree', 'contract-worktree.sh'].includes(helper))
+      ? [' (contract-worktree is internal; use rh worktrees start to start a worktree)'] : [];
+    const retiredCli = namesRetiredCli(command) ? [` (the ${RETIRED_CLI_NAME} command is now ${CLI_NAME})`] : [];
+    const missing = [...command.matchAll(/\b(bun|npm) run(?=\s)/g)].flatMap((match) => {
+      const target = rootRunTarget(command.slice(match.index + match[0].length));
+      return target === null || resolves(match[1]!, target) ? [] : [` (missing script "${target}")`];
+    });
+    return retired.length > 0 || missing.length > 0 || retiredCli.length > 0 ? [`${key}: ${command}${[...retiredCli, ...replacement, ...missing].join('')}`] : [];
+  });
+  const customizedNotice = customized.length === 0 ? ''
+    : `Package scripts that init manages differ from every released value; init and upgrade keep them: ${customized.join('; ')}`;
+  if (findings.length === 0) {
+    if (customized.length > 0) {
+      add({ location: 'project', surface: 'file', path, retiredBy: 'customized-managed-value', ownership: 'unowned', proof: null, action: 'report', advisory: true, reason: customizedNotice });
+    }
+    return;
+  }
+  add({ location: 'project', surface: 'file', path, retiredBy: 'retired-script-reference', ownership: 'unowned', proof: null, action: 'report',
+    reason: `Package scripts call a helper that rh run does not expose, a script that package.json does not define, or the retired ${RETIRED_CLI_NAME} command; review them without automatic edits: ${findings.join('; ')}${customizedNotice && `. ${customizedNotice}`}` });
+}
+
+/**
+ * Files that init writes once and the user owns afterward, and the policy that the user edits.
+ * A line that names the retired command gets an advisory report: the package keeps the name, so
+ * prose mentions stay. A package script line is a command, so that report stays pending.
+ * Init and upgrade rewrite only managed bytes.
+ * An unchanged released root context is a refresh item instead, which replaces this report.
+ */
+const USER_OWNED_PROJECT_TEXT = ['CLAUDE.md', 'AGENTS.md', 'tasks/lessons.md', '.ai/harness/policy.json'] as const;
+
+function scanRetiredCliCalls(root: string, add: AddItem): void {
+  for (const name of USER_OWNED_PROJECT_TEXT) {
+    const path = join(root, name);
+    if (!isLegacyPathSafe(root, path, false) || !stat(path)?.isFile()) continue;
+    const lines = readFileSync(path, 'utf8').split('\n').flatMap((line, index) => namesRetiredCli(line) ? [index + 1] : []);
+    if (lines.length === 0) continue;
+    add({ location: 'project', surface: 'file', path, retiredBy: 'retired-cli-command', ownership: 'unowned', proof: null, action: 'report', advisory: true,
+      reason: `Line ${lines.join(', ')} names ${RETIRED_CLI_NAME}; change each line that calls it to ${CLI_NAME}. Upgrade does not edit this file.` });
+  }
+}
+
+/** codex-handoff-resume is the only retired generator that a release shipped with this marker (resume.md). */
+const RETIRED_GENERATOR_MARKER = /^<!-- generated-by: repo-harness (codex-handoff-resume) v\d+ -->$/;
+const RETIRED_GENERATOR_MARKER_LINES = 3;
+
+/**
+ * Rules that left the managed .gitignore block while older releases still
+ * wrote their files. Removing a rule while its files exist turns that runtime
+ * state into untracked files, so init keeps each rule until no file that it
+ * matches exists, and the inventory lists those files.
+ * Each rule is a path, a directory with a trailing `/`, or a name prefix with a trailing `*`.
+ */
+export const RETIRED_RUNTIME_IGNORE_RULES: readonly string[] = [
+  '.claude/.session-id',
+  '.claude/.trace.jsonl',
+  '.ai/harness/active-plan',
+  '.ai/harness/sprint/',
+  '.ai/harness/handoff/current.md',
+  '.ai/harness/handoff/resume.md',
+  '.claude/.active-plan',
+  '.claude/.plan-state/',
+  'tasks/current.md',
+  'tasks/.current.md.tmp.*',
+];
+
+/** A link counts as one file; it is never followed. */
+function filesBelow(repoRoot: string, path: string): string[] {
+  const entry = stat(join(repoRoot, path));
+  if (!entry) return [];
+  if (!entry.isDirectory()) return [path];
+  return readdirSync(join(repoRoot, path)).sort().flatMap((name) => filesBelow(repoRoot, `${path}/${name}`));
+}
+
+/**
+ * Repo-relative POSIX paths of the files that a retired rule matches. A rule
+ * below a symlinked ancestor matches nothing: those files are outside the repository.
+ */
+export function retiredRuntimeRuleFiles(repoRoot: string, rule: string): string[] {
+  if (!rule.endsWith('*')) {
+    const path = rule.replace(/\/$/, '');
+    return isLegacyPathSafe(repoRoot, join(repoRoot, path)) ? filesBelow(repoRoot, path) : [];
+  }
+  const parent = dirname(rule);
+  const prefix = basename(rule).slice(0, -1);
+  if (!isLegacyPathSafe(repoRoot, join(repoRoot, parent), false) || !stat(join(repoRoot, parent))?.isDirectory()) return [];
+  return readdirSync(join(repoRoot, parent)).sort().filter((name) => name.startsWith(prefix))
+    .flatMap((name) => filesBelow(repoRoot, `${parent}/${name}`));
+}
+
+/** Fail closed: an unreadable directory counts as user content. */
+function directoryHasOtherEntries(directory: string, ownName: string): boolean {
+  try {
+    // The upgrade holds a per-target lock beside the file while it re-plans.
+    const ownLock = `${ownName}.repo-harness.lock`;
+    return readdirSync(directory).some((name) => name !== ownName && name !== ownLock);
+  } catch {
+    return true;
+  }
+}
+
+/** Read-only inventory. Shipped retirement records define candidates and ownership proof. */
+export function planLegacyLeftovers(options: LegacyInventoryOptions): { items: LeftoverItem[] } {
+  const actions = actionsOf();
+  const owned = options.installOwnership();
+  const packages = options.scope === 'project' ? [] : currentCatalogPackages(options.packageRoot);
+  const livePaths = new Set(packages.flatMap((pkg) => ['.claude', '.codex', '.agents'].map((host) => `${host}/skills/${pkg.name}`)));
+  const hookAction = actions.find((action) => action.surface === 'hook-entry');
+  const hookRetirement = `${hookAction?.retiredBy ?? ''} ${hookAction?.id ?? 'retired-host-hook-templates'}`.trim();
+  const items = new Map<string, LeftoverItem>();
+  const projectEnabled = options.scope !== 'global' && !isRepoHarnessSourceCheckout(options.cwd);
+  // A hook command's position is part of its key: two equal commands are two removals.
+  const add = (item: LeftoverItem, position = ''): void => {
+    const key = `${item.location}:${item.path}:${item.surface}:${item.hookEvent ?? ''}:${item.hookCommand ?? ''}:${position}`;
+    const old = items.get(key);
+    if (!old || item.retiredBy === 'current-package-skill' || (old.action === 'report' && item.action !== 'report')) items.set(key, item);
+  };
+  for (const action of actions) {
+    if (action.action !== 'remove' || action.ownership !== 'known_generated' || action.surface === 'hook-entry') continue;
+    const location = action.location ?? 'project';
+    if (location === 'project' ? !projectEnabled : options.scope === 'project') continue;
+    const root = resolve(location === 'project' ? options.cwd : options.home);
+    for (const contractPath of action.paths ?? []) {
+      if (contractPath.includes('*') || (location === 'global' && livePaths.has(contractPath))) continue;
+      if (isAbsolute(contractPath) || contractPath.includes('\\') || contractPath.split('/').includes('..')) throw new Error(`unsafe legacy inventory path: ${contractPath}`);
+      const path = resolve(root, contractPath);
+      const base = { location, path, retiredBy: `${action.retiredBy ?? ''} ${action.id ?? 'retired-asset'}`.trim() };
+      if (!isLegacyPathSafe(root, path)) {
+        add({ ...base, surface: action.surface ?? 'file', ownership: 'unowned', proof: null, action: 'report', reason: 'Path has a protected symlink, a non-directory ancestor or an entry that rh cannot inspect.' });
+        continue;
+      }
+      const snapshot = legacyPathSnapshot(path);
+      if (!snapshot) continue;
+      const ownership = classify(path, snapshot, action, contractPath, location === 'global' ? owned : NONE_OWNED);
+      // A placeholder file is removable only when no sibling entry needs its
+      // directory; a populated directory is user content, so it stays reported.
+      const soleEntryBlocked = snapshot.kind === 'file' && (action.onlyWhenSoleEntry ?? []).includes(contractPath)
+        && directoryHasOtherEntries(dirname(path), basename(path));
+      add({ ...base, surface: snapshot.kind === 'symlink' ? 'symlink' : snapshot.kind === 'directory' ? (action.surface === 'skill' ? 'skill' : 'directory') : 'file',
+        ...ownership, action: ownership.ownership === 'owned-clean' && !soleEntryBlocked ? 'remove' : 'report',
+        ...(soleEntryBlocked ? { reason: 'Directory contains user files; keep the placeholder and the directory.' } : {}),
+        expectedContentHash: snapshot.contentHash, expectedSymlinkTarget: snapshot.symlinkTarget });
+    }
+  }
+  for (const location of ['project', 'global'] as const) {
+    if (location === 'project' ? !projectEnabled : options.scope === 'project') continue;
+    const root = resolve(location === 'project' ? options.cwd : options.home);
+    for (const name of ['.claude/settings.json', '.codex/hooks.json']) {
+      const path = join(root, name);
+      // Null when the path is not a regular file that rh can inspect and read.
+      let bytes: Buffer | null;
+      try {
+        if (!isLegacyPathSafe(root, path, false)) {
+          if (stat(dirname(path))) add({ location, surface: 'hook-entry', path, retiredBy: hookRetirement, ownership: 'unowned', proof: null, action: 'report', reason: 'Hook path has a protected symlink ancestor or an entry that rh cannot inspect.' });
+          continue;
+        }
+        const entry = stat(path);
+        if (!entry) continue;
+        bytes = entry.isFile() ? readFileSync(path) : null;
+      } catch (error) {
+        if (!inaccessible(error)) throw error;
+        bytes = null;
+      }
+      const hookFile = bytes ? hookFileRemovals(bytes, path, hookLocation(location, options)) : { refused: INVALID_HOOK_SETTINGS };
+      if ('refused' in hookFile) {
+        add({ location, surface: 'hook-entry', path, retiredBy: hookRetirement, ownership: 'unowned', proof: null, action: 'report', reason: hookFile.refused });
+        continue;
+      }
+      for (const entry of hookFile.removals) {
+        add({ location, surface: 'hook-entry', path, retiredBy: hookRetirement, ownership: 'owned-clean', proof: 'managed-hook', action: 'strip-entry',
+          expectedContentHash: sha256Prefixed(bytes!), hookEvent: entry.event, hookCommand: entry.command }, `${entry.block}:${entry.index}`);
+      }
+    }
+  }
+  if (options.scope !== 'project') {
+    for (const name of ['.claude/skills', '.codex/skills', '.agents/skills']) {
+      const root = join(resolve(options.home), name);
+      if (!isLegacyPathSafe(options.home, root, false) || !stat(root)?.isDirectory()) continue;
+      for (const name of readdirSync(root).sort()) {
+        const path = join(root, name);
+        if (!stat(path)?.isSymbolicLink() || existsSync(path)) continue;
+        const target = readlinkSync(path);
+        // An older package path is owned only by an exact link record in the ledger.
+        const record = owned(path)?.committed;
+        const linkOwned = record?.type === 'symlink' && record.target === target;
+        add({ location: 'global', surface: 'symlink', path, retiredBy: 'dangling-skill-link', ownership: linkOwned ? 'owned-clean' : 'unowned', proof: linkOwned ? 'manifest' : null, action: linkOwned ? 'remove' : 'report', expectedSymlinkTarget: target, reason: linkOwned ? undefined : 'Dangling link has no exact path record in the host-config ledger.' });
+      }
+    }
+  }
+  if (projectEnabled) {
+    const retiredPaths = actions.filter((action) => (action.location ?? 'project') === 'project' && action.action === 'remove').flatMap((action) => [...(action.paths ?? [])]).filter((path) => !path.includes('*'));
+    const root = resolve(options.cwd);
+    const library = join(root, '.ai/hooks/lib/workflow-state.sh');
+    const libraryEntry = isLegacyPathSafe(root, library) ? stat(library) : null;
+    if (libraryEntry) {
+      add({ location: 'project', surface: libraryEntry.isSymbolicLink() ? 'symlink' : libraryEntry.isDirectory() ? 'directory' : 'file',
+        path: library, retiredBy: 'legacy-workflow-state-library', ownership: 'unowned', proof: null, action: 'report',
+        reason: 'Legacy workflow-state library. The package no longer ships an operator library. Change callers to rh run <helper>. Test callers, review local edits, and back up the copy before manual removal. Upgrade preserves it.' });
+    }
+    const scanDocument = (path: string): void => {
+      if (!isLegacyPathSafe(root, path, false) || !stat(path)?.isFile()) return;
+      const content = readFileSync(path, 'utf8');
+      if (!retiredPaths.some((retired) => content.includes(retired))) return;
+      const generator = content.split('\n', RETIRED_GENERATOR_MARKER_LINES)
+        .map((line) => RETIRED_GENERATOR_MARKER.exec(line.trim())?.[1]).find((name) => name !== undefined);
+      // The marker classifies the file only. It is not an ownership proof, so the item stays a report item.
+      add({ location: 'project', surface: 'file', path, ownership: 'unowned', proof: null, action: 'report', ...(generator
+        ? { retiredBy: 'retired-generated-artifact', reason: `Output of the retired ${generator} generator. Upgrade does not remove it; record upgrade decide --remove or --keep.` }
+        : { retiredBy: 'retired-script-reference', reason: 'Document refers to a retired path; review it without automatic edits.' }) });
+    };
+    for (const name of ['AGENTS.md', 'CLAUDE.md']) scanDocument(join(root, name));
+    const walk = (directory: string): void => {
+      if (!isLegacyPathSafe(root, directory, false) || !stat(directory)?.isDirectory()) return;
+      for (const name of readdirSync(directory).sort()) {
+        const path = join(directory, name);
+        const entry = stat(path);
+        if (entry?.isDirectory()) walk(path);
+        else if (entry?.isFile() && name.endsWith('.md')) scanDocument(path);
+      }
+    };
+    walk(join(root, '.ai'));
+    scanPackageScripts(root, add);
+    scanRetiredCliCalls(root, add);
+    // init keeps the ignore rule while these files exist; the rule leaves the block only after they are gone.
+    for (const rule of RETIRED_RUNTIME_IGNORE_RULES) {
+      for (const file of retiredRuntimeRuleFiles(root, rule)) {
+        const path = resolve(root, file);
+        add({ location: 'project', surface: stat(path)?.isSymbolicLink() ? 'symlink' : 'file', path, retiredBy: 'retired-runtime-ignore-rule',
+          ownership: 'unowned', proof: null, action: 'report',
+          reason: `Retired runtime state. The managed .gitignore block keeps ${rule} while this file exists; record upgrade decide --remove or --keep.` });
+      }
+    }
+  }
+  if (projectEnabled) scanProjectRefresh(options, actions, owned, add);
+  if (options.scope !== 'project') {
+    scanInstalledSkills(options, actions, owned, add, packages);
+    scanGlobalDocuments(options, actions, add, packages);
+    scanCodexPlugin(options, add);
+    scanStateArtifacts(options, owned, add);
+  }
+  const planned = [...items.values()];
+  const liveRefreshPaths = new Set(planned.filter((item) => item.surface === 'skill' && (item.action === 'refresh' || item.retiredBy === 'current-package-skill')).map((item) => item.path));
+  const selected = planned.filter((item) => !(item.action === 'remove' && liveRefreshPaths.has(item.path)));
+  const preservedSkills = selected.filter((item) => item.surface === 'skill' && item.retiredBy === 'current-package-skill' && item.action === 'report');
+  const preserved = selected.map((item) => item.action !== 'report' && preservedSkills.some((skill) => item.path.startsWith(`${skill.path}${sep}`))
+    ? { ...item, action: 'report' as const, reason: 'Keep this entry inside an installed skill that cannot be refreshed.' } : item);
+  const directories = preserved.filter((item) => ['remove', 'refresh'].includes(item.action) && (item.surface === 'directory' || item.surface === 'skill'));
+  // A proved whole tree owns its children. Keep leaves visible when the tree differs.
+  const visible = preserved.filter((item) => !directories.some((directory) => directory.location === item.location
+    && item.path.startsWith(`${directory.path}${sep}`)));
+  return { items: visible.sort((left, right) => `${left.location}:${left.surface}:${left.path}:${left.hookEvent ?? ''}:${left.hookCommand ?? ''}`.localeCompare(`${right.location}:${right.surface}:${right.path}:${right.hookEvent ?? ''}:${right.hookCommand ?? ''}`)) };
+}
+
+export function formatLegacyLeftoverSummary(plan: { readonly items: readonly LeftoverItem[] } | readonly LeftoverItem[]): string {
+  const items = Array.isArray(plan) ? plan as readonly LeftoverItem[] : (plan as { readonly items: readonly LeftoverItem[] }).items;
+  return `${items.length} leftovers (${items.filter((item) => item.action !== 'report').length} removable). Run: rh upgrade`;
+}

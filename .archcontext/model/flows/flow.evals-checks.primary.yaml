@@ -1,0 +1,74 @@
+schemaVersion: archcontext.flow/v1
+id: flow.evals-checks.primary
+capabilityId: capability.verification.evals-checks
+name: "Execute a declared verification check"
+applicability: required
+participants:
+  - id: capability
+    nodeId: capability.verification.evals-checks
+  - id: component
+    nodeId: component.evals-checks.primary
+steps:
+  - id: dispatch
+    from: capability
+    to: component
+    label: "Dispatch Prepared Verification Execution"
+    evidence:
+      entrypointId: entrypoint.evals-checks.primary
+      sourceSymbol: "executeAdmittedVerification"
+      sinkId: sink.evals-checks.prepare
+  - id: dispatch-check
+    from: capability
+    to: component
+    label: "Dispatch Verification Check Execution"
+    evidence:
+      entrypointId: entrypoint.evals-checks.primary
+      sourceSymbol: "executePrepared"
+      sinkId: sink.evals-checks.primary
+outcomes:
+  - id: success
+    kind: success
+    label: "Execute a declared verification check completes"
+    steps:
+      - id: invoke-success
+        from: capability
+        to: component
+        label: "Invoke Prepared Verification Execution"
+        evidence:
+          entrypointId: entrypoint.evals-checks.primary
+          sourceSymbol: "executeAdmittedVerification"
+          sinkId: sink.evals-checks.prepare
+      - id: invoke-success-check
+        from: capability
+        to: component
+        label: "Invoke Verification Check Execution"
+        evidence:
+          entrypointId: entrypoint.evals-checks.primary
+          sourceSymbol: "executePrepared"
+          sinkId: sink.evals-checks.primary
+    terminal:
+      participant: capability
+      label: Return success receipt
+  - id: error
+    kind: error
+    label: "Execute a declared verification check is rejected or fails"
+    steps:
+      - id: invoke-error
+        from: capability
+        to: component
+        label: "Propagate Prepared Verification Execution failure"
+        evidence:
+          entrypointId: entrypoint.evals-checks.primary
+          sourceSymbol: "executeAdmittedVerification"
+          sinkId: sink.evals-checks.prepare
+      - id: invoke-error-check
+        from: capability
+        to: component
+        label: "Propagate Verification Check Execution failure"
+        evidence:
+          entrypointId: entrypoint.evals-checks.primary
+          sourceSymbol: "executePrepared"
+          sinkId: sink.evals-checks.primary
+    terminal:
+      participant: capability
+      label: Return typed failure

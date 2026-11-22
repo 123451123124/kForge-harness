@@ -1,0 +1,224 @@
+import { afterEach, describe, expect, test } from 'bun:test';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import {
+  commandNames,
+  createHookEventTelemetry,
+  HOOK_EVENT_TELEMETRY_PATH,
+  HOOK_EVENT_TELEMETRY_PROTOCOL,
+} from '../../src/cli/hook/event-telemetry';
+import type { HookIdentity } from '../../src/cli/hook/hook-input';
+import { readHookMetrics } from '../../scripts/run-harness-profile-benchmark';
+
+const scratch: string[] = [];
+
+afterEach(() => {
+  for (const path of scratch.splice(0)) rmSync(path, { recursive: true, force: true });
+});
+
+function tempDir(prefix: string): string {
+  const path = mkdtempSync(join(tmpdir(), prefix));
+  scratch.push(path);
+  return path;
+}
+
+function identity(overrides: Partial<HookIdentity> = {}): HookIdentity {
+  return { host: 'claude', sessionId: null, runId: null, turnId: null, ...overrides };
+}
+
+/** A bin directory that holds one executable file per name. */
+function binWith(...names: string[]): string {
+  const bin = tempDir('hrd08-event-bin-');
+  for (const name of names) {
+    writeFileSync(join(bin, name), '#!/bin/sh\n');
+    chmodSync(join(bin, name), 0o755);
+  }
+  return bin;
+}
+
+/** Names that `finalize` writes for a shell command under a given hook PATH. */
+function recordedNames(command: string, pathValue: string | undefined): string[] {
+  const repoRoot = tempDir('hrd08-event-recorded-');
+  return [...createHookEventTelemetry({ repoRoot, event: 'PreToolUse', routeId: 'bash', pathValue }).finalize({
+    identity: identity(),
+    exitCode: 0,
+    blocked: false,
+    reason: 'ok',
+    command,
+  }).command_names];
+}
+
+describe('HRD-08 event telemetry authority', () => {
+  test('writes one v2 record that carries the resolved identity', () => {
+    const repoRoot = tempDir('hrd08-event-telemetry-');
+    const record = createHookEventTelemetry({ repoRoot, event: 'PreToolUse', routeId: 'edit' }).finalize({
+      identity: identity({ host: 'codex', sessionId: 'session-1', runId: 'run-1', turnId: 'turn-1' }),
+      exitCode: 0,
+      blocked: false,
+      reason: 'ok',
+    });
+    const lines = readFileSync(join(repoRoot, HOOK_EVENT_TELEMETRY_PATH), 'utf8').trim().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0])).toEqual(record);
+    expect(Object.keys(record).sort()).toEqual([
+      'blocked', 'command_names', 'completed_at', 'elapsed_ms', 'event', 'event_id', 'exit_code', 'fingerprint',
+      'host', 'protocol', 'reason', 'route_id', 'run_id', 'session_id', 'started_at', 'turn_id',
+    ]);
+    expect(record).toMatchObject({
+      protocol: HOOK_EVENT_TELEMETRY_PROTOCOL,
+      host: 'codex',
+      session_id: 'session-1',
+      run_id: 'run-1',
+      turn_id: 'turn-1',
+      event: 'PreToolUse',
+      route_id: 'edit',
+      exit_code: 0,
+      blocked: false,
+      reason: 'ok',
+      command_names: [],
+    });
+    expect(record.elapsed_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  test('records program names of a shell command and never its arguments', () => {
+    const repoRoot = tempDir('hrd08-event-command-names-');
+    const record = createHookEventTelemetry({
+      repoRoot, event: 'PreToolUse', routeId: 'bash', pathValue: binWith('cd', 'gh', 'jq', 'bun', 'brew', 'sudo', 'env'),
+    }).finalize({
+      identity: identity(),
+      exitCode: 0,
+      blocked: false,
+      reason: 'ok',
+      command: 'cd /Users/alice/repo && GH_TOKEN=sk-proj-FAKE0123456789abc gh pr view 12 | jq .title; sudo /opt/homebrew/bin/brew list\n(env FOO=1 bun test) & "$HOME/bin/x"',
+    });
+    // A command given by path (`/opt/homebrew/bin/brew`) is not counted.
+    expect(record.command_names).toEqual(['cd', 'gh', 'jq', 'bun']);
+    const line = readFileSync(join(repoRoot, HOOK_EVENT_TELEMETRY_PATH), 'utf8');
+    for (const secret of ['/Users/alice', 'sk-proj-FAKE0123456789abc', 'pr view', '.title']) expect(line).not.toContain(secret);
+  });
+
+  test('command names keep at most sixteen unique names', () => {
+    expect(commandNames(Array.from({ length: 20 }, (_, index) => `tool${index} --flag`).join(' && '))).toHaveLength(16);
+    expect(commandNames('git status; git diff')).toEqual(['git']);
+    expect(commandNames('')).toEqual([]);
+  });
+
+  test('command names never come from quoted data or heredoc bodies', () => {
+    // A secret that passes COMMAND_NAME, so only the scanner keeps it out.
+    const secret = 'sk-proj-AbCdEf0123456789xyz';
+    expect(commandNames(`cat <<EOF\n${secret}\nEOF`)).toEqual(['cat']);
+    expect(commandNames(`cat <<-'END' > out\n\t${secret}\n\tEND\nls -la`)).toEqual(['cat', 'ls']);
+    expect(commandNames(`echo "a; ${secret}" && git status`)).toEqual(['echo', 'git']);
+    expect(commandNames(`printf 'x|${secret}' | wc -l`)).toEqual(['printf', 'wc']);
+    expect(commandNames(`echo \\; ${secret}`)).toEqual(['echo']);
+    expect(commandNames(`echo "unterminated; ${secret}`)).toEqual(['echo']);
+    expect(commandNames(`git log <<< "x; ${secret}"; jq .`)).toEqual(['git', 'jq']);
+  });
+
+  test('the scan stops at a construct it does not model and keeps the names before it', () => {
+    const s = 'sk-proj-AbCdEf0123456789xyz';
+    const cases: [string, string[]][] = [
+      [`git commit -m "$(cat <<'EOF'\nFix "x; ${s} y" now\nEOF\n)"`, ['git']],
+      [`gh pr create --body "$(cat <<'EOF'\nSet "| ${s} | b |" here\nEOF\n)"`, ['gh']],
+      [`gh pr create --body "$(cat <<'EOF'\nSet "| ${s}\n| b |" here\nEOF\n)"`, ['gh']],
+      [`echo "$(jq -r ".a | ${s} x" f)"`, ['echo']],
+      [`echo "a \`${s}\` b"`, ['echo']],
+      [`echo "\${A:-x; ${s} }"`, ['echo']],
+      [`git status # then; ${s}`, ['git']],
+      [`# check (docs) here\nls`, ['ls']],
+      [`echo \${A:-x; ${s} }`, ['echo']],
+      [`KEYS=(${s} other)`, []],
+      [`echo $((1<<2))\nls; ${s}`, ['echo']],
+      [`echo $'x\\'; ${s}'`, ['echo']],
+      [`cat <<EOF\na; ${s}\n| b\nc\nEOF\nls`, ['cat', 'ls']],
+      [`cat <<$X\n${s}\n$X`, ['cat']],
+      [`cat <<'A B'\nx'\nA\n${s}\nA B`, ['cat']],
+      [`cat <<'E\\OF'\nEOF\n${s}\nE\\OF`, ['cat']],
+      [`case "$k" in a) echo 1;; ${s}) echo 2;; esac`, []],
+      [`case "$k" in (a) echo 1;; (${s}) echo 2;; esac`, []],
+      [`case "$k" in a|${s}) echo 1;; esac`, []],
+      [`git status && case x in y) ;; esac; ${s}`, ['git']],
+      [`[[ $t =~ ^(ghp|${s})$ ]] && echo y`, []],
+      [`ls @(a|${s})`, ['ls']],
+      [`ls (a|${s})`, ['ls']],
+      [`cat <<"EOF"\n${s}\nEOF\nls`, ['cat', 'ls']],
+      [`cat <<\\EOF\n${s}\nEOF\nls`, ['cat', 'ls']],
+      [`/usr/bin/git status; ./faketool`, []],
+    ];
+    for (const [command, names] of cases) {
+      const result = commandNames(command);
+      expect(result).not.toContain(s);
+      expect([command, result]).toEqual([command, names]);
+    }
+  });
+
+  test('NAME=$( is scanned like $( and the scan still stops at NAME=(', () => {
+    const s = 'sk-proj-AbCdEf0123456789xyz';
+    const cases: [string, string[]][] = [
+      [`x=$(git rev-parse HEAD) && git log -1 ${s}`, ['git']],
+      [`repo=$(git rev-parse --show-toplevel); cd $repo && ls ${s}`, ['git', 'cd', 'ls']],
+      [`x=$(git rev-parse HEAD); KEYS=(${s} other)`, ['git']],
+      [`KEYS=(${s} other); ls`, []],
+    ];
+    for (const [command, names] of cases) {
+      const result = commandNames(command);
+      expect(result).not.toContain(s);
+      expect([command, result]).toEqual([command, names]);
+    }
+  });
+
+  test('finalize records only names of executables on the hook PATH', () => {
+    const s = 'sk-proj-AbCdEf0123456789xyz';
+    const bin = binWith('faketool', 'git');
+    writeFileSync(join(bin, 'notexec'), 'data');
+    mkdirSync(join(bin, 'somedir'));
+    expect(recordedNames(`faketool run; ${s} x; notexec; somedir; git status`, bin)).toEqual(['faketool', 'git']);
+    expect(recordedNames(`x=$(git rev-parse HEAD) && ${s} y; faketool`, bin)).toEqual(['git', 'faketool']);
+    expect(recordedNames(`./faketool; ${bin}/faketool`, bin)).toEqual([]);
+    expect(recordedNames('faketool', undefined)).toEqual([]);
+    expect(recordedNames('faketool', `relative:${bin}`)).toEqual(['faketool']);
+
+    const repoRoot = tempDir('hrd08-event-path-record-');
+    createHookEventTelemetry({ repoRoot, event: 'PreToolUse', routeId: 'bash', pathValue: bin }).finalize({
+      identity: identity(), exitCode: 0, blocked: false, reason: 'ok', command: `faketool ${s}; ${s} --flag; git status`,
+    });
+    const line = readFileSync(join(repoRoot, HOOK_EVENT_TELEMETRY_PATH), 'utf8');
+    expect(JSON.parse(line).command_names).toEqual(['faketool', 'git']);
+    expect(line).not.toContain(s);
+  });
+
+  test('semantic fingerprints detect repeated equivalent blocked events', () => {
+    const repoRoot = tempDir('hrd08-event-fingerprint-');
+    const run = (reason: string) => createHookEventTelemetry({ repoRoot, event: 'PreToolUse', routeId: 'edit' }).finalize({
+      identity: identity(),
+      exitCode: 2,
+      blocked: true,
+      reason,
+    });
+
+    const first = run('blocked');
+    const second = run('blocked');
+    expect(first.event_id).not.toBe(second.event_id);
+    expect(first.fingerprint).toBe(second.fingerprint);
+    expect(run('handler-failed').fingerprint).not.toBe(first.fingerprint);
+  });
+
+  test('telemetry write failure never changes the hook result record', () => {
+    const parent = tempDir('hrd08-event-fail-open-');
+    const notDirectory = join(parent, 'not-a-directory');
+    writeFileSync(notDirectory, 'occupied', 'utf8');
+    const telemetry = createHookEventTelemetry({ repoRoot: notDirectory, event: 'Stop', routeId: 'default' });
+    const result = { identity: identity(), exitCode: 0, blocked: false, reason: 'ok' };
+
+    expect(() => telemetry.finalize(result)).not.toThrow();
+    expect(telemetry.finalize(result).reason).toBe('ok');
+  });
+
+  test('the benchmark reader rejects the retired per-script protocol', () => {
+    const repoRoot = tempDir('hrd08-retired-protocol-');
+    mkdirSync(join(repoRoot, '.ai/harness/runs'), { recursive: true });
+    writeFileSync(join(repoRoot, HOOK_EVENT_TELEMETRY_PATH), `${JSON.stringify({ protocol: 1, script: 'prompt-guard.sh' })}\n`);
+    expect(() => readHookMetrics(repoRoot)).toThrow('invalid or mixed hook event telemetry protocol');
+  });
+});

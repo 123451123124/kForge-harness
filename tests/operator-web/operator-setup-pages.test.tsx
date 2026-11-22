@@ -1,0 +1,809 @@
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { Window } from 'happy-dom';
+
+import { decodeSetupSnapshot, unavailableSetupSnapshot } from '../../src/core/setup/decode';
+import { decodeCliInventory, unavailableCliInventory, type CliInventorySnapshotV1 } from '../../src/core/setup/cli-inventory';
+import { fetchCliInventory } from '../../src/operator-web/CliPage';
+import type { SetupSnapshotV2 } from '../../src/core/setup/types';
+import { decodeDevActivitySnapshot } from '../../src/core/dev-activity/decode';
+import { unavailableRuntimeOverlay } from '../../src/core/operator/runtime-status';
+import { OperatorApp, type OperatorAppProps } from '../../src/operator-web/App';
+import type { OperatorLocale } from '../../src/operator-web/i18n';
+import { fixtureProps, FIXTURE_NAMES } from '../../src/operator-web/fixtures';
+import { busyDevActivity } from '../../src/operator-web/fixtures/dev-activity';
+import { busyWorktrees } from '../../src/operator-web/fixtures/worktrees';
+import { decodeWorktrees } from '../../src/core/public-projections/worktrees';
+import { degradedSetup, loadingSetup, readySetup } from '../../src/operator-web/fixtures/setup';
+import { registryOf } from '../../src/operator-web/fixtures';
+import { busyQuota, degradedQuota } from '../../src/operator-web/fixtures/quota';
+import type { QuotaReader } from '../../src/operator-web/quota';
+
+const REGISTRY = registryOf(['repo-harness', 'repo-console']);
+import { DEFAULT_LOCATION, parseWorkspaceLocation, workspaceHash } from '../../src/operator-web/workspace-location';
+
+let root: Root | null = null;
+let window: Window;
+
+function installDom(url = 'http://127.0.0.1:4318/'): void {
+  window = new Window({ url });
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: (media: string) => ({ matches: false, media, onchange: null, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, dispatchEvent: () => true }),
+  });
+  Object.assign(globalThis, {
+    window, document: window.document, navigator: window.navigator, localStorage: window.localStorage,
+    HTMLElement: window.HTMLElement, Element: window.Element, Node: window.Node, Event: window.Event,
+    MouseEvent: window.MouseEvent, KeyboardEvent: window.KeyboardEvent, IS_REACT_ACT_ENVIRONMENT: true,
+  });
+}
+
+const NOW = Date.now();
+const activity = decodeDevActivitySnapshot(busyDevActivity(NOW));
+const worktrees = decodeWorktrees(busyWorktrees(NOW));
+
+function props(setup: SetupSnapshotV2 | null, overrides: Partial<OperatorAppProps> = {}): OperatorAppProps {
+  return {
+    initialLocale: 'en', initialRepositories: REGISTRY, readRepositories: async () => REGISTRY,
+    initialDevActivity: activity, fetchDevActivity: async () => activity,
+    initialRuntimeOverlay: unavailableRuntimeOverlay(), readRuntimeStatus: async () => unavailableRuntimeOverlay(),
+    readNotifyStatus: () => new Promise(() => {}),
+    readCliInventory: async () => unavailableCliInventory(),
+    readBotAccess: () => new Promise(() => {}),
+    readAgentsSettings: () => new Promise(() => {}),
+    readSeatsSettings: () => new Promise(() => {}),
+    readQuota: () => new Promise(() => {}),
+    readTests: async () => ({ state: 'unavailable', reason: 'tests_pending' }),
+    ...(setup ? { initialSetup: setup, readSetup: async () => setup } : {}),
+    initialWorktrees: worktrees, readWorktrees: async () => worktrees,
+    ...overrides,
+  };
+}
+
+async function mount(hash: string, appProps: OperatorAppProps): Promise<void> {
+  window.location.hash = hash;
+  const container = document.createElement('div');
+  document.body.append(container);
+  root = createRoot(container);
+  await act(async () => root?.render(<OperatorApp {...appProps} />));
+}
+
+const page = () => document.querySelector<HTMLElement>('[data-setup-page]')!;
+const text = (selector: string) => document.querySelector(selector)?.textContent ?? '';
+const all = (selector: string) => Array.from(document.querySelectorAll<HTMLElement>(selector));
+const navLink = (workspace: string) => document.querySelector<HTMLAnchorElement>(`.workspace-nav a[data-workspace="${workspace}"]`)!;
+
+beforeEach(() => installDom());
+afterEach(async () => {
+  await act(async () => root?.unmount());
+  root = null;
+  window.happyDOM.abort();
+});
+
+describe('setup fixtures', () => {
+  test('every setup fixture passes the browser decoder and every named fixture carries one', () => {
+    for (const snapshot of [readySetup(NOW), degradedSetup(NOW), loadingSetup()]) expect(() => decodeSetupSnapshot(snapshot)).not.toThrow();
+    for (const name of FIXTURE_NAMES) expect(fixtureProps(name).initialSetup?.projection_version).toBe('repo-harness.setup.v2');
+    expect(fixtureProps('busy').initialSetup?.status).toBe('ready');
+    expect(fixtureProps('empty').initialSetup?.reason).toBe('collection_pending');
+    expect(fixtureProps('degraded').initialSetup?.status).toBe('stale');
+  });
+});
+
+describe('navigation', () => {
+  test('setup pages have their own hash and refuse a parameter', () => {
+    for (const workspace of ['agents', 'skills', 'hooks', 'cli'] as const) {
+      expect(parseWorkspaceLocation(`#${workspace}`)).toEqual({ workspace, module: null, item: null });
+      expect(workspaceHash({ workspace, module: null, item: null })).toBe(`#${workspace}`);
+      expect(parseWorkspaceLocation(`#${workspace}/extra`)).toEqual(DEFAULT_LOCATION);
+    }
+  });
+
+  test('the setup pages sit between Repositories and Architecture and route by hash', async () => {
+    await mount('', props(readySetup(NOW)));
+    for (const workspace of ['agents', 'skills', 'hooks']) {
+      await act(async () => navLink(workspace).click());
+      expect(window.location.hash).toBe(`#${workspace}`);
+      expect(navLink(workspace).getAttribute('aria-current')).toBe('page');
+      expect(page().getAttribute('data-setup-page')).toBe(workspace);
+    }
+  });
+
+  test('below 760 px the side rail is a drawer: the menu button opens it, a link or a repository pick routes and closes it, Escape closes it and returns focus', async () => {
+    await mount('', props(readySetup(NOW)));
+    const rail = () => document.querySelector<HTMLElement>('[data-nav-rail]')!;
+    const open = document.querySelector<HTMLButtonElement>('[data-rail-open]')!;
+    expect(open.className).toContain('rail:hidden');
+    expect(open.getAttribute('aria-controls')).toBe(rail().id);
+    expect(open.getAttribute('aria-expanded')).toBe('false');
+    expect(rail().getAttribute('data-drawer')).toBe('closed');
+    expect(rail().className).toContain('max-rail:invisible');
+    expect(document.querySelector('[data-rail-backdrop]')).toBeNull();
+    await act(async () => open.click());
+    expect(rail().getAttribute('data-drawer')).toBe('open');
+    expect(open.getAttribute('aria-expanded')).toBe('true');
+    expect(rail().className).not.toContain('max-rail:invisible');
+    expect(document.querySelector('[data-rail-backdrop]')).not.toBeNull();
+    expect(document.activeElement?.getAttribute('aria-label')).toBe('Close sidebar');
+    await act(async () => navLink('hooks').click());
+    expect(window.location.hash).toBe('#hooks');
+    expect(rail().getAttribute('data-drawer')).toBe('closed');
+    open.focus();
+    await act(async () => open.click());
+    await act(async () => { document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }) as unknown as Event); });
+    expect(rail().getAttribute('data-drawer')).toBe('closed');
+    expect(open.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(open);
+    await act(async () => open.click());
+    await act(async () => document.querySelector<HTMLButtonElement>('[data-repository-switch]')!.click());
+    await act(async () => document.querySelector<HTMLButtonElement>('[data-switch-option]:not([data-switch-option=""])')!.click());
+    expect(rail().getAttribute('data-drawer')).toBe('closed');
+  });
+
+  test('the repository switch lists every repository, recent pick first, then by activity, then by name', async () => {
+    const switchLabels = () => all('[data-switch-option] [data-switch-label]').map(label => label.textContent);
+    const openSwitch = () => act(async () => document.querySelector<HTMLButtonElement>('[data-repository-switch]')!.click());
+    await mount('#architecture', fixtureProps('busy'));
+    await openSwitch();
+    // repo-harness and operator-site have Dev Activity work; the other five sort by name.
+    expect(switchLabels()).toEqual(['repo-harness', 'operator-site', 'docs-site', 'field-notes', 'infra', 'service-api', 'web-app']);
+    await act(async () => all('[data-switch-option]').find(option => option.textContent?.includes('web-app'))!.click());
+    await openSwitch();
+    expect(switchLabels().slice(0, 3)).toEqual(['web-app', 'repo-harness', 'operator-site']);
+  });
+
+  test('a stored repository that is no longer registered pins the first one, and a switch on a module page opens the new map', async () => {
+    const [first, second] = REGISTRY.repositories;
+    localStorage.setItem('repo-harness:operator-repository', 'repo_0000000000000000');
+    await mount('#architecture/capability.workflow-engine.pipeline', props(readySetup(NOW), { readArchitectureMap: () => new Promise(() => {}) }));
+    const switchButton = () => document.querySelector<HTMLButtonElement>('[data-repository-switch]')!;
+    expect(switchButton().getAttribute('data-selected')).toBe(first!.repository_id);
+    await act(async () => switchButton().click());
+    await act(async () => document.querySelector<HTMLButtonElement>(`[data-switch-option="${second!.repository_id}"]`)!.click());
+    expect([switchButton().getAttribute('data-selected'), window.location.hash]).toEqual([second!.repository_id, '#architecture']);
+  });
+
+  test('a replaced stale pin opens the root of a single-repository page and passes no old module or docs path', async () => {
+    const pending = { readArchitectureMap: () => new Promise<never>(() => {}), readDocsTree: () => new Promise<never>(() => {}) };
+    for (const [hash, rootHash] of [['#architecture/capability.workflow-engine.pipeline', '#architecture'], ['#docs/docs/design/old.md', '#docs']]) {
+      localStorage.setItem('repo-harness:operator-repository', 'repo_0000000000000000');
+      // A browser gives a hash navigation an entry without a record; happy-dom keeps the previous one.
+      // The URL of the previous mount names a repository, so the entry also drops it.
+      window.history.replaceState(null, '', '/');
+      await mount(hash!, props(readySetup(NOW), pending));
+      expect([document.querySelector('[data-repository-switch]')?.getAttribute('data-selected'), window.location.hash]).toEqual([REGISTRY.repositories[0]!.repository_id, rootHash]);
+      await act(async () => root?.unmount());
+    }
+  });
+
+  test('r1 Back after a repository switch restores the module page together with its repository', async () => {
+    const [first, second] = REGISTRY.repositories;
+    await mount('#architecture/capability.workflow-engine.pipeline', props(readySetup(NOW), { readArchitectureMap: () => new Promise(() => {}) }));
+    const switchButton = () => document.querySelector<HTMLButtonElement>('[data-repository-switch]')!;
+    await act(async () => switchButton().click());
+    await act(async () => document.querySelector<HTMLButtonElement>(`[data-switch-option="${second!.repository_id}"]`)!.click());
+    await act(async () => { window.history.back(); await new Promise(resolve => setTimeout(resolve, 0)); });
+    expect([switchButton().getAttribute('data-selected'), window.location.hash]).toEqual([first!.repository_id, '#architecture/capability.workflow-engine.pipeline']);
+  });
+
+  test('r2 a reload keeps the repository that its history entry records when another tab stored a different pick', async () => {
+    const [first, second] = REGISTRY.repositories;
+    const architecture = props(readySetup(NOW), { readArchitectureMap: () => new Promise(() => {}) });
+    await mount('#architecture/capability.workflow-engine.pipeline', architecture);
+    await act(async () => root?.unmount());
+    localStorage.setItem('repo-harness:operator-repository', second!.repository_id);
+    await mount('#architecture/capability.workflow-engine.pipeline', architecture);
+    expect([document.querySelector('[data-repository-switch]')?.getAttribute('data-selected'), window.location.hash, (window.history.state as { repositoryId?: string } | null)?.repositoryId, localStorage.getItem('repo-harness:operator-repository')])
+      .toEqual([first!.repository_id, '#architecture/capability.workflow-engine.pipeline', first!.repository_id, second!.repository_id]);
+  });
+
+  test('r3 a typed hash after a switch and Back keeps the repository that the app shows', async () => {
+    const [first, second] = REGISTRY.repositories;
+    await mount('#architecture/capability.workflow-engine.pipeline', props(readySetup(NOW), { readArchitectureMap: () => new Promise(() => {}) }));
+    const switchButton = () => document.querySelector<HTMLButtonElement>('[data-repository-switch]')!;
+    await act(async () => switchButton().click());
+    await act(async () => document.querySelector<HTMLButtonElement>(`[data-switch-option="${second!.repository_id}"]`)!.click());
+    await act(async () => { window.history.back(); await new Promise(resolve => setTimeout(resolve, 0)); });
+    // A typed hash is a new entry without a record, then a hashchange event (happy-dom would copy the previous record).
+    await act(async () => {
+      window.history.pushState(null, '', '#architecture/capability.workflow-engine.state');
+      window.dispatchEvent(new window.Event('hashchange'));
+    });
+    expect([switchButton().getAttribute('data-selected'), window.location.hash, localStorage.getItem('repo-harness:operator-repository')])
+      .toEqual([first!.repository_id, '#architecture/capability.workflow-engine.state', second!.repository_id]);
+  });
+
+  test('1-SHELL-N1 every page in the shell routes by its hash with one repository switch; later pages have no entry or route', async () => {
+    const pages = [['home', 'home'], ['board', 'board'], ['repositories', 'repositories'], ['worktrees', 'worktrees'], ['docs', 'docs'], ['agents', 'agents'], ['skills', 'skills'],
+      ['hooks', 'hooks'], ['cli', 'cli'], ['bots', 'bots'], ['architecture', 'architecture'], ['tests', 'tests'], ['rules', 'rules'], ['system', 'system'], ['tools', 'tools']] as const;
+    for (const [workspace, entry] of pages) {
+      if (root) {
+        await act(async () => root?.unmount());
+        root = null;
+        window.happyDOM.abort();
+        installDom();
+      }
+      await mount(`#${workspace}`, props(readySetup(NOW), { readCiRepairs: async () => ({ state: 'ok', issues: [] }) }));
+      expect(document.querySelector('main')?.getAttribute('data-workspace')).toBe(workspace);
+      expect(all('.workspace-nav a[aria-current="page"]').map(link => link.getAttribute('data-workspace'))).toEqual([entry]);
+      expect(all('[data-repository-switch]')).toHaveLength(1);
+      expect(document.querySelector('.operator-header [data-repository-switch], .operator-header select, main [data-repository-switch]')).toBeNull();
+    }
+    expect(all('.workspace-nav a[data-workspace]').map(link => link.getAttribute('data-workspace')))
+      .toEqual(['home', 'board', 'repositories', 'worktrees', 'docs', 'agents', 'skills', 'hooks', 'cli', 'bots', 'architecture', 'tests', 'rules', 'system', 'tools']);
+    // The Settings page is gone, with no alias: its old fragments open the default page.
+    for (const later of ['sessions', 'recent', 'settings', 'settings/seats']) {
+      expect(parseWorkspaceLocation(`#${later}`)).toEqual(DEFAULT_LOCATION);
+    }
+  });
+
+  test('the setup result is read only while a setup page shows, once on each return', async () => {
+    const snapshot = readySetup(NOW);
+    let reads = 0;
+    await mount('', props(null, { readSetup: async () => { reads++; return snapshot; } }));
+    expect(reads).toBe(0);
+    await act(async () => navLink('agents').click());
+    expect(reads).toBe(1);
+    await act(async () => navLink('skills').click());
+    await act(async () => navLink('hooks').click());
+    expect(reads).toBe(1);
+    await act(async () => navLink('board').click());
+    await act(async () => navLink('agents').click());
+    expect(reads).toBe(2);
+  });
+});
+
+describe('topbar freshness', () => {
+  test('the one freshness line follows the page: setup check on setup pages, activity elsewhere', async () => {
+    await mount('#agents', props(readySetup(NOW)));
+    const line = () => document.querySelector('[data-freshness]')!;
+    expect(line().getAttribute('data-freshness-source')).toBe('setup');
+    expect(line().textContent).toBe('Setup check read 3m ago · 2 need attention');
+    await act(async () => navLink('home').click());
+    expect(line().hasAttribute('data-freshness-source')).toBe(false);
+    expect(line().textContent).toContain('sources ok');
+    await act(async () => navLink('hooks').click());
+    expect(line().getAttribute('data-freshness-source')).toBe('setup');
+  });
+
+  test('stale, pending and failed setup reads say so in the line', async () => {
+    const cases: readonly [SetupSnapshotV2, string, string][] = [
+      [degradedSetup(NOW), 'stale', 'Showing setup check from 25m ago · last read failed · 5 need attention'],
+      [loadingSetup(), 'pending', 'Reading configuration…'],
+      [unavailableSetupSnapshot('setup_check_timeout'), 'failed', 'Setup check unavailable · setup check did not finish within 90 s'],
+    ];
+    for (const [snapshot, state, words] of cases) {
+      await mount('#skills', props(snapshot));
+      const line = document.querySelector('[data-freshness-source="setup"]')!;
+      expect(line.getAttribute('data-freshness')).toBe(state);
+      expect(line.textContent).toBe(words);
+      await act(async () => root?.unmount());
+      root = null; document.body.innerHTML = '';
+    }
+  });
+});
+
+describe('Agents page', () => {
+  test.each([
+    ['ok', 'Detected · repo-harness package installed'],
+    ['warn', 'Detected · repo-harness package missing'],
+    ['fail', 'Detected · package check failed'],
+  ] as const)('Pi reports its package entry state (%s) and repair command', async (status, sentence) => {
+    const snapshot = readySetup(NOW);
+    snapshot.hosts[2] = { host: 'pi', reported: true, detected: true, cli_version: '1.4.0', adapter: null, adapter_check: null, package_check: status };
+    if (status !== 'ok') snapshot.checks.push({ id: 'doctor.pi-package', status, title: 'Pi package entry', detail: 'Package entry needs repair', command: 'rh install --target both' });
+    await mount('#agents', props(snapshot));
+    expect(text('[data-host-row="pi"] [data-host-sentence]')).toBe(sentence);
+    if (status !== 'ok') expect(text('[data-host-row="pi"] [data-command]')).toContain('rh install --target both');
+    expect(text('[data-host-row="claude"] [data-host-sentence]')).toBe('Connected · 5/5 managed hooks');
+  });
+
+  test('one status line, a copyable command per item, and one row per host', async () => {
+    await mount('#agents', props(readySetup(NOW)));
+    expect(page().getAttribute('data-setup-state')).toBe('ready');
+    expect(text('[data-setup-attention]')).toBe('2 items need attention');
+    expect(document.querySelector('[data-setup-attention]')!.getAttribute('data-setup-attention')).toBe('2');
+    const checks = all('[data-check]');
+    expect(checks.map(row => row.getAttribute('data-check'))).toEqual(['doctor.security-config', 'runtime.skills_cli']);
+    expect(checks[0]!.querySelector('[data-command]')?.textContent).toContain('rh security scan --json');
+    expect(all('[data-host-row]').map(row => row.getAttribute('data-host-row'))).toEqual(['claude', 'codex', 'pi']);
+    expect(text('[data-host-row="claude"] [data-host-sentence]')).toBe('Connected · 5/5 managed hooks');
+    expect(text('[data-host-row="codex"]')).toContain('v0.162.0');
+    expect(all('[data-fleet-role]').map(row => row.getAttribute('data-fleet-role'))).toEqual(['deep-reasoner', 'explorer', 'harness-evaluator']);
+  });
+
+  test('a stale read keeps its data, shows its age and reason, and lists failures first', async () => {
+    await mount('#agents', props(degradedSetup(NOW)));
+    expect(page().getAttribute('data-setup-state')).toBe('stale');
+    expect(page().textContent).toContain('Showing configuration read 25m ago');
+    expect(page().textContent).toContain('setup check did not finish within 90 s');
+    // Three compact rows show first; the rest open on request, still failures first.
+    expect(all('[data-check]').map(row => row.getAttribute('data-check-status'))).toEqual(['fail', 'fail', 'needs_agent']);
+    const more = document.querySelector<HTMLButtonElement>('[data-checks-more]')!;
+    expect(more.textContent).toBe('Show 2 more');
+    await act(async () => more.click());
+    expect(all('[data-check]').map(row => row.getAttribute('data-check-status'))).toEqual(['fail', 'fail', 'needs_agent', 'warn', 'warn']);
+    expect(more.textContent).toBe('Show fewer');
+    expect(text('[data-host-row="codex"] [data-host-sentence]')).toBe('Connected · 4/5 managed hooks · 3 projection mismatches');
+    expect(text('[data-host-row="codex"] [data-host-mismatch-summary]')).toContain('SubagentStart · context · missing');
+    expect(text('[data-host-row="codex"] [data-command]')).toContain('rh install --host codex');
+    expect(text('[data-host-row="claude"] [data-host-sentence]')).toBe('Connected · 5/5 managed hooks · projection not compared');
+    expect(text('[data-fleet-role="harness-evaluator"] [data-host-cell="codex"]')).toContain('missing');
+    // A check without a command says so instead of inventing one.
+    expect(text('[data-check="runtime.skills_cli"]')).toContain('No command · see details');
+    // The multi-line detail opens below its row only on request.
+    const row = document.querySelector('[data-check="doctor.skill-projection"]')!;
+    expect(row.querySelector('pre')).toBeNull();
+    await act(async () => row.querySelector<HTMLButtonElement>('button[aria-expanded]')!.click());
+    expect(row.querySelector('pre')?.textContent).toContain('codex repo-harness-ship: missing');
+  });
+});
+
+describe('Agents page quota section', () => {
+  const account = (id: string) => document.querySelector<HTMLElement>(`[data-quota-account="${id}"]`)!;
+  const inAccount = (id: string, selector: string) => account(id).querySelector(selector)?.textContent ?? '';
+
+  test('busy: each account shows its state and windows, and ChatGPT shows its plan and credits', async () => {
+    await mount('#agents', props(readySetup(NOW), { readQuota: async () => ({ state: 'ok', settings: busyQuota(NOW) }) }));
+    expect(all('[data-quota-account]').map(row => [row.getAttribute('data-quota-account'), row.getAttribute('data-quota-attention')]))
+      .toEqual([['claude', 'true'], ['chatgpt', 'false'], ['agy_gemini', 'false'], ['agy_other', 'true']]);
+    expect(account('claude').querySelector('[data-quota-state]')!.getAttribute('data-quota-state')).toBe('tight');
+    expect(account('claude').querySelector('[data-quota-state]')!.className).toContain('text-kumo-warning');
+    expect(inAccount('claude', '[data-quota-window="seven_day"] [data-quota-used]')).toBe('88% used');
+    expect(inAccount('claude', '[data-quota-window="seven_day"] [data-quota-pace]')).toBe('pace +5.9');
+    expect(inAccount('claude', '[data-quota-window="seven_day"]')).toContain('7 d');
+    expect(account('claude').querySelector('[data-quota-window="seven_day"] [data-quota-resets]')!.getAttribute('data-quota-resets'))
+      .toBe(busyQuota(NOW).accounts[0]!.windows[1]!.resets_at);
+    expect(inAccount('claude', '[data-quota-window="five_hour"] [data-quota-pace]')).toBe('pace -19');
+    expect(account('chatgpt').querySelector('[data-quota-state]')!.getAttribute('data-quota-state')).toBe('normal');
+    expect(inAccount('chatgpt', '[data-quota-window="primary"] [data-quota-state]')).toBe('Surplus');
+    expect(inAccount('chatgpt', '[data-quota-codex]')).toBe('Plan plus · Credits 12.50');
+    expect(account('chatgpt').querySelector('[data-quota-reason]')).toBeNull();
+    expect(account('agy_gemini').textContent).toContain('Antigravity Gemini');
+    expect(inAccount('agy_gemini', '[data-quota-window="5h"] [data-quota-used]')).toBe('10% used');
+    expect(inAccount('agy_gemini', '[data-quota-window="weekly"] [data-quota-used]')).toBe('38% used');
+    expect(account('agy_other').textContent).toContain('Antigravity Claude and GPT');
+    expect(account('agy_other').querySelector('[data-quota-state]')!.getAttribute('data-quota-state')).toBe('exhausted');
+    expect(account('agy_other').querySelector('[data-quota-codex]')).toBeNull();
+  });
+
+  test('degraded: unknown and exhausted take the attention style; an unknown account and an absent window show their reasons', async () => {
+    await mount('#agents', props(readySetup(NOW), { readQuota: async () => ({ state: 'ok', settings: degradedQuota(NOW) }) }));
+    expect(all('[data-quota-account]').map(row => [row.getAttribute('data-quota-account'), row.getAttribute('data-quota-attention')]))
+      .toEqual([['claude', 'true'], ['chatgpt', 'true']]);
+    expect(account('claude').querySelector('[data-quota-state]')!.getAttribute('data-quota-state')).toBe('unknown');
+    expect(inAccount('claude', '[data-quota-reason]')).toBe('no capture');
+    expect(account('claude').querySelector('[data-quota-window]')).toBeNull();
+    expect(account('chatgpt').querySelector('[data-quota-state]')!.className).toContain('text-kumo-danger');
+    expect(inAccount('chatgpt', '[data-quota-window="primary"] [data-quota-reason]')).toBe('primary absent');
+    expect(account('chatgpt').querySelector('[data-quota-window="primary"] [data-quota-used]')).toBeNull();
+    expect(inAccount('chatgpt', '[data-quota-window="secondary"] [data-quota-used]')).toBe('97% used');
+    expect(inAccount('chatgpt', '[data-quota-credits]')).toBe('No credits');
+  });
+
+  test('the page reads once when Agents opens and once per Refresh; a failed read is unavailable with its reason and no rows', async () => {
+    const answers: Awaited<ReturnType<QuotaReader>>[] = [
+      { state: 'unavailable', reason: 'unreachable' },
+      { state: 'ok', settings: busyQuota(NOW) },
+      { state: 'unavailable', reason: 'settings_invalid' },
+    ];
+    let reads = 0;
+    await mount('', props(readySetup(NOW), { readQuota: async () => answers[reads++]! }));
+    expect(reads).toBe(0);
+    await act(async () => navLink('agents').click());
+    expect(reads).toBe(1);
+    expect(document.querySelector('[data-quota-unavailable]')!.getAttribute('data-quota-unavailable')).toBe('unreachable');
+    expect(text('[data-quota-unavailable]')).toContain('Reason: the operator service returned no quota report. Refresh to read again.');
+    await act(async () => document.querySelector<HTMLButtonElement>('[data-quota-refresh]')!.click());
+    expect(reads).toBe(2);
+    expect(all('[data-quota-account]')).toHaveLength(4);
+    await act(async () => navLink('skills').click());
+    await act(async () => navLink('agents').click());
+    expect(reads).toBe(3);
+    expect(all('[data-quota-account]')).toHaveLength(0);
+    expect(text('[data-quota-unavailable]')).toContain('the quota report failed validation');
+  });
+});
+
+describe('Skills page', () => {
+  test('closing a catalog drawer opened from Skills focuses the matching Tools row', async () => {
+    await mount('#skills', props(loadingSetup()));
+    const trigger = document.querySelector<HTMLButtonElement>('[data-tool="waza"] > button')!;
+    trigger.focus();
+    await act(async () => trigger.click());
+    expect(window.location.hash).toBe('#tools/waza');
+    expect(trigger.isConnected).toBe(false);
+    expect(document.activeElement?.getAttribute('aria-label')).toBe('Close details');
+    await act(async () => { document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }) as unknown as Event); });
+    expect(window.location.hash).toBe('#tools');
+    expect(document.querySelector('[data-tool-drawer]')).toBeNull();
+    expect(document.activeElement?.closest('[data-tool]')?.getAttribute('data-tool')).toBe('waza');
+  });
+
+  test('recommended skills remain separate from host projections and open catalog metadata', async () => {
+    await mount('#skills', props(loadingSetup()));
+    expect(all('[data-tool]').map(row => row.dataset.tool)).toEqual(['waza', 'herdr-skill', 'hai-stack']);
+    expect(all('[data-skill]')).toHaveLength(0);
+    await act(async () => document.querySelector<HTMLButtonElement>('[data-tool="waza"] button')!.click());
+    expect(window.location.hash).toBe('#tools/waza');
+    expect(text('[data-tool-drawer]')).toContain('tw93');
+    expect(text('[data-tool-drawer]')).toContain('planning · debugging · review');
+    // The catalog records the install owner (core, a plugin id or none) in place of install profiles.
+    expect(text('[data-tool-drawer]')).toContain('Installed bycore');
+    for (const id of ['herdr-skill', 'hai-stack']) {
+      await act(async () => navLink('skills').click());
+      await act(async () => document.querySelector<HTMLButtonElement>(`[data-tool="${id}"] > button`)!.click());
+      expect(window.location.hash).toBe(`#tools/${id}`);
+      expect(document.querySelector('[data-tool-drawer]')?.getAttribute('data-tool-drawer')).toBe(id);
+    }
+  });
+  test('abnormal skills come first and each host cell uses setup check words', async () => {
+    await mount('#skills', props(degradedSetup(NOW)));
+    const rows = all('[data-skill]');
+    const flags = rows.map(row => row.getAttribute('data-skill-abnormal'));
+    expect(flags.slice(0, 4)).toEqual(['true', 'true', 'true', 'true']);
+    expect(flags.slice(4).every(flag => flag === 'false')).toBe(true);
+    expect(rows.slice(0, 4).map(row => row.getAttribute('data-skill'))).toEqual(['repo-harness-ship', 'obsidian-memory', 'herdr', 'think']);
+    const state = (skill: string, host: string) => document.querySelector(`[data-skill="${skill}"] [data-host-cell="${host}"] [data-skill-state]`)!.getAttribute('data-skill-state');
+    expect(state('repo-harness-ship', 'codex')).toBe('missing');
+    expect(state('herdr', 'claude')).toBe('stale copy');
+    expect(state('think', 'claude')).toBe('drift');
+    expect(state('repo-harness', 'claude')).toBe('ok link');
+    expect(text('[data-skill="repo-harness"] [data-host-cell="claude"]')).toContain('installed · link');
+    expect(text('[data-skill="herdr"] [data-host-cell="claude"]')).toContain('drift · copy');
+    // The catalog lists Pi for every fixture skill and setup check judged none there.
+    expect(state('think', 'pi')).toBe('not_installed');
+    expect(text('[data-skills-abnormal]')).toBe('4 need attention');
+    // The only action repairs repo-harness skills with the recorded selection.
+    expect(text('[data-skill-repair="update"]')).toContain('recorded plugin selection: architecture, product');
+    expect(text('[data-skill-repair="update"] [data-command] code')).toBe('rh update');
+    expect(text('[data-skill="repo-harness-ship"]')).toContain('Validates finished worktrees');
+    // The skill projection check that setup check flagged sits above the table with its command.
+    expect(text('[data-setup-page="skills"] [data-check="doctor.skill-projection"] [data-command]')).toContain('repo-harness skills sync');
+  });
+
+  test('a ready read without a flagged projection check shows only the table', async () => {
+    await mount('#skills', props(readySetup(NOW)));
+    expect(document.querySelector('[data-check]')).toBeNull();
+    expect(text('[data-skills-abnormal]')).toBe('All match their source');
+    expect(all('[data-skill-abnormal="true"]')).toHaveLength(0);
+    expect(document.querySelector('[data-skill-repair]')).toBeNull();
+  });
+
+  test('host cells without a judgment follow the catalog hosts, and no ledger means no update command', async () => {
+    const snapshot = degradedSetup(NOW);
+    const skills = snapshot.skills.map(skill => skill.name === 'think' ? { ...skill, catalog_hosts: ['claude' as const, 'codex' as const] }
+      : skill.name === 'hunt' ? { ...skill, catalog_hosts: null } : skill);
+    await mount('#skills', props({ ...snapshot, skills, install_selection: null }));
+    const state = (skill: string) => document.querySelector(`[data-skill="${skill}"] [data-host-cell="pi"] [data-skill-state]`)!.getAttribute('data-skill-state');
+    expect([state('repo-harness'), state('think'), state('hunt')]).toEqual(['not_installed', 'not_supported', 'not_judged']);
+    expect(document.querySelector('[data-skill-repair="update"]')).toBeNull();
+    expect(text('[data-skill-repair="no-ledger"]')).toContain('rh update cannot run');
+  });
+
+  test('other skills in each host root are listed read only by name and path', async () => {
+    await mount('#skills', props(readySetup(NOW)));
+    expect(all('[data-other-skill]').map(row => [row.closest('[data-skill-root]')!.getAttribute('data-skill-root'), row.textContent])).toEqual([
+      ['claude', 'frontend-design~/.claude/skills/frontend-design'], ['claude', 'pdf~/.claude/skills/pdf'],
+    ]);
+    expect(text('[data-skill-root="codex"]')).toContain('No other skills');
+    expect(text('[data-skill-root="pi"]')).toContain('No skill root');
+    expect(all('[data-other-skill] button, [data-other-skill] a')).toHaveLength(0);
+    await act(async () => root?.unmount());
+    root = null; document.body.innerHTML = '';
+    await mount('#skills', props({ ...readySetup(NOW), skill_roots: [] }));
+    expect(text('[data-other-skills="unknown"]')).toContain('the skill catalog could not be read');
+  });
+
+  test('no judged skills never reads as all-consistent; the flagged check explains it', async () => {
+    const snapshot = readySetup(NOW);
+    await mount('#skills', props({ ...snapshot, skills: [], checks: [{ id: 'doctor.skill-projection', status: 'fail', title: 'Host skills match their source and install ledger', detail: 'invalid skill catalog: [private path]', command: null }] }));
+    expect(document.querySelector('[data-skills-abnormal]')).toBeNull();
+    expect(page().textContent).not.toContain('All match their source');
+    expect(text('[data-check="doctor.skill-projection"]')).toContain('No command · see details');
+    expect(page().textContent).toContain('Setup check judged no skills.');
+  });
+});
+
+describe('Hooks page', () => {
+  for (const locale of ['en', 'zh'] as const) {
+    for (const [calls, english] of [[1, '1 call'], [2, '2 calls']] as const) {
+      test(`hook usage count grammar: ${locale}, ${calls}`, async () => {
+        const snapshot = readySetup(NOW);
+        snapshot.hook_usage = {
+          window_hours: 24,
+          routes: [{ host: 'codex', event: 'PreToolUse', route_id: 'edit', calls, blocked: 0, last_blocked_at: null }],
+          recent_denials: [],
+        };
+        await mount('#hooks', props(decodeSetupSnapshot(snapshot), { initialLocale: locale }));
+        const expected = locale === 'en' ? `${english} · 0 blocked` : `${calls} 次调用 · 0 次拦截`;
+        expect(document.querySelector('[data-hook-usage="edit"] .tabular-nums')?.textContent).toBe(expected);
+      });
+    }
+  }
+
+  test('usage shows recorded counts per host and guard denials separately', async () => {
+    const snapshot = readySetup(NOW);
+    snapshot.hook_usage = {
+      window_hours: 24,
+      routes: [{ host: 'codex', event: 'PreToolUse', route_id: 'edit', calls: 7, blocked: 2, last_blocked_at: new Date(NOW).toISOString() }],
+      recent_denials: [{ at: new Date(NOW - 48 * 3600000).toISOString(), guard: 'RepoScopeGuard', reason: 'Denied [private path]' }],
+    };
+    await mount('#hooks', props(decodeSetupSnapshot(snapshot)));
+    expect(text('[data-hook-usage="edit"]')).toContain('7 calls · 2 blocked');
+    expect(text('[data-hook-usage="edit"]')).toContain('Codex');
+    expect(text('[data-hook-usage="edit"]')).toContain('PreToolUse.edit');
+    expect(text('[data-hook-denial]')).toContain('RepoScopeGuard');
+    expect(text('[data-hook-denial]')).toContain('Denied [private path]');
+    expect(text('[data-hook-denial]')).toContain(new Date(NOW - 48 * 3600000).toISOString());
+    expect(page().textContent).toContain('operator service repository');
+  });
+
+  test('missing usage stays unknown rather than zero', async () => {
+    await mount('#hooks', props({ ...readySetup(NOW), hook_usage: null }));
+    expect(page().textContent).toContain('Hook usage was not collected.');
+    expect(all('[data-hook-usage], [data-hook-denial]')).toHaveLength(0);
+  });
+  test('routes group by event with per-host support, and mismatches list under their host', async () => {
+    await mount('#hooks', props(degradedSetup(NOW)));
+    expect(all('[data-hook-event]').map(row => row.getAttribute('data-hook-event'))).toEqual(['SessionStart', 'PreToolUse', 'UserPromptSubmit', 'SubagentStart', 'Stop']);
+    const subagent = document.querySelector('[data-hook-event="PreToolUse"] [data-route="subagent"]')!;
+    expect(subagent.querySelector('[data-host-cell="codex"] [data-route-host]')!.getAttribute('data-route-host')).toBe('unsupported');
+    expect(subagent.textContent).toContain('Agent');
+    expect(text('[data-hook-event="SessionStart"] [data-route="default"]')).toContain('every tool');
+    expect(all('[data-managed-host="codex"] [data-mismatch]').map(row => row.textContent)).toEqual([
+      'SubagentStart · context · missing', 'Stop · default · timeout differs', 'PreToolUse · entry without a route id · unexpected entry',
+    ]);
+    expect(all('[data-managed-host="claude"] [data-mismatch]')).toHaveLength(0);
+  });
+});
+
+describe('first read and failures', () => {
+  test('before the first collection finishes each page says it is reading', async () => {
+    for (const hash of ['#agents', '#skills', '#hooks']) {
+      await mount(hash, props(loadingSetup()));
+      expect(page().getAttribute('data-setup-state')).toBe('pending');
+      expect(page().textContent).toContain('Reading configuration (about 20 s)');
+      expect(all('[data-host-row], [data-skill], [data-route]')).toHaveLength(0);
+      await act(async () => root?.unmount());
+      root = null; document.body.innerHTML = '';
+    }
+  });
+
+  test('a page shows the read as pending until the reader answers', async () => {
+    await mount('#agents', props(null, { readSetup: () => new Promise(() => {}) }));
+    expect(page().getAttribute('data-setup-state')).toBe('pending');
+  });
+
+  test('a failed collection names its reason and the command to run by hand', async () => {
+    await mount('#skills', props(unavailableSetupSnapshot('setup_check_failed')));
+    expect(page().getAttribute('data-setup-state')).toBe('failed');
+    expect(page().getAttribute('data-setup-reason')).toBe('setup_check_failed');
+    expect(page().textContent).toContain('Configuration could not be read');
+    expect(page().textContent).toContain('setup check failed');
+    expect(page().textContent).toContain('rh setup check');
+  });
+
+  test('an unreachable service is a failure with the same command; a later refresh failure keeps data', async () => {
+    await mount('#hooks', props(null, { readSetup: async () => { throw new Error('offline'); } }));
+    expect(page().getAttribute('data-setup-state')).toBe('failed');
+    expect(page().getAttribute('data-setup-reason')).toBe('unreachable');
+    expect(page().textContent).toContain('the operator service did not answer');
+    expect(page().textContent).toContain('rh setup check');
+    await act(async () => root?.unmount());
+    root = null; document.body.innerHTML = '';
+
+    await mount('#hooks', props(readySetup(NOW), { readSetup: async () => { throw new Error('offline'); } }));
+    // The seeded snapshot shows; returning to the page reads, fails, and keeps it.
+    await act(async () => navLink('board').click());
+    await act(async () => navLink('hooks').click());
+    expect(page().getAttribute('data-setup-state')).toBe('refresh-failed');
+    expect(all('[data-route]').length).toBeGreaterThan(0);
+  });
+});
+
+describe('Tools page', () => {
+  const tools = () => document.querySelector<HTMLElement>('[data-tools-page]');
+  const row = (id: string) => document.querySelector<HTMLButtonElement>(`[data-tool="${id}"] button`)!;
+  const drawer = () => document.querySelector<HTMLElement>('[data-tool-drawer]');
+
+  test('#tools lists the catalog; #tools/<id> opens a catalog entry; anything else is the default page', () => {
+    expect(parseWorkspaceLocation('#tools')).toEqual({ workspace: 'tools', module: null, item: null });
+    expect(parseWorkspaceLocation('#tools/codegraph')).toEqual({ workspace: 'tools', module: null, item: 'codegraph' });
+    expect(workspaceHash({ workspace: 'tools', module: null, item: null })).toBe('#tools');
+    expect(workspaceHash({ workspace: 'tools', module: null, item: 'codegraph' })).toBe('#tools/codegraph');
+    for (const hash of ['#tools/CodeGraph', '#tools/code_graph', '#tools/%2e%2e', '#tools/not-in-catalog', '#tools/codegraph/extra', '#tools/']) {
+      expect(parseWorkspaceLocation(hash)).toEqual(DEFAULT_LOCATION);
+    }
+  });
+
+  test('Tools closes the Observe group after System and routes by hash without a setup read', async () => {
+    let reads = 0;
+    await mount('', props(null, { readSetup: async () => { reads++; return readySetup(NOW); } }));
+    const order = all('.workspace-nav a[data-workspace]').map(link => link.getAttribute('data-workspace'));
+    expect(order.indexOf('tools')).toBe(order.indexOf('system') + 1);
+    expect(all('[aria-labelledby="nav-group-observe"] a[data-workspace]').at(-1)?.getAttribute('data-workspace')).toBe('tools');
+    await act(async () => navLink('tools').click());
+    expect(window.location.hash).toBe('#tools');
+    expect(navLink('tools').getAttribute('aria-current')).toBe('page');
+    expect(tools()).not.toBeNull();
+    expect(reads).toBe(0);
+  });
+
+  test('local tools and resources list with counts; no tool reads as installed', async () => {
+    await mount('#tools', props(readySetup(NOW)));
+    expect(all('[data-tool-group]').map(group => group.getAttribute('data-tool-group'))).toEqual(['local_tool', 'skill', 'resource']);
+    expect(text('#tools-local_tool-heading')).toBe('Local tools1');
+    expect(text('#tools-skill-heading')).toBe('Recommended skills3');
+    expect(text('#tools-resource-heading')).toBe('Recommended resources3');
+    const status = Object.fromEntries(all('[data-tool]').map(item => [item.getAttribute('data-tool'), item.querySelector('[data-tool-status]')!.getAttribute('data-tool-status')]));
+    expect(status).toEqual({ waza: 'unknown', codegraph: 'unknown', 'herdr-skill': 'unknown', 'hai-stack': 'na', shaders: 'na', 'awesome-design-md': 'na', 'claude-quickstarts': 'na' });
+    expect(text('[data-tool="hai-stack"] [data-tool-status]')).toBe('N/A');
+    // hai-stack declares no SPDX license; the license cell says so.
+    expect(text('[data-tool="hai-stack"]')).toContain('Unknown');
+    expect(text('[data-tool="shaders"]')).toContain('MIT');
+    // The only command on the page is the read-only detector report.
+    expect(all('[data-command] code').map(code => code.textContent)).toEqual(['rh run check-agent-tooling']);
+  });
+
+  test('a row opens its drawer with links and no install command; Escape closes and returns focus', async () => {
+    await mount('#tools', props(readySetup(NOW)));
+    row('codegraph').focus();
+    await act(async () => row('codegraph').click());
+    expect(window.location.hash).toBe('#tools/codegraph');
+    expect(drawer()?.getAttribute('data-tool-drawer')).toBe('codegraph');
+    expect(text('#tool-drawer-title')).toBe('CodeGraph');
+    expect(drawer()!.querySelectorAll('[data-command]')).toHaveLength(0);
+    const links = Array.from(drawer()!.querySelectorAll('a')).map(link => [link.getAttribute('href'), link.getAttribute('rel')]);
+    expect(links).toEqual([
+      ['https://github.com/colbymchenry/codegraph', 'noreferrer noopener'],
+      ['https://github.com/aimpact-inc/repo-harness/blob/main/docs/reference-configs/external-tooling.md#codegraph', 'noreferrer noopener'],
+    ]);
+    await act(async () => { document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }) as unknown as Event); });
+    expect(window.location.hash).toBe('#tools');
+    expect(drawer()).toBeNull();
+    expect(document.activeElement).toBe(row('codegraph'));
+  });
+
+  test('a resource drawer says it is not detected; the summary follows the locale', async () => {
+    await mount('#tools/awesome-design-md', props(readySetup(NOW), { initialLocale: 'zh' }));
+    expect(drawer()?.getAttribute('data-tool-drawer')).toBe('awesome-design-md');
+    expect(drawer()!.textContent).toContain('来自知名品牌设计系统的 DESIGN.md 文件');
+    expect(text('[data-tool-status-reason]')).toBe('repo-harness 不安装、也不探测资源。');
+    expect(navLink('tools').textContent).toBe('工具');
+  });
+});
+
+function cliSnapshot(): CliInventorySnapshotV1 {
+  return decodeCliInventory({
+    projection_version: 'repo-harness.cli-inventory.v1', status: 'ready', reason: null, collected_at: new Date(NOW).toISOString(),
+    entries: [{
+      id: 'npm:example', source: 'npm', package: 'example', version: '1.2.3', commands: ['example'],
+      location: '~/.local/bin', size_bytes: 1024, last_used_at: null, unused: null,
+      github: { repo: 'owner/example', candidates: [], stars: 42, archived: true, moved: true, monorepo: true },
+      deprecated: true, uninstall: { steps: ['example logout', 'npm rm -g example'], config: 'rm -rf ~/.config/example' },
+    }],
+  });
+}
+
+describe('CLI inventory page', () => {
+  for (const [locale, expected] of [['en', '1m ago'], ['zh', '1 分钟前']] as const) {
+    test(`last agent use is a localized relative time: ${locale}`, async () => {
+      const snapshot = cliSnapshot();
+      const at = new Date(Date.now() - 90_000).toISOString();
+      snapshot.entries[0]!.last_used_at = at;
+      await mount('#cli', props(null, { initialLocale: locale, readCliInventory: async () => snapshot }));
+      const time = document.querySelector('[data-cli-entry="npm:example"] time');
+      expect(time?.textContent).toBe(expected);
+      expect(time?.getAttribute('datetime')).toBe(at);
+    });
+  }
+
+  test('reads the cache only while CLI is open and copies removal steps without executing', async () => {
+    let reads = 0;
+    let setupReads = 0;
+    const copied: string[] = [];
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (text: string) => { copied.push(text); } } });
+    await mount('', props(null, {
+      readSetup: async () => { setupReads++; return readySetup(NOW); },
+      readCliInventory: async () => { reads++; return cliSnapshot(); },
+    }));
+    expect(reads).toBe(0);
+    await act(async () => navLink('cli').click());
+    expect(window.location.hash).toBe('#cli');
+    expect(reads).toBe(1);
+    expect(setupReads).toBe(0);
+    expect(text('[data-cli-page]')).toContain('Shell history is not read.');
+    expect(text('[data-cli-unused="null"]')).toBe('Not enough agent-use records to judge');
+    for (const word of ['1.2.3', '1024 bytes', '42 stars', 'Whole repository', 'Archived upstream', 'Repository moved', 'Deprecated']) {
+      expect(text('[data-cli-entry]')).toContain(word);
+    }
+    expect(all('[data-cli-entry] a').map(link => link.getAttribute('href'))).toEqual(['https://github.com/owner/example']);
+    expect(all('[data-cli-removal] [data-command] code').map(node => node.textContent)).toEqual(['example logout', 'npm rm -g example', 'rm -rf ~/.config/example']);
+    expect(text('[data-cli-config]')).toContain('Separate removal');
+    const buttons = all('[data-cli-page] button');
+    expect(buttons.every(button => button.getAttribute('aria-label')?.startsWith('Copy '))).toBe(true);
+    await act(async () => buttons[1]!.click());
+    expect(copied).toEqual(['npm rm -g example']);
+    expect(reads).toBe(1);
+    expect(all('[data-cli-page] form, [data-cli-page] input, [data-cli-page] [draggable="true"]')).toHaveLength(0);
+  });
+
+  test('unknown use, recent use, unused and ambiguous upstreams remain distinct', async () => {
+    const snapshot = cliSnapshot();
+    const first = snapshot.entries[0]!;
+    snapshot.entries.push({ ...first, id: 'manual:second', commands: ['second'], source: 'manual', unused: true, uninstall: null,
+      location: '[private path]', github: { repo: null, candidates: ['one/second', 'two/second'], monorepo: false, stars: null, archived: null, moved: false } });
+    snapshot.entries.push({ ...first, id: 'npm:third', commands: ['third'], unused: false, last_used_at: new Date(NOW - 60000).toISOString(), size_bytes: null, github: null });
+    await mount('#cli', props(null, { initialCliInventory: decodeCliInventory(snapshot) }));
+    expect(all('[data-cli-unused]').map(row => row.dataset.cliUnused)).toEqual(['null', 'true', 'false']);
+    expect(text('[data-cli-entry="manual:second"]')).toContain('No agent use in 90 days');
+    expect(text('[data-cli-entry="manual:second"]')).not.toContain('stars');
+    expect(text('[data-cli-entry="manual:second"]')).toContain('No uninstall command is available');
+    expect(all('[data-cli-entry="manual:second"] a')).toHaveLength(2);
+    expect(text('[data-cli-entry="npm:third"]')).toContain('Used in the last 90 days');
+  });
+
+  test('pending, unavailable, stale and empty collections never masquerade as current entries', async () => {
+    for (const [snapshot, state, entries] of [
+      [unavailableCliInventory(), 'pending', 0],
+      [unavailableCliInventory('collection_failed'), 'failed', 0],
+      [{ ...cliSnapshot(), status: 'stale', reason: 'collection_failed' }, 'stale', 1],
+      [{ ...cliSnapshot(), entries: [] }, 'ready', 0],
+    ] as const) {
+      await mount('#cli', props(null, { initialCliInventory: decodeCliInventory(snapshot) }));
+      expect(document.querySelector('[data-cli-page]')?.getAttribute('data-cli-state')).toBe(state);
+      expect(all('[data-cli-entry]')).toHaveLength(entries);
+      await act(async () => root?.unmount());
+      root = null; document.body.innerHTML = '';
+    }
+  });
+
+  test('an unreachable read fails; a failed refresh retains the last inventory with a warning', async () => {
+    const readCliInventory = async () => { throw new Error('private error'); };
+    await mount('#cli', props(null, { readCliInventory }));
+    expect(document.querySelector('[data-cli-page]')?.getAttribute('data-cli-state')).toBe('failed');
+    expect(text('[data-cli-page]')).not.toContain('private error');
+    await act(async () => root?.unmount());
+    root = null; document.body.innerHTML = '';
+    await mount('#cli', props(null, { readCliInventory, initialCliInventory: cliSnapshot() }));
+    await act(async () => navLink('tools').click());
+    await act(async () => navLink('cli').click());
+    expect(document.querySelector('[data-cli-page]')?.getAttribute('data-cli-state')).toBe('refresh-failed');
+    expect(all('[data-cli-entry]')).toHaveLength(1);
+    expect(text('[data-cli-page]')).toContain('Refresh failed');
+  });
+
+  test('the browser uses GET and rejects raw paths at the decoder boundary', async () => {
+    const originalFetch = globalThis.fetch;
+    const snapshot = cliSnapshot();
+    const requests: Array<[string, RequestInit | undefined]> = [];
+    globalThis.fetch = (async (url: string, options?: RequestInit) => {
+      requests.push([String(url), options]);
+      return new Response(JSON.stringify(snapshot), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const signal = new AbortController().signal;
+      expect(await fetchCliInventory(signal)).toEqual(snapshot);
+      expect(requests[0]![0]).toBe('/api/v1/cli-inventory');
+      expect(requests[0]![1]?.method ?? 'GET').toBe('GET');
+      expect(requests[0]![1]?.signal).toBe(signal);
+      snapshot.entries[0]!.location = '/Users/private-owner/bin';
+      await expect(fetchCliInventory(signal)).rejects.toThrow('cli inventory invalid: location');
+    } finally { globalThis.fetch = originalFetch; }
+  });
+});
+
+test('the Skills and Hooks pages carry no write, form or drag controls', async () => {
+  for (const hash of ['#skills', '#hooks']) {
+    await mount(hash, props(degradedSetup(NOW)));
+    const main = document.querySelector('main')!;
+    expect(main.querySelectorAll('form, input, select, textarea, [draggable="true"], [contenteditable]')).toHaveLength(0);
+    // Buttons copy, disclose, or navigate to a recommended skill's catalog entry.
+    const buttons = Array.from(main.querySelectorAll('button'));
+    expect(buttons.every(button => button.getAttribute('aria-label')?.startsWith('Copy ') || button.hasAttribute('aria-expanded') || button.matches('[data-tool-group="skill"] [data-tool] > button:only-child'))).toBe(true);
+    await act(async () => root?.unmount());
+    root = null; document.body.innerHTML = '';
+  }
+});

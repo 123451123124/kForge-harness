@@ -1,0 +1,50 @@
+schemaVersion: archcontext.flow/v1
+id: flow.action-commands.selection-projection
+capabilityId: capability.public-surface.action-commands
+name: Select the skill projection for a plugin selection
+applicability: required
+participants:
+  - id: capability
+    nodeId: capability.public-surface.action-commands
+  - id: catalog
+    nodeId: component.action-commands.skill-surface-catalog
+steps:
+  - id: select-facades
+    from: capability
+    to: catalog
+    label: Compute the facade set for the requested plugin selection
+    evidence:
+      entrypointId: entrypoint.action-commands.selection-projection
+      sourceSymbol: main
+      sinkId: sink.action-commands.facades-for-selection
+outcomes:
+  - id: success
+    kind: success
+    label: Projection is printed for the sync script
+    steps:
+      - id: print-projection
+        from: capability
+        to: catalog
+        label: Print the facades and host placements that the selection projects
+        evidence:
+          entrypointId: entrypoint.action-commands.selection-projection
+          sourceSymbol: main
+          sinkId: sink.action-commands.facades-for-selection
+    terminal:
+      participant: capability
+      label: Return the selection projection
+  - id: error
+    kind: error
+    label: Manifest is missing or invalid
+    steps:
+      - id: reject-catalog
+        from: capability
+        to: catalog
+        label: Parse manifest.json and print every diagnostic when it is not valid
+        evidence:
+          entrypointId: entrypoint.action-commands.selection-projection
+          sourceSymbol: loadCatalog
+          sinkId: sink.action-commands.parse-catalog
+    terminal:
+      participant: capability
+      label: Exit nonzero before any host mutation

@@ -1,0 +1,80 @@
+schemaVersion: archcontext.flow/v1
+id: flow.global-runtime-reconciliation.primary
+capabilityId: capability.runtime-harness.global-runtime-reconciliation
+name: Reconcile the global runtime closure
+applicability: required
+participants:
+  - id: cli-root
+    nodeId: component.global-runtime-reconciliation.cli-root
+  - id: update-command
+    nodeId: capability.runtime-harness.global-runtime-reconciliation
+  - id: reconciler
+    nodeId: component.global-runtime-reconciliation.primary
+  - id: archctx-closure
+    nodeId: component.architecture.archctx-closure
+  - id: hook-adapters
+    nodeId: capability.runtime-harness.hook-adapters
+steps:
+  - id: candidate-setup
+    from: cli-root
+    to: reconciler
+    label: Run setup inside the installed candidate after the parent token and package identity match
+    evidence:
+      entrypointId: entrypoint.global-runtime-reconciliation.cli-root
+      sourceSymbol: runCandidateRuntimeReconciliation
+      sinkId: sink.global-runtime-reconciliation.setup
+  - id: install-and-readback
+    from: update-command
+    to: reconciler
+    label: Install candidate and verify exact dependency closure
+    evidence:
+      entrypointId: entrypoint.global-runtime-reconciliation.candidate-readback
+      sourceSymbol: verifyInstalledManagedRuntime
+      sinkId: sink.global-runtime-reconciliation.candidate-readback
+outcomes:
+  - id: success
+    kind: success
+    label: Mandatory closure and selected plugin tooling are ready
+    steps:
+      - id: configure-architecture
+        from: reconciler
+        to: archctx-closure
+        label: Configure the global architecture projection through the setup port when the architecture plugin is selected
+        evidence:
+          entrypointId: entrypoint.global-runtime-reconciliation.update
+          sourceSymbol: runGlobalRuntimeSetupInTransaction
+          sinkId: sink.global-runtime-reconciliation.architecture-configuration
+      - id: install-adapters
+        from: reconciler
+        to: hook-adapters
+        label: Install the managed host adapters
+        evidence:
+          entrypointId: entrypoint.global-runtime-reconciliation.update
+          sourceSymbol: installHostAdapters
+          sinkId: sink.global-runtime-reconciliation.host-adapters
+      - id: register-pi-package
+        from: reconciler
+        to: hook-adapters
+        label: "Check and register the installed candidate's Pi package when the host selection enables it"
+        evidence:
+          entrypointId: entrypoint.global-runtime-reconciliation.update
+          sourceSymbol: runGlobalRuntimeSetupInTransaction
+          sinkId: sink.global-runtime-reconciliation.pi-package
+    terminal:
+      participant: reconciler
+      label: Continue host runtime refresh
+  - id: error
+    kind: error
+    label: Package or Node or capability or tooling readback failed
+    steps:
+      - id: return-failure
+        from: update-command
+        to: reconciler
+        label: Return typed failure before later host mutation
+        evidence:
+          entrypointId: entrypoint.global-runtime-reconciliation.candidate-readback
+          sourceSymbol: verifyInstalledManagedRuntime
+          sinkId: sink.global-runtime-reconciliation.candidate-readback
+    terminal:
+      participant: update-command
+      label: Stop update with recovery detail

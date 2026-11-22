@@ -1,0 +1,163 @@
+import {
+  EMPTY_AGENTS_CONFIG,
+  decodeAgentsConfig,
+  type AgentsConfigV1,
+  type AgentsSettingsRequestV1,
+  type AgentsSettingsResultV1,
+} from '../../core/board/agents-settings';
+import {
+  SEAT_IDS,
+  SEAT_RUNTIMES,
+  SeatsConfigMigrationRequiredError,
+  decodeSeatsConfig,
+  seatsConfigInvalidMessage,
+  seatHostId,
+  type SeatsConfigV1,
+} from '../../core/board/seats-settings';
+import { isDocsHostRuntimeId } from '../../core/operator/docs-host-runtimes';
+import { isReviewRuntimeId, REVIEW_RUNTIME_IDS } from '../../core/review/review-runtimes';
+import { GlobalConfigurationError, mutateGlobalConfiguration, readGlobalConfiguration } from './global-configuration';
+
+/** The operator target lock precedes the shared global runtime transaction lock. */
+
+export type AgentsConfigurationErrorCode =
+  | 'busy'
+  | 'config_invalid'
+  | 'config_is_link'
+  | 'revision_conflict'
+  | 'runtime_unknown'
+  | 'runtime_not_enabled'
+  | 'runtime_in_use'
+  | 'seats_config_invalid'
+  | SeatsConfigMigrationRequiredError['code']
+  | 'use_not_supported'
+  | 'docs_isolation_unverified'
+  | 'default_docs_invalid';
+
+export class AgentsConfigurationError extends Error {
+  constructor(readonly code: AgentsConfigurationErrorCode, message: string) {
+    super(message);
+    this.name = 'AgentsConfigurationError';
+  }
+}
+
+export interface AgentsConfiguration {
+  readonly revision: string;
+  readonly agents: AgentsConfigV1;
+}
+
+export function readAgentsConfiguration(env: NodeJS.ProcessEnv = process.env): AgentsConfiguration {
+  let document: ReturnType<typeof readGlobalConfiguration>;
+  try {
+    document = readGlobalConfiguration(env);
+  } catch {
+    throw new AgentsConfigurationError('config_invalid', 'The repo-harness configuration file is not a valid JSON object.');
+  }
+  return { revision: document.revision, agents: sectionOf(document.config) };
+}
+
+function sectionOf(config: Record<string, unknown>): AgentsConfigV1 {
+  if (config.agents === undefined) return EMPTY_AGENTS_CONFIG;
+  try {
+    return decodeAgentsConfig(config.agents);
+  } catch {
+    throw new AgentsConfigurationError('config_invalid', 'The agents section of the repo-harness configuration is not valid.');
+  }
+}
+
+const docsIsolationUnverified = (runtime: string) =>
+  new AgentsConfigurationError('docs_isolation_unverified', `Runtime ${runtime} has no verified docs isolation, so it cannot run doc sessions.`);
+
+const sorted = (ids: Iterable<string>): string[] => [...ids].sort();
+const sameList = (left: readonly string[], right: readonly string[]): boolean =>
+  left.length === right.length && left.every((id, index) => id === right[index]);
+
+function nextSection(current: AgentsConfigV1, request: AgentsSettingsRequestV1, knownRuntimes: ReadonlySet<string>): AgentsConfigV1 {
+  const enabled = new Set(current.enabled);
+  const docs = new Set(current.uses.docs);
+  const review = new Set(current.uses.review);
+  for (const change of request.changes) {
+    // A runtime that left the registry, for example after an OAR upgrade, can still be turned off.
+    const disables = !change.enabled && change.uses.length === 0;
+    if (!disables && !knownRuntimes.has(change.runtime)) {
+      throw new AgentsConfigurationError('runtime_unknown', `Runtime ${change.runtime} is not in the runtime registry.`);
+    }
+    if (!change.enabled && change.uses.length > 0) {
+      throw new AgentsConfigurationError('runtime_not_enabled', `Runtime ${change.runtime} must be enabled to have a use.`);
+    }
+    if (change.uses.includes('review') && !isReviewRuntimeId(change.runtime)) {
+      throw new AgentsConfigurationError('use_not_supported', `Runtime ${change.runtime} cannot review; supported review runtimes: ${REVIEW_RUNTIME_IDS.join(', ')}.`);
+    }
+    // Only a new docs use is a launch decision. A stored docs use stays inert and never blocks a write, and
+    // removing it needs no verification, so a legacy value can still leave.
+    const storedDocsUse = current.uses.docs.includes(change.runtime);
+    if (change.uses.includes('docs') && !storedDocsUse && !isDocsHostRuntimeId(change.runtime)) {
+      throw docsIsolationUnverified(change.runtime);
+    }
+    if (change.enabled) enabled.add(change.runtime);
+    else enabled.delete(change.runtime);
+    for (const [use, set] of [['docs', docs], ['review', review]] as const) {
+      if (change.uses.includes(use)) set.add(change.runtime);
+      else set.delete(change.runtime);
+    }
+  }
+  const defaultDocs = request.default_docs_runtime === undefined ? current.default_docs : request.default_docs_runtime;
+  // An unchanged stored default never blocks a write; only a new default needs a verified runtime.
+  if (defaultDocs !== null && defaultDocs !== current.default_docs && !isDocsHostRuntimeId(defaultDocs)) throw docsIsolationUnverified(defaultDocs);
+  if (defaultDocs !== null && !docs.has(defaultDocs)) {
+    throw new AgentsConfigurationError('default_docs_invalid', 'The default docs runtime must be enabled for docs. Choose another default or clear it.');
+  }
+  return { enabled: sorted(enabled), uses: { docs: sorted(docs), review: sorted(review) }, default_docs: defaultDocs };
+}
+
+function checkSeatRuntimes(value: unknown, before: readonly string[], after: readonly string[]): void {
+  const disabled = SEAT_RUNTIMES.filter(runtime => {
+    const host = seatHostId(runtime);
+    return before.includes(host) && !after.includes(host);
+  });
+  if (disabled.length === 0) return;
+
+  let seats: SeatsConfigV1;
+  try {
+    seats = decodeSeatsConfig(value);
+  } catch (error) {
+    if (error instanceof SeatsConfigMigrationRequiredError) throw new AgentsConfigurationError(error.code, error.message);
+    throw new AgentsConfigurationError('seats_config_invalid', seatsConfigInvalidMessage(error));
+  }
+  const affected = SEAT_IDS.flatMap(id => {
+    const runtime = seats[id]?.runtime;
+    return runtime !== undefined && disabled.includes(runtime) ? [`${id} (${runtime})`] : [];
+  });
+  if (affected.length > 0) {
+    throw new AgentsConfigurationError('runtime_in_use', `The runtime change would leave ${affected.join(', ')} without an enabled runtime.`);
+  }
+}
+
+function changedKeys(current: AgentsConfigV1, next: AgentsConfigV1): string[] {
+  return [
+    ...(sameList(current.enabled, next.enabled) ? [] : ['agents.enabled']),
+    ...(sameList(current.uses.docs, next.uses.docs) ? [] : ['agents.uses.docs']),
+    ...(sameList(current.uses.review, next.uses.review) ? [] : ['agents.uses.review']),
+    ...(current.default_docs === next.default_docs ? [] : ['agents.default_docs']),
+  ];
+}
+
+export function applyAgentsSettings(
+  request: AgentsSettingsRequestV1,
+  knownRuntimes: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): AgentsSettingsResultV1 {
+  try {
+    const result = mutateGlobalConfiguration(env, (config) => {
+      const current = sectionOf(config);
+      const next = nextSection(current, request, new Set(knownRuntimes));
+      checkSeatRuntimes(config.seats, current.enabled, next.enabled);
+      const changed = changedKeys(current, next);
+      return { ...(changed.length ? { config: { ...config, agents: next } } : {}), value: changed };
+    }, { expectedRevision: request.expected_revision });
+    return { config_revision: result.revision, changed_keys: result.value };
+  } catch (error) {
+    if (error instanceof GlobalConfigurationError) throw new AgentsConfigurationError(error.code, error.message);
+    throw error;
+  }
+}

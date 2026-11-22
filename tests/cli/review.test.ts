@@ -1,0 +1,827 @@
+import { afterEach, expect, spyOn, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { taskReviewRunner } from '../../src/effects/review-runner/task-review-runner';
+import { buildReviewCommand, pullRequestSelectionFromOptions } from '../../src/cli/commands/review';
+import { renderAcceptanceClaim, validateReviewPublishReceipt } from '../../src/core/review/review-publish';
+import { createReviewAdmission, reviewCampaignKey, type ReviewAdmissionInput } from '../../src/core/review/authority-context';
+import { readReviewAdmission } from '../../src/effects/admission/admission-store';
+import { gatesDirectoryName } from '../../src/effects/git/repository-identity';
+import * as accountHome from '../../src/effects/runtime/os-account-home';
+import * as herdrCore from '../../src/effects/terminal/herdr-core';
+import { hashVerificationPlan } from '../../src/core/evidence/verification-plan';
+import { controlApprovalFixture } from '../helpers/control-approval-fixture';
+import { initGitRepo, tmpWorkspace } from '../helpers/repo-fixture';
+import { recordPluginSelection } from '../helpers/install-ownership';
+import { PLUGIN_IDS, type PluginId, type PluginSelection } from '../../src/core/skill-surface/plugin-manifest';
+import { HEAD as PUBLISH_HEAD, PR as PUBLISH_PR, installFakeGh, passingScenario } from '../helpers/publication-merge-fake-gh';
+
+const roots: string[] = [];
+afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+const hash = (s: string) => `sha256:${createHash('sha256').update(s).digest('hex')}`;
+
+function peerGateFixture() {
+  const root = tmpWorkspace('peer-gate'), home = join(root, 'home'); roots.push(root);
+  const env = { ...process.env, HOME: home, REPO_HARNESS_HOME: join(home, '.repo-harness'), BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' };
+  const probe = join(root, 'probe.ts');
+  writeFileSync(probe, String.raw`process.on('exit', () => process.stderr.write('peer-modules:' + JSON.stringify(Object.keys(require.cache).filter(path => /[\\/]src[\\/](?:effects[\\/](?:review-runner[\\/]|terminal[\\/](?:task-session|task-runtime-observation|native-task-session|herdr-notify-install|notify-relay)\.ts)|cli[\\/]commands[\\/](?:herdr|events)-actions\.ts)|[\\/]@botiverse[\\/]oar[\\/]|[\\/]assets[\\/]herdr[\\/]/.test(path))) + '\n'));`);
+  const select = (plugins: readonly PluginId[], selection: PluginSelection = plugins) => recordPluginSelection(env, plugins, selection);
+  const run = (args: string[]) => {
+    const result = spawnSync(process.execPath, ['--preload', probe, join(import.meta.dir, '../../src/cli/index.ts'), ...args],
+      { cwd: root, env, encoding: 'utf8', timeout: 20_000 });
+    const loaded = JSON.parse(/peer-modules:(\[[^\n]*\])/.exec(result.stderr)?.[1] ?? 'null');
+    return { ...result, loaded };
+  };
+  const selectors = ['--repository-id', 'R', '--issue-id', 'I', '--campaign-id', 'C', '--grant-sha256', hash('grant'), '--policy-sha256', hash('policy'), '--actor', 'U'];
+  return { root, env, select, run, selectors };
+}
+
+test('peer-runtime guards refuse before loading actions and preserve the recorded selection repair', () => {
+  const f = peerGateFixture();
+  const round = ['--reviewer-repo', f.root, '--claim-ref', 'claim', '--claim-revision', hash('claim'), '--verification', 'missing.json'];
+  const commands = [
+    ...['round', 'status', 'close', 'cancel'].map(op => ['review', op, ...f.selectors, ...(op === 'round' ? round : [])]),
+    ['herdr', 'notify', 'install'], ['herdr', 'notify', 'start'], ['herdr', 'notify', 'uninstall'],
+    ['herdr', 'notify', 'relay', '--home', f.root], ['events', 'install'],
+    ['operator', 'cleanup-investigation-job', 'session', 'job', '1'],
+  ];
+  for (const selection of [['operator'], 'all'] as const) {
+    f.select(['operator'], selection);
+    for (const args of commands) {
+      const result = f.run(args);
+      expect(result.status, `${args.join(' ')}: ${result.stderr}`).toBe(1);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain('install_plugin_unavailable: ');
+      expect(result.stderr).toContain(selection === 'all' ? 'run: rh update\n' : 'run: rh install --plugins operator,peer-runtime\n');
+      expect(result.loaded).toEqual([]);
+    }
+  }
+});
+
+test('core commands and help load no peer-runtime modules; a selected action loads its body', () => {
+  const f = peerGateFixture(); f.select([]);
+  for (const args of [
+    ['status', '--json'], ['doctor', '--json'], ['seats', 'argv', 'worker', '--json'],
+    ['review', 'admit', '--request', 'missing.json'], ['review', 'revoke', '--request', 'missing.json'],
+    ['review', 'publish', '--pr', '1', '--receipt', 'missing.json', '--seat', 'gatekeeper'],
+    ['review', 'round', '--help'], ['herdr', 'notify', 'install', '--help'], ['events', 'install', '--help'],
+  ]) {
+    const result = f.run(args);
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).not.toContain('install_plugin_unavailable: ');
+    expect(result.loaded, args.join(' ')).toEqual([]);
+  }
+  f.select(PLUGIN_IDS, 'all');
+  const selected = f.run(['herdr', 'notify', 'start']);
+  expect(selected.status).toBe(1); // A private HOME has no notify config and starts no terminal.
+  expect(selected.stderr).not.toContain('install_plugin_unavailable: ');
+  expect(selected.loaded).toContainEqual(expect.stringContaining('/commands/herdr-actions.ts'));
+});
+
+function fixture() {
+  const root = tmpWorkspace('review-cli-repo'), home = tmpWorkspace('review-cli-home'); roots.push(root, home); initGitRepo(root);
+  const input: ReviewAdmissionInput = { issue_number: 903, execution_mode: 'contract', repository_id: 'R_provider', issue_id: 'I_903',
+    campaign_id: 'review', actor_id: 'U_owner', goal: { revision: 'goal-1', content: 'Preserve feedback and acceptance.' }, oracles: [],
+    policy: { reviewer: 'Codex', user_waiver: 'forbidden', policy_sha256: hash('policy') }, allowed_paths: ['src/**'], benchmark: 'not_required',
+    verification_plan: { protocol: 1, checks: [{ id: 'behavior', kind: 'command', command: 'true', cwd: '.', phase: 'verification',
+      cost: 'normal', evidence_policy: 'current_exact', necessity: 'Check the feature.', inputs: { env: [] } }] } };
+  const admission = createReviewAdmission(input);
+  const identity = { repository_id: input.repository_id, issue_id: input.issue_id, campaign_id: input.campaign_id };
+  const active = join(home, '.repo-harness', 'gates', gatesDirectoryName(root), 'review-admissions', reviewCampaignKey(identity).slice(7), 'active.json');
+  const request = (name: string, body: unknown) => { const file = join(root, `${name}.json`); writeFileSync(file, JSON.stringify(body)); return file; };
+  const read = (grant: string) => readReviewAdmission({ repoRoot: root, authorityHome: home, ...identity, expectedGrantSha256: grant,
+    expectedPolicySha256: input.policy.policy_sha256, expectedActor: input.actor_id, expectedGoal: input.goal,
+    round: { subject: { status: 'ok', scope: 'normalized-final-content', target_ref: 'main', target_rev: '1'.repeat(40), head_rev: '2'.repeat(40),
+      review_subject_sha256: hash('content') }, verification: { plan_sha256: hashVerificationPlan(input.verification_plan),
+      source_sha256: hash('source'), evidence_sha256: hash('report'), tree_sha256: hash('tree') } } });
+  return { root, home, input, admission, identity, active, request, read };
+}
+
+async function runReview(home: string, args: readonly string[]) {
+  // Only the account home is redirected; the command still uses the real store, locks and CAS.
+  const homeSpy = spyOn(accountHome, 'osAccountHome').mockReturnValue(home);
+  const exitCode = process.exitCode;
+  let stdout = '', stderr = '';
+  const out = spyOn(console, 'log').mockImplementation((value: unknown) => { stdout += `${String(value)}\n`; });
+  const err = spyOn(console, 'error').mockImplementation((value: unknown) => { stderr += `${String(value)}\n`; });
+  try {
+    process.exitCode = 0;
+    await buildReviewCommand(() => taskReviewRunner).parseAsync([...args], { from: 'user' });
+    return { status: Number(process.exitCode ?? 0), stdout, stderr };
+  } finally {
+    homeSpy.mockRestore(); out.mockRestore(); err.mockRestore(); process.exitCode = exitCode;
+  }
+}
+
+test('review revoke applies an exact active-grant CAS and task consumers observe the revocation', async () => {
+  const f = fixture();
+  const admitted = await runReview(f.home, ['admit', '--repo', f.root, '--request', f.request('admit', {
+    admission: f.input, approval: controlApprovalFixture(f.root, f.admission, 0), expectedRevision: 0 })]);
+  expect(admitted.status, admitted.stderr).toBe(0);
+  const grant = JSON.parse(admitted.stdout).grant_sha256 as string;
+  expect(f.read(grant).revision).toBe(1);
+  const revoke = (name: string, changes: Record<string, unknown>) => runReview(f.home, ['revoke', '--repo', f.root, '--request',
+    f.request(name, { ...f.identity, expectedGrantSha256: grant, expectedRevision: 1, ...changes })]);
+
+  const before = readFileSync(f.active, 'utf8');
+  const stale = await revoke('stale-grant', { expectedGrantSha256: hash('stale grant') });
+  expect(stale.status).toBe(1);
+  expect(stale.stderr).toContain('review revoke: review_admission_revoked_or_replaced');
+  const staleRevision = await revoke('stale-revision', { expectedRevision: 0 });
+  expect(staleRevision.status).toBe(1);
+  expect(staleRevision.stderr).toContain('review_admission_revision_changed');
+  const unknown = await revoke('unknown', { campaign_id: 'unknown-campaign' });
+  expect(unknown.status).toBe(1);
+  expect(unknown.stderr).toContain('review_admission_missing');
+  const extra = await revoke('extra-field', { approval: {} });
+  expect(extra.status).toBe(1);
+  expect(extra.stderr).toContain('review_control_request_invalid');
+  expect(readFileSync(f.active, 'utf8')).toBe(before);
+  expect(f.read(grant).revision).toBe(1);
+
+  const revoked = await revoke('revoke', {});
+  expect(revoked.status, revoked.stderr).toBe(0);
+  expect(JSON.parse(revoked.stdout)).toEqual({ revision: 2, revoked_grant_sha256: grant });
+  expect(() => f.read(grant)).toThrow('revoked_or_replaced');
+  const again = await revoke('revoke-again', { expectedRevision: 2 });
+  expect(again.status).toBe(1);
+  expect(again.stderr).toContain('review_admission_revoked_or_replaced');
+});
+const publishHome = () => { const home = tmpWorkspace('review-publish-home'); roots.push(home); return home; };
+
+function publishReceipt(overrides: Record<string, unknown> = {}) {
+  return {
+    protocol: 2,
+    kind: 'repo-harness-review-publish-receipt',
+    round: 1,
+    subject_sha: PUBLISH_HEAD,
+    risk_tier: 'high',
+    reviewer: { harness: 'codex', actual_model: 'gpt-5.1-codex' },
+    verdict: 'FAIL',
+    model_relation: 'different-family',
+    summary: 'One blocking finding and one NIT.',
+    findings: [
+      { id: 'F1', severity: 'P1', path: 'src/example.ts', line: 12, evidence: 'The guard drops the last item.', fix: 'Use the inclusive bound.' },
+      { id: 'N1', severity: 'P3', message: 'Rename the helper for clarity.' },
+    ],
+    confirmed_fixed: [],
+    ...overrides,
+  };
+}
+
+// Lines 10-14 of src/example.ts are in the PR diff; the default F1 finding sits on line 12.
+const DIFF_PATCH = '@@ -10,3 +10,5 @@\n context\n-old\n+new\n+added\n context\n context\n';
+const publishScenario = (overrides: Parameters<typeof passingScenario>[0] = {}) =>
+  passingScenario({ changedFiles: [{ filename: 'src/example.ts', patch: DIFF_PATCH }], ...overrides });
+
+function publishFixture(scenario = publishScenario()) {
+  const root = tmpWorkspace('review-publish-root'); roots.push(root);
+  const gh = installFakeGh(root, scenario);
+  return { root, gh, receipt: join(root, 'receipt.json') };
+}
+
+async function runPublish(fixture: ReturnType<typeof publishFixture>, seat: string | undefined, receipt: unknown, extraArgs: readonly string[] = []) {
+  writeFileSync(fixture.receipt, JSON.stringify(receipt));
+  const previous = process.env.REPO_HARNESS_GH_BIN;
+  process.env.REPO_HARNESS_GH_BIN = fixture.gh.bin;
+  try {
+    const seatArgs = seat === undefined ? [] : ['--seat', seat];
+    return await runReview(publishHome(), ['publish', '--repo', fixture.root, '--pr', String(PUBLISH_PR), '--receipt', fixture.receipt, '--json', ...seatArgs, ...extraArgs]);
+  } finally {
+    if (previous === undefined) delete process.env.REPO_HARNESS_GH_BIN;
+    else process.env.REPO_HARNESS_GH_BIN = previous;
+  }
+}
+
+function postedInputs(fixture: ReturnType<typeof publishFixture>, suffix: string) {
+  return fixture.gh.inputs().filter((entry) => entry.args.some((arg) => arg === suffix || arg.endsWith(suffix)));
+}
+
+test('publish posts the claim, one review thread per P1/P2, then the record', async () => {
+  const fixture = publishFixture();
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt());
+  expect(result.status, result.stderr).toBe(0);
+  const output = JSON.parse(result.stdout);
+  expect(output).toMatchObject({ ok: true, pr: PUBLISH_PR, head_sha: PUBLISH_HEAD, round: 1, threads: 1, resolved_threads: [] });
+  expect(output.claim_url).toContain('/pull/' + PUBLISH_PR + '#issuecomment-');
+  expect(output.review_url).toContain('#pullrequestreview-');
+  expect(output.record_url).toContain('/pull/' + PUBLISH_PR + '#issuecomment-');
+
+  const posts = fixture.gh.inputs().filter((entry) => entry.input !== '').map((entry) => JSON.parse(entry.input));
+  expect(posts).toHaveLength(3);
+  expect(posts[0].body).toContain('repo-harness acceptance claim\nRole: acceptor\nSeat: gatekeeper\n');
+  expect(posts[0].body).toContain('Tier: high');
+  expect(posts[0].body).toContain('Agent: codex (gpt-5.1-codex), read-only');
+  expect(posts[1]).toMatchObject({ commit_id: PUBLISH_HEAD, event: 'COMMENT' });
+  expect(posts[1].comments).toHaveLength(1);
+  expect(posts[1].comments[0]).toMatchObject({ path: 'src/example.ts', line: 12, side: 'RIGHT' });
+  expect(posts[1].comments[0].body).toContain('The guard drops the last item.');
+  expect(posts[1].comments[0].body).toContain('Use the inclusive bound.');
+  expect(posts[1].body).toContain('Rename the helper for clarity.');
+  expect(posts[1].body).not.toContain('The guard drops the last item.');
+  expect(posts[1].comments[0].body).not.toContain('Rename the helper for clarity.');
+  expect(posts[2].body).toContain('repo-harness acceptance record');
+  expect(posts[2].body).toContain('\nSeat: gatekeeper\n');
+  expect(posts[2].body).toContain('Model relation: different-family');
+  expect(posts[2].body).toContain('FAIL: 1 P1, 1 P3');
+  expect(posts[2].body).toContain(output.claim_url);
+  expect(posts[2].body).toContain('read-only');
+  expect(posts[2].body).not.toContain('fresh context');
+
+  const reviewerFixture = publishFixture();
+  const reviewerResult = await runPublish(reviewerFixture, 'reviewer', publishReceipt());
+  expect(reviewerResult.status, reviewerResult.stderr).toBe(0);
+  const reviewerPosts = reviewerFixture.gh.inputs().filter((entry) => entry.input !== '').map((entry) => JSON.parse(entry.input));
+  expect(reviewerPosts[0].body).toContain('\nSeat: reviewer\n');
+  expect(reviewerPosts[2].body).toContain('\nSeat: reviewer\n');
+});
+
+test.each([['omitted', undefined], ['invalid', 'worker']] as const)('publish refuses an %s seat before calling GitHub', async (_case, seat) => {
+  const fixture = publishFixture();
+  const result = await runPublish(fixture, seat, publishReceipt());
+
+  expect(fixture.gh.calls()).toEqual([]);
+  expect(result.status).toBe(2);
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    ok: false, error: 'review_receipt_invalid', exit_code: 2, posted: [],
+    message: 'review publish requires --seat gatekeeper or --seat reviewer',
+  });
+});
+
+test('a FAIL receipt with no blocking finding is invalid and posts nothing', async () => {
+  const fixture = publishFixture();
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt({ findings: [{ id: 'N1', severity: 'P3', message: 'Only a NIT.' }] }));
+  expect(result.status).toBe(2);
+  expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: 'review_receipt_invalid', exit_code: 2, posted: [] });
+  expect(fixture.gh.calls()).toEqual([]);
+});
+
+test('a FAIL receipt whose only finding is a P2 is invalid: P2 does not block the merge', async () => {
+  const fixture = publishFixture();
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt({ findings: [
+    { id: 'F1', severity: 'P2', path: 'src/example.ts', line: 12, evidence: 'A small real defect.', fix: 'Close the boundary case.' }] }));
+  expect(result.status).toBe(2);
+  expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: 'review_receipt_invalid', exit_code: 2, posted: [] });
+  expect(JSON.parse(result.stdout).message).toContain('FAIL requires at least one P0 or P1 finding');
+  expect(fixture.gh.calls()).toEqual([]);
+});
+
+test('a PASS receipt that carries a P2 is accepted, and the P2 gets its own follow-up thread', async () => {
+  const fixture = publishFixture();
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt({ verdict: 'PASS', findings: [
+    { id: 'F2', severity: 'P2', path: 'src/example.ts', line: 12, evidence: 'A small real defect.', fix: 'Close the boundary case.' }] }));
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, threads: 1 });
+  const posts = fixture.gh.inputs().filter((entry) => entry.input !== '').map((entry) => JSON.parse(entry.input));
+  expect(posts[1].comments).toHaveLength(1);
+  expect(posts[1].comments[0].body).toContain('**P2 F2**');
+  expect(posts[2].body).toContain('PASS: 1 P2');
+});
+
+const OWNER_BASE = 'https://github.com/example/repo-harness';
+const ownerRecord = (path: string) => OWNER_BASE + path + '#issuecomment-900';
+
+test('a round above 5 without an owner record is refused and posts nothing', async () => {
+  const fixture = publishFixture();
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt({ round: 6 }));
+  expect(result.status).toBe(2);
+  expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: 'review_receipt_invalid', posted: [] });
+  expect(fixture.gh.inputs().some((entry) => entry.input !== '')).toBe(false);
+});
+
+test('a round above 5 with an owner record on the PR names it in the claim and the record', async () => {
+  const url = ownerRecord('/pull/' + PUBLISH_PR);
+  const fixture = publishFixture();
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt({ round: 6 }), ['--owner-record', url]);
+  expect(result.status, result.stderr).toBe(0);
+  const posts = fixture.gh.inputs().filter((entry) => entry.input !== '').map((entry) => JSON.parse(entry.input));
+  expect(posts[0].body).toContain('Round: 6\n');
+  expect(posts[0].body).toContain('Owner record: ' + url);
+  expect(posts[2].body).toContain('Owner record: ' + url);
+});
+
+test('a round above 5 accepts an owner record on an issue the PR closes and refuses other issues', async () => {
+  const closing = publishFixture(publishScenario({ closing: ['example/repo-harness#2000'] }));
+  const accepted = await runPublish(closing, 'gatekeeper', publishReceipt({ round: 6 }), ['--owner-record', ownerRecord('/issues/2000')]);
+  expect(accepted.status, accepted.stderr).toBe(0);
+  const other = publishFixture(publishScenario({ closing: ['example/repo-harness#2000'] }));
+  const refused = await runPublish(other, 'gatekeeper', publishReceipt({ round: 6 }), ['--owner-record', ownerRecord('/issues/2001')]);
+  expect(refused.status).toBe(2);
+  expect(other.gh.inputs().some((entry) => entry.input !== '')).toBe(false);
+});
+
+test('an owner record must match the closing issue repository and the path kind', async () => {
+  const refuse = async (closing: string, path: string) => {
+    const fixture = publishFixture(publishScenario({ closing: [closing] }));
+    const result = await runPublish(fixture, 'gatekeeper', publishReceipt({ round: 6 }), ['--owner-record', ownerRecord(path)]);
+    expect(result.status).toBe(2);
+    expect(fixture.gh.inputs().some((entry) => entry.input !== '')).toBe(false);
+  };
+  await refuse('other/repo#2000', '/issues/2000');
+  await refuse('example/repo-harness#2000', '/pull/2000');
+});
+
+test('an owner record with a round up to 5 is refused', async () => {
+  const fixture = publishFixture();
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt({ round: 5 }), ['--owner-record', ownerRecord('/pull/' + PUBLISH_PR)]);
+  expect(result.status).toBe(2);
+  expect(fixture.gh.inputs().some((entry) => entry.input !== '')).toBe(false);
+});
+
+test('a stale subject exits 2 and posts nothing', async () => {
+  const fixture = publishFixture();
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt({ subject_sha: 'b'.repeat(40) }));
+  expect(result.status).toBe(2);
+  expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: 'review_subject_stale', exit_code: 2, posted: [] });
+  expect(fixture.gh.calls().some((args) => args.includes('POST'))).toBe(false);
+  expect(fixture.gh.inputs().some((entry) => entry.input !== '')).toBe(false);
+});
+
+test('a PASS receipt with no P1/P2 opens no review thread', async () => {
+  const fixture = publishFixture();
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt({ verdict: 'PASS', findings: [
+    { id: 'N1', severity: 'P3', message: 'Rename the helper for clarity.' },
+  ] }));
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, threads: 0 });
+  const review = JSON.parse(postedInputs(fixture, '/reviews')[0]!.input);
+  expect(review.comments ?? []).toEqual([]);
+  expect(review.body).toContain('Rename the helper for clarity.');
+  expect(review.event).toBe('COMMENT');
+});
+
+const earlierReview = (round: number) => 'repo-harness acceptance review\nRound: ' + round + '\nSubject: ' + 'b'.repeat(40) + '\n';
+const confirmReceipt = (ids: readonly string[]) => publishReceipt({ round: 2, verdict: 'PASS', findings: [], confirmed_fixed: ids });
+// The thread mutations in call order: the mutation name and its body variable, if any.
+const threadMutations = (fixture: ReturnType<typeof publishFixture>) => fixture.gh.calls()
+  .filter((args) => args.some((arg) => arg.startsWith('query=mutation')))
+  .map((args) => [/\{ (\w+)\(/.exec(args.find((arg) => arg.startsWith('query='))!)![1], args.find((arg) => arg.startsWith('body='))?.slice(5)]);
+
+test('publish replies on and resolves an earlier-round thread that its receipt confirms, after the record', async () => {
+  const fixture = publishFixture(publishScenario({ threadNodes: { PRRT_one: { reviewBody: earlierReview(1) } } }));
+  const result = await runPublish(fixture, 'gatekeeper', confirmReceipt(['PRRT_one']));
+  expect(result.status, result.stderr).toBe(0);
+  const output = JSON.parse(result.stdout);
+  expect(output.resolved_threads).toEqual(['PRRT_one']);
+  expect(threadMutations(fixture)).toEqual([
+    ['addPullRequestReviewThreadReply', 'repo-harness review reply\nAgent: codex (gpt-5.1-codex), read-only\nDisposition: confirmed fixed in round 2 on '
+      + PUBLISH_HEAD + '\nWhy: ' + output.record_url + '\n'],
+    ['resolveReviewThread', undefined]]);
+  const calls = fixture.gh.calls();
+  // The reply cites the record, so the record POST comes first.
+  expect(calls.findIndex((args) => args.some((arg) => arg.includes('addPullRequestReviewThreadReply'))))
+    .toBeGreaterThan(calls.map((args) => args.some((arg) => arg.endsWith('/issues/' + PUBLISH_PR + '/comments'))).lastIndexOf(true));
+});
+
+test('a confirmed id that is not an earlier publish thread of this PR is refused and nothing is posted', async () => {
+  for (const thread of [{ reviewBody: 'Looks good to me.' }, { pr: PUBLISH_PR + 1, reviewBody: earlierReview(1) }, { reviewBody: earlierReview(2) },
+    { association: 'NONE', reviewBody: earlierReview(1) }]) {
+    const fixture = publishFixture(publishScenario({ threadNodes: { PRRT_one: thread } }));
+    const result = await runPublish(fixture, 'gatekeeper', confirmReceipt(['PRRT_one']));
+    expect(result.status, JSON.stringify(thread)).toBe(2);
+    expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: 'review_receipt_invalid', posted: [] });
+    expect(fixture.gh.inputs().some((entry) => entry.input !== '')).toBe(false);
+    expect(threadMutations(fixture)).toEqual([]);
+  }
+});
+
+test('an already-resolved confirmed thread is left as is only when it passes the provenance rule', async () => {
+  const fixture = publishFixture(publishScenario({ threadNodes: { PRRT_one: { reviewBody: earlierReview(1) }, PRRT_done: { isResolved: true, reviewBody: earlierReview(1) } } }));
+  const result = await runPublish(fixture, 'gatekeeper', confirmReceipt(['PRRT_done', 'PRRT_one']));
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ resolved_threads: ['PRRT_one'], already_resolved_threads: ['PRRT_done'] });
+  expect(fixture.gh.calls().filter((args) => args.includes('id=PRRT_done') && args.some((arg) => arg.startsWith('query=mutation')))).toEqual([]);
+  const outside = publishFixture(publishScenario({ threadNodes: { PRRT_done: { isResolved: true, association: 'NONE', reviewBody: earlierReview(1) } } }));
+  const refused = await runPublish(outside, 'gatekeeper', confirmReceipt(['PRRT_done']));
+  expect(JSON.parse(refused.stdout)).toMatchObject({ ok: false, error: 'review_receipt_invalid', posted: [] });
+  expect(outside.gh.inputs().some((entry) => entry.input !== '')).toBe(false);
+  expect(threadMutations(outside)).toEqual([]);
+});
+
+test('a failed or unknown thread write stops publish, names the record and both thread sets, and is not retried', async () => {
+  const threadNodes = { PRRT_one: { reviewBody: earlierReview(1) }, PRRT_two: { reviewBody: earlierReview(1) }, PRRT_three: { reviewBody: earlierReview(1) } };
+  for (const [stage, outcome, error] of [['reply', 'rejected', 'review_publish_partial'], ['resolve', 'unknown', 'review_publish_unknown'],
+    ['reply', 'unconfirmed', 'review_publish_unknown'], ['resolve', 'unconfirmed', 'review_publish_unknown']] as const) {
+    const fixture = publishFixture(publishScenario({ threadNodes, failThread: { stage, id: 'PRRT_two', outcome } }));
+    const result = await runPublish(fixture, 'gatekeeper', confirmReceipt(['PRRT_one', 'PRRT_two', 'PRRT_three']));
+    expect(result.status, stage).toBe(5);
+    const output = JSON.parse(result.stdout);
+    expect(output).toMatchObject({ ok: false, error });
+    const recordUrl = output.posted.at(-1);
+    expect(recordUrl).toContain('/pull/' + PUBLISH_PR + '#issuecomment-');
+    expect(output.message).toContain('record ' + recordUrl + '; resolved threads: PRRT_one; unresolved threads: PRRT_two, PRRT_three');
+    expect(threadMutations(fixture).map(([name]) => name)).toEqual(stage === 'reply'
+      ? ['addPullRequestReviewThreadReply', 'resolveReviewThread', 'addPullRequestReviewThreadReply']
+      : ['addPullRequestReviewThreadReply', 'resolveReviewThread', 'addPullRequestReviewThreadReply', 'resolveReviewThread']);
+  }
+});
+
+test('head movement between thread writes stops before the next write with the thread progress', async () => {
+  const fixture = publishFixture(publishScenario({ threadNodes: { PRRT_one: { reviewBody: earlierReview(1) }, PRRT_two: { reviewBody: earlierReview(1) } },
+    headSequence: [PUBLISH_HEAD, PUBLISH_HEAD, PUBLISH_HEAD, PUBLISH_HEAD, PUBLISH_HEAD, 'f'.repeat(40)] }));
+  const result = await runPublish(fixture, 'gatekeeper', confirmReceipt(['PRRT_one', 'PRRT_two']));
+  expect(result.status).toBe(5);
+  const output = JSON.parse(result.stdout);
+  expect(output).toMatchObject({ ok: false, error: 'review_publish_partial' });
+  expect(output.message).toContain('to the reply on thread PRRT_two; record ' + output.posted.at(-1) + '; resolved threads: PRRT_one; unresolved threads: PRRT_two');
+  expect(threadMutations(fixture).map(([name]) => name)).toEqual(['addPullRequestReviewThreadReply', 'resolveReviewThread']);
+});
+
+test('a finding outside the diff goes into the review body, not an inline comment', async () => {
+  const fixture = publishFixture();
+  const outside = { id: 'F2', severity: 'P2', path: 'src/example.ts', line: 15, evidence: 'A pre-existing call site ignores the result.', fix: 'Check the result.' };
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt({ findings: [
+    { id: 'F1', severity: 'P1', path: 'src/example.ts', line: 12, evidence: 'The guard drops the last item.', fix: 'Use the inclusive bound.' }, outside] }));
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, threads: 1 });
+  const review = JSON.parse(postedInputs(fixture, '/reviews')[0]!.input);
+  expect(review.comments).toHaveLength(1);
+  expect(review.comments[0].line).toBe(12);
+  expect(review.body).toContain('## Findings outside the diff');
+  expect(review.body).toContain('F2 at src/example.ts:15');
+  expect(review.body).not.toContain('F1 at');
+});
+
+test('a retry reuses the claim already on the PR instead of posting a second one', async () => {
+  const claimUrl = 'https://github.com/example/repo-harness/pull/' + PUBLISH_PR + '#issuecomment-777';
+  const claimBody = renderAcceptanceClaim(validateReviewPublishReceipt(publishReceipt()));
+  const fixture = publishFixture(publishScenario({ existingComments: [{ body: claimBody, html_url: claimUrl }] }));
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt());
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout).claim_url).toBe(claimUrl);
+  expect(fixture.gh.inputs().filter((entry) => entry.input.includes('repo-harness acceptance claim'))).toHaveLength(0);
+  expect(JSON.parse(postedInputs(fixture, '/issues/' + PUBLISH_PR + '/comments').find((entry) => entry.input !== '')!.input).body).toContain('Claim: ' + claimUrl);
+});
+
+test('a later conflicting claim for the same subject and round stops the retry even after an identical one', async () => {
+  const claimBody = renderAcceptanceClaim(validateReviewPublishReceipt(publishReceipt({ risk_tier: 'low' })));
+  const fixture = publishFixture(publishScenario({ existingComments: [
+    { body: renderAcceptanceClaim(validateReviewPublishReceipt(publishReceipt())), html_url: 'https://github.com/example/repo-harness/pull/' + PUBLISH_PR + '#issuecomment-777' },
+    { body: claimBody, html_url: 'https://github.com/example/repo-harness/pull/' + PUBLISH_PR + '#issuecomment-778' }] }));
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt());
+  expect(result.status).toBe(2);
+  expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: 'review_publish_conflict', exit_code: 2, posted: [] });
+  expect(fixture.gh.inputs().some((entry) => entry.input !== '')).toBe(false);
+});
+
+// A High round has two reviews of one subject (acceptor.md section 2.2): they publish in turn, each with its own claim (#2061).
+test('a second reviewer agent of the same subject and round posts its own claim and record', async () => {
+  const pass = (harness: string, actual_model: string) => publishReceipt({ reviewer: { harness, actual_model }, verdict: 'PASS', summary: 'No blocking finding.', findings: [] });
+  const posted = (fixture: ReturnType<typeof publishFixture>) => postedInputs(fixture, '/issues/' + PUBLISH_PR + '/comments')
+    .filter((entry) => entry.input !== '').map((entry) => (JSON.parse(entry.input) as { body: string }).body);
+  const first = publishFixture();
+  const gatekeeper = await runPublish(first, 'gatekeeper', pass('codex', 'gpt-5.1-codex'));
+  expect(gatekeeper.status, gatekeeper.stderr).toBe(0);
+  const firstClaim = JSON.parse(gatekeeper.stdout).claim_url as string;
+  const [claimBody, recordBody] = posted(first);
+  const second = publishFixture(publishScenario({ existingComments: [{ body: claimBody!, html_url: firstClaim }, { body: recordBody!, html_url: JSON.parse(gatekeeper.stdout).record_url }] }));
+  const reviewer = await runPublish(second, 'reviewer', pass('claude', 'claude-opus-5-5'));
+  expect(reviewer.status, reviewer.stderr).toBe(0);
+  const secondClaim = JSON.parse(reviewer.stdout).claim_url as string;
+  expect(secondClaim).not.toBe(firstClaim);
+  expect(posted(second).map((body) => body.split('\n')[0])).toEqual(['repo-harness acceptance claim', 'repo-harness acceptance record']);
+  expect([recordBody, posted(second)[1]].map((body) => body!.split('\n')[1])).toEqual(['Claim: ' + firstClaim, 'Claim: ' + secondClaim]);
+});
+
+test('a failure after the claim stops with review_publish_partial and the posted URLs', async () => {
+  const fixture = publishFixture(publishScenario({ failPost: 'review' }));
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt());
+  expect(result.status).toBe(5);
+  const output = JSON.parse(result.stdout);
+  expect(output).toMatchObject({ ok: false, error: 'review_publish_partial', exit_code: 5 });
+  expect(output.posted).toHaveLength(1);
+  expect(output.posted[0]).toContain('/pull/' + PUBLISH_PR + '#issuecomment-');
+  expect(fixture.gh.inputs().filter((entry) => entry.args.some((arg) => arg.endsWith('/reviews')))).toHaveLength(1);
+  expect(fixture.gh.inputs().filter((entry) => entry.input.includes('repo-harness acceptance record'))).toHaveLength(0);
+});
+
+test('a POST with an unknown outcome exits 5 with the confirmed URLs and is not retried', async () => {
+  const fixture = publishFixture(publishScenario({ unknownPost: 'review' }));
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt());
+  expect(result.status).toBe(5);
+  const output = JSON.parse(result.stdout);
+  expect(output).toMatchObject({ ok: false, error: 'review_publish_unknown', exit_code: 5, inspect_required: true });
+  expect(output.posted).toHaveLength(1);
+  expect(output.posted[0]).toContain('/pull/' + PUBLISH_PR + '#issuecomment-');
+  expect(output.confirmed_urls).toEqual(output.posted);
+  expect(output.message).toContain('inspection is required');
+  expect(fixture.gh.inputs().filter((entry) => entry.args.some((arg) => arg.endsWith('/reviews')))).toHaveLength(1);
+  expect(fixture.gh.inputs().filter((entry) => entry.input.includes('repo-harness acceptance record'))).toHaveLength(0);
+});
+
+test('a claim POST with no provider answer exits 5 with no confirmed URL and requires inspection', async () => {
+  const fixture = publishFixture(publishScenario({ unknownPost: 'claim', unknownPostMode: 'timeout' }));
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt());
+  expect(result.status).toBe(5);
+  const output = JSON.parse(result.stdout);
+  expect(output).toMatchObject({ ok: false, error: 'review_publish_unknown', exit_code: 5, inspect_required: true, posted: [] });
+  expect(output.confirmed_urls).toEqual([]);
+  expect(fixture.gh.inputs().filter((entry) => entry.args.some((arg) => arg.endsWith('/reviews')))).toHaveLength(0);
+  expect(fixture.gh.inputs().filter((entry) => entry.input.includes('repo-harness acceptance record'))).toHaveLength(0);
+});
+
+test('a POST transport failure with exit 1 and EOF reports the unknown outcome', async () => {
+  const fixture = publishFixture(publishScenario({ unknownPost: 'review', unknownPostMode: 'transport' }));
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt());
+  expect(result.status).toBe(5);
+  const output = JSON.parse(result.stdout);
+  expect(output).toMatchObject({ ok: false, error: 'review_publish_unknown', exit_code: 5, inspect_required: true });
+  expect(output.posted).toHaveLength(1);
+  expect(output.posted[0]).toContain('/pull/' + PUBLISH_PR + '#issuecomment-');
+  expect(output.message).toContain('gh: EOF');
+  expect(fixture.gh.inputs().filter((entry) => entry.args.some((arg) => arg.endsWith('/reviews')))).toHaveLength(1);
+  expect(fixture.gh.inputs().filter((entry) => entry.input.includes('repo-harness acceptance record'))).toHaveLength(0);
+});
+
+test('a record POST whose response fails URL validation exits 5 and keeps the confirmed URLs', async () => {
+  const fixture = publishFixture(publishScenario({ unknownPost: 'record', unknownPostMode: 'bad_url' }));
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt());
+  expect(result.status).toBe(5);
+  const output = JSON.parse(result.stdout);
+  expect(output).toMatchObject({ ok: false, error: 'review_publish_unknown', exit_code: 5, inspect_required: true });
+  expect(output.posted).toHaveLength(2);
+  expect(output.posted[0]).toContain('/pull/' + PUBLISH_PR + '#issuecomment-');
+  expect(output.posted[1]).toContain('#pullrequestreview-');
+  expect(output.confirmed_urls).toEqual(output.posted);
+  expect(fixture.gh.inputs().filter((entry) => entry.input.includes('repo-harness acceptance record'))).toHaveLength(1);
+});
+
+test('a valid review URL with a wrong binding or state is retained in the unknown outcome', async () => {
+  for (const reviewBinding of ['wrong_commit', 'wrong_state'] as const) {
+    const fixture = publishFixture(publishScenario({ reviewBinding }));
+    const result = await runPublish(fixture, 'gatekeeper', publishReceipt());
+    expect(result.status).toBe(5);
+    const output = JSON.parse(result.stdout);
+    expect(output).toMatchObject({ ok: false, error: 'review_publish_unknown', exit_code: 5, inspect_required: true });
+    expect(output.posted).toHaveLength(2);
+    expect(output.posted[0]).toContain('/pull/' + PUBLISH_PR + '#issuecomment-');
+    expect(output.posted[1]).toContain('#pullrequestreview-');
+    expect(output.confirmed_urls).toEqual(output.posted);
+    expect(fixture.gh.inputs().filter((entry) => entry.args.some((arg) => arg.endsWith('/reviews')))).toHaveLength(1);
+    expect(fixture.gh.inputs().filter((entry) => entry.input.includes('repo-harness acceptance record'))).toHaveLength(0);
+  }
+});
+
+test('head movement between the claim and the review stops before the review', async () => {
+  const moved = 'f'.repeat(40);
+  const fixture = publishFixture(publishScenario({ headSequence: [PUBLISH_HEAD, moved] }));
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt());
+  expect(result.status).toBe(5);
+  const output = JSON.parse(result.stdout);
+  expect(output).toMatchObject({ ok: false, error: 'review_publish_partial', exit_code: 5 });
+  expect(output.posted).toHaveLength(1);
+  expect(output.posted[0]).toContain('/pull/' + PUBLISH_PR + '#issuecomment-');
+  expect(output.message).toContain('head moved');
+  expect(output.message).toContain('inspection is required');
+  expect(fixture.gh.inputs().filter((entry) => entry.args.some((arg) => arg.endsWith('/reviews')))).toHaveLength(0);
+  expect(fixture.gh.inputs().filter((entry) => entry.input.includes('repo-harness acceptance record'))).toHaveLength(0);
+});
+
+test('head movement between the review and the record stops before the record', async () => {
+  const moved = 'f'.repeat(40);
+  const fixture = publishFixture(publishScenario({ headSequence: [PUBLISH_HEAD, PUBLISH_HEAD, moved] }));
+  const result = await runPublish(fixture, 'gatekeeper', publishReceipt());
+  expect(result.status).toBe(5);
+  const output = JSON.parse(result.stdout);
+  expect(output).toMatchObject({ ok: false, error: 'review_publish_partial', exit_code: 5 });
+  expect(output.posted).toHaveLength(2);
+  expect(output.posted[1]).toContain('#pullrequestreview-');
+  expect(output.message).toContain('before the record');
+  expect(fixture.gh.inputs().filter((entry) => entry.input.includes('repo-harness acceptance record'))).toHaveLength(0);
+});
+
+
+test('review round registers one admission repository id and parses the optional PR selection', () => {
+  const command = buildReviewCommand(() => taskReviewRunner);
+  const round = command.commands.find((child) => child.name() === 'round');
+  if (!round) throw new Error('review round is missing');
+  const longs = round.options.map((option) => option.long).filter((value): value is string => value !== undefined);
+  expect(longs.filter((value) => value === '--repository-id')).toHaveLength(1);
+  expect(longs).toEqual(expect.arrayContaining(['--repository', '--pr', '--base']));
+  // Parse the flags without running the action.
+  round.parseOptions(['--repository-id', '1001', '--repository', 'example/repo-harness', '--pr', '42', '--base', 'b'.repeat(40)]);
+  expect(round.opts()).toMatchObject({ repositoryId: '1001', repository: 'example/repo-harness', pr: '42', base: 'b'.repeat(40) });
+});
+
+test('review round refuses the classic --launch herdr value before it reads the admission', async () => {
+  const home = publishHome();
+  const required = ['--repository-id', '1001', '--issue-id', 'I_1', '--campaign-id', 'review', '--grant-sha256', hash('grant'),
+    '--policy-sha256', hash('policy'), '--actor', 'U_owner', '--reviewer-repo', home, '--claim-ref', 'claim', '--claim-revision', hash('claim'),
+    '--verification', 'report.json', '--repo', home];
+  const classic = await runReview(home, ['round', ...required, '--launch', 'herdr', '--herdr-endpoint', join(home, 'endpoint.json')]);
+  expect(classic.status).toBe(1);
+  expect(classic.stderr).toContain('review: review_launch_unsupported');
+  const unaddressed = await runReview(home, ['round', ...required]);
+  expect(unaddressed.status).toBe(1);
+  expect(unaddressed.stderr).toContain('review_launch_addressing_invalid; --herdr-endpoint is required for herdr-app');
+});
+
+test('the optional PR selection is all-or-none and admission identity alone is not a selection', () => {
+  const admission = { repositoryId: '1001' };
+  expect(pullRequestSelectionFromOptions(admission)).toBeUndefined();
+  for (const partial of [
+    { repository: 'example/repo-harness' },
+    { pr: '42' },
+    { base: 'b'.repeat(40) },
+    { repository: 'example/repo-harness', pr: '42' },
+  ]) {
+    expect(() => pullRequestSelectionFromOptions({ ...admission, ...partial }))
+      .toThrow('--repository, --pr and --base must be given together');
+  }
+  expect(pullRequestSelectionFromOptions({ ...admission, repository: 'example/repo-harness', pr: '42', base: 'b'.repeat(40) }))
+    .toEqual({ repository: 'example/repo-harness', provider_repository_id: '1001', pr_number: 42, expected_base_sha: 'b'.repeat(40) });
+});
+
+const seatPacket = (seat = 'gatekeeper', head = PUBLISH_HEAD) => `Task: review PR #${PUBLISH_PR} at head ${head} (tier high, round 1), as the ${seat} of repo-harness-issue-flow. Review.`;
+
+function seatFixture(texts: readonly string[] | null, options: { agentDir?: string; symlinkCwd?: boolean; seat?: string; head?: string } = {}) {
+  const fixture = publishFixture();
+  const home = join(fixture.root, 'home');
+  const real = join(fixture.root, 'seat-real');
+  mkdirSync(real, { recursive: true });
+  const realCwd = realpathSync(real);
+  let cwd = real;
+  if (options.symlinkCwd) { cwd = join(fixture.root, 'seat-link'); symlinkSync(real, cwd); }
+  const agentDir = options.agentDir ?? join(home, '.pi', 'agent');
+  const directory = join(agentDir, 'sessions', '--' + realCwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-') + '--');
+  if (texts !== null) {
+    mkdirSync(directory, { recursive: true });
+    const lines = [JSON.stringify({ type: 'message', message: { role: 'user', content: [{ type: 'text', text: seatPacket(options.seat, options.head) }] } }),
+      ...texts.map((text) => JSON.stringify({ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text }] } }))];
+    writeFileSync(join(directory, 'a.jsonl'), lines.join('\n') + '\n');
+  }
+  return { ...fixture, home, cwd, directory };
+}
+
+async function runCollect(fixture: ReturnType<typeof seatFixture>, agentDir?: string, seat = 'gatekeeper', terminal: { pr?: string; status?: string; argv?: string[]; closed?: string[] } = {}) {
+  const hc = spyOn(herdrCore, 'hcGet').mockReturnValue({ address: 't9', cwd: fixture.cwd, status: terminal.status === undefined ? null : { state: terminal.status },
+    foreground: terminal.argv === undefined ? null : { pid: 1, name: 'pi', argv: terminal.argv, cwd: fixture.cwd },
+    labels: { 'repo-harness.seat': seat, ...(terminal.pr === undefined ? {} : { 'repo-harness.pr': terminal.pr }) } } as never);
+  const ports = spyOn(herdrCore, 'boardHostPorts').mockReturnValue({ closeTerminal: (address: string) => { terminal.closed?.push(address); return { status: 'closed' }; } } as never);
+  const previous = process.env.REPO_HARNESS_GH_BIN;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.REPO_HARNESS_GH_BIN = fixture.gh.bin;
+  if (agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    return await runReview(fixture.home, ['collect', '--repo', fixture.root, '--seat', 't9', '--pr', String(PUBLISH_PR), '--json']);
+  } finally {
+    hc.mockRestore();
+    ports.mockRestore();
+    if (previous === undefined) delete process.env.REPO_HARNESS_GH_BIN; else process.env.REPO_HARNESS_GH_BIN = previous;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+}
+
+const receiptBlock = (receipt: unknown) => 'Done.\nRECEIPT-JSON\n```json\n' + JSON.stringify(receipt, null, 2) + '\n```\n';
+
+test('collect publishes the last RECEIPT-JSON block of the seat session', async () => {
+  const fixture = seatFixture([receiptBlock(publishReceipt({ subject_sha: 'b'.repeat(40) })), receiptBlock(publishReceipt())]);
+  const result = await runCollect(fixture);
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, pr: PUBLISH_PR, head_sha: PUBLISH_HEAD, round: 1, threads: 1, seat_close: { outcome: 'kept', reason: 'other_pr' } });
+});
+
+test('collect closes only the done review seat whose launch packet names the published head, and keeps a seat that still works', async () => {
+  const closed: string[] = [];
+  const current = ['pi', '--model', 'm', seatPacket()];
+  const done = await runCollect(seatFixture([receiptBlock(publishReceipt())]), undefined, 'gatekeeper', { pr: String(PUBLISH_PR), status: 'done', argv: current, closed });
+  expect(done.status, done.stderr).toBe(0);
+  expect([JSON.parse(done.stdout).seat_close, closed]).toEqual([{ outcome: 'closed' }, ['t9']]);
+  // An earlier-head pane shares the worktree, PR and seat labels: collecting the current head through its address leaves it open.
+  const earlier = await runCollect(seatFixture([receiptBlock(publishReceipt())]), undefined, 'gatekeeper', { pr: String(PUBLISH_PR), status: 'done', argv: ['pi', seatPacket('gatekeeper', 'b'.repeat(40))], closed });
+  expect(earlier.status, earlier.stderr).toBe(0);
+  expect([JSON.parse(earlier.stdout).seat_close, closed]).toEqual([{ outcome: 'kept', reason: 'launch_unbound' }, ['t9']]);
+  const working = await runCollect(seatFixture([receiptBlock(publishReceipt())]), undefined, 'gatekeeper', { pr: String(PUBLISH_PR), status: 'working', argv: current, closed });
+  expect([JSON.parse(working.stdout).seat_close, closed]).toEqual([{ outcome: 'kept', reason: 'seat_not_done' }, ['t9']]);
+});
+
+test('collect fails closed on a missing record, block, bad JSON, invalid receipt and stale subject', async () => {
+  const cases: [string, readonly string[] | null, string, string][] = [
+    ['missing session', null, 'review_receipt_invalid', 'session record is missing'],
+    ['no block', ['no receipt here'], 'review_receipt_invalid', 'no RECEIPT-JSON block'],
+    ['bad JSON', ['RECEIPT-JSON\n{"protocol": '], 'review_receipt_invalid', 'decodes to a repo-harness-review-publish-receipt object'],
+    ['not a receipt', ['RECEIPT-JSON\n{"protocol": 1}'], 'review_receipt_invalid', 'decodes to a repo-harness-review-publish-receipt object'],
+    ['top-level array', ['RECEIPT-JSON\n' + JSON.stringify([publishReceipt()])], 'review_receipt_invalid', 'decodes to a repo-harness-review-publish-receipt object'],
+    ['invalid receipt', ['RECEIPT-JSON\n' + JSON.stringify(publishReceipt({ protocol: 1 }))], 'review_receipt_invalid', ''],
+    ['stale subject', [receiptBlock(publishReceipt({ subject_sha: 'b'.repeat(40) }))], 'review_subject_stale', ''],
+    ['receipt for another head than its packet', [receiptBlock(publishReceipt({ subject_sha: 'b'.repeat(40) }))], 'review_receipt_invalid', 'not the packet head'],
+  ];
+  for (const [label, texts, code, message] of cases) {
+    const fixture = seatFixture(texts, label === 'stale subject' ? { head: 'b'.repeat(40) } : {});
+    const result = await runCollect(fixture);
+    expect(result.status, label).toBe(2);
+    expect(JSON.parse(result.stdout), label).toMatchObject({ ok: false, error: code, posted: [] });
+    expect(JSON.parse(result.stdout).message, label).toContain(message);
+    expect(fixture.gh.calls().some((args) => args.includes('POST')), label).toBe(false);
+  }
+});
+
+test('collect binds a session by seat, PR and the PR head, across Pi, Claude and Codex records', async () => {
+  const line = (role: string, text: string) => JSON.stringify({ message: { role, content: role === 'user' ? text : [{ type: 'text', text }] } }) + '\n';
+  const OLD_HEAD = 'b'.repeat(40);
+  const session = (seat: string, head: string, receiptHead = head) => line('user', seatPacket(seat, head)) + line('assistant', receiptBlock(publishReceipt({ subject_sha: receiptHead })));
+  const newer = (path: string) => { const future = new Date(Date.now() + 60_000); utimesSync(path, future, future); };
+
+  // Two Pi gatekeeper seats and an earlier round share one worktree; the other seat's and the earlier round's sessions are newer.
+  const pi = seatFixture([receiptBlock(publishReceipt())]);
+  for (const [name, text] of [['fallback.jsonl', session('gatekeeper-fallback', PUBLISH_HEAD)], ['round0.jsonl', session('gatekeeper', OLD_HEAD)]] as const) {
+    writeFileSync(join(pi.directory, name), text);
+    newer(join(pi.directory, name));
+  }
+  // An aborted attempt at the same head (no receipt) is no candidate and causes no ambiguity.
+  writeFileSync(join(pi.directory, 'aborted.jsonl'), line('user', seatPacket('gatekeeper', PUBLISH_HEAD)) + line('assistant', 'I stopped early.'));
+  const own = await runCollect(pi);
+  expect(own.status, own.stderr).toBe(0);
+  expect(JSON.parse(own.stdout)).toMatchObject({ ok: true, head_sha: PUBLISH_HEAD });
+  const fallback = await runCollect(pi, undefined, 'gatekeeper-fallback');
+  expect(fallback.status, fallback.stderr).toBe(0);
+
+  // Claude Code: string user content under CLAUDE_CONFIG_DIR/projects, with a hook entry before the packet.
+  const claude = seatFixture(null);
+  const configDir = join(claude.root, 'claude-config');
+  const projectDir = join(configDir, 'projects', realpathSync(claude.cwd).replace(/[^A-Za-z0-9]/g, '-'));
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(join(projectDir, 's.jsonl'), line('user', '<system-reminder>x</system-reminder>') + session('reviewer', PUBLISH_HEAD));
+  process.env.CLAUDE_CONFIG_DIR = configDir;
+  try {
+    const result = await runCollect(claude, undefined, 'reviewer');
+    expect(result.status, result.stderr).toBe(0);
+  } finally { delete process.env.CLAUDE_CONFIG_DIR; }
+
+  // Codex: a rollout under CODEX_HOME/sessions/<date> whose session_meta names the cwd; other cwds are skipped.
+  const codex = seatFixture(null);
+  const codexHome = join(codex.root, 'codex-home');
+  const day = join(codexHome, 'sessions', '2026', '11', '16');
+  mkdirSync(day, { recursive: true });
+  const item = (role: string, kind: string, text: string) => JSON.stringify({ type: 'response_item', payload: { type: 'message', role, content: [{ type: kind, text }] } }) + '\n';
+  const meta = (cwd: string) => JSON.stringify({ type: 'session_meta', payload: { cwd, base_instructions: { text: 'x'.repeat(100_000) } } }) + '\n';
+  writeFileSync(join(day, 'rollout-a.jsonl'), meta(realpathSync(codex.cwd)) + item('user', 'input_text', '# AGENTS.md') + item('user', 'input_text', seatPacket()) + item('assistant', 'output_text', receiptBlock(publishReceipt())));
+  writeFileSync(join(day, 'rollout-b.jsonl'), meta(tmpdir()) + item('user', 'input_text', seatPacket()));
+  process.env.CODEX_HOME = codexHome;
+  try {
+    const result = await runCollect(codex);
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, head_sha: PUBLISH_HEAD });
+    // A second session for the same seat and head is ambiguous.
+    writeFileSync(join(day, 'rollout-c.jsonl'), meta(realpathSync(codex.cwd)) + item('user', 'input_text', seatPacket()) + item('assistant', 'output_text', receiptBlock(publishReceipt())));
+    const ambiguous = await runCollect(codex);
+    expect(ambiguous.status).toBe(2);
+    expect(JSON.parse(ambiguous.stdout).message).toContain('2 sessions');
+  } finally { delete process.env.CODEX_HOME; }
+});
+
+test('collect finds the session directory from the realpath of the seat cwd and the Pi agent dir', async () => {
+  const viaLink = seatFixture([receiptBlock(publishReceipt())], { symlinkCwd: true });
+  const linked = await runCollect(viaLink);
+  expect(linked.status, linked.stderr).toBe(0);
+
+  const agentDir = join(mkdtempSync(join(tmpdir(), 'rh-pi-agent-')), 'agent');
+  try {
+    const moved = seatFixture([receiptBlock(publishReceipt())], { agentDir });
+    const result = await runCollect(moved, agentDir);
+    expect(result.status, result.stderr).toBe(0);
+    // Without the override the same seat has no record, and the error names the directory looked for.
+    const missing = await runCollect(moved);
+    expect(JSON.parse(missing.stdout).message).toContain(join(moved.home, '.pi', 'agent', 'sessions'));
+  } finally {
+    rmSync(join(agentDir, '..'), { recursive: true, force: true });
+  }
+});
+
+test('collect decodes the seat form RECEIPT-JSON: with a fenced block and takes the last receipt', async () => {
+  const earlier = publishReceipt({ summary: 'Evidence: RECEIPT-JSON: followed by fenced JSON.' });
+  const last = publishReceipt();
+  const seatForm = (receipt: unknown) => 'RECEIPT-JSON:\n```json\n' + JSON.stringify(receipt, null, 2) + '\n```\n';
+  const result = await runCollect(seatFixture([seatForm(earlier), seatForm(last)]));
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, head_sha: PUBLISH_HEAD });
+});
+
+test('collect skips a RECEIPT-JSON marker inside a string and takes the last receipt object', async () => {
+  const quoted = publishReceipt({ summary: 'See RECEIPT-JSON { "kind": "x" } for the format.' });
+  const fixture = seatFixture([receiptBlock(quoted), 'The block is below.\nRECEIPT-JSON is the marker.']);
+  const result = await runCollect(fixture);
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, head_sha: PUBLISH_HEAD });
+});
+
+test('collect writes Seat: gatekeeper or Seat: reviewer into acceptance claim and record, mapping gatekeeper-fallback to gatekeeper and refusing non-review seats', async () => {
+  const posted = (fixture: ReturnType<typeof seatFixture>) =>
+    fixture.gh.inputs().filter((entry) => entry.input !== '').map((entry) => JSON.parse(entry.input).body as string);
+  for (const [seatLabel, expectedSeat] of [['gatekeeper', 'gatekeeper'], ['gatekeeper-fallback', 'gatekeeper'], ['reviewer', 'reviewer']] as const) {
+    const fixture = seatFixture([receiptBlock(publishReceipt())], { seat: seatLabel });
+    const result = await runCollect(fixture, undefined, seatLabel);
+    expect(result.status, result.stderr).toBe(0);
+    const bodies = posted(fixture);
+    expect(bodies[0]).toContain(`Role: acceptor\nSeat: ${expectedSeat}\n`);
+    expect(bodies[2]).toContain(`\nSeat: ${expectedSeat}\n`);
+  }
+  const worker = seatFixture([receiptBlock(publishReceipt())], { seat: 'worker' });
+  const refused = await runCollect(worker, undefined, 'worker');
+  expect(refused.status).toBe(2);
+  expect(JSON.parse(refused.stdout)).toMatchObject({ ok: false, error: 'review_receipt_invalid', posted: [] });
+  expect(JSON.parse(refused.stdout).message).toContain('non-review seat worker');
+});

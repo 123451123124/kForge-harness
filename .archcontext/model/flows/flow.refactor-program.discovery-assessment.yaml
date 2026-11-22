@@ -1,0 +1,50 @@
+schemaVersion: archcontext.flow/v1
+id: flow.refactor-program.discovery-assessment
+capabilityId: capability.runtime-harness.refactor-program
+name: Observe measured refactor suggestions
+applicability: required
+participants:
+  - id: refactor-program
+    nodeId: capability.runtime-harness.refactor-program
+  - id: archctx-provider
+    nodeId: component.refactor-program.archctx-provider
+steps:
+  - id: scan
+    from: refactor-program
+    to: archctx-provider
+    label: Scan the repository for structural observations and read their lifecycle records
+    evidence:
+      entrypointId: entrypoint.refactor-program.observe
+      sourceSymbol: discoverRefactorRecommendations
+      sinkId: sink.refactor-program.provider-scan
+outcomes:
+  - id: suggested
+    kind: success
+    label: Open suggestions are shown with their metrics and module statistics
+    steps:
+      - id: present
+        from: refactor-program
+        to: archctx-provider
+        label: Keep observations without a recorded user decision
+        evidence:
+          entrypointId: entrypoint.refactor-program.observe
+          sourceSymbol: discoverRefactorRecommendations
+          sinkId: sink.refactor-program.provider-scan
+    terminal:
+      participant: refactor-program
+      label: Return evidence-backed suggestions for the user to decide
+  - id: unavailable
+    kind: error
+    label: A missing model, provider or complete code facts produces no suggestion
+    steps:
+      - id: report-unavailable
+        from: refactor-program
+        to: archctx-provider
+        label: Report the provider failure or the incomplete code facts
+        evidence:
+          entrypointId: entrypoint.refactor-program.observe
+          sourceSymbol: discoverRefactorRecommendations
+          sinkId: sink.refactor-program.provider-scan
+    terminal:
+      participant: refactor-program
+      label: Return an unavailable or proof_required status

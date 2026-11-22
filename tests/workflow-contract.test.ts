@@ -1,0 +1,580 @@
+import { describe, test, expect } from "bun:test";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { spawnSync } from "child_process";
+import { inspectRepo } from "../scripts/inspect-project-state";
+import { planAdoption } from "../src/effects/adoption/plan";
+import { applyAdoptionPlan } from "../src/effects/fs-transaction";
+import { loadWorkflowContract } from "../scripts/workflow-contract";
+import { renderWorkflowContractMarker } from "../src/core/adoption/workflow-contract-asset";
+import { captureGitVirtualTreeSnapshot } from "../src/effects/evidence/verification-execution";
+import { hashManagedTree } from "../src/effects/managed-tree";
+
+const ROOT = join(import.meta.dir, "..");
+
+describe("workflow contract manifest", () => {
+  test("registers the closed cutover closure protocol", () => {
+    const contract = JSON.parse(readFileSync(join(ROOT, "assets/workflow-contract.v1.json"), "utf8"));
+    expect(contract.cutoverClosure).toEqual({
+      protocol: 1,
+      categories: ["old_implementation", "callers", "fallback", "tests", "docs_and_projections", "compatibility_expiry"],
+      dispositions: ["removed", "migrated", "retained_with_reason", "not_applicable"],
+      selectorKinds: ["path", "relation", "symbol"],
+      errorCodes: ["refactor_closure_residue", "refactor_closure_incomplete", "refactor_closure_missing"],
+      authority: "scripts/cutover-closure.ts",
+      evidenceKind: "cutover_closure",
+    });
+    expect(contract.helpers.scripts).toContain("cutover-closure.ts");
+  });
+
+  test("self-hosted opt-in marker matches the renderer and the protocol", () => {
+    const runtime = readFileSync(join(ROOT, ".ai/harness/workflow-contract.json"), "utf-8");
+    expect(runtime).toBe(renderWorkflowContractMarker());
+    expect(JSON.parse(runtime)).toEqual({ kind: "repo-harness.workflow-contract-marker", protocol: 1 });
+  });
+
+  test("each real delegated runner owns one boundary for its own brief protocol", () => {
+    const envelope="Execution boundary: implement exactly the Goal, In scope items, Allowed Paths, and Exit Criteria in this brief.";
+    const parentBrief="Execution boundary: implement exactly the parent brief Goal/Scope/Verify/Rollback.";
+    for(const [path,sentence] of [["src/cli/hook/subagent-context.ts",parentBrief]]) {
+      const content=readFileSync(join(ROOT,path),"utf8");
+      expect(content.split(sentence).length-1).toBe(1);
+    }
+    for(const path of ["scripts/install-agent-fleet.sh"]) {
+      const content=readFileSync(join(ROOT,path),"utf8");
+      expect(content).not.toContain(envelope);expect(content).not.toContain(parentBrief);
+    }
+  });
+
+  test("helper inventory should come from the workflow contract", () => {
+    const contract = loadWorkflowContract(join(ROOT, "assets/workflow-contract.v1.json"));
+    expect(contract.helpers.runtimeDirectory).toBe("package:scripts");
+    expect(contract.helpers.runtimeSource).toBe("package");
+    expect(Object.hasOwn(contract.helpers, "compatibilityDirectory")).toBe(false);
+    expect(contract.helpers.scripts).toContain("contract-worktree.sh");
+    expect(contract.helpers.scripts).toContain("ship-worktrees.sh");
+    expect(contract.helpers.scripts).toContain("heartbeat-triage.sh");
+    expect(contract.helpers.scripts).not.toContain("prepare-handoff.sh");
+    expect(contract.helpers.scripts).toContain("verify-sprint.sh");
+    expect(contract.helpers.scripts).not.toContain("context-budget.ts");
+    expect(contract.helpers.scripts).toContain("capability-resolver.ts");
+    expect(contract.helpers.scripts).not.toContain("architecture-event.ts");
+    expect(contract.helpers.scripts).toContain("capability-config.ts");
+    expect(contract.helpers.scripts).not.toContain("architecture-queue.sh");
+    expect(contract.helpers.scripts).not.toContain("archive-architecture-request.sh");
+    expect(contract.helpers.scripts).not.toContain("context-contract-sync.sh");
+    expect(contract.helpers.scripts).not.toContain("prepare-codex-handoff.sh");
+    expect(contract.helpers.scripts).not.toContain("codex-handoff-resume.sh");
+    expect(contract.helpers.scripts).toContain("select-agent-context-blocks.sh");
+    expect(contract.helpers.scripts).not.toContain("check-brain-manifest.sh");
+    expect(contract.helpers.scripts).not.toContain("sync-brain-docs.sh");
+    expect(contract.helpers.scripts).toContain("check-deploy-sql-order.sh");
+    expect(contract.helpers.scripts).not.toContain("check-architecture-sync.sh");
+    expect(contract.helpers.scripts).toContain("install-agent-fleet.sh");
+    expect(contract.externalTooling?.waza?.primaryHost).toBe("codex");
+    expect(contract.externalTooling?.waza?.managedSkills).toContain("think");
+    expect(contract.externalTooling?.codexAutomationProfile?.requiredSkills).toEqual(["health", "check", "mermaid"]);
+    expect(contract.externalTooling?.codexAutomationProfile?.routes.architectureDiagram).toBe("mermaid");
+    expect(contract.externalTooling?.codexAutomationProfile?.vendoringPolicy).toBe("do-not-vendor-skill-body");
+    expect(contract.externalTooling?.diagramDesign?.skillName).toBe("mermaid");
+    expect(contract.externalTooling?.diagramDesign?.vendoringPolicy).toBe("do-not-vendor");
+    expect(contract.documentation?.referenceConfigs?.source).toBe("user-level-runtime-docs");
+    expect(contract.documentation?.referenceConfigs?.repoStubDirectory).toBe("docs/reference-configs");
+    expect(contract.documentation?.referenceConfigs?.packageDirectory).toBe("assets/reference-configs");
+    expect(contract.documentation?.referenceConfigs?.resolverCommand).toBe("rh docs path <doc-id>");
+    expect(contract.documentation?.referenceConfigs?.stubMarker).toBe("<!-- repo-harness: reference-config-stub v1 -->");
+    expect(contract.agenticDevelopment?.routing.productDiscovery).toBe("parent-agent:geju");
+    expect(contract.agenticDevelopment?.routing.complexEngineeringPlan).toBe("parent-agent:geju");
+    expect(contract.agenticDevelopment?.routing.designPlan).toBe("parent-agent:geju");
+    expect(contract.agenticDevelopment?.routing.bugOrRegression).toBe("waza:hunt");
+    expect(contract.agenticDevelopment?.dueDiligence.levels).toContain("P2_DATA_FLOW_TRACE");
+    expect(contract.agenticDevelopment?.dueDiligence.explicitReportRequiredFor).toContain("complex_engineering_plan");
+    expect(Object.hasOwn(contract.documents, "currentStatus")).toBe(false);
+    expect(Object.hasOwn(contract.documents, "planDirectory")).toBe(false);
+    expect(contract.adoptionTemplates?.files?.spec.document).toBe("spec");
+    expect(contract.adoptionTemplates?.files?.spec.lines.join("\n")).toContain("{{repoName}}");
+    expect(contract.artifacts.requiredFiles).toContain(".ai/harness/workflow-contract.json");
+    expect(contract.artifacts.requiredFiles).not.toContain(".codex/hooks.json");
+    expect(contract.artifacts.requiredFiles).not.toContain(".ai/harness/brain-manifest.json");
+    expect(contract.artifacts.requiredFiles).toContain(".ai/context/capabilities.json");
+    expect(contract.artifacts.requiredFiles).toContain(".ai/context/capability-source-map.json");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/capability-resolver.ts");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/architecture-event.ts");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/capability-config.ts");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/contract-worktree.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/contract-run.ts");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/ship-worktrees.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/heartbeat-triage.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/capture-plan.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/refresh-current-status.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/sync-brain-docs.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("tasks/current.md");
+    expect(contract.artifacts.runtimeFiles).not.toContain("tasks/current.md");
+    expect(contract.artifacts.runtimeFiles).not.toContain(".ai/harness/handoff/current.md");
+    expect(contract.artifacts.requiredFiles).toContain("docs/architecture/index.md");
+    expect(contract.artifacts.requiredFiles).not.toContain(".claude/templates/implementation-notes.template.md");
+    expect(contract.artifacts.requiredFiles).not.toContain(".claude/templates/review.template.md");
+    expect(contract.artifacts.requiredFiles).not.toContain("tasks/todos.md");
+    expect(contract.artifacts.requiredFiles).toContain("tasks/lessons.md");
+    expect(contract.artifacts.requiredFiles).not.toContain(".claude/templates/contract.template.md");
+    expect(Object.hasOwn(contract.documents, "deferredGoalLedger")).toBe(false);
+    expect(Object.hasOwn(contract.documents, "implementationNotesDirectory")).toBe(false);
+    expect(Object.hasOwn(contract.adoptionTemplates?.files ?? {}, "deferredGoalLedger")).toBe(false);
+    expect(contract.documents.lessonsLog).toBe("tasks/lessons.md");
+    expect(contract.artifacts.requiredFiles).not.toContain(".claude/settings.json");
+    expect(contract.artifacts.requiredFiles).not.toContain(".codex/hooks.json");
+    expect(contract.artifacts.requiredDirectories).not.toContain(".codex");
+    expect(contract.artifacts.requiredDirectories).not.toContain("tasks/notes");
+    expect(contract.artifacts.requiredDirectories).not.toContain("tasks/reviews");
+    expect(contract.artifacts.requiredDirectories).not.toContain("tasks/examples");
+    expect(contract.artifacts.requiredDirectories).not.toContain("tasks/contracts");
+    expect(contract.artifacts.requiredDirectories).not.toContain("tasks/workstreams");
+    expect(contract.artifacts.requiredDirectories).toContain("docs/prds");
+    expect(contract.artifacts.requiredDirectories).not.toContain("docs/architecture/domains");
+    expect(contract.artifacts.requiredDirectories).not.toContain("docs/architecture/snapshots");
+    expect(contract.artifacts.requiredDirectories).toContain("docs/architecture/modules");
+    expect(contract.artifacts.requiredDirectories).toContain(".ai/harness/worktrees");
+    expect(contract.artifacts.requiredDirectories).toContain(".ai/harness/triage");
+    expect(contract.artifacts.requiredDirectories).toContain(".ai/harness/planning");
+    expect(contract.artifacts.requiredDirectories).not.toContain(".ai/harness/scripts");
+    expect(contract.artifacts.requiredDirectories).not.toContain("scripts");
+    expect(contract.artifacts.requiredDirectories).toContain("deploy/scripts");
+    expect(contract.artifacts.requiredDirectories).toContain("deploy/submissions");
+    expect(contract.artifacts.requiredDirectories).toContain("deploy/sql");
+    expect(contract.artifacts.requiredFiles).toContain("deploy/README.md");
+    expect(contract.artifacts.requiredFiles).toContain("docs/reference-configs/agentic-development-flow.md");
+    expect(contract.artifacts.requiredFiles).toContain("docs/reference-configs/global-working-rules.md");
+    expect(contract.artifacts.requiredFiles).toContain("docs/reference-configs/heartbeat-triage.md");
+    expect(contract.artifacts.requiredFiles).not.toContain(".ai/harness/handoff/resume.md");
+    expect(contract.artifacts.requiredFiles).not.toContain(".ai/harness/context-budget/latest.json");
+    expect(contract.artifacts.runtimeFiles).not.toContain(".ai/harness/handoff/resume.md");
+    expect(contract.artifacts.runtimeFiles).not.toContain(".ai/harness/context-budget/latest.json");
+    expect(contract.artifacts.runtimeFiles).toContain(".ai/harness/capability-context/");
+    expect(contract.artifacts.runtimeFiles).toContain(".ai/harness/planning/");
+    expect(contract.artifacts.runtimeFiles).not.toContain(".ai/harness/checks/latest.json");
+    expect(contract.artifacts.runtimeFiles).not.toContain(".ai/harness/architecture/events.jsonl");
+    expect(contract.artifacts.runtimeFiles).not.toContain(".ai/harness/active-plan");
+    expect(contract.artifacts.runtimeFiles).toContain(".ai/harness/active-worktree");
+    expect(contract.artifacts.runtimeFiles).toContain(".ai/harness/worktrees/");
+    expect(contract.artifacts.runtimeFiles).toContain(".ai/harness/triage/inbox.md");
+    expect(contract.artifacts.runtimeFiles).not.toContain(".ai/harness/workstreams/events.jsonl");
+    expect(contract.migrations.upgrade?.strategyVersion).toBe(1);
+    expect(contract.migrations.upgrade?.actionClasses).toContain("reconfigure");
+    expect(contract.migrations.upgrade?.safety.removeOnlyOwnership).toBe("known_generated");
+    expect(contract.migrations.upgrade?.actions.some((action) => action.action === "remove" && action.ownership === "known_generated")).toBe(true);
+    const retiredDrift = contract.migrations.upgrade?.actions.find((action) => action.id === "legacy-architecture-drift-helper");
+    expect(retiredDrift?.action).toBe("remove");
+    expect(retiredDrift?.ownership).toBe("known_generated");
+    expect(retiredDrift?.paths).toContain("assets/templates/helpers/architecture-drift.sh");
+    const legacyRootHelpers = contract.migrations.upgrade?.actions.find((action) => action.id === "legacy-root-helper-runtime");
+    expect(legacyRootHelpers?.action).toBe("remove");
+    expect(legacyRootHelpers?.ownership).toBe("known_generated");
+    expect(legacyRootHelpers?.cleanupMode).toBe("generated_helper");
+    expect(legacyRootHelpers?.paths).toContain("scripts/architecture-drift.sh");
+    expect(legacyRootHelpers?.paths).toContain("scripts/check-task-workflow.sh");
+    expect(legacyRootHelpers?.paths).toContain("scripts/architecture-queue.sh");
+    const queueScaffold = contract.migrations.upgrade?.actions.find((action) => action.id === "architecture-request-queue-scaffold");
+    expect(queueScaffold?.action).toBe("remove");
+    expect(queueScaffold?.cleanupMode).toBe("exact_fingerprint");
+    expect(queueScaffold?.paths).toEqual([".ai/harness/architecture/.gitkeep", ".ai/harness/architecture/events.jsonl", "docs/architecture/requests/.gitkeep"]);
+    const retiredScaffolds = contract.migrations.upgrade?.actions.find((action) => action.id === "retired-plan-task-scaffolds");
+    expect(retiredScaffolds?.action).toBe("remove");
+    expect(retiredScaffolds?.cleanupMode).toBe("exact_fingerprint");
+    expect(retiredScaffolds?.paths).toEqual([
+      "tasks/current.md",
+      ".claude/templates/plan.template.md",
+      ".claude/templates/sprint.template.md",
+      ".claude/templates/contract.template.md",
+      "tasks/workstreams/.gitkeep",
+      ".ai/harness/active-plan",
+    ]);
+    expect(contract.migrations.upgrade?.actions.some((action) => action.id === "stale-project-copies")).toBe(false);
+  });
+
+  test("helper descriptions should cover the helper inventory 1:1 with non-empty text", () => {
+    const raw = JSON.parse(readFileSync(join(ROOT, "assets/workflow-contract.v1.json"), "utf-8")) as {
+      helpers: { scripts: string[]; descriptions?: Record<string, unknown> };
+    };
+    const scriptIds = raw.helpers.scripts.map((fileName) => fileName.replace(/\.(sh|ts)$/, ""));
+    const descriptions = raw.helpers.descriptions ?? {};
+
+    expect(Object.keys(descriptions).sort()).toEqual([...scriptIds].sort());
+    for (const id of scriptIds) {
+      const description = descriptions[id];
+      expect(typeof description).toBe("string");
+      expect((description as string).trim().length).toBeGreaterThan(0);
+    }
+  });
+
+  test("lessons ledger template lists the Lessons Retro record fields", () => {
+    const raw = JSON.parse(readFileSync(join(ROOT, "assets/workflow-contract.v1.json"), "utf-8")) as {
+      adoptionTemplates: { files: { lessonsLog: { lines: string[] } } };
+    };
+    const sop = readFileSync(join(ROOT, "assets/reference-configs/agentic-development-flow.md"), "utf-8");
+    const recordBlock = sop.slice(sop.indexOf("## Lessons Retro")).match(/```markdown\n([\s\S]*?)\n```/)?.[1] ?? "";
+    const fieldsOf = (lines: readonly string[]) => lines.flatMap((line) => line.match(/^- ([A-Z][A-Za-z ]*):/)?.[1] ?? []);
+    const recordFields = fieldsOf(recordBlock.split("\n"));
+
+    // maintenance-triage reads Mistake pattern, Enforced by, Triggered by correction and Seen; the retro ladder needs Name.
+    for (const field of ["Date", "Mistake pattern", "Prevention rule", "Triggered by correction", "Name", "Enforced by", "Seen"]) {
+      expect(recordFields).toContain(field);
+    }
+    expect(
+      fieldsOf(raw.adoptionTemplates.files.lessonsLog.lines),
+      "adoptionTemplates.files.lessonsLog in assets/workflow-contract.v1.json must list the record fields of assets/reference-configs/agentic-development-flow.md#lessons-retro in the same order; change both together",
+    ).toEqual(recordFields);
+  });
+
+  test("source root resolver accepts only the explicit source-checkout authority", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "workflow-contract-source-root-"));
+    const sourceRoot = join(tmp, "source-root");
+    try {
+      mkdirSync(join(sourceRoot, "assets"), { recursive: true });
+      writeFileSync(join(sourceRoot, "assets", "workflow-contract.v1.json"), "{}\n");
+      const code = [
+        'import { resolveAgenticDevRoot, resolveUpstreamWorkflowContract } from "./scripts/workflow-contract.ts";',
+        'console.log(resolveAgenticDevRoot());',
+        'console.log(resolveUpstreamWorkflowContract());',
+      ].join("\n");
+      const explicit = spawnSync("bun", ["-e", code], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          REPO_HARNESS_SOURCE_ROOT: sourceRoot,
+          AGENTIC_DEV_ROOT: "/tmp/ignored-agentic-root",
+          AGENTIC_DEV_SKILL_ROOT: "/tmp/ignored-skill-root",
+          PROJECT_INITIALIZER_ROOT: "/tmp/ignored-project-initializer-root",
+        },
+      });
+      expect(explicit.status).toBe(0);
+      expect(explicit.stdout.trim().split("\n")).toEqual([
+        sourceRoot,
+        join(sourceRoot, "assets", "workflow-contract.v1.json"),
+      ]);
+
+      const relative = spawnSync("bun", ["-e", code], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: { ...process.env, REPO_HARNESS_SOURCE_ROOT: "relative/source" },
+      });
+      expect(relative.status).not.toBe(0);
+      expect(relative.stderr).toContain("REPO_HARNESS_SOURCE_ROOT must be an absolute path");
+
+      const resolverSource = readFileSync(join(ROOT, "scripts/workflow-contract.ts"), "utf-8");
+      expect(resolverSource).not.toContain("AGENTIC_DEV_SKILL_ROOT");
+      expect(resolverSource).not.toContain("PROJECT_INITIALIZER_ROOT");
+      expect(resolverSource).not.toContain("repo-harness-skill");
+      expect(resolverSource).not.toContain("/Users/");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("workflow contract loader fails closed for missing and malformed contracts", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "workflow-contract-invalid-"));
+    try {
+      const contractPath = join(tmp, "workflow-contract.json");
+      expect(() => loadWorkflowContract(contractPath)).toThrow("workflow contract not found");
+
+      writeFileSync(contractPath, "{broken\n");
+      expect(() => loadWorkflowContract(contractPath)).toThrow("invalid workflow contract JSON");
+
+      writeFileSync(contractPath, `${JSON.stringify({ version: "1.0.0" })}\n`);
+      expect(() => loadWorkflowContract(contractPath)).toThrow("contractId must be a non-empty string");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+
+  test("live runtime caches remain ignored and excluded from installed copies", () => {
+    const workspace = mkdtempSync(join(tmpdir(), "runtime-cache-preservation-"));
+    const source = join(workspace, "source");
+    const destination = join(workspace, "installed");
+    const ownedDestination = join(workspace, "owned-installed");
+    const home = join(workspace, "home");
+    const oldRuntime = ".ai/harness/checks/latest.json";
+    const unownedCache = ".ai/harness/checks/unowned-cache.json";
+    const oldRuntimeBytes = '{"history":"retained private runtime bytes"}\n';
+    const caches = [
+      "change-assessment.latest.json", "minimal-change.latest.json",
+      "contract-verify.latest.json", "runtime-evidence-release.latest.json",
+    ].map((name) => `.ai/harness/checks/${name}`);
+    try {
+      mkdirSync(join(source, ".ai/harness/checks"), { recursive: true });
+      mkdirSync(destination);
+      mkdirSync(home);
+      writeFileSync(join(source, "SKILL.md"), "# cache exclusion fixture\n");
+      // The tracked block and the user-level runtime-state block together form the effective rules.
+      writeFileSync(join(source, ".gitignore"), ["runtime.gitignore", "runtime-state.gitignore"].map((name) => readFileSync(join(ROOT, "assets/templates", name), "utf8")).join("\n"));
+      expect(spawnSync("git", ["init", "-q"], { cwd: source }).status).toBe(0);
+      for (const cache of caches) {
+        writeFileSync(join(source, cache), "private runtime cache fixture\n");
+        expect(spawnSync("git", ["check-ignore", "--no-index", "--", cache], { cwd: source }).status).toBe(0);
+      }
+      writeFileSync(join(source, oldRuntime), oldRuntimeBytes);
+      writeFileSync(join(source, unownedCache), "private cache without a registered writer\n");
+      for (const cache of [oldRuntime, unownedCache]) {
+        expect(spawnSync("git", ["check-ignore", "--no-index", "--", cache], { cwd: source }).status).toBe(0);
+      }
+      const status = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: source, encoding: "utf8" });
+      expect(status.status).toBe(0);
+      expect(status.stdout).not.toContain(oldRuntime);
+      expect(status.stdout).not.toContain(unownedCache);
+      const snapshot = captureGitVirtualTreeSnapshot(source);
+      writeFileSync(join(source, unownedCache), "changed private cache bytes\n");
+      expect(captureGitVirtualTreeSnapshot(source).snapshot_hash).toBe(snapshot.snapshot_hash);
+      const contract = JSON.parse(readFileSync(join(ROOT, "assets/workflow-contract.v1.json"), "utf8")) as { installedCopyExcludes: string[] };
+      const copied = spawnSync("rsync", ["-a", ...contract.installedCopyExcludes.map((pattern) => `--exclude=${pattern}`), `${source}/`, `${destination}/`], { encoding: "utf8" });
+      expect(copied.status).toBe(0);
+      expect(copied.stderr).toBe("");
+      for (const cache of caches) expect(existsSync(join(destination, cache))).toBe(false);
+      expect(existsSync(join(destination, ".gitignore"))).toBe(true);
+      for (const cache of [oldRuntime, unownedCache]) expect(existsSync(join(destination, cache))).toBe(false);
+      const ownedCopy = spawnSync(process.execPath, ['-e', [
+        "const fs = require('node:fs'), path = require('node:path');",
+        "const root = process.env.REPO_HARNESS_SOURCE_ROOT;",
+        "const { stageInstalledSkillCopy } = require(path.join(root, 'src/cli/installer/skill-sync.ts'));",
+        "const contract = JSON.parse(fs.readFileSync(path.join(root, 'assets/workflow-contract.v1.json'), 'utf8'));",
+        "fs.renameSync(stageInstalledSkillCopy(process.env.STAGE_SOURCE, 'canonical-skill', process.env.STAGE_TRANSACTION, contract), process.env.STAGE_DESTINATION);",
+      ].join('\n')], {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: home,
+          TMPDIR: tmpdir(),
+          BUN_INSTALL: join(home, ".bun"),
+          CODEX_SKILLS_ROOT: join(home, ".codex/skills"),
+          CLAUDE_SKILLS_ROOT: join(home, ".claude/skills"),
+          REPO_HARNESS_SOURCE_ROOT: ROOT,
+          STAGE_SOURCE: source, STAGE_TRANSACTION: workspace, STAGE_DESTINATION: ownedDestination,
+          BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
+          REPO_HARNESS_LINK_INSTALLED_COPIES: "0",
+          REPO_HARNESS_INSTALL_PLUGINS: "",
+        },
+      });
+      expect(ownedCopy.status, ownedCopy.stdout + ownedCopy.stderr).toBe(0);
+      expect(readFileSync(join(ownedDestination, "SKILL.md"))).toEqual(readFileSync(join(source, "SKILL.md")));
+      for (const cache of [...caches, oldRuntime, unownedCache]) expect(existsSync(join(ownedDestination, cache))).toBe(false);
+      const marker = JSON.parse(readFileSync(join(ownedDestination, ".repo-harness-owner.json"), "utf8"));
+      expect(marker.owner).toBe("repo-harness");
+      expect(marker.content_hash).toBe(hashManagedTree(ownedDestination));
+      expect(readFileSync(join(source, oldRuntime), "utf8")).toBe(oldRuntimeBytes);
+      expect(readFileSync(join(source, unownedCache), "utf8")).toBe("changed private cache bytes\n");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test("runtime harness artifacts should be ignored local state, not tracked deliverables", () => {
+    const contract = loadWorkflowContract(join(ROOT, "assets/workflow-contract.v1.json"));
+    const runtimeFiles = contract.artifacts.runtimeFiles ?? [];
+    expect(runtimeFiles).not.toContain(".ai/harness/checks/latest.json");
+    expect(runtimeFiles).toContain(".ai/harness/evidence/");
+    expect(runtimeFiles).not.toContain(".ai/harness/active-plan");
+    expect(runtimeFiles).toContain(".ai/harness/active-worktree");
+    expect(runtimeFiles).toContain(".ai/harness/archive/");
+    expect(runtimeFiles).toContain(".ai/harness/planning/");
+    const placeholderBackedRuntime = new Set([
+      ".ai/harness/runs/.gitkeep",
+      ".ai/harness/security/.gitkeep",
+      ".ai/harness/triage/.gitkeep",
+      ".ai/harness/worktrees/",
+      ".ai/harness/planning/",
+    ]);
+
+    for (const file of runtimeFiles.filter((name) => !placeholderBackedRuntime.has(name))) {
+      const tracked = spawnSync("git", ["ls-files", "--error-unmatch", file], {
+        cwd: ROOT,
+        encoding: "utf-8",
+      });
+      if (existsSync(join(ROOT, file))) {
+        expect(tracked.status).not.toBe(0);
+      } else {
+        expect(existsSync(join(ROOT, file))).toBe(false);
+      }
+    }
+
+    const gitignore = readFileSync(join(ROOT, ".gitignore"), "utf-8");
+    expect(gitignore).not.toContain("tasks/.current.md.tmp.*");
+    expect(gitignore).not.toContain("tasks/current.md");
+    expect(gitignore).not.toContain(".claude/.plan-state/");
+    expect(gitignore).not.toContain(".ai/harness/checks/latest.json");
+    expect(gitignore).not.toContain(".ai/harness/handoff/current.md");
+    expect(gitignore).toContain(".repo-harness/");
+    expect(gitignore).not.toContain(".repo-harness/chatgpt-browser.local.json");
+    expect(gitignore).toContain(".archcontext/");
+    // The .ai/harness runtime rules live in the user-level Git excludes block.
+    const runtimeState = readFileSync(join(ROOT, "assets/templates/runtime-state.gitignore"), "utf-8");
+    expect(runtimeState).not.toContain(".ai/harness/checks/latest.json");
+    expect(runtimeState).toContain(".ai/harness/evidence/");
+    expect(runtimeState).toContain(".ai/harness/state/");
+    expect(runtimeState).toContain(".ai/harness/checks/*.latest.json");
+    expect(runtimeState).toContain(".ai/harness/checks/*.latest.md");
+    expect(runtimeState).toContain(".ai/harness/archive/");
+    expect(runtimeState).not.toContain(".ai/harness/handoff/current.md");
+    expect(runtimeState).toContain(".ai/harness/handoff/");
+    expect(runtimeState).toContain(".ai/harness/planning/");
+    expect(runtimeState).toContain("!.ai/harness/planning/.gitkeep");
+    expect(runtimeState).toContain(".ai/harness/worktrees/");
+    expect(runtimeState).not.toContain(".ai/harness/chatgpt/bridge-extension/");
+    expect(runtimeState).toContain(".ai/harness/triage/*");
+    expect(runtimeState).toContain("!.ai/harness/triage/.gitkeep");
+  }, 30_000);
+});
+
+describe("state inspection and legacy doc migration", () => {
+  test("inspector uses the package contract regardless of repo marker content", () => {
+    const repo = mkdtempSync(join(tmpdir(), "inspect-project-state-marker-"));
+    try {
+      mkdirSync(join(repo, ".ai", "harness"), { recursive: true });
+      mkdirSync(join(repo, "docs"), { recursive: true });
+      writeFileSync(join(repo, "docs", "TODO.md"), "- [ ] legacy task\n");
+      const markerPath = join(repo, ".ai", "harness", "workflow-contract.json");
+      const missing = inspectRepo(repo);
+      expect(missing.drift_signals).toContain("missing-runtime-contract-manifest");
+      expect(missing.upgrade_plan.map((item) => item.id)).toContain("runtime-contract-refresh");
+
+      writeFileSync(markerPath, renderWorkflowContractMarker());
+      const expected = inspectRepo(repo);
+      expect(expected.drift_signals).not.toContain("missing-runtime-contract-manifest");
+      expect(expected.upgrade_plan.map((item) => item.id)).toContain("legacy-docs-todo");
+      for (const content of [
+        readFileSync(join(ROOT, "tests/fixtures/adoption/workflow-contract-v0.19.5.json"), "utf8"),
+        "{}\n",
+        "{broken\n",
+      ]) {
+        writeFileSync(markerPath, content);
+        expect(inspectRepo(repo)).toEqual(expected);
+      }
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("inspector should classify pre-tasks-first drift", () => {
+    const repo = mkdtempSync(join(tmpdir(), "inspect-project-state-"));
+
+    try {
+      mkdirSync(join(repo, "docs"), { recursive: true });
+      writeFileSync(join(repo, "docs/TODO.md"), "- [ ] legacy task\n");
+      writeFileSync(join(repo, "docs/plan.md"), "# legacy plan\n");
+      writeFileSync(join(repo, "docs/PROGRESS.md"), "# Session Notes\n- [ ] ship it\n");
+
+      const result = inspectRepo(repo);
+      expect(result.mode).toBe("migrate");
+      expect(result.legacy_contract_version).toBe("pre-tasks-first");
+      expect(result.drift_signals).toContain("legacy-docs-plan");
+      expect(result.drift_signals).toContain("legacy-docs-todo");
+      expect(result.drift_signals).toContain("legacy-docs-progress");
+      expect(result.upgrade_plan.map((item) => item.id)).toContain("legacy-docs-plan");
+      expect(result.upgrade_plan.map((item) => item.action)).toContain("archive");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("inspector should produce an upgrade plan for current-v1 repos with stale managed config", () => {
+    const repo = mkdtempSync(join(tmpdir(), "inspect-project-state-current-stale-"));
+
+    try {
+      mkdirSync(join(repo, "plans"), { recursive: true });
+      mkdirSync(join(repo, "tasks"), { recursive: true });
+      mkdirSync(join(repo, ".ai", "harness"), { recursive: true });
+      mkdirSync(join(repo, ".claude", "hooks"), { recursive: true });
+      const staleContract = JSON.parse(readFileSync(join(ROOT, "assets/workflow-contract.v1.json"), "utf-8"));
+      delete staleContract.migrations.upgrade;
+      writeFileSync(join(repo, ".ai", "harness", "workflow-contract.json"), JSON.stringify(staleContract, null, 2) + "\n");
+      writeFileSync(join(repo, ".ai", "harness", "policy.json"), JSON.stringify({ version: 1 }, null, 2));
+      writeFileSync(join(repo, ".claude", "hooks", "run-hook.sh"), "#!/bin/bash\necho generated\n");
+      writeFileSync(join(repo, ".claude", "hooks", "custom-bash.sh"), "#!/bin/bash\necho custom\n");
+
+      const result = inspectRepo(repo);
+      expect(result.mode).toBe("audit");
+      expect(result.legacy_contract_version).toBe("current-v1");
+      expect(result.drift_signals).toContain("stale-generated-claude-hook-shims");
+      expect(result.upgrade_plan.map((item) => item.id)).toContain("legacy-claude-hook-shims");
+      expect(result.upgrade_plan.map((item) => item.id)).toContain("custom-claude-hooks-preserve");
+      expect(result.upgrade_plan.find((item) => item.id === "legacy-claude-hook-shims")?.ownership).toBe("known_generated");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("inspector should prefer audit over skill-factory for initialized repos", () => {
+    const repo = mkdtempSync(join(tmpdir(), "inspect-project-state-audit-"));
+
+    try {
+      mkdirSync(join(repo, "plans"), { recursive: true });
+      mkdirSync(join(repo, "tasks"), { recursive: true });
+      mkdirSync(join(repo, ".claude", "skill-factory"), { recursive: true });
+
+      const result = inspectRepo(repo);
+      expect(result.mode).toBe("audit");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("canonical adoption leaves legacy documents in place without creating a todo ledger", () => {
+    const repo = mkdtempSync(join(tmpdir(), "migrate-workflow-docs-"));
+
+    try {
+      expect(spawnSync("git", ["init", "-q"], { cwd: repo }).status).toBe(0);
+      mkdirSync(join(repo, "docs"), { recursive: true });
+      const legacy: Record<string, string> = {
+        "docs/TODO.md": "- [ ] port old checklist\n",
+        "docs/plan.md": "# Old Plan\n\nKeep the useful parts.\n",
+        "docs/PROGRESS.md": "# Session Notes\n\n- [ ] investigate drift\n",
+      };
+      for (const [path, bytes] of Object.entries(legacy)) writeFileSync(join(repo, path), bytes);
+
+      const summary = applyAdoptionPlan(planAdoption({ repoRoot: repo, mode: "standard", apply: true }), { record: "ledger", env: process.env });
+      expect(summary.ok).toBe(true);
+      expect(existsSync(join(repo, "tasks/todos.md"))).toBe(false);
+      expect(existsSync(join(repo, "docs/researches/README.md"))).toBe(true);
+      for (const [path, bytes] of Object.entries(legacy)) expect(readFileSync(join(repo, path), "utf-8")).toBe(bytes);
+      expect(existsSync(join(repo, "tasks/archive"))).toBe(false);
+      expect(existsSync(join(repo, "plans"))).toBe(false);
+      expect(existsSync(join(repo, "docs/researches/legacy-progress-import.md"))).toBe(false);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  for (const filename of ["todos.md", "todo.md"]) {
+    test(`canonical adoption preserves pre-existing tasks/${filename}`, () => {
+      const repo = mkdtempSync(join(tmpdir(), "preserve-workflow-todo-"));
+      const content = "# Old Todo\n\n- [ ] existing task\n";
+
+      try {
+        expect(spawnSync("git", ["init", "-q"], { cwd: repo }).status).toBe(0);
+        mkdirSync(join(repo, "tasks"), { recursive: true });
+        writeFileSync(join(repo, "tasks", filename), content);
+
+        const summary = applyAdoptionPlan(planAdoption({ repoRoot: repo, mode: "standard", apply: true }), { record: "ledger", env: process.env });
+        expect(summary.ok).toBe(true);
+        expect(readFileSync(join(repo, "tasks", filename), "utf-8")).toBe(content);
+        expect(existsSync(join(repo, "tasks/archive/legacy-tasks-todo.md"))).toBe(false);
+        expect(existsSync(join(repo, "tasks", `${filename}.migrated.bak`))).toBe(false);
+        const result = inspectRepo(repo);
+        expect(result.drift_signals).not.toContain("legacy-singular-todo-file");
+        expect(result.drift_signals).not.toContain("legacy-task-checklist-format");
+        expect(result.upgrade_plan.map((item) => item.id)).not.toContain("legacy-singular-todo-file");
+        expect(result.upgrade_plan.map((item) => item.id)).not.toContain("legacy-task-checklist-format");
+      } finally {
+        rmSync(repo, { recursive: true, force: true });
+      }
+    });
+  }
+});

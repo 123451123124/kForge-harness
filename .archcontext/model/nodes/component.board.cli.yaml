@@ -1,0 +1,16 @@
+schemaVersion: "archcontext.node/v2"
+id: "component.board.cli"
+kind: "component"
+name: "Board (cli)"
+status: "active"
+parent: "capability.organization.board"
+layer: "cli"
+summary: "Exposes board reads, seat commands and typed protocol comment posts."
+responsibilities:
+  - "Expose board, attention, seats and quota commands."
+  - "Post plan, hold, release, disposition and question comments only after field validation and a round trip through the existing parser; dry-run writes nothing."
+source:
+  include:
+    - "src/cli/commands/board.ts"
+    - "src/cli/commands/quota.ts"
+    - "src/cli/commands/seats.ts"

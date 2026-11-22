@@ -1,0 +1,658 @@
+import { useState, type ReactNode } from 'react';
+import { Banner, Button, Empty, Loader, cn } from '@cloudflare/kumo';
+import { ArrowClockwiseIcon, CaretDownIcon, CaretRightIcon, ChatCircleDotsIcon, CheckIcon, MinusIcon, TerminalWindowIcon, WarningCircleIcon, WarningIcon } from '@phosphor-icons/react';
+import {
+  SETUP_HOSTS,
+  type SetupCheck,
+  type SetupCheckStatus,
+  type SetupFleetRole,
+  type SetupHookMismatch,
+  type SetupHookRoute,
+  type SetupHost,
+  type SetupHostFacts,
+  type SetupHostSkillRoot,
+  type SetupInstallSelection,
+  type SetupSkill,
+  type SetupSnapshotV2,
+} from '../core/setup/types';
+import type { OperatorMessageKey, OperatorTranslate } from './i18n';
+import { ageWords } from './labels';
+import {
+  hostCommand,
+  hostSentence,
+  orderChecks,
+  orderSkills,
+  setupPageState,
+  SETUP_CHECK_COMMAND,
+  SKILL_UPDATE_COMMAND,
+  skillAbnormal,
+  skillCell,
+  type SetupPageState,
+  type SetupView,
+  type SkillCell,
+} from './setup';
+import { CommandLine, SectionTitle, StatusDot, type DotTone } from './ui';
+import { ToolGroup } from './ToolsPage';
+import { AgentSettings, HostRuntimeControls } from './SettingsPage';
+import { ReportingLanguage } from './LanguageControls';
+import type { LanguageReader, LanguageWriter, ReportingHost, ReportingPreset } from './language-settings';
+import { SeatsSection } from './SeatsPage';
+import type { AgentsSettingsForm } from './settings';
+import type { SeatsSettingsForm } from './seats';
+import type { QuotaAccountReport, QuotaReport, QuotaWindowReport, QuotaWindowState } from '../core/board/quota';
+import type { QuotaSection as QuotaRead, QuotaView } from './quota';
+
+export type SetupPage = 'agents' | 'skills' | 'hooks';
+
+interface PageProps { readonly view: SetupView; readonly now: number; readonly t: OperatorTranslate }
+
+const HOST_ICON: Readonly<Record<SetupHost, ReactNode>> = {
+  claude: <ChatCircleDotsIcon size={16} aria-hidden="true" />,
+  codex: <TerminalWindowIcon size={16} aria-hidden="true" />,
+  pi: <TerminalWindowIcon size={16} aria-hidden="true" />,
+};
+
+const CHECK_TONE: Readonly<Record<SetupCheckStatus, DotTone>> = { ok: 'ok', warn: 'warn', fail: 'danger', needs_agent: 'warn', na: 'neutral' };
+
+const SKILL_CELL: Readonly<Record<SkillCell, { readonly key: OperatorMessageKey; readonly tone: DotTone }>> = {
+  'ok link': { key: 'setup.skillState.okLink', tone: 'ok' },
+  'ok copy': { key: 'setup.skillState.okCopy', tone: 'ok' },
+  drift: { key: 'setup.skillState.drift', tone: 'warn' },
+  missing: { key: 'setup.skillState.missing', tone: 'warn' },
+  'stale copy': { key: 'setup.skillState.staleCopy', tone: 'warn' },
+  'dangling link': { key: 'setup.skillState.danglingLink', tone: 'danger' },
+  'wrong link': { key: 'setup.skillState.wrongLink', tone: 'danger' },
+  'invalid path type': { key: 'setup.skillState.invalidPathType', tone: 'danger' },
+  'source missing': { key: 'setup.skillState.sourceMissing', tone: 'danger' },
+  'unowned real directory': { key: 'setup.skillState.unownedRealDirectory', tone: 'danger' },
+  not_supported: { key: 'setup.skillState.notSupported', tone: 'neutral' },
+  not_installed: { key: 'setup.skillState.notInstalled', tone: 'neutral' },
+  not_judged: { key: 'setup.skillState.notJudged', tone: 'neutral' },
+};
+
+const SKILL_PROJECTION_CHECK = 'doctor.skill-projection';
+/** Checks shown before "Show N more"; the Hosts list must stay above the fold. */
+const CHECK_PREVIEW = 3;
+
+const hostName = (host: SetupHost, t: OperatorTranslate) => t(`setup.host.${host}`);
+
+function Card({ labelledBy, children, className }: { readonly labelledBy: string; readonly children: ReactNode; readonly className?: string }) {
+  return <section aria-labelledby={labelledBy} className={cn('flex min-w-0 flex-col gap-3 rounded-xl border border-kumo-line bg-kumo-base p-4 sm:p-5', className)}>{children}</section>;
+}
+
+function stateName(state: SetupPageState): string {
+  if (state.kind !== 'data') return state.kind;
+  if (state.snapshot.status === 'stale') return 'stale';
+  return state.refreshFailed ? 'refresh-failed' : 'ready';
+}
+
+/**
+ * The shared frame: the first read, a failure, or data with its age. The
+ * children get the snapshot, or null while there is none: the Agents page
+ * keeps its settings sections without a setup check result.
+ */
+function SetupFrame({ page, view, now, t, children }: PageProps & { readonly page: SetupPage; readonly children: (snapshot: SetupSnapshotV2 | null) => ReactNode }) {
+  const state = setupPageState(view);
+  const age = state.kind === 'data' && state.snapshot.collected_at ? ageWords(state.snapshot.collected_at, now, t) : null;
+  return (
+    <div className="flex min-w-0 flex-col gap-5" data-setup-page={page} data-setup-state={stateName(state)}
+      data-setup-reason={state.kind === 'failed' ? state.reason : state.kind === 'data' ? state.snapshot.reason ?? undefined : undefined}>
+      <header className="border-b border-kumo-hairline pb-4">
+        <h1 className="text-xl font-semibold text-kumo-strong">{t(`nav.${page}`)}</h1>
+      </header>
+      {state.kind === 'pending' && <Empty size="sm" icon={<Loader size={24} />} title={t('setup.pending.title')} description={t('setup.pending.body')} />}
+      {state.kind === 'failed' && (
+        <Empty size="sm" icon={<WarningCircleIcon size={32} />} title={t('setup.failed.title')}
+          description={t('setup.failed.body', { reason: t(`setup.reason.${state.reason}`) })} commandLine={SETUP_CHECK_COMMAND} />
+      )}
+      {state.kind === 'data' && <>
+        {state.snapshot.status === 'stale' && state.snapshot.reason && (
+          <Banner variant="alert" icon={<WarningIcon />} title={age ? t('setup.stale.title', { age }) : t('setup.stale.titleUnknown')}
+            description={t('setup.stale.body', { reason: t(`setup.reason.${state.snapshot.reason}`) })} />
+        )}
+        {state.snapshot.status !== 'stale' && state.refreshFailed && (
+          <Banner variant="alert" icon={<WarningIcon />} title={t('setup.refreshFailed.title')}
+            description={age ? t('setup.refreshFailed.body', { age }) : t('setup.refreshFailed.bodyUnknown')} />
+        )}
+      </>}
+      {children(state.kind === 'data' ? state.snapshot : null)}
+    </div>
+  );
+}
+
+/** One per-host value. On a phone the host name sits beside it; on wide screens the column header names it. */
+function HostCell({ host, children, t }: { readonly host: SetupHost; readonly children: ReactNode; readonly t: OperatorTranslate }) {
+  return (
+    <span className="inline-flex min-w-0 items-center gap-1.5 text-xs text-kumo-default md:w-32 md:shrink-0" data-host-cell={host}>
+      <span className="text-kumo-subtle md:sr-only">{hostName(host, t)}</span>
+      {children}
+    </span>
+  );
+}
+
+function HostCells({ render, t }: { readonly render: (host: SetupHost) => ReactNode; readonly t: OperatorTranslate }) {
+  return (
+    <span className="flex flex-wrap gap-x-4 gap-y-1 md:flex-nowrap md:gap-0">
+      {SETUP_HOSTS.map(host => <HostCell key={host} host={host} t={t}>{render(host)}</HostCell>)}
+    </span>
+  );
+}
+
+/** Wide-screen column header; each cell already names its host for screen readers. */
+function ColumnHeader({ lead, t }: { readonly lead: ReactNode; readonly t: OperatorTranslate }) {
+  return (
+    <div aria-hidden="true" className="hidden items-center gap-4 border-b border-kumo-hairline px-3 pb-2 text-xs font-medium text-kumo-subtle md:flex">
+      <span className="flex min-w-0 flex-1 gap-4">{lead}</span>
+      <span className="flex">{SETUP_HOSTS.map(host => <span key={host} className="w-32 shrink-0">{hostName(host, t)}</span>)}</span>
+    </div>
+  );
+}
+
+const ROW = 'flex min-w-0 flex-col gap-2 px-3 py-2.5 md:flex-row md:items-center md:gap-4';
+
+// --- Agents ---
+
+/** One compact line per check; the multi-line detail opens below on request. */
+function CheckRow({ check, t }: { readonly check: SetupCheck; readonly t: OperatorTranslate }) {
+  const [open, setOpen] = useState(false);
+  const detailId = `check-detail-${check.id}`;
+  return (
+    <li className="flex min-w-0 flex-col" data-check={check.id} data-check-status={check.status}>
+      {/* Phone: title and Details on one row, the command full width below. Wide: one line. */}
+      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-x-2 gap-y-1.5 px-3 py-1.5 md:flex md:items-center md:gap-3">
+        <p className="flex min-w-0 items-start gap-2 text-sm md:order-1 md:flex-1 md:items-center">
+          <StatusDot tone={CHECK_TONE[check.status]} className="mt-1.5 md:mt-0" />
+          <span className="min-w-0 [overflow-wrap:anywhere] md:flex md:items-center md:gap-2">
+            <span className="font-medium text-kumo-strong md:truncate" title={check.title}>{check.title}</span>
+            <span className="ml-2 text-xs whitespace-nowrap text-kumo-subtle md:ml-0 md:shrink-0">{t(`setup.check.status.${check.status}`)}</span>
+          </span>
+        </p>
+        <button type="button" aria-expanded={open} aria-controls={detailId} onClick={() => setOpen(value => !value)}
+          className="inline-flex min-h-7 shrink-0 cursor-pointer items-center gap-0.5 rounded-md px-1.5 text-xs text-kumo-subtle hover:bg-kumo-tint hover:text-kumo-default focus-visible:ring-2 focus-visible:ring-kumo-brand focus-visible:outline-none md:order-3">
+          {open ? <CaretDownIcon size={12} aria-hidden="true" /> : <CaretRightIcon size={12} aria-hidden="true" />}
+          {t('setup.check.details')}
+        </button>
+        <div className="col-span-2 flex min-w-0 md:order-2 md:w-[28rem] md:shrink-0">
+          {check.command
+            ? <CommandLine command={check.command} t={t} className="min-w-0 flex-1 py-0.5" />
+            : <span className="min-w-0 flex-1 px-2 text-xs text-kumo-subtle">{t('setup.check.noCommand')}</span>}
+        </div>
+      </div>
+      {open && <pre id={detailId} className="mx-3 mb-2 rounded-md bg-kumo-recessed px-2 py-1.5 whitespace-pre-wrap font-mono text-xs leading-5 text-kumo-default [overflow-wrap:anywhere]">{check.detail}</pre>}
+    </li>
+  );
+}
+
+function AttentionSummary({ snapshot, t }: { readonly snapshot: SetupSnapshotV2; readonly t: OperatorTranslate }) {
+  const checks = orderChecks(snapshot.checks);
+  const tone: DotTone = checks.some(check => check.status === 'fail') ? 'danger' : checks.length > 0 ? 'warn' : 'ok';
+  const summary = snapshot.summary;
+  const [expanded, setExpanded] = useState(false);
+  const shown = expanded ? checks : checks.slice(0, CHECK_PREVIEW);
+  return (
+    <Card labelledBy="setup-attention-heading">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <h2 id="setup-attention-heading" className="flex items-center gap-2 text-base font-semibold text-kumo-strong" data-setup-attention={checks.length}>
+          <StatusDot tone={tone} />
+          {checks.length === 0 ? t('setup.agents.clear') : checks.length === 1 ? t('setup.agents.attentionOne') : t('setup.agents.attention', { count: checks.length })}
+        </h2>
+        {summary && <p className="text-xs text-kumo-subtle tabular-nums">{t('setup.agents.summary', { ok: summary.ok, warn: summary.warn, fail: summary.fail, needs_agent: summary.needs_agent, na: summary.na })}</p>}
+      </div>
+      {checks.length > 0 && (
+        <ul className="flex flex-col divide-y divide-kumo-hairline rounded-lg border border-kumo-hairline">
+          {shown.map(check => <CheckRow key={check.id} check={check} t={t} />)}
+        </ul>
+      )}
+      {checks.length > CHECK_PREVIEW && (
+        <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)} data-checks-more
+          className="w-fit cursor-pointer rounded-md px-1.5 text-xs font-medium text-kumo-link hover:underline focus-visible:ring-2 focus-visible:ring-kumo-brand focus-visible:outline-none">
+          {expanded ? t('setup.agents.less') : t('setup.agents.more', { count: checks.length - CHECK_PREVIEW })}
+        </button>
+      )}
+    </Card>
+  );
+}
+
+function mismatchText(mismatch: SetupHookMismatch, t: OperatorTranslate): string {
+  const kind = mismatch.kind === 'field-mismatch'
+    ? t('setup.mismatch.field', { field: mismatch.field ?? t('setup.mismatch.someField') })
+    : t(`setup.mismatch.${mismatch.kind}`);
+  return `${mismatch.event} · ${mismatch.route_id ?? t('setup.mismatch.unnamed')} · ${kind}`;
+}
+
+function sentenceText(facts: SetupHostFacts, t: OperatorTranslate): string {
+  const sentence = hostSentence(facts);
+  switch (sentence.kind) {
+    case 'package': return t(`setup.host.piPackage.${sentence.status}`);
+    case 'not_reported': return t('setup.host.notReported', { host: hostName(facts.host, t) });
+    case 'not_detected': return t('setup.host.notDetected');
+    case 'not_inspected': return t('setup.host.notInspected');
+    case 'not_configured': return t('setup.host.notConfigured', { managed: sentence.managed, expected: sentence.expected });
+    case 'connected': {
+      const parts = [t('setup.host.connected', { managed: sentence.managed, expected: sentence.expected })];
+      if (sentence.mismatches > 0) parts.push(sentence.mismatches === 1 ? t('setup.host.mismatchOne') : t('setup.host.mismatches', { count: sentence.mismatches }));
+      else if (sentence.projection === null) parts.push(t('setup.host.notCompared'));
+      return parts.join(' · ');
+    }
+  }
+}
+
+function hostTone(facts: SetupHostFacts): DotTone {
+  if (facts.host === 'pi') return facts.package_check === null ? 'neutral' : CHECK_TONE[facts.package_check];
+  return facts.adapter_check === null ? 'neutral' : CHECK_TONE[facts.adapter_check];
+}
+
+/** Section 1: each host of the setup check with its Agent settings switch, then the runtimes no host row shows. */
+function HostList({ snapshot, agents, now, t }: {
+  readonly snapshot: SetupSnapshotV2 | null; readonly agents: AgentsSettingsForm; readonly now: number; readonly t: OperatorTranslate;
+}) {
+  return (
+    <Card labelledBy="setup-hosts-heading">
+      <SectionTitle id="setup-hosts-heading">{t('setup.hosts.title')}</SectionTitle>
+      {snapshot && <ul className="flex flex-col divide-y divide-kumo-hairline rounded-lg border border-kumo-hairline">
+        {snapshot.hosts.map(facts => {
+          const repair = hostCommand(snapshot.checks, facts.host);
+          const mismatches = facts.adapter?.mismatches ?? [];
+          return (
+            <li key={facts.host} className="flex min-w-0 flex-col gap-2 px-3 py-3 md:flex-row md:items-start md:gap-4"
+              data-host-row={facts.host} data-host-reported={String(facts.reported)}>
+              <span className="flex shrink-0 items-center gap-2 md:w-44">
+                <span className="text-kumo-subtle">{HOST_ICON[facts.host]}</span>
+                <span className="text-sm font-medium text-kumo-strong">{hostName(facts.host, t)}</span>
+                {facts.cli_version && <span className="font-mono text-xs text-kumo-subtle">{t('setup.host.version', { version: facts.cli_version })}</span>}
+              </span>
+              <span className="flex min-w-0 flex-1 flex-col gap-1">
+                <span className="flex min-w-0 items-start gap-2 text-sm text-kumo-default">
+                  <StatusDot tone={hostTone(facts)} className="mt-1.5" />
+                  <span className="min-w-0 [overflow-wrap:anywhere]" data-host-sentence>{sentenceText(facts, t)}</span>
+                </span>
+                {mismatches.length > 0 && (
+                  <span className="pl-4 text-xs text-kumo-subtle [overflow-wrap:anywhere]" data-host-mismatch-summary>
+                    {mismatches.slice(0, 3).map(mismatch => mismatchText(mismatch, t)).join('; ')}
+                    {mismatches.length > 3 && ` ${t('setup.host.moreMismatches', { count: mismatches.length - 3 })}`}
+                  </span>
+                )}
+              </span>
+              <span className="min-w-0 md:w-80 md:shrink-0">
+                {repair?.command
+                  ? <CommandLine command={repair.command} t={t} />
+                  : facts.adapter_check && <span className="text-xs text-kumo-subtle">{t(`setup.check.status.${facts.adapter_check}`)}</span>}
+              </span>
+              <HostRuntimeControls form={agents} id={facts.host} t={t} />
+            </li>
+          );
+        })}
+      </ul>}
+      <AgentSettings form={agents} hostRows={snapshot ? snapshot.hosts.map(facts => facts.host) : []} now={now} t={t} />
+    </Card>
+  );
+}
+
+function fleetCell(state: SetupFleetRole['hosts'][SetupHost], t: OperatorTranslate): ReactNode {
+  if (state === null) return <><StatusDot tone="neutral" /><span className="text-kumo-subtle">{t('setup.fleet.notReported')}</span></>;
+  return <><StatusDot tone={state === 'installed' ? 'ok' : 'warn'} /><span>{t(`setup.fleet.${state}`)}</span></>;
+}
+
+function FleetTable({ snapshot, t }: { readonly snapshot: SetupSnapshotV2; readonly t: OperatorTranslate }) {
+  const unknown = t('setup.unknown');
+  return (
+    <Card labelledBy="setup-fleet-heading">
+      <SectionTitle id="setup-fleet-heading" count={snapshot.fleet.length}>{t('setup.fleet.title')}</SectionTitle>
+      {snapshot.fleet.length === 0 ? <p className="text-sm text-kumo-subtle">{t('setup.fleet.empty')}</p> : (
+        <div className="flex min-w-0 flex-col">
+          <ColumnHeader t={t} lead={<><span className="w-40 shrink-0">{t('setup.fleet.role')}</span><span className="w-36 shrink-0">{t('setup.fleet.modelEffort')}</span><span>{t('setup.fleet.description')}</span></>} />
+          <ul className="flex flex-col divide-y divide-kumo-hairline">
+            {snapshot.fleet.map(role => (
+              <li key={role.name} className={ROW} data-fleet-role={role.name}>
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5 md:flex-row md:items-center md:gap-4">
+                  <span className="font-mono text-sm font-medium text-kumo-strong md:w-40 md:shrink-0 [overflow-wrap:anywhere]">{role.name}</span>
+                  <span className="text-xs text-kumo-default md:w-36 md:shrink-0" data-fleet-model>
+                    {role.model ?? unknown}<span className="text-kumo-subtle"> · </span>{role.effort ?? unknown}
+                  </span>
+                  <span className="min-w-0 text-xs text-kumo-subtle md:line-clamp-2" title={role.description ?? undefined}>{role.description ?? t('setup.fleet.noDescription')}</span>
+                </span>
+                <HostCells t={t} render={host => fleetCell(role.hosts[host], t)} />
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+export const QUOTA_TONE: Readonly<Record<QuotaWindowState, DotTone>> = { exhausted: 'danger', tight: 'warn', unknown: 'unknown', normal: 'ok', surplus: 'ok', absent: 'neutral' };
+/** The page's attention style: the report's own state picks it; the page judges nothing. */
+const QUOTA_ATTENTION: Readonly<Partial<Record<QuotaWindowState, string>>> = { exhausted: 'text-kumo-danger', tight: 'text-kumo-warning', unknown: 'text-kumo-warning' };
+
+/** The accounts whose own state asks for attention, in report order. */
+export const quotaAttention = (report: QuotaReport): readonly QuotaAccountReport[] => report.accounts.filter(account => account.state in QUOTA_ATTENTION);
+
+/** A failed read: its reason and no account data. */
+export function QuotaUnavailable({ reason, t }: { readonly reason: Extract<QuotaView, { kind: 'unavailable' }>['reason']; readonly t: OperatorTranslate }) {
+  return <Banner variant="error" data-quota-unavailable={reason} title={t('setup.quota.unavailable')} description={t('setup.quota.unavailableBody', { reason: t(`setup.quota.reason.${reason}`) })} />;
+}
+
+function windowLength(minutes: number, t: OperatorTranslate): string {
+  if (minutes % 1440 === 0) return t('setup.quota.days', { count: minutes / 1440 });
+  if (minutes % 60 === 0) return t('setup.quota.hours', { count: minutes / 60 });
+  return t('setup.quota.minutes', { count: minutes });
+}
+
+function QuotaState({ state, t }: { readonly state: QuotaWindowState; readonly t: OperatorTranslate }) {
+  return (
+    <span className={cn('inline-flex items-center gap-1.5 text-xs font-medium', QUOTA_ATTENTION[state] ?? 'text-kumo-default')} data-quota-state={state}>
+      <StatusDot tone={QUOTA_TONE[state]} />{t(`setup.quota.state.${state}`)}
+    </span>
+  );
+}
+
+/** Each value only when the report has it; an `unknown` or `absent` window gives its reason instead of numbers it lacks. */
+export function QuotaWindow({ window, bare = false, t }: { readonly window: QuotaWindowReport; /** No state: the row around it already shows one. */ readonly bare?: boolean; readonly t: OperatorTranslate }) {
+  const parts: ReactNode[] = [];
+  if (window.used_percent !== null) parts.push(<span key="used" data-quota-used>{t('setup.quota.used', { percent: window.used_percent })}</span>);
+  if (window.resets_at !== null) parts.push(<span key="resets" data-quota-resets={window.resets_at} title={window.resets_at}>{t('setup.quota.resets', { time: new Date(window.resets_at).toLocaleString() })}</span>);
+  if (window.pace !== null) parts.push(<span key="pace" data-quota-pace>{t('setup.quota.pace', { pace: `${window.pace > 0 ? '+' : ''}${window.pace}` })}</span>);
+  return (
+    <li className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-kumo-default" data-quota-window={window.window}>
+      <span className="font-mono text-kumo-strong">{window.window}</span>
+      {window.window_minutes !== null && <span className="text-kumo-subtle">{windowLength(window.window_minutes, t)}</span>}
+      {!bare && <QuotaState state={window.state} t={t} />}
+      {parts.map((part, index) => <span key={index} className="tabular-nums">{index > 0 && <span className="text-kumo-subtle">· </span>}{part}</span>)}
+      {(window.state === 'unknown' || window.state === 'absent') && window.reason !== null
+        && <span className="text-kumo-subtle [overflow-wrap:anywhere]" data-quota-reason>{window.reason}</span>}
+    </li>
+  );
+}
+
+function creditsText(codex: NonNullable<QuotaAccountReport['codex']>, t: OperatorTranslate): string {
+  const credits = codex.credits;
+  if (credits === null) return t('setup.quota.creditsUnknown');
+  if (credits.unlimited) return t('setup.quota.creditsUnlimited');
+  if (!credits.has_credits) return t('setup.quota.creditsNone');
+  return credits.balance === null ? t('setup.quota.creditsNoBalance') : t('setup.quota.credits', { balance: credits.balance });
+}
+
+function QuotaRow({ account, now, t }: { readonly account: QuotaAccountReport; readonly now: number; readonly t: OperatorTranslate }) {
+  const attention = account.state in QUOTA_ATTENTION;
+  return (
+    <li className="flex min-w-0 flex-col gap-2 px-3 py-3 md:flex-row md:items-start md:gap-4"
+      data-quota-account={account.account} data-quota-attention={String(attention)}>
+      <span className="flex shrink-0 flex-col gap-1 md:w-44">
+        <span className="text-sm font-medium text-kumo-strong">{t(`setup.quota.account.${account.account}`)}</span>
+        <QuotaState state={account.state} t={t} />
+        {account.observed_at !== null && <span className="text-xs text-kumo-subtle">{t('setup.quota.observed', { age: ageWords(account.observed_at, now, t) })}</span>}
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col gap-1.5">
+        {account.reason !== null && <span className={cn('text-xs [overflow-wrap:anywhere]', QUOTA_ATTENTION[account.state] ?? 'text-kumo-subtle')} data-quota-reason>{account.reason}</span>}
+        {account.windows.length > 0 && <ul className="flex flex-col gap-1">{account.windows.map(window => <QuotaWindow key={window.window} window={window} t={t} />)}</ul>}
+        {account.codex && (
+          <span className="text-xs text-kumo-subtle" data-quota-codex>
+            {account.codex.plan_type === null ? t('setup.quota.planUnknown') : t('setup.quota.plan', { plan: account.codex.plan_type })}
+            {' · '}<span data-quota-credits>{creditsText(account.codex, t)}</span>
+          </span>
+        )}
+      </span>
+    </li>
+  );
+}
+
+/** Section 4: the quota read model, one row per provider account. */
+function QuotaSection({ quota, now, t }: { readonly quota: QuotaRead; readonly now: number; readonly t: OperatorTranslate }) {
+  const { view } = quota;
+  return (
+    <Card labelledBy="agents-quota-heading">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1" data-agents-section="quota" data-quota-view={view.kind}>
+        <SectionTitle id="agents-quota-heading">{t('setup.quota.title')}</SectionTitle>
+        {view.kind === 'ready' && <span className="text-xs text-kumo-subtle">{t('setup.quota.readAt', { age: ageWords(view.report.read_at, now, t) })}</span>}
+        <Button size="sm" variant="secondary" icon={<ArrowClockwiseIcon />} onClick={quota.refresh} disabled={quota.reading} className="ml-auto" data-quota-refresh>
+          {t('setup.quota.refresh')}
+        </Button>
+      </div>
+      {view.kind === 'loading' && <p role="status" className="flex items-center gap-2 text-sm text-kumo-subtle"><Loader size={16} />{t('setup.quota.reading')}</p>}
+      {view.kind === 'unavailable' && <QuotaUnavailable reason={view.reason} t={t} />}
+      {view.kind === 'ready' && (view.report.accounts.length === 0
+        ? <p className="text-sm text-kumo-subtle">{t('setup.quota.empty')}</p>
+        : <ul className="flex flex-col divide-y divide-kumo-hairline rounded-lg border border-kumo-hairline">
+          {view.report.accounts.map(account => <QuotaRow key={account.account} account={account} now={now} t={t} />)}
+        </ul>)}
+    </Card>
+  );
+}
+
+/** Hosts, then the sub-agents, then the seats that run on both: the order is the dependency order. Quota is per provider account, after them. */
+export function AgentsPage({ agents, seats, quota, readReportingLanguage, writeReportingLanguage, generation, ...props }: PageProps & {
+  readonly agents: AgentsSettingsForm; readonly seats: SeatsSettingsForm; readonly quota: QuotaRead;
+  readonly readReportingLanguage: LanguageReader<readonly ReportingHost[]>; readonly writeReportingLanguage: LanguageWriter<ReportingPreset>; readonly generation: number;
+}) {
+  return (
+    <SetupFrame page="agents" {...props}>
+      {snapshot => <>
+        {snapshot && <AttentionSummary snapshot={snapshot} t={props.t} />}
+        <HostList snapshot={snapshot} agents={agents} now={props.now} t={props.t} />
+        <Card labelledBy="setup-language-heading">
+          <ReportingLanguage headingId="setup-language-heading" read={readReportingLanguage} write={writeReportingLanguage} generation={generation} t={props.t} />
+        </Card>
+        {snapshot && <FleetTable snapshot={snapshot} t={props.t} />}
+        <SeatsSection form={seats} agents={agents} setup={snapshot} quota={quota} t={props.t} />
+        <QuotaSection quota={quota} now={props.now} t={props.t} />
+      </>}
+    </SetupFrame>
+  );
+}
+
+// --- Skills ---
+
+function SkillRow({ skill, t }: { readonly skill: SetupSkill; readonly t: OperatorTranslate }) {
+  return (
+    <li className={ROW} data-skill={skill.name} data-skill-abnormal={String(skillAbnormal(skill))}>
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5 md:flex-row md:items-center md:gap-4">
+        <span className="font-mono text-sm font-medium text-kumo-strong md:w-56 md:shrink-0 [overflow-wrap:anywhere]">{skill.name}</span>
+        <span className="min-w-0 text-xs text-kumo-subtle md:line-clamp-2" title={skill.summary ?? undefined}>{skill.summary ?? t('setup.skills.noSummary')}</span>
+      </span>
+      <HostCells t={t} render={host => {
+        const cell = skillCell(skill, host);
+        const { key, tone } = SKILL_CELL[cell];
+        return <span className="inline-flex items-center gap-1.5" data-skill-state={cell}><StatusDot tone={tone} /><span className={tone === 'neutral' ? 'text-kumo-subtle' : undefined}>{t(key)}</span></span>;
+      }} />
+    </li>
+  );
+}
+
+function selectionText(selection: SetupInstallSelection, t: OperatorTranslate): string {
+  if (selection === 'all') return t('setup.skills.selectionAll');
+  return selection.length === 0 ? t('setup.skills.selectionCore') : selection.join(', ');
+}
+
+/** The only action: `rh update` repairs repo-harness skills. It needs the install ledger. */
+function SkillRepair({ selection, t }: { readonly selection: SetupInstallSelection | null; readonly t: OperatorTranslate }) {
+  if (selection === null) return <p className="text-sm text-kumo-subtle" data-skill-repair="no-ledger">{t('setup.skills.noLedger')}</p>;
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5" data-skill-repair="update">
+      <p className="text-sm text-kumo-default">{t('setup.skills.repair', { selection: selectionText(selection, t) })}</p>
+      <CommandLine command={SKILL_UPDATE_COMMAND} t={t} />
+    </div>
+  );
+}
+
+function SkillRoot({ root, t }: { readonly root: SetupHostSkillRoot; readonly t: OperatorTranslate }) {
+  return (
+    <section aria-labelledby={`skill-root-${root.host}`} className="flex min-w-0 flex-col" data-skill-root={root.host}>
+      <h3 id={`skill-root-${root.host}`} className="flex flex-wrap items-center gap-x-2 px-3 pb-1 text-xs">
+        <span className="font-semibold text-kumo-strong">{hostName(root.host, t)}</span>
+        <span className="font-mono text-kumo-subtle [overflow-wrap:anywhere]">{root.root}</span>
+      </h3>
+      {root.other_skills === null || root.other_skills.length === 0
+        ? <p className="px-3 text-sm text-kumo-subtle">{t(root.other_skills === null ? 'setup.skills.rootMissing' : 'setup.skills.noOther')}</p>
+        : (
+          <ul className="flex flex-col divide-y divide-kumo-hairline rounded-lg border border-kumo-hairline">
+            {root.other_skills.map(name => (
+              <li key={name} className={ROW} data-other-skill={name}>
+                <span className="font-mono text-sm text-kumo-strong md:w-56 md:shrink-0 [overflow-wrap:anywhere]">{name}</span>
+                <span className="min-w-0 font-mono text-xs text-kumo-subtle [overflow-wrap:anywhere]">{`${root.root}/${name}`}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+    </section>
+  );
+}
+
+function OtherSkills({ roots, t }: { readonly roots: readonly SetupHostSkillRoot[]; readonly t: OperatorTranslate }) {
+  return (
+    <Card labelledBy="setup-other-skills-heading">
+      <SectionTitle id="setup-other-skills-heading" count={roots.reduce((total, root) => total + (root.other_skills?.length ?? 0), 0)}>{t('setup.skills.other')}</SectionTitle>
+      {roots.length === 0 ? <p className="text-sm text-kumo-subtle" data-other-skills="unknown">{t('setup.skills.otherUnknown')}</p> : <>
+        <p className="text-xs text-kumo-subtle">{t('setup.skills.otherNote')}</p>
+        <div className="flex min-w-0 flex-col gap-4">{roots.map(root => <SkillRoot key={root.host} root={root} t={t} />)}</div>
+      </>}
+    </Card>
+  );
+}
+
+export function SkillsPage(props: PageProps & { readonly onOpenTool: (id: string) => void }) {
+  const { t } = props;
+  return (
+    <>
+    <SetupFrame page="skills" {...props}>
+      {snapshot => {
+        if (snapshot === null) return null;
+        const skills = orderSkills(snapshot.skills);
+        const abnormal = skills.filter(skillAbnormal).length;
+        // The skill projection check itself, when setup check flagged it; its detail explains missing rows.
+        const projection = snapshot.checks.find(check => check.id === SKILL_PROJECTION_CHECK) ?? null;
+        return (<>
+          <Card labelledBy="setup-skills-heading">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <SectionTitle id="setup-skills-heading" count={skills.length}>{t('setup.skills.title')}</SectionTitle>
+              {/* With no rows there is nothing to call consistent; the flagged check, if any, says why. */}
+              {skills.length > 0 && (
+                <span className={cn('inline-flex items-center gap-1.5 text-xs', abnormal > 0 ? 'text-kumo-warning' : 'text-kumo-subtle')} data-skills-abnormal={abnormal}>
+                  <StatusDot tone={abnormal > 0 ? 'warn' : 'ok'} />
+                  {abnormal === 0 ? t('setup.skills.allOk') : t('setup.skills.abnormal', { count: abnormal })}
+                </span>
+              )}
+            </div>
+            {projection && <ul className="rounded-lg border border-kumo-hairline" aria-label={t('setup.skills.check')}><CheckRow check={projection} t={t} /></ul>}
+            {abnormal > 0 && <SkillRepair selection={snapshot.install_selection} t={t} />}
+            {skills.length === 0 ? <p className="text-sm text-kumo-subtle">{t('setup.skills.empty')}</p> : (
+              <div className="flex min-w-0 flex-col">
+                <ColumnHeader t={t} lead={<><span className="w-56 shrink-0">{t('setup.skills.skill')}</span><span>{t('setup.skills.summary')}</span></>} />
+                <ul className="flex flex-col divide-y divide-kumo-hairline">{skills.map(skill => <SkillRow key={skill.name} skill={skill} t={t} />)}</ul>
+              </div>
+            )}
+          </Card>
+          <OtherSkills roots={snapshot.skill_roots} t={t} />
+        </>);
+      }}
+    </SetupFrame>
+    <ToolGroup kind="skill" onOpen={props.onOpenTool} t={t} />
+    </>
+  );
+}
+
+// --- Hooks ---
+
+function ManagedEntries({ snapshot, t }: { readonly snapshot: SetupSnapshotV2; readonly t: OperatorTranslate }) {
+  return (
+    <Card labelledBy="setup-managed-heading">
+      <SectionTitle id="setup-managed-heading">{t('setup.hooks.managed')}</SectionTitle>
+      <ul className="flex flex-col divide-y divide-kumo-hairline rounded-lg border border-kumo-hairline">
+        {snapshot.hosts.map(facts => {
+          const mismatches = facts.adapter?.mismatches ?? [];
+          return (
+            <li key={facts.host} className="flex min-w-0 flex-col gap-1.5 px-3 py-2.5 md:flex-row md:items-start md:gap-4" data-managed-host={facts.host}>
+              <span className="flex shrink-0 items-center gap-2 md:w-44">
+                <span className="text-kumo-subtle">{HOST_ICON[facts.host]}</span>
+                <span className="text-sm font-medium text-kumo-strong">{hostName(facts.host, t)}</span>
+              </span>
+              <span className="flex min-w-0 flex-1 flex-col gap-1.5">
+                <span className="flex min-w-0 items-start gap-2 text-sm">
+                  <StatusDot tone={hostTone(facts)} className="mt-1.5" />
+                  <span className="min-w-0 [overflow-wrap:anywhere]">{sentenceText(facts, t)}</span>
+                </span>
+                {mismatches.length > 0 && (
+                  <ul className="flex flex-col gap-1 pl-4" aria-label={t('setup.hooks.mismatches')}>
+                    {mismatches.map((mismatch, index) => (
+                      <li key={index} className="font-mono text-xs text-kumo-default [overflow-wrap:anywhere]" data-mismatch={mismatch.kind}>{mismatchText(mismatch, t)}</li>
+                    ))}
+                  </ul>
+                )}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </Card>
+  );
+}
+
+function RouteRow({ route, t }: { readonly route: SetupHookRoute; readonly t: OperatorTranslate }) {
+  return (
+    <li className={ROW} data-route={route.route_id}>
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5 md:flex-row md:items-center md:gap-4">
+        <span className="font-mono text-sm text-kumo-strong md:w-64 md:shrink-0 [overflow-wrap:anywhere]">{route.route_id}</span>
+        <span className="text-xs text-kumo-subtle [overflow-wrap:anywhere]">
+          <span className="md:sr-only">{t('setup.hooks.matcher')}: </span>
+          {route.matcher === null ? t('setup.hooks.allTools') : <code className="font-mono">{route.matcher}</code>}
+        </span>
+      </span>
+      <HostCells t={t} render={host => route.hosts.includes(host)
+        ? <span className="inline-flex items-center gap-1 text-kumo-success" data-route-host="supported"><CheckIcon size={14} aria-hidden="true" /><span className="text-kumo-default">{t('setup.hooks.supported')}</span></span>
+        : <span className="inline-flex items-center gap-1 text-kumo-subtle" data-route-host="unsupported"><MinusIcon size={14} aria-hidden="true" />{t('setup.hooks.unsupported')}</span>} />
+    </li>
+  );
+}
+
+export function HooksPage(props: PageProps) {
+  const { t } = props;
+  return (
+    <SetupFrame page="hooks" {...props}>
+      {snapshot => snapshot && <>
+        <ManagedEntries snapshot={snapshot} t={t} />
+        <Card labelledBy="setup-usage-heading">
+          <SectionTitle id="setup-usage-heading">{t('setup.hooks.usage')}</SectionTitle>
+          {snapshot.hook_usage === null ? <p className="text-sm text-kumo-subtle">{t('setup.hooks.usageUnknown')}</p> : <>
+            <p className="text-xs text-kumo-subtle">{t('setup.hooks.usageScope', { hours: snapshot.hook_usage.window_hours })}</p>
+            {snapshot.hook_usage.routes.length === 0 ? <p className="text-sm text-kumo-subtle">{t('setup.hooks.noCalls')}</p> : (
+              <ul className="divide-y divide-kumo-hairline">
+                {snapshot.hook_usage.routes.map(row => <li key={`${row.host}:${row.event}:${row.route_id}`} data-hook-usage={row.route_id}
+                  className="flex flex-wrap justify-between gap-2 py-2 text-sm">
+                  <span className="break-all font-mono">{row.event}.{row.route_id} · {hostName(row.host, t)}</span>
+                  <span className="tabular-nums">{t(row.calls === 1 ? 'setup.hooks.countsOne' : 'setup.hooks.counts', { calls: row.calls, blocked: row.blocked })}</span>
+                </li>)}
+              </ul>
+            )}
+            <h3 className="text-sm font-medium">{t('setup.hooks.denials')}</h3>
+            {snapshot.hook_usage.recent_denials.length === 0 ? <p className="text-sm text-kumo-subtle">{t('setup.hooks.noDenials')}</p> : (
+              <ul className="divide-y divide-kumo-hairline">
+                {snapshot.hook_usage.recent_denials.map((row, index) => <li key={index} data-hook-denial className="py-2 text-sm [overflow-wrap:anywhere]">
+                  <p className="text-xs text-kumo-subtle"><time dateTime={row.at}>{row.at}</time> · {row.guard}</p>
+                  <p>{row.reason}</p>
+                </li>)}
+              </ul>
+            )}
+          </>}
+        </Card>
+        <Card labelledBy="setup-routes-heading">
+          <SectionTitle id="setup-routes-heading" count={snapshot.hooks.reduce((total, event) => total + event.routes.length, 0)}>{t('setup.hooks.routes')}</SectionTitle>
+          {snapshot.hooks.length === 0 ? <p className="text-sm text-kumo-subtle">{t('setup.hooks.empty')}</p> : (
+            <div className="flex min-w-0 flex-col gap-4">
+              <ColumnHeader t={t} lead={<><span className="w-64 shrink-0">{t('setup.hooks.route')}</span><span>{t('setup.hooks.matcher')}</span></>} />
+              {snapshot.hooks.map(event => (
+                <section key={event.event} aria-labelledby={`hook-event-${event.event}`} className="flex min-w-0 flex-col" data-hook-event={event.event}>
+                  <h3 id={`hook-event-${event.event}`} className="flex items-center gap-2 px-3 pb-1 font-mono text-xs font-semibold text-kumo-strong">
+                    {event.event}<span className="rounded-full bg-kumo-recessed px-1.5 font-sans font-medium tabular-nums text-kumo-subtle">{event.routes.length}</span>
+                  </h3>
+                  <ul className="flex flex-col divide-y divide-kumo-hairline rounded-lg border border-kumo-hairline">
+                    {event.routes.map(route => <RouteRow key={route.route_id} route={route} t={t} />)}
+                  </ul>
+                </section>
+              ))}
+            </div>
+          )}
+        </Card>
+      </>}
+    </SetupFrame>
+  );
+}

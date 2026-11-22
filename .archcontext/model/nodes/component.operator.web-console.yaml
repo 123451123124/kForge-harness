@@ -1,0 +1,30 @@
+schemaVersion: archcontext.node/v2
+id: component.operator.web-console
+kind: component
+name: Operator Web Console
+status: active
+parent: capability.runtime-harness.operator
+layer: web
+summary: Prebuilt browser console that renders operator JSON observations and sends its write requests through one write client.
+responsibilities:
+  - Fetch observations with GET and decode each body with the shared core decoder before render.
+  - Render Home and the Board, Repositories, Agents, Skills, Hooks, CLI, Bots, Architecture, Tests, Rules, System and Tools pages in one side rail with a repository switch, and the Settings page at the foot of the rail.
+  - Build the Paper and Ink themes, type styles, logo and pixel characters from the design system's tokens.json and asset files.
+  - Place each architecture view as one scene of boxes, routes and labels that the canvas, the SVG file and the checks read.
+  - The Settings page writes through one POST /api/v1/settings/agents that carries the draft's changes, the revision it read and a request_id; after reconcile_required it locks the form until a reload.
+  - The Rules candidate drawer at #rules/candidate/<candidate_id> sends rules_promote with the edited prompt, the snapshot's marker line of the selected routing class, the ledger blob and a new request_id for each click, and rules_reconcile once per click after a refused or unconfirmed answer; it never retries on a timer, picks a seat, dispatches, merges or runs the GO command, which it shows as copyable text.
+source:
+  include:
+    - src/operator-web/**
+    - packages/operator-web/**
+    - vite.operator.config.ts
+    - docs/design/operator-console/design-system/**
+  entrypoints:
+    - id: entrypoint.operator.web-dev-activity
+      path: src/operator-web/dev-activity.ts
+      symbols:
+        - name: fetchDevActivity
+          sinks:
+            - id: sink.operator.web-dev-activity-decode
+              path: src/core/dev-activity/decode.ts
+              symbol: decodeDevActivitySnapshot

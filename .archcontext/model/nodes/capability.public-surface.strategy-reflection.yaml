@@ -1,0 +1,43 @@
+schemaVersion: archcontext.node/v2
+id: capability.public-surface.strategy-reflection
+kind: capability
+name: Strategy Reflection
+status: active
+layer: effects
+summary: Collects a bounded strategy context packet and validates inert strategic proposals on explicit request.
+responsibilities:
+  - Read the human-owned strategy document and its hash-and-revision evidence under fixed byte and time budgets.
+  - Export one digest-bound context packet with every unknown and truncation made explicit.
+  - Validate a proposal against that packet and never grant execution authority.
+  - Project the explicit-setup repo-harness-strategy skill to host skill roots on request.
+source:
+  include:
+    - src/core/strategy/**
+    - src/effects/strategy/**
+    - src/cli/commands/strategy.ts
+    - src/cli/commands/strategy-actions.ts
+    - docs/strategy/**
+  entrypoints:
+    - id: entrypoint.strategy-reflection.primary
+      path: src/cli/commands/strategy-actions.ts
+      symbols:
+        - name: context
+          sinks:
+            - id: sink.strategy-reflection.primary
+              path: src/effects/strategy/context.ts
+              symbol: collectStrategyContext
+        - name: validate
+          sinks:
+            - id: sink.strategy-reflection.validate
+              path: src/effects/strategy/context.ts
+              symbol: validateStrategyRequest
+extensions:
+  harnessTier: "plugin"
+  harnessContract: "Surface"
+  contractFiles:
+    agents: "AGENTS.md"
+    claude: "CLAUDE.md"
+  lspProfile: "typescript-lsp"
+  verification:
+    - "bun run test:files tests/strategy.test.ts --timeout 60000 --max-concurrency 1"
+    - "bun run check:type"

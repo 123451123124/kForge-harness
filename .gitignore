@@ -1,0 +1,114 @@
+# Prepack-built single-file hook bundle (projection of src/cli/hook-entry.ts)
+dist/
+
+# Console package license copied from the root during prepack
+packages/operator-web/LICENSE
+
+# Bun
+bun.lockb
+
+# IDE
+.idea/
+.vscode/settings.json
+.cursor/
+
+# Local tool state (not project deliverables)
+.sisyphus/boulder.json
+.sisyphus/notepads/
+.understand-anything/
+autoresearch/
+
+# BEGIN: repo-harness generated-runtime
+# Dependencies
+node_modules/
+
+# Project-specific
+artifacts/
+coverage/
+*.tar.gz
+*.tgz
+
+# External references
+_ref/
+.archcontext/*
+!.archcontext/manifest.yaml
+!.archcontext/product.yaml
+!.archcontext/model/
+.archcontext/model/*
+!.archcontext/model/nodes/
+!.archcontext/model/relations/
+!.archcontext/model/flows/
+!.archcontext/decisions/
+!.archcontext/policies/
+!.archcontext/practices/
+!.archcontext/projections/
+.codegraph/
+.claude/.codegraph-state/
+
+# Local operations state
+_ops/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# OS metadata
+.DS_Store
+
+# Host and tool directories
+.repo-harness/
+.codex/*
+.claude/worktrees/
+# END: repo-harness generated-runtime
+
+# Repository-owned: this checkout runs the harness on itself, so it ignores its own runtime state without host state
+!.archcontext/model/constraints/
+!.archcontext/model/state-machines/
+.claude/.session-id
+.claude/.trace.jsonl
+.ai/harness/checks/post-bash-latest.json
+.claude/settings.local.json
+.claude/.atomic_pending
+.claude/.session-handoff.md
+.claude/.task-state.json
+.claude/.task-handoff.md
+.claude/*.tmp
+.claude/*.bak
+.claude/*.bak.*
+.claude/*.backup-*
+.ai/harness/checks/
+.ai/harness/checks/*.latest.json
+.ai/harness/checks/*.latest.md
+.ai/harness/events.jsonl
+.ai/harness/archive/
+.ai/harness/backups/
+.ai/harness/failures/latest.jsonl
+.ai/harness/standing-orders.md
+.ai/harness/capability-context/
+.ai/harness/journal/
+.ai/harness/architecture-projection/
+.ai/harness/security/*
+!.ai/harness/security/.gitkeep
+.ai/harness/planning/*
+!.ai/harness/planning/.gitkeep
+.ai/harness/delegation/*
+.ai/harness/architecture/events.jsonl
+.ai/harness/active-worktree
+.ai/harness/worktrees/
+.ai/harness/evidence/
+.ai/harness/runs/
+.ai/harness/state/
+.ai/harness/chatgpt/
+.ai/harness/handoff/gptpro/
+.ai/harness/mcp/
+.ai/harness/triage/*
+!.ai/harness/triage/.gitkeep
+
+# Project-specific: track the Codex fleet agent definitions under the managed .codex/* rule
+!.codex/
+!.codex/agents/
+!.codex/agents/*.toml
+
+# CI affected-test selection artifact (scripts/select-ci-coverage.ts)
+/.ci-affected-tests.json

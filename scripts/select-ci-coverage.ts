@@ -1,0 +1,366 @@
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { dirname, join, posix } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { discoverPathReferences, loadPathReferences, savePathReferences, sourceKey } from './ci-path-consumers';
+import { isDocumentationPath, PROJECTION_DIRECTORY, PROJECTION_MANIFEST, projectionOutputs } from '../src/core/ci/documentation-path';
+import { loadTestDurations, planShards } from './select-test-suite';
+
+export type CoverageInput = {
+  eventName: string; event: unknown; headSha: string; actualHead: string; diffRaw: string | null;
+};
+export type CoverageSelection = { mode: 'affected' | 'documentation' | 'daily' | 'report' | 'invalid'; reason: string; paths: string[] };
+export function validSha(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{40}$/.test(value) && value !== '0'.repeat(40);
+}
+
+export function diffBase(eventName: string, event: unknown): unknown {
+  const payload = event as any;
+  if (eventName === 'pull_request') return payload?.pull_request?.base?.sha;
+  return payload?.before;
+}
+function validPath(path: string): boolean {
+  return !path.split('/').some(part => !part || part === '.' || part === '..') && !/[\r\n]/.test(path);
+}
+export function selectCoverage(input: CoverageInput): CoverageSelection {
+  const result = (mode: CoverageSelection['mode'], reason: string, paths: string[] = []): CoverageSelection => ({ mode, reason, paths });
+  const { eventName, event, headSha, actualHead, diffRaw } = input;
+  if (!validSha(headSha) || headSha !== actualHead) return result('invalid', 'checkout-mismatch');
+  if (eventName === 'schedule' || eventName === 'workflow_dispatch') return result('daily', 'fixed-main-snapshot');
+  if (!['pull_request', 'push', 'local'].includes(eventName)) return result('invalid', 'unknown-event');
+  if (!validSha(diffBase(eventName, event))) return result('invalid', 'invalid-diff-endpoint');
+  if (eventName === 'local' && diffRaw === '') return result('affected', 'complete-diff');
+  if (diffRaw === null || !diffRaw || !diffRaw.endsWith('\0')) return result('invalid', 'diff-unavailable-or-empty');
+  const records = diffRaw.slice(0, -1).split('\0');
+  if (records.length % 2) return result('invalid', 'invalid-diff');
+  const paths: string[] = [];
+  for (let index = 0; index < records.length; index += 2) {
+    const metadata = /^:(\d{6}) (\d{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) ([AMD])$/.exec(records[index]!);
+    const path = records[index + 1]!;
+    if (!metadata || !validPath(path)) return result('invalid', 'invalid-diff');
+    const [, oldMode, newMode, oldSha, newSha, status] = metadata;
+    const modes = ['100644', '100755', '120000', '160000'];
+    if (status === 'A' ? oldMode !== '000000' || oldSha !== '0'.repeat(40) || !modes.includes(newMode!)
+      : status === 'D' ? newMode !== '000000' || newSha !== '0'.repeat(40) || !modes.includes(oldMode!)
+      : !modes.includes(oldMode!) || !modes.includes(newMode!)) return result('invalid', 'invalid-diff');
+    paths.push(path);
+  }
+  return result(eventName === 'push' ? 'report' : 'affected', 'complete-diff', paths);
+}
+
+/** Imports and exact paths propagate; directory content edges apply to direct changes only. */
+export async function selectAffectedTests(paths: readonly string[], sources: ReadonlyMap<string, string>, documentationConsumers: readonly string[], previousSources: ReadonlyMap<string, string> = new Map()): Promise<string[]> {
+  const result = await analyzeAffectedTests(paths, sources, documentationConsumers, previousSources);
+  if (result.uncovered.length) throw new Error(`Affected coverage is unknown for: ${result.uncovered.join(', ')}. Add the actual consumer regression; do not substitute a skipped/full-suite pass.`);
+  return result.tests;
+}
+
+/** Every CI test job sources this runner. */
+const CI_TEST_RUNNER = 'scripts/lib/ci-run-tests.sh';
+
+/** The bunfig test preloads run in every test process. Empty when bunfig.toml is absent or names none. */
+export function configuredTestPreloads(sources: ReadonlyMap<string, string>): string[] {
+  const preload = (Bun.TOML.parse(sources.get('bunfig.toml') ?? '') as any)?.test?.preload;
+  if (preload === undefined) return [];
+  if (!Array.isArray(preload) || preload.some((path: unknown) => typeof path !== 'string' || !validPath(path.replace(/^\.\//, '')))) throw new Error('Platform coverage requires test preloads');
+  return preload.map((path: string) => path.replace(/^\.\//, ''));
+}
+
+export async function analyzeAffectedTests(paths: readonly string[], sources: ReadonlyMap<string, string>, documentationConsumers: readonly string[], previousSources: ReadonlyMap<string, string> = new Map(), outputs: ReadonlySet<string> = new Set()) {
+  const files = [...sources.keys()];
+  const allTests = files.filter(file => /^tests\/.*\.test\.tsx?$/.test(file)).sort();
+  const globalInputs = platformImportClosure(configuredTestPreloads(sources), sources).add(CI_TEST_RUNNER);
+  if (previousSources.size) {
+    const baseSources = new Map([...sources, ...previousSources]);
+    for (const path of platformImportClosure(configuredTestPreloads(baseSources), baseSources)) globalInputs.add(path);
+  }
+  const fullReasons = paths.filter(path => ['package.json', 'bun.lock', 'bunfig.toml', 'tsconfig.json'].includes(path) || globalInputs.has(path));
+  const reverse = new Map<string, Set<string>>();
+  const data = new Map<string, Set<string>>();
+  const add = (graph: Map<string, Set<string>>, dependency: string, consumer: string) => {
+    if (dependency === consumer) return;
+    const entries = graph.get(dependency) ?? new Set<string>(); entries.add(consumer); graph.set(dependency, entries);
+  };
+  const candidates = new Set([...files, ...paths, ...previousSources.keys()]);
+  const references = new Map<string, Map<string, boolean>>();
+  const rootedReferences = new Map<string, Map<string, boolean>>();
+  const reference = (index: typeof references, key: string, dependency: string, directory: boolean) => {
+    const entries = index.get(key) ?? new Map<string, boolean>(); entries.set(dependency, directory); index.set(key, entries);
+  };
+  for (const dependency of candidates) {
+    reference(references, dependency, dependency, false);
+    reference(rootedReferences, dependency, dependency, false);
+    const parts = dependency.split('/');
+    for (let i = 1; i < parts.length; i++) {
+      reference(references, parts.slice(0, i).join('/'), dependency, true);
+      reference(rootedReferences, parts.slice(0, i).join('/'), dependency, true);
+      if (parts.at(-1)!.includes('.')) reference(references, parts.slice(i).join('/'), dependency, false);
+    }
+  }
+  const pathReferences = await discoverPathReferences([...sources, ...previousSources]);
+  for (const [file, source] of [...sources, ...previousSources]) {
+    if (!/\.[cm]?[jt]sx?$/.test(file)) continue;
+    const imports = new Bun.Transpiler({ loader: file.endsWith('x') ? 'tsx' : 'ts', tsconfig: { compilerOptions: { jsx: 'react' } } }).scanImports(source.replace(/^#![^\n]*$/gm, '')).map(entry => entry.path);
+    for (const raw of imports) {
+      const relativePath = posix.normalize(posix.join(dirname(file), raw));
+      for (const dependency of [relativePath, `${relativePath}.ts`, `${relativePath}.tsx`, `${relativePath}/index.ts`, `${relativePath}/index.tsx`]) {
+        if (candidates.has(dependency)) add(reverse, dependency, file);
+      }
+    }
+    for (const entry of pathReferences.get(sourceKey(file, source)) ?? []) {
+      const wildcard = entry.path.indexOf('*');
+      const literal = wildcard >= 0 ? entry.path.slice(0, wildcard).replace(/\/$/, '') : entry.path;
+      if (!literal) continue;
+      for (const [dependency, directory] of (entry.rooted ? rootedReferences : references).get(literal) ?? []) {
+        if (directory && entry.operation === 'constructed') continue;
+        add(directory && entry.operation !== 'execute' ? data : reverse, dependency, file);
+      }
+      if (entry.rooted) continue;
+      const relativePath = posix.normalize(posix.join(dirname(file), literal));
+      for (const dependency of [relativePath, `${relativePath}.ts`, `${relativePath}.tsx`, `${relativePath}/index.ts`, `${relativePath}/index.tsx`]) {
+        if (candidates.has(dependency)) add(reverse, dependency, file);
+      }
+    }
+  }
+  const dailyInputs = discoverDailyInputs(sources);
+  const tests = new Set<string>();
+  const uncovered: string[] = [], dailyOnly: string[] = [], retired: string[] = [];
+  for (const path of paths) {
+    // A projection output selects no test by name, and it needs no coverage of its own.
+    if (outputs.has(path)) continue;
+    if (isDocumentationPath(path)) { for (const test of documentationConsumers) if (sources.has(test)) tests.add(test); continue; }
+    if (fullReasons.includes(path)) continue;
+    // Eval fixtures are inputs to the eval suite; a rename or deletion must run it.
+    if (path.startsWith('evals/fixtures/')) {
+      if (sources.has('tests/run-skill-evals.test.ts')) tests.add('tests/run-skill-evals.test.ts');
+      else uncovered.push(path);
+      continue;
+    }
+    const seen = new Set([path]); const queue = [path]; let covered = false;
+    for (const consumer of data.get(path) ?? []) if (!seen.has(consumer)) { seen.add(consumer); queue.push(consumer); }
+    for (let i = 0; i < queue.length; i++) {
+      const consumer = queue[i]!;
+      if (/^tests\/.*\.test\.tsx?$/.test(consumer) && sources.has(consumer)) { tests.add(consumer); covered = true; }
+      for (const next of reverse.get(consumer) ?? []) if (!seen.has(next)) { seen.add(next); queue.push(next); }
+    }
+    if (covered || path.startsWith('docs/images/')) continue;
+    if (previousSources.has(path) && !sources.has(path) && [...seen].some(file => /^tests\/.*\.test\.tsx?$/.test(file) && previousSources.has(file)) && [...seen].every(file => !sources.has(file))) { retired.push(path); continue; }
+    if (dailyInputs.has(path)) { dailyOnly.push(path); continue; }
+    // Deleted skill-routing evidence has no runtime consumer: reports, matrices
+    // and probes are inputs to an explicit eval command, not source code.
+    // Retire the deletion instead of demanding a test edge. The non-code guard
+    // keeps a deleted script or test under the same prefix fail-closed.
+    if (previousSources.has(path) && !sources.has(path) && path.startsWith('evals/skill-routing/') && !/\.[cm]?[jt]sx?$/.test(path)) { retired.push(path); continue; }
+    uncovered.push(path);
+  }
+  return { graph: { reverse, data }, tests: fullReasons.length ? allTests : [...tests].sort(), uncovered, dailyOnly, retired, fullReasons };
+}
+
+/** Explicit daily commands are evidence of deferred execution, never a claimed PR pass. */
+export function discoverDailyInputs(sources: ReadonlyMap<string, string>): Set<string> {
+  const script = sources.get('scripts/check-ci.sh') ?? '';
+  const start = script.indexOf('if [[ "$lane" == all || "$lane" == functional ]]');
+  if (start < 0) return new Set();
+  const inputs = new Set<string>();
+  let depth = 0;
+  // Only command-position control words count. Do not scan past the closing fi,
+  // including a command on the same line. Ignore quoted text and comments.
+  const code = script.slice(start).replace(/"(?:\\.|[^"\\])*"|'[^']*'|#[^\n]*/g, '');
+  for (const statement of code.split(/[;\n]/)) {
+    const command = statement.trim().replace(/^(?:then|else)\s+/, '');
+    if (/^if\b/.test(command)) depth++;
+    if (/^fi\b/.test(command) && --depth === 0) return inputs;
+    for (const match of command.matchAll(/(?:^|\s)(?:bash|bun)\s+(scripts\/[\w/.-]+\.(?:sh|ts))/g)) {
+      if (sources.has(match[1]!)) inputs.add(match[1]!);
+    }
+  }
+  return new Set();
+}
+export type PlatformInputs = { native: ReadonlySet<string>; home: ReadonlySet<string> };
+/** CI machinery that every platform job runs. */
+function ciMachineryPath(path: string): boolean {
+  return ['package.json', 'bun.lock', 'bunfig.toml', 'tsconfig.json', 'scripts/check-ci.sh',
+    'scripts/ci-path-consumers.ts', 'scripts/ci-documentation-consumers.ts'].includes(path)
+    || path.startsWith('scripts/lib/') || /^scripts\/select-[^/]+\.ts$/.test(path) || path === 'src/core/ci/documentation-path.ts';
+}
+export type NativeTrigger = { cause: 'shared' | 'herdr-pin' | 'native-closure'; path: string };
+/**
+ * Each changed path that selects the native job, with its cause. Of `.github/`, only
+ * the CI workflow is shared; the local actions that the job uses are native inputs.
+ */
+export function nativeTriggers(paths: readonly string[], inputs: PlatformInputs): NativeTrigger[] {
+  return paths.flatMap((path): NativeTrigger[] => ciMachineryPath(path) || path === '.github/workflows/ci.yml' ? [{ cause: 'shared', path }]
+    // The native job installs the hc version pinned in this package file (install-pinned-herdr-core action).
+    : path === 'src/core/terminal/herdr-core-pin.json' ? [{ cause: 'herdr-pin', path }]
+      : inputs.native.has(path) ? [{ cause: 'native-closure', path }] : []);
+}
+export function selectPlatformCoverage(paths: readonly string[], inputs: PlatformInputs): { native_oar: boolean; home_isolation: boolean } {
+  return {
+    native_oar: nativeTriggers(paths, inputs).length > 0,
+    home_isolation: paths.some(path => path.startsWith('.github/') || ciMachineryPath(path) || inputs.home.has(path)),
+  };
+}
+
+/** Resolve only real local imports. A native or HOME root pulls in every repo-local module it imports. */
+export function platformImportClosure(roots: readonly string[], sources: ReadonlyMap<string, string>): Set<string> {
+  const seen = new Set(roots);
+  const queue = [...roots];
+  for (let index = 0; index < queue.length; index++) {
+    const file = queue[index]!;
+    const source = sources.get(file);
+    if (source === undefined) throw new Error(`Platform coverage requires source: ${file}`);
+    // Data imports such as JSON schemas are trigger inputs with no imports of their own.
+    if (!/\.[cm]?[jt]sx?$/.test(file)) continue;
+    const imports = new Bun.Transpiler({ loader: file.endsWith('x') ? 'tsx' : 'ts' }).scanImports(source.replace(/^#![^\n]*$/gm, ''));
+    for (const entry of imports) {
+      if (!entry.path.startsWith('.')) continue;
+      const base = posix.normalize(posix.join(dirname(file), entry.path));
+      const dependency = [base, `${base}.ts`, `${base}.tsx`, `${base}/index.ts`, `${base}/index.tsx`].find(path => sources.has(path));
+      if (!dependency) throw new Error(`Unresolved platform import: ${file} -> ${entry.path}`);
+      if (seen.has(dependency)) continue;
+      seen.add(dependency); queue.push(dependency);
+    }
+  }
+  return seen;
+}
+
+export function bundleInputPaths(metafile: unknown): string[] {
+  const inputs = (metafile as any)?.inputs;
+  if (!inputs || typeof inputs !== 'object' || Array.isArray(inputs) || !Object.keys(inputs).length) throw new Error('OAR bundle inputs are missing');
+  const paths = Object.keys(inputs).map(path => path.replace(/^\.\//, ''));
+  if (paths.some(path => !validPath(path) || path.startsWith('/') || /^[A-Za-z]:/.test(path))) throw new Error('Invalid OAR bundle input path');
+  return paths;
+}
+
+/** Workflow test commands and package build scripts own the native inventory. No second file list. */
+export async function discoverPlatformInputs(sources: ReadonlyMap<string, string>, root = process.cwd()): Promise<PlatformInputs> {
+  const workflow = Bun.YAML.parse(sources.get('.github/workflows/ci.yml') ?? '') as any;
+  const testsFor = (job: string, name: string): string[] => {
+    const steps = workflow?.jobs?.[job]?.steps?.filter((step: any) => step.name === name);
+    if (steps?.length !== 1 || typeof steps[0].run !== 'string') throw new Error(`Platform coverage requires ${job}: ${name}`);
+    // A job with a `test` matrix names its files in its legs, so its legs are the inventory.
+    const legs = workflow.jobs[job].strategy?.matrix?.test;
+    const commands: unknown[] = Array.isArray(legs) ? legs : [steps[0].run];
+    const found = commands.map(command => typeof command === 'string' ? command.match(/tests\/[\w/.-]+\.test\.tsx?/g) ?? [] : []);
+    if (!found.length || found.some(tests => !tests.length)) throw new Error(`Platform tests are missing: ${name}`);
+    return [...new Set(found.flat())];
+  };
+  const preloads = configuredTestPreloads(sources);
+  if (!preloads.length) throw new Error('Platform coverage requires test preloads');
+  const native = platformImportClosure([...testsFor('native-oar', 'Run native OAR acceptance tests'), ...preloads], sources);
+  const home = platformImportClosure([...testsFor('home-isolation', 'Run the isolation tests'), ...preloads], sources);
+  for (const step of workflow.jobs['native-oar'].steps) if (typeof step.uses === 'string' && step.uses.startsWith('./')) {
+    const action = `${step.uses.slice(2).replace(/\/$/, '')}/`;
+    for (const path of sources.keys()) if (path.startsWith(action)) native.add(path);
+  }
+  // A native leg runs the shell scripts that its sources launch, so they are native inputs.
+  const launchers = [...native].filter(path => /\.[cm]?[jt]sx?$/.test(path)).map(path => [path, sources.get(path)!] as const);
+  const references = await discoverPathReferences(launchers);
+  for (const [file, source] of launchers) for (const entry of references.get(sourceKey(file, source)) ?? []) {
+    if (entry.operation === 'execute' && entry.path.endsWith('.sh') && sources.has(entry.path)) native.add(entry.path);
+  }
+  const directory = mkdtempSync(join(tmpdir(), 'rh-ci-platform-'));
+  try {
+    const name = 'build:oar-review-host', metafile = join(directory, 'build-oar-review-host.json');
+    const build = spawnSync(process.execPath, ['run', name, `--metafile=${metafile}`, `--outfile=${join(directory, 'host.js')}`], { cwd: root, encoding: 'utf8' });
+    if (build.status !== 0) throw new Error(`Platform bundle failed: ${name}\n${build.stdout}\n${build.stderr}`);
+    for (const path of bundleInputPaths(JSON.parse(readFileSync(metafile, 'utf8')))) native.add(path);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+  return { native, home };
+}
+
+/** Every input of the path parse: the analyzer's local import closure and the lockfile that pins the TypeScript parser. */
+export function pathAnalyzerFingerprint(sources: ReadonlyMap<string, string>): string {
+  const hash = createHash('sha256');
+  for (const file of [...platformImportClosure(['scripts/ci-path-consumers.ts'], sources), 'bun.lock'].sort()) {
+    const source = sources.get(file);
+    if (source === undefined) throw new Error(`Path reference cache requires source: ${file}`);
+    hash.update(`${file}\0${source}\0`);
+  }
+  return hash.digest('hex');
+}
+
+function git(args: string[]): string {
+  const result = spawnSync('git', args, { encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(result.stderr || `git ${args[0]} failed`);
+  return result.stdout;
+}
+if (import.meta.main) {
+  const args = process.argv.slice(2);
+  const local = args.length === 2 && args[0] === '--base' && !!args[1] && !args[1].startsWith('-');
+  if (args.length && !local) throw new Error('Usage: select-ci-coverage.ts [--base <git-ref>]');
+  const actualHead = git(['rev-parse', 'HEAD']).trim();
+  const eventName = local ? 'local' : process.env.GITHUB_EVENT_NAME ?? '';
+  const headSha = local ? actualHead : process.env.GITHUB_SHA ?? '';
+  const event = local ? { before: git(['rev-parse', '--verify', `${args[1]}^{commit}`]).trim() }
+    : JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH!, 'utf8'));
+  const base = diffBase(eventName, event);
+  const diffRaw = validSha(base) && validSha(headSha) && actualHead === headSha
+    ? git(['diff', '--raw', '--no-abbrev', '--no-renames', '-z', base, ...(local ? [] : [headSha]), '--']) : null;
+  const input = { eventName, event, headSha, actualHead, diffRaw };
+  const selection = selectCoverage(input);
+  if (selection.mode === 'invalid') throw new Error(selection.reason);
+  if (selection.mode === 'daily' && process.env.GITHUB_REF !== 'refs/heads/main') throw new Error('Daily validation requires the fixed main snapshot');
+  let platforms = { native_oar: selection.mode === 'daily', home_isolation: selection.mode === 'daily' };
+  let nativeReason = selection.mode === 'daily' ? 'daily' : 'none';
+  if (selection.mode === 'affected' && local) {
+    const untracked = git(['ls-files', '--others', '--exclude-standard', '--exclude=.ci-affected-tests.json', '-z']).split('\0').filter(Boolean);
+    if (untracked.some(path => !validPath(path))) throw new Error('invalid-diff');
+    selection.paths = [...new Set([...selection.paths, ...untracked])];
+  }
+  // A mixed diff keeps every documentation consumer. A documentation-only diff runs the tests that
+  // name a changed document; with none, it runs no build or test job. A test that only may read
+  // any document (a child process in the checkout root) runs in the daily suite.
+  let documentationConsumers: string[] = [];
+  // A projection output counts as documentation only when no code path joins it, and no test is
+  // selected for it by name. A missing or invalid manifest stops the selection.
+  const outputs = selection.mode === 'affected' && selection.paths.some(path => path.startsWith(PROJECTION_DIRECTORY))
+    ? projectionOutputs(readFileSync(PROJECTION_MANIFEST, 'utf8')) : new Set<string>();
+  const documentsOnly = selection.paths.length > 0 && selection.paths.every(path => isDocumentationPath(path) || outputs.has(path));
+  if (selection.mode === 'affected' && (documentsOnly || selection.paths.some(path => isDocumentationPath(path) && !outputs.has(path)))) {
+    const { discoverDocumentationReaders, namedDocumentReaders } = await import('./ci-documentation-consumers');
+    // Changed paths add the base-tree documents that the head no longer has, so a deletion keeps its readers.
+    const tracked = git(['ls-files', '-z']).split('\0').filter(isDocumentationPath);
+    const readers = await discoverDocumentationReaders(process.cwd(), new Set([...tracked, ...selection.paths.filter(isDocumentationPath)]));
+    documentationConsumers = documentsOnly ? namedDocumentReaders(readers, selection.paths.filter(path => !outputs.has(path))) : [...readers.keys()];
+    if (!documentationConsumers.length && documentsOnly) selection.mode = 'documentation';
+  }
+  // The push-to-main run fills the cache that PR runs restore; it runs no test.
+  const referenceCache = process.env.CI_PATH_REFERENCE_CACHE;
+  if (selection.mode === 'affected' || (selection.mode === 'report' && referenceCache)) {
+    const sources = new Map<string, string>();
+    for (const file of git(['ls-files', ...(local ? ['--cached', '--others', '--exclude-standard', '--exclude=.ci-affected-tests.json'] : []), '-z']).split('\0').filter(Boolean)) if (existsSync(file)) {
+      try { sources.set(file, readFileSync(file, 'utf8')); } catch { /* directories/submodules are validated by their consumer */ }
+    }
+    const previousSources = new Map<string, string>();
+    const analyzer = referenceCache ? pathAnalyzerFingerprint(sources) : '';
+    if (referenceCache) console.log(`Loaded ${loadPathReferences(referenceCache, analyzer)} cached path-reference entries`);
+    if (selection.mode === 'report') await discoverPathReferences([...sources]);
+    else {
+      for (const file of selection.paths) {
+        const old = spawnSync('git', ['show', `${base}:${file}`], { encoding: 'utf8' });
+        if (old.status === 0) previousSources.set(file, old.stdout);
+      }
+      const platformInputs = await discoverPlatformInputs(sources);
+      platforms = selectPlatformCoverage(selection.paths, platformInputs);
+      const triggers = nativeTriggers(selection.paths, platformInputs);
+      if (triggers.length) nativeReason = triggers.map(({ cause, path }) => `${cause}:${path}`).join(',');
+      const coverage = await analyzeAffectedTests(selection.paths, sources, documentationConsumers, previousSources, outputs);
+      if (coverage.uncovered.length) throw new Error(`Affected coverage is unknown for: ${coverage.uncovered.join(', ')}`);
+      for (const path of coverage.dailyOnly) console.log(`daily-only=${path}; not verified by this PR`);
+      const tests = coverage.tests;
+      // The shard plan is the selection: each verify shard runs one array, and no shard computes a split.
+      const total = Number(process.env.CI_SHARD_TOTAL ?? '1');
+      const durations = loadTestDurations();
+      const plan = planShards(tests, durations, total);
+      writeFileSync('.ci-affected-tests.json', JSON.stringify(plan));
+      console.log(`Selected ${tests.length} affected tests for ${selection.paths.length} changed paths`);
+      console.log(`Test durations: ${durations ? `${Object.keys(durations).length} recorded files` : 'no table; equal weights'}`);
+      for (const [index, files] of plan.entries()) console.log(`shard ${index}/${total}: ${files.length} files${files.length ? `: ${files.join(' ')}` : ''}`);
+    }
+    if (referenceCache) savePathReferences(referenceCache, analyzer, [...sources, ...previousSources]);
+  }
+  console.log(`mode=${selection.mode}\nreason=${selection.reason}\nhead=${headSha}\nbase=${base ?? headSha}\nnative_oar=${platforms.native_oar}\nnative_oar_reason=${nativeReason}\nhome_isolation=${platforms.home_isolation}`);
+  if (!local) appendFileSync(process.env.GITHUB_OUTPUT!, `mode=${selection.mode}\nsha=${headSha}\nnative_oar=${platforms.native_oar}\nhome_isolation=${platforms.home_isolation}\n`);
+}

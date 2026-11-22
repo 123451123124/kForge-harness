@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "profile": "stable-root-progressive-subdir",
+  "functional_block_selector": {
+    "script": "rh capability blocks",
+    "rule": "compatibility selector; capability registry is the source of truth"
+  },
+  "lsp_profiles": {
+    "default": "typescript-lsp",
+    "selection": "functional-block-first"
+  },
+  "root_context_files": [
+    "CLAUDE.md",
+    "AGENTS.md",
+    "docs/spec.md",
+    "tasks/lessons.md",
+    ".archcontext/model/nodes",
+    ".ai/harness/policy.json"
+  ],
+  "discoverable_contexts": [
+    {
+      "path": "assets/CLAUDE.md",
+      "priority": "high",
+      "char_budget": 1000,
+      "purpose": "capability-contract",
+      "capability_id": "workflow-engine-contract-assets",
+      "functional_block": "assets/workflow-contract.v1.json",
+      "matched_prefix": "assets/workflow-contract.v1.json",
+      "architecture_domain": "workflow-engine",
+      "architecture_capability": "contract-assets",
+      "target_agent": "claude",
+      "lsp_profile": "typescript-lsp",
+      "doc_scope": "capability-contract",
+      "verification_hint": "bun test tests/workflow-contract.test.ts tests/scaffold-parity.test.ts"
+    },
+    {
+      "path": "assets/AGENTS.md",
+      "priority": "high",
+      "char_budget": 1000,
+      "purpose": "capability-contract",
+      "capability_id": "workflow-engine-contract-assets",
+      "functional_block": "assets/workflow-contract.v1.json",
+      "matched_prefix": "assets/workflow-contract.v1.json",
+      "architecture_domain": "workflow-engine",
+      "architecture_capability": "contract-assets",
+      "target_agent": "codex",
+      "lsp_profile": "typescript-lsp",
+      "doc_scope": "capability-contract",
+      "verification_hint": "bun test tests/workflow-contract.test.ts tests/scaffold-parity.test.ts"
+    },
+    {
+      "path": "src/cli/hook/CLAUDE.md",
+      "priority": "high",
+      "char_budget": 1000,
+      "purpose": "capability-contract",
+      "capability_id": "runtime-harness-hook-adapters",
+      "functional_block": "src/cli/hook",
+      "matched_prefix": "src/cli/hook",
+      "architecture_domain": "runtime-harness",
+      "architecture_capability": "hook-adapters",
+      "target_agent": "claude",
+      "lsp_profile": "typescript-lsp",
+      "doc_scope": "capability-contract",
+      "verification_hint": "bun test tests/hook-runtime.test.ts tests/hook-contracts.test.ts tests/workflow-contract.test.ts"
+    },
+    {
+      "path": "src/cli/hook/AGENTS.md",
+      "priority": "high",
+      "char_budget": 1000,
+      "purpose": "capability-contract",
+      "capability_id": "runtime-harness-hook-adapters",
+      "functional_block": "src/cli/hook",
+      "matched_prefix": "src/cli/hook",
+      "architecture_domain": "runtime-harness",
+      "architecture_capability": "hook-adapters",
+      "target_agent": "codex",
+      "lsp_profile": "typescript-lsp",
+      "doc_scope": "capability-contract",
+      "verification_hint": "bun test tests/hook-runtime.test.ts tests/hook-contracts.test.ts tests/workflow-contract.test.ts"
+    },
+    {
+      "path": "docs/reference-configs/*.md",
+      "priority": "low",
+      "char_budget": 900,
+      "purpose": "deep-doc"
+    },
+    {
+      "path": "scripts/CLAUDE.md",
+      "priority": "high",
+      "char_budget": 1000,
+      "purpose": "capability-contract",
+      "capability_id": "workflow-engine-inspection-migration",
+      "functional_block": "scripts/inspect-project-state.ts",
+      "matched_prefix": "scripts/inspect-project-state.ts",
+      "architecture_domain": "workflow-engine",
+      "architecture_capability": "inspection-migration",
+      "target_agent": "claude",
+      "lsp_profile": "typescript-lsp",
+      "doc_scope": "capability-contract",
+      "verification_hint": "record local commands here before implementation"
+    },
+    {
+      "path": "scripts/AGENTS.md",
+      "priority": "high",
+      "char_budget": 1000,
+      "purpose": "capability-contract",
+      "capability_id": "workflow-engine-inspection-migration",
+      "functional_block": "scripts/inspect-project-state.ts",
+      "matched_prefix": "scripts/inspect-project-state.ts",
+      "architecture_domain": "workflow-engine",
+      "architecture_capability": "inspection-migration",
+      "target_agent": "codex",
+      "lsp_profile": "typescript-lsp",
+      "doc_scope": "capability-contract",
+      "verification_hint": "record local commands here before implementation"
+    }
+  ],
+  "budgets": {
+    "root_total_chars": 12000,
+    "per_discoverable_file_chars": 1200
+  }
+}

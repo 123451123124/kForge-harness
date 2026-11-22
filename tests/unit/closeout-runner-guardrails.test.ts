@@ -1,0 +1,868 @@
+import { afterEach, describe, expect, test } from 'bun:test';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { spawnSync } from 'child_process';
+import {
+  helperTimeoutMs,
+  runHelper,
+} from '../../src/effects/runtime/helper-runner';
+import { acquireExpensiveRunLock } from '../../src/effects/expensive-run-lock';
+import { acquireExclusiveDirectoryLock } from '../../src/effects/locking/exclusive-directory-lock';
+import {
+  PROCESS_GROUP_CALL_TIMEOUT_OVERHEAD_MS,
+  runProcess,
+} from '../../src/effects/process-runner';
+import {
+  withHarnessBenchmarkExecutionLock,
+} from '../../scripts/run-harness-profile-benchmark';
+
+const ROOT = join(import.meta.dir, '..', '..');
+const temporaryRoots: string[] = [];
+
+function temporaryRoot(prefix: string): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  temporaryRoots.push(root);
+  return root;
+}
+
+function runGit(cwd: string, args: readonly string[]): void {
+  const result = spawnSync('git', [...args], { cwd, encoding: 'utf-8' });
+  expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+}
+
+function initializeGitRepository(root: string): void {
+  runGit(root, ['init', '-b', 'main']);
+  runGit(root, ['config', 'user.name', 'Guardrail Fixture']);
+  runGit(root, ['config', 'user.email', 'guardrail@example.test']);
+  writeFileSync(join(root, 'README.md'), 'fixture\n');
+  runGit(root, ['add', 'README.md']);
+  runGit(root, ['commit', '-m', 'fixture']);
+}
+
+async function waitForPath(path: string, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+    await Bun.sleep(10);
+  }
+}
+
+function createVerifierRuntime(root: string, body: readonly string[]): string {
+  const sourceRoot = join(root, 'fixture-runtime');
+  mkdirSync(join(sourceRoot, 'assets'), { recursive: true });
+  mkdirSync(join(sourceRoot, 'scripts'), { recursive: true });
+  writeFileSync(join(sourceRoot, 'assets', 'workflow-contract.v1.json'), `${JSON.stringify({
+    helpers: {
+      scripts: ['verify-sprint.sh'],
+      descriptions: { 'verify-sprint': 'fixture verifier' },
+    },
+  })}\n`);
+  const helper = join(sourceRoot, 'scripts', 'verify-sprint.sh');
+  writeFileSync(helper, ['#!/bin/bash', ...body, ''].join('\n'));
+  chmodSync(helper, 0o755);
+  return sourceRoot;
+}
+
+async function waitForChildProcess(parentPid: number, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = spawnSync('ps', ['-axo', 'ppid='], { encoding: 'utf-8' });
+    if (result.status === 0 && result.stdout.split(/\s+/).includes(String(parentPid))) return;
+    await Bun.sleep(10);
+  }
+  throw new Error(`timed out waiting for child of ${parentPid}`);
+}
+
+function isPositiveSafePid(pid: number): pid is number {
+  return Number.isSafeInteger(pid) && pid > 0;
+}
+
+async function waitForSupervisorProcessGroup(runtimeTmp: string, timeoutMs: number): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    for (const entry of readdirSync(runtimeTmp)) {
+      try {
+        const receipt = JSON.parse(readFileSync(join(runtimeTmp, entry, 'receipt.json'), 'utf-8')) as {
+          processGroupPid?: unknown;
+        };
+        if (typeof receipt.processGroupPid === 'number' && isPositiveSafePid(receipt.processGroupPid)) {
+          return receipt.processGroupPid;
+        }
+      } catch {
+        // The receipt is absent or partly written.
+      }
+    }
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for a supervisor receipt in ${runtimeTmp}`);
+    await Bun.sleep(10);
+  }
+}
+
+function parentPidOf(pid: number): number {
+  const raw = spawnSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf-8' }).stdout.trim();
+  const parentPid = Number(raw);
+  if (!/^[1-9]\d*$/.test(raw) || !isPositiveSafePid(parentPid) || parentPid === 1) {
+    throw new Error(`ps did not report a parent PID for ${pid}: ${JSON.stringify(raw)}`);
+  }
+  return parentPid;
+}
+
+function killIfPresent(pid: number, signal: NodeJS.Signals): void {
+  if (!isPositiveSafePid(pid)) return;
+  try {
+    process.kill(pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+  }
+}
+
+function killGroupIfPresent(pid: number | null, signal: NodeJS.Signals): void {
+  if (pid === null || !isPositiveSafePid(pid)) return;
+  try {
+    process.kill(-pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+  }
+}
+
+function processGroupExists(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+afterEach(() => {
+  for (const root of temporaryRoots.splice(0)) {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+describe('closeout runner guardrails', () => {
+  test('one candidate commit has one PR CI lane with cancellation', () => {
+    const workflow = readFileSync(join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf-8');
+    expect(workflow).toContain('pull_request:');
+    expect(workflow).not.toMatch(/push:[\s\S]*codex\/\*\*/);
+    // The lane stays per PR: a newer event for the same PR cancels the older candidate.
+    expect(workflow).toContain('group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}');
+    expect(workflow).toContain("cancel-in-progress: ${{ github.event_name == 'pull_request' }}");
+  });
+
+  test('helper identity selects immutable ordinary, verifier, and closeout budgets', () => {
+    expect(helperTimeoutMs('check-context-files')).toBe(120_000);
+    expect(helperTimeoutMs('verify-sprint')).toBe(3_660_000);
+    expect(helperTimeoutMs('verify-sprint')).toBe(3_660_000);
+    expect(helperTimeoutMs('contract-worktree')).toBe(900_000);
+    expect(helperTimeoutMs('merge-gate')).toBe(900_000);
+    expect(helperTimeoutMs('ship-worktrees')).toBe(900_000);
+  });
+
+  test('outer timeout terminates descendants that ignore TERM before they can publish a sentinel', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-outer-group-');
+    const sentinel = join(root, 'descendant-survived');
+    const result = runProcess(
+      'bash',
+      ['-c', `trap '' TERM; (trap '' TERM; sleep 1; touch "${sentinel}") & wait`],
+      { cwd: root, timeoutMs: 50, processGroup: true },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.timedOut).toBe(true);
+    expect(result.error).toContain('process timed out after 50ms');
+    await Bun.sleep(1_100);
+    expect(existsSync(sentinel)).toBe(false);
+  });
+
+  test('leader exit is not completion while its process group still has a descendant', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-leader-exit-');
+    const sentinel = join(root, 'descendant-survived');
+    const result = runProcess(
+      'bash',
+      ['-c', `(trap '' TERM; sleep 1; touch "${sentinel}") & exit 0`],
+      { cwd: root, timeoutMs: 50, processGroup: true },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.timedOut).toBe(true);
+    await Bun.sleep(1_100);
+    expect(existsSync(sentinel)).toBe(false);
+  });
+
+  test('repeated supervisor signals cannot interrupt TERM-to-KILL cleanup', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-double-signal-');
+    const started = join(root, 'target-started');
+    const sentinel = join(root, 'descendant-survived');
+    const receipt = join(root, 'receipt.json');
+    const supervisor = Bun.spawn([
+      process.execPath,
+      join(ROOT, 'src/effects/process-supervisor.ts'),
+      '--metadata', receipt,
+      '--parent-pid', String(process.pid),
+      '--timeout-ms', '5000',
+      '--capture-bytes', '1024',
+      '--stdio', 'pipe',
+      '--', 'bash', '-c', `touch "${started}"; trap '' TERM; sleep 1; touch "${sentinel}"`,
+    ], { cwd: root, detached: true, stdout: 'pipe', stderr: 'pipe' });
+    await waitForPath(started);
+    await Bun.sleep(50);
+    process.kill(supervisor.pid, 'SIGTERM');
+    await Bun.sleep(50);
+    process.kill(supervisor.pid, 'SIGTERM');
+    expect(await supervisor.exited).toBe(143);
+    expect(JSON.parse(readFileSync(receipt, 'utf-8')).interruptedBy).toBe('SIGTERM');
+    await Bun.sleep(1_100);
+    expect(existsSync(sentinel)).toBe(false);
+  }, 30_000);
+
+  test('supervisor parent probes preserve permission, absence and unexpected-error results', () => {
+    const root = temporaryRoot('repo-harness-parent-probe-');
+    for (const code of ['EPERM', 'ESRCH', 'EIO', 'EIO-watch']) {
+      const receipt = join(root, `${code}.json`);
+      const result = spawnSync(process.execPath, ['-e', `
+        const { runProcessSupervisorCli } = await import(process.argv[1]);
+        const code = process.argv[2];
+        const kill = process.kill;
+        let probes = 0;
+        process.kill = (pid, signal) => {
+          if (pid === process.ppid && signal === 0 && (++probes > 3 || code !== 'EIO-watch')) {
+            throw Object.assign(new Error(code), { code: code === 'EIO-watch' ? 'EIO' : code });
+          }
+          return kill(pid, signal);
+        };
+        process.exitCode = await runProcessSupervisorCli(process.argv.slice(3));
+      `, join(ROOT, 'src/effects/process-supervisor.ts'), code,
+        '--metadata', receipt, '--parent-pid', String(process.pid), '--timeout-ms', '2000',
+        '--capture-bytes', '1024', '--stdio', 'pipe', '--', process.execPath, '-e', code === 'EIO-watch' ? 'setInterval(() => {}, 1000)' : '',
+      ], { encoding: 'utf-8', timeout: 5_000 });
+      expect(result.status, result.stderr).toBe(code === 'EPERM' ? 0 : 1);
+      const recorded = JSON.parse(readFileSync(receipt, 'utf-8'));
+      expect(recorded.spawnError).toBe(code === 'EPERM' ? '' : code === 'ESRCH' ? 'helper caller exited before lock acquisition' : code);
+      expect(recorded.parentLost).toBe(false);
+    }
+  });
+
+  test('supervised spawn failure returns a bounded error instead of hanging on pipe close', () => {
+    const startedAt = Date.now();
+    const result = runProcess('/repo-harness/definitely-missing-command', [], {
+      processGroup: true,
+      timeoutMs: 1_000,
+    });
+
+    expect(result.ok).toBe(false);
+    // `timedOut === false` is what proves the failure was detected at spawn
+    // rather than by consuming the 1s bound above; the duration below only has
+    // to separate "returned" from "hung on pipe close", which is unbounded.
+    // A tighter wall-clock number measures machine load, not the guarantee.
+    expect(result.timedOut).toBe(false);
+    expect(result.error).not.toBe('');
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  });
+
+  test('the launcher barrier preserves inherited target stdin and stdout', async () => {
+    const root = temporaryRoot('repo-harness-launcher-stdio-');
+    const workerPath = join(root, 'stdio-worker.ts');
+    writeFileSync(workerPath, [
+      `import { runProcess } from ${JSON.stringify(join(ROOT, 'src/effects/process-runner.ts'))};`,
+      `const result = runProcess('bash', ['-c', 'IFS= read -r value; printf "target:%s\\n" "$value"'],`,
+      `  { cwd: ${JSON.stringify(root)}, timeoutMs: 1_000, processGroup: true, stdio: 'inherit' });`,
+      'process.exitCode = result.status;',
+      '',
+    ].join('\n'));
+    const worker = Bun.spawn([process.execPath, workerPath], {
+      cwd: root, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+    });
+    worker.stdin.write('barrier-safe\n');
+    worker.stdin.end();
+
+    expect(await worker.exited).toBe(0);
+    expect(await new Response(worker.stdout).text()).toContain('target:barrier-safe');
+  }, 30_000);
+
+  // The test must stop the supervisor inside the target window, which opens
+  // when the supervisor parses its arguments, before its cold start ends.
+  // Every wait below derives from this one value.
+  const stoppedSupervisorTargetTimeoutMs = 1_500;
+  // runProcess returns within this time after the target timeout: the parent
+  // hard timeout (target + 1500 ms) plus the backstop TERM/KILL grace.
+  const stoppedSupervisorCallMs = stoppedSupervisorTargetTimeoutMs + PROCESS_GROUP_CALL_TIMEOUT_OVERHEAD_MS;
+  const stoppedSupervisorExitMarginMs = 1_000;
+  const stoppedSupervisorWorkerExitMs = stoppedSupervisorCallMs + stoppedSupervisorExitMarginMs;
+  test('the parent hard timeout returns even when the supervisor event loop is stopped', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-supervisor-hard-timeout-');
+    const runtimeTmp = join(root, 'tmp');
+    mkdirSync(runtimeTmp);
+    const resultPath = join(root, 'result.json');
+    const workerPath = join(root, 'hard-timeout-worker.ts');
+    writeFileSync(workerPath, [
+      `import { runProcess } from ${JSON.stringify(join(ROOT, 'src/effects/process-runner.ts'))};`,
+      "import { writeFileSync } from 'fs';",
+      `const result = runProcess('bash', ['-c', 'sleep 60'], { cwd: ${JSON.stringify(root)}, timeoutMs: ${stoppedSupervisorTargetTimeoutMs}, processGroup: true });`,
+      `writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify(result));`,
+      '',
+    ].join('\n'));
+
+    const worker = Bun.spawn([process.execPath, workerPath], {
+      cwd: root, detached: true, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, TMPDIR: runtimeTmp },
+    });
+    let supervisorPid: number | null = null;
+    let processGroupPid: number | null = null;
+    try {
+      // The supervisor publishes the launcher PGID before it arms its target
+      // timer. Stop it from here at once: a stop sent by the target would race
+      // that timer against the launcher and target start-up. After the call
+      // budget the worker has returned, so no later receipt can be live.
+      processGroupPid = await waitForSupervisorProcessGroup(runtimeTmp, stoppedSupervisorCallMs);
+      supervisorPid = parentPidOf(processGroupPid);
+      process.kill(supervisorPid, 'SIGSTOP');
+      const exitCode = await Promise.race([
+        worker.exited,
+        Bun.sleep(stoppedSupervisorWorkerExitMs).then(() => null),
+      ]);
+      expect(exitCode).toBe(0);
+      const result = JSON.parse(readFileSync(resultPath, 'utf-8')) as {
+        ok: boolean;
+        timedOut: boolean;
+      };
+      expect(result.ok).toBe(false);
+      expect(result.timedOut).toBe(true);
+      expect(JSON.parse(readFileSync(resultPath, 'utf-8')).error).toContain(
+        'process supervisor exceeded hard timeout',
+      );
+      expect(processGroupExists(processGroupPid)).toBe(false);
+    } finally {
+      killGroupIfPresent(processGroupPid, 'SIGKILL');
+      if (supervisorPid !== null) killIfPresent(supervisorPid, 'SIGKILL');
+      killIfPresent(worker.pid, 'SIGKILL');
+    }
+  }, stoppedSupervisorCallMs + stoppedSupervisorWorkerExitMs + stoppedSupervisorExitMarginMs);
+
+  test('expensive-lock wait consumes the command deadline and reports timeout before target start', async () => {
+    const root = temporaryRoot('repo-harness-lock-wait-timeout-');
+    initializeGitRepository(root);
+    const holderStarted = join(root, 'holder-started');
+    const targetStarted = join(root, 'target-started');
+    const holderWorker = join(root, 'lock-holder.ts');
+    writeFileSync(holderWorker, [
+      `import { acquireExpensiveRunLock } from ${JSON.stringify(join(ROOT, 'src/effects/expensive-run-lock.ts'))};`,
+      "import { writeFileSync } from 'fs';",
+      `const lock = acquireExpensiveRunLock(${JSON.stringify(root)});`,
+      `writeFileSync(${JSON.stringify(holderStarted)}, 'started\\n');`,
+      'await Bun.sleep(300);',
+      'lock.release();',
+      '',
+    ].join('\n'));
+
+    const holder = Bun.spawn([process.execPath, holderWorker], {
+      cwd: root, stdout: 'pipe', stderr: 'pipe',
+    });
+    await waitForPath(holderStarted);
+    const result = runProcess('touch', [targetStarted], {
+      cwd: root,
+      stdio: 'pipe',
+      processGroup: true,
+      timeoutMs: 50,
+      expensiveRunLock: { cwd: root, gitBin: 'git' },
+    });
+
+    expect(await holder.exited).toBe(0);
+    expect(result.timedOut).toBe(true);
+    expect(existsSync(targetStarted)).toBe(false);
+  }, 30_000);
+
+  test.skipIf(process.platform !== 'win32')('Windows expensive supervision retains the taskkill release path without a POSIX registration', () => {
+    const root = temporaryRoot('repo-harness-windows-expensive-');
+    initializeGitRepository(root);
+    const lockPath = join(root, '.git/repo-harness/expensive-run.lock');
+    const result = runProcess(process.execPath, ['-e', [
+      "const { readdirSync, readFileSync } = require('fs');",
+      `const lockPath = ${JSON.stringify(lockPath)};`,
+      "const [entry] = readdirSync(lockPath);",
+      "const owner = JSON.parse(readFileSync(lockPath + '/' + entry, 'utf8'));",
+      "if (owner.expensive_group !== undefined) process.exit(23);",
+      "console.log('windows-no-posix-registration');",
+    ].join('\n')], {
+      cwd: root, processGroup: true, timeoutMs: 5000,
+      expensiveRunLock: { cwd: root, gitBin: 'git' },
+    });
+    expect(result.ok).toBe(true);
+    expect(result.stdout).toContain('windows-no-posix-registration');
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test('supervisor persists its exact owner nonce and PGID before target startup', () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-group-registration-');
+    initializeGitRepository(root);
+    const lockPath = join(root, '.git/repo-harness/expensive-run.lock');
+    const result = runProcess(process.execPath, ['-e', [
+      "import { readdirSync, readFileSync } from 'fs';",
+      `const lockPath = ${JSON.stringify(lockPath)};`,
+      "const [entry] = readdirSync(lockPath);",
+      "const owner = JSON.parse(readFileSync(lockPath + '/' + entry, 'utf8'));",
+      "if (owner.expensive_group.owner_token !== owner.token || owner.expensive_group.process_group_pid !== process.ppid) process.exit(23);",
+      "console.log(JSON.stringify(owner));",
+    ].join('\n')], {
+      cwd: root, processGroup: true, timeoutMs: 1000,
+      expensiveRunLock: { cwd: root, gitBin: 'git' },
+    });
+    expect(result.ok).toBe(true);
+    const owner = JSON.parse(result.stdout);
+    expect(owner.expensive_group.protocol).toBe(1);
+    expect(owner.expensive_group.owner_token).toBe(owner.token);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test('dead supervisor is reclaimed only after its entire registered group drains', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-orphan-group-');
+    initializeGitRepository(root);
+    const started = join(root, 'started');
+    const receiptPath = join(root, 'receipt.json');
+    const lockPath = join(root, '.git/repo-harness/expensive-run.lock');
+    const supervisor = Bun.spawn([
+      process.execPath, join(ROOT, 'src/effects/process-supervisor.ts'),
+      '--metadata', receiptPath, '--parent-pid', String(process.pid),
+      '--timeout-ms', '10000', '--capture-bytes', '1024', '--stdio', 'ignore',
+      '--expensive-lock-cwd', root, '--git-bin', 'git', '--',
+      'bash', '-c', `trap '' TERM; touch "${started}"; (trap '' TERM; sleep 60) & wait`,
+    ], { cwd: root, stdout: 'ignore', stderr: 'ignore' });
+    let groupPid: number | null = null;
+    try {
+      await waitForPath(started);
+      const [entry] = readdirSync(lockPath);
+      const ownerPath = join(lockPath, entry!);
+      const original = readFileSync(ownerPath, 'utf8');
+      const owner = JSON.parse(original);
+      const observedGroupPid: unknown = owner.expensive_group.process_group_pid;
+      if (typeof observedGroupPid !== 'number' || !Number.isSafeInteger(observedGroupPid) || observedGroupPid < 1) {
+        throw new Error('supervisor did not publish a valid process-group PID');
+      }
+      groupPid = observedGroupPid;
+      expect(owner.pid).toBe(supervisor.pid);
+      expect(owner.expensive_group.owner_token).toBe(owner.token);
+      expect(JSON.parse(readFileSync(receiptPath, 'utf8')).processGroupPid).toBe(groupPid);
+      supervisor.kill('SIGKILL');
+      expect(await supervisor.exited).not.toBe(0);
+      // Even the group leader's death does not prove a resistant descendant exited.
+      killIfPresent(groupPid, 'SIGKILL');
+      expect(processGroupExists(groupPid)).toBe(true);
+      expect(() => acquireExpensiveRunLock(root, 'git', 1)).toThrow('timed out');
+      expect(readFileSync(ownerPath, 'utf8')).toBe(original);
+      killGroupIfPresent(groupPid, 'SIGKILL');
+      const deadline = Date.now() + 2000;
+      while (processGroupExists(groupPid) && Date.now() < deadline) await Bun.sleep(10);
+      expect(processGroupExists(groupPid)).toBe(false);
+      // Unknown host, nonce or schema is not accepted as a drain proof.
+      for (const expensive_group of [
+        { ...owner.expensive_group, hostname: 'other-host' },
+        { ...owner.expensive_group, owner_token: 'forged' },
+        { process_group_pid: groupPid },
+      ]) {
+        const changed = JSON.stringify({ ...owner, expensive_group });
+        writeFileSync(ownerPath, changed);
+        expect(() => acquireExpensiveRunLock(root, 'git', 1)).toThrow('timed out');
+        expect(readFileSync(ownerPath, 'utf8')).toBe(changed);
+      }
+      writeFileSync(ownerPath, original);
+      const next = acquireExpensiveRunLock(root, 'git', 100);
+      expect(next.ownerToken).not.toBe(owner.token);
+      next.release(); next.release();
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      supervisor.kill('SIGKILL');
+      killGroupIfPresent(groupPid, 'SIGKILL');
+      await supervisor.exited;
+    }
+  }, 10000);
+
+  test('expensive lock without a supervisor registration preserves a dead owner as unknown', async () => {
+    const root = temporaryRoot('repo-harness-unregistered-orphan-');
+    initializeGitRepository(root);
+    const ready = join(root, 'ready');
+    const holder = Bun.spawn([process.execPath, '-e', [
+      `import { acquireExpensiveRunLock } from ${JSON.stringify(join(ROOT, 'src/effects/expensive-run-lock.ts'))};`,
+      "import { writeFileSync } from 'fs';",
+      `acquireExpensiveRunLock(${JSON.stringify(root)});`,
+      `writeFileSync(${JSON.stringify(ready)}, 'ready');`,
+      'await Bun.sleep(10000);',
+    ].join('\n')], { stdout: 'ignore', stderr: 'ignore' });
+    try {
+      await waitForPath(ready);
+      holder.kill('SIGKILL'); await holder.exited;
+      const lockPath = join(root, '.git/repo-harness/expensive-run.lock');
+      const [entry] = readdirSync(lockPath);
+      const bytes = readFileSync(join(lockPath, entry!), 'utf8');
+      expect(() => acquireExpensiveRunLock(root, 'git', 1)).toThrow('timed out');
+      expect(readFileSync(join(lockPath, entry!), 'utf8')).toBe(bytes);
+    } finally { holder.kill('SIGKILL'); await holder.exited; }
+  }, 10000);
+
+  test('registered group cannot release its expensive token while it is live', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-live-group-release-');
+    initializeGitRepository(root);
+    const lock = acquireExpensiveRunLock(root);
+    const child = Bun.spawn(['sleep', '60'], { detached: true, stdout: 'ignore', stderr: 'ignore' });
+    try {
+      lock.registerProcessGroup(child.pid);
+      expect(() => lock.release()).toThrow('not been proven drained');
+      lock.assertOwned();
+      child.kill('SIGKILL'); await child.exited;
+      lock.release(); lock.release();
+      expect(existsSync(lock.lockPath)).toBe(false);
+    } finally { child.kill('SIGKILL'); await child.exited; }
+  }, 10000);
+
+  test('a read-only helper does not wait for the expensive command lane', () => {
+    const root = temporaryRoot('repo-harness-reader-lane-');
+    initializeGitRepository(root);
+    const started = join(root, 'reader-started');
+    const sourceRoot = createVerifierRuntime(root, [`touch "${started}"`]);
+    const holder = acquireExpensiveRunLock(root);
+    try {
+      const result = runHelper({ helper: 'verify-sprint', cwd: root,
+        env: { REPO_HARNESS_SOURCE_ROOT: sourceRoot }, stdio: 'pipe', timeoutMs: 1000 });
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(started)).toBe(true);
+    } finally {
+      holder.release();
+    }
+  });
+
+  test('helper timeout releases the shared expensive-run token after group cleanup', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-helper-lock-');
+    initializeGitRepository(root);
+    const sentinel = join(root, 'descendant-survived');
+    const sourceRoot = createVerifierRuntime(root, [
+      "trap '' TERM",
+      `(trap '' TERM; sleep 1; touch "${sentinel}") &`,
+      'wait',
+    ]);
+
+    const result = runHelper({
+      helper: 'verify-sprint',
+      cwd: root,
+      env: { REPO_HARNESS_SOURCE_ROOT: sourceRoot },
+      stdio: 'pipe',
+      timeoutMs: 50,
+    });
+    expect(result.reason).toBe('timeout');
+    const nextOwner = acquireExpensiveRunLock(root);
+    nextOwner.release();
+    await Bun.sleep(1_100);
+    expect(existsSync(sentinel)).toBe(false);
+  }, 30_000);
+
+  test('caller-only SIGTERM makes the supervisor clean its group and release its token', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-parent-loss-');
+    initializeGitRepository(root);
+    const started = join(root, 'target-started');
+    const sentinel = join(root, 'descendant-survived');
+    const sourceRoot = createVerifierRuntime(root, [
+      `touch "${started}"`,
+      "trap 'exit 0' TERM",
+      `(trap '' TERM; sleep 1; touch "${sentinel}") &`,
+      'wait',
+    ]);
+    const worker = join(root, 'helper-entrypoint.ts');
+    writeFileSync(worker, [
+      `import { runHelper } from ${JSON.stringify(join(ROOT, 'src/effects/runtime/helper-runner.ts'))};`,
+      `const result = runHelper({ helper: 'verify-sprint', cwd: ${JSON.stringify(root)},`,
+      `  env: { REPO_HARNESS_SOURCE_ROOT: ${JSON.stringify(sourceRoot)} }, stdio: 'pipe', timeoutMs: 10_000 });`,
+      'process.exitCode = result.exitCode;',
+      '',
+    ].join('\n'));
+    const entrypoint = Bun.spawn([process.execPath, worker], {
+      cwd: root, detached: true, stdout: 'pipe', stderr: 'pipe',
+    });
+    await waitForPath(started);
+    process.kill(entrypoint.pid, 'SIGTERM');
+    expect(await entrypoint.exited).not.toBe(0);
+    const nextOwner = acquireExpensiveRunLock(root);
+    nextOwner.release();
+    await Bun.sleep(1_100);
+    expect(existsSync(sentinel)).toBe(false);
+  }, 10_000);
+
+  test('a caller killed while waiting for the expensive lane can never start its command', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-waiting-parent-loss-');
+    initializeGitRepository(root);
+    const targetStarted = join(root, 'target-started');
+    const worker = join(root, 'waiting-helper-entrypoint.ts');
+    writeFileSync(worker, [
+      `import { runProcess } from ${JSON.stringify(join(ROOT, 'src/effects/process-runner.ts'))};`,
+      `runProcess('touch', [${JSON.stringify(targetStarted)}], { cwd: ${JSON.stringify(root)},`,
+      `  expensiveRunLock: { cwd: ${JSON.stringify(root)}, gitBin: 'git' }, processGroup: true, stdio: 'pipe', timeoutMs: 10_000 });`,
+      '',
+    ].join('\n'));
+    const holder = acquireExpensiveRunLock(root);
+    const entrypoint = Bun.spawn([process.execPath, worker], {
+      cwd: root, detached: true, stdout: 'pipe', stderr: 'pipe',
+    });
+    await waitForChildProcess(entrypoint.pid);
+    process.kill(entrypoint.pid, 'SIGTERM');
+    expect(await entrypoint.exited).not.toBe(0);
+    holder.release();
+    const nextOwner = acquireExpensiveRunLock(root);
+    nextOwner.release();
+    await Bun.sleep(200);
+    expect(existsSync(targetStarted)).toBe(false);
+  }, 10_000);
+
+  test('linked worktrees serialize through one Git common-directory lock', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-common-lock-');
+    initializeGitRepository(root);
+    const linked = `${root}-linked`;
+    temporaryRoots.push(linked);
+    runGit(root, ['worktree', 'add', '-b', 'linked', linked]);
+
+    const holderEntered = join(root, 'holder-entered');
+    const contenderEntered = join(root, 'contender-entered');
+    const releaseHolder = join(root, 'release-holder');
+    const worker = join(root, 'lock-worker.ts');
+    writeFileSync(worker, [
+      `import { acquireExpensiveRunLock } from ${JSON.stringify(join(ROOT, 'src/effects/expensive-run-lock.ts'))};`,
+      "import { existsSync, writeFileSync } from 'fs';",
+      'const [cwd, entered, release] = process.argv.slice(2);',
+      'const lock = acquireExpensiveRunLock(cwd);',
+      "writeFileSync(entered, 'entered\\n');",
+      'while (!existsSync(release)) await Bun.sleep(10);',
+      'lock.release();',
+      '',
+    ].join('\n'));
+
+    const holder = Bun.spawn([process.execPath, worker, root, holderEntered, releaseHolder], {
+      cwd: root, stdout: 'pipe', stderr: 'pipe',
+    });
+    await waitForPath(holderEntered);
+    const contenderRelease = join(root, 'release-contender');
+    writeFileSync(contenderRelease, 'release\n');
+    const contender = Bun.spawn([process.execPath, worker, linked, contenderEntered, contenderRelease], {
+      cwd: linked, stdout: 'pipe', stderr: 'pipe',
+    });
+    await Bun.sleep(150);
+    expect(existsSync(contenderEntered)).toBe(false);
+    writeFileSync(releaseHolder, 'release\n');
+    expect(await holder.exited).toBe(0);
+    expect(await contender.exited).toBe(0);
+    expect(existsSync(contenderEntered)).toBe(true);
+  }, 10_000);
+
+  test('Git common-directory lock rejects a symlink ancestor without touching its target', () => {
+    const root = temporaryRoot('repo-harness-lock-symlink-');
+    initializeGitRepository(root);
+    const victim = temporaryRoot('repo-harness-lock-victim-');
+    const commonDir = realpathSync(join(root, '.git'));
+    symlinkSync(victim, join(commonDir, 'repo-harness'));
+
+    expect(() => acquireExpensiveRunLock(root)).toThrow('unsafe lock ancestor');
+    expect(readdirSync(victim)).toEqual([]);
+  }, 30_000);
+
+  test('a lock handle revalidates its ancestor identities before protected work starts', () => {
+    const root = temporaryRoot('repo-harness-lock-revalidation-');
+    const canonicalRoot = realpathSync(root);
+    mkdirSync(join(canonicalRoot, 'lane'));
+    const lock = acquireExclusiveDirectoryLock(canonicalRoot, 'lane/owner.lock');
+    renameSync(join(canonicalRoot, 'lane'), join(canonicalRoot, 'displaced-lane'));
+    mkdirSync(join(canonicalRoot, 'lane'));
+
+    expect(() => lock.assertOwned()).toThrow('unsafe lock ancestor');
+    lock.release();
+  });
+
+  test('an abnormally abandoned expensive token is never auto-reclaimed', () => {
+    const root = temporaryRoot('repo-harness-abandoned-expensive-lock-');
+    initializeGitRepository(root);
+    const lockPath = join(realpathSync(join(root, '.git')), 'repo-harness', 'expensive-run.lock');
+    mkdirSync(lockPath, { recursive: true });
+    const createdAt = Date.now() - 60_000;
+    const token = `999999-${createdAt}-00000000-0000-4000-8000-000000000000`;
+    const ownerPath = join(lockPath, `${token}.json`);
+    writeFileSync(ownerPath, `${JSON.stringify({ pid: 999999, start_time: 'fixture-exited-owner', created_at: createdAt, token })}\n`);
+
+    expect(() => acquireExpensiveRunLock(root)).toThrow('timed out waiting for exclusive lock');
+    expect(existsSync(ownerPath)).toBe(true);
+  }, 7_000);
+
+  test('benchmark execution lock spans await and releases on success and failure', async () => {
+    const root = temporaryRoot('repo-harness-benchmark-lock-');
+    initializeGitRepository(root);
+    const contenderAttempting = join(root, 'contender-attempting');
+    const contenderEntered = join(root, 'contender-entered');
+    const worker = join(root, 'benchmark-lock-contender.ts');
+    writeFileSync(worker, [
+      `import { acquireExpensiveRunLock } from ${JSON.stringify(join(ROOT, 'src/effects/expensive-run-lock.ts'))};`,
+      "import { writeFileSync } from 'fs';",
+      `writeFileSync(${JSON.stringify(contenderAttempting)}, 'attempting\\n');`,
+      `const lock = acquireExpensiveRunLock(${JSON.stringify(root)});`,
+      `writeFileSync(${JSON.stringify(contenderEntered)}, 'entered\\n');`,
+      'lock.release();',
+      '',
+    ].join('\n'));
+    let contender: ReturnType<typeof Bun.spawn> | undefined;
+    const execution = withHarnessBenchmarkExecutionLock(true, root, async () => {
+      contender = Bun.spawn([process.execPath, worker], { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
+      await waitForPath(contenderAttempting);
+      await Bun.sleep(50);
+      expect(existsSync(contenderEntered)).toBe(false);
+      return 'done';
+    });
+    expect(await execution).toBe('done');
+    expect(await contender!.exited).toBe(0);
+    expect(existsSync(contenderEntered)).toBe(true);
+
+    await expect(withHarnessBenchmarkExecutionLock(true, root, async () => {
+      throw new Error('fixture failure');
+    })).rejects.toThrow('fixture failure');
+    const nextOwner = acquireExpensiveRunLock(root);
+    nextOwner.release();
+  }, 10_000);
+
+  test('benchmark async signal cleanup releases its token without running the matrix', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-benchmark-signal-');
+    initializeGitRepository(root);
+    const started = join(root, 'benchmark-started');
+    const worker = join(root, 'benchmark-signal-worker.ts');
+    writeFileSync(worker, [
+      `import { installProducerSignalCleanup, withHarnessBenchmarkExecutionLock } from ${JSON.stringify(join(ROOT, 'scripts/run-harness-profile-benchmark.ts'))};`,
+      "import { writeFileSync } from 'fs';",
+      'installProducerSignalCleanup();',
+      `await withHarnessBenchmarkExecutionLock(true, ${JSON.stringify(root)}, async () => {`,
+      `  writeFileSync(${JSON.stringify(started)}, 'started\\n');`,
+      '  await new Promise(() => {});',
+      '});',
+      '',
+    ].join('\n'));
+    const producer = Bun.spawn([process.execPath, worker], {
+      cwd: ROOT, detached: true, stdout: 'pipe', stderr: 'pipe',
+    });
+    await waitForPath(started);
+    process.kill(producer.pid, 'SIGTERM');
+    expect(await producer.exited).toBe(143);
+    const nextOwner = acquireExpensiveRunLock(root);
+    nextOwner.release();
+  }, 10_000);
+
+  test('benchmark signal cleanup retains its token until a leaderless provider group is drained', async () => {
+    if (process.platform === 'win32') return;
+    const root = temporaryRoot('repo-harness-benchmark-provider-group-');
+    initializeGitRepository(root);
+    const providerStarted = join(root, 'provider-started');
+    const providerGroupPid = join(root, 'provider-group-pid');
+    const descendantSentinel = join(root, 'descendant-survived');
+    const contenderAttempting = join(root, 'contender-attempting');
+    const contenderEntered = join(root, 'contender-entered');
+    const producerWorker = join(root, 'benchmark-provider-group-worker.ts');
+    const contenderWorker = join(root, 'benchmark-provider-group-contender.ts');
+    const providerCommand = [
+      "trap 'exit 0' TERM",
+      `printf '%s\\n' "$$" > ${JSON.stringify(providerGroupPid)}`,
+      `(trap '' TERM; sleep 1; touch ${JSON.stringify(descendantSentinel)}) >/dev/null 2>&1 &`,
+      `touch ${JSON.stringify(providerStarted)}`,
+      'wait',
+    ].join('\n');
+    writeFileSync(producerWorker, [
+      `import { installProducerSignalCleanup, runBoundedProviderProcess, withHarnessBenchmarkExecutionLock } from ${JSON.stringify(join(ROOT, 'scripts/run-harness-profile-benchmark.ts'))};`,
+      'installProducerSignalCleanup();',
+      `await withHarnessBenchmarkExecutionLock(true, ${JSON.stringify(root)}, async () => {`,
+      `  await runBoundedProviderProcess(['bash', '-c', ${JSON.stringify(providerCommand)}], ${JSON.stringify(root)}, process.env, Date.now() + 5_000);`,
+      '});',
+      '',
+    ].join('\n'));
+    writeFileSync(contenderWorker, [
+      `import { acquireExpensiveRunLock } from ${JSON.stringify(join(ROOT, 'src/effects/expensive-run-lock.ts'))};`,
+      "import { readFileSync, writeFileSync } from 'fs';",
+      `writeFileSync(${JSON.stringify(contenderAttempting)}, 'attempting\\n');`,
+      `const lock = acquireExpensiveRunLock(${JSON.stringify(root)});`,
+      `const providerGroupPid = Number(readFileSync(${JSON.stringify(providerGroupPid)}, 'utf8').trim());`,
+      'let providerGroupAlive = true;',
+      "try { process.kill(-providerGroupPid, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') providerGroupAlive = false; else throw error; }",
+      `writeFileSync(${JSON.stringify(contenderEntered)}, providerGroupAlive ? 'alive\\n' : 'drained\\n');`,
+      'lock.release();',
+      '',
+    ].join('\n'));
+
+    const producer = Bun.spawn([process.execPath, producerWorker], {
+      cwd: ROOT, detached: true, stdout: 'pipe', stderr: 'pipe',
+    });
+    await waitForPath(providerStarted);
+    await waitForPath(providerGroupPid);
+    process.kill(producer.pid, 'SIGTERM');
+    const contender = Bun.spawn([process.execPath, contenderWorker], {
+      cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
+    });
+    await waitForPath(contenderAttempting);
+    // The token is released only after terminateActiveProviderGroups() drains
+    // the leaderless group. Process exit follows that release, but scheduler
+    // order may let the contender run first, so observe the real invariant at
+    // lock acquisition: the recorded provider process group must already be
+    // absent. This is the same observable production uses before releasing.
+    await waitForPath(contenderEntered, 5_000);
+    expect(await contender.exited).toBe(0);
+    expect(readFileSync(contenderEntered, 'utf8')).toBe('drained\n');
+    expect(await producer.exited).toBe(143);
+    await Bun.sleep(600);
+    expect(existsSync(descendantSentinel)).toBe(false);
+  }, 10_000);
+
+  test('ship scans the frozen candidate without rerunning local verification', () => {
+    const ship = readFileSync(join(ROOT, 'scripts/ship-worktrees.sh'), 'utf-8');
+
+    expect(ship).not.toContain('run_cmd bash "$helper_dir/verify-sprint.sh"');
+    expect(ship).toContain('"$helper_dir/merge-gate.ts" fingerprint --base "$gate_base_ref" --format sha');
+    expect(ship).toContain('[[ "$scanned_head" == "$verified_sha" ]]');
+  });
+
+  test('ship forwards empty and non-empty child arguments under the system Bash', () => {
+    const ship = readFileSync(join(ROOT, 'scripts/ship-worktrees.sh'), 'utf-8');
+    expect(ship.match(/\$\{child_args\[@\]\+"\$\{child_args\[@\]\}"\}/g) ?? []).toHaveLength(1);
+
+    const emptyProbe = spawnSync('/bin/bash', [
+      '-uc',
+      'child_args=(); set -- ${child_args[@]+"${child_args[@]}"}; test "$#" -eq 0',
+    ], { encoding: 'utf-8' });
+    expect(emptyProbe.status).toBe(0);
+
+    const nonEmptyProbe = spawnSync('/bin/bash', [
+      '-uc',
+      'child_args=(--ready "two words"); set -- ${child_args[@]+"${child_args[@]}"}; test "$#" -eq 2 && test "$1" = --ready && test "$2" = "two words"',
+    ], { encoding: 'utf-8' });
+    expect(nonEmptyProbe.status).toBe(0);
+  }, 30_000);
+
+  test('the fixed source retains the ordinary default without making it closeout authority', () => {
+    const processRunner = readFileSync(join(ROOT, 'src/effects/process-runner.ts'), 'utf-8');
+    const helperRunner = readFileSync(join(ROOT, 'src/effects/runtime/helper-runner.ts'), 'utf-8');
+    const ship = readFileSync(join(ROOT, 'scripts/ship-worktrees.sh'), 'utf-8');
+    const result = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf-8' });
+
+    expect(result.status).toBe(0);
+    expect(processRunner).toContain('DEFAULT_PROCESS_TIMEOUT_MS = 120_000');
+    expect(helperRunner).toContain('helperTimeoutMs');
+    expect(ship).not.toContain('run_cmd bash "$helper_dir/verify-sprint.sh"');
+  }, 30_000);
+});

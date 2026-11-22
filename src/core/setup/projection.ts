@@ -1,0 +1,273 @@
+// Pure projection of one setup check build into the public setup snapshot.
+// Callers supply already-read inputs; this module has no filesystem or process
+// access. Machine-state text (check title, detail, command, hook mismatch
+// event) passes through `publicAgentConfigText`. Package-owned text (catalog
+// summaries, fleet frontmatter, route ids and matchers) is public and is copied
+// verbatim; the decoder still rejects a path-like value there.
+
+import { publicAgentConfigText } from '../operator/agent-config';
+import {
+  SETUP_HOOK_EVENTS,
+  SETUP_HOSTS,
+  SETUP_PROJECTION,
+  type SetupCheck,
+  type SetupCheckStatus,
+  type SetupFleetRole,
+  type SetupHookEvent,
+  type SetupHookMismatch,
+  type SetupHookUsage,
+  type SetupHost,
+  type SetupHostFacts,
+  type SetupHostSkillRoot,
+  type SetupOverallStatus,
+  type SetupSkill,
+  type SetupSnapshotV2,
+  type SetupSummary,
+} from './types';
+import type { SkillProjectionState } from '../skill-surface/projection-state';
+
+export interface SetupRawCheck {
+  readonly id: string;
+  readonly title: string;
+  readonly status: SetupCheckStatus;
+  readonly detail: string;
+}
+
+/** One `StatusReport.targets` entry. */
+export interface SetupRawAdapter {
+  readonly id: string;
+  readonly installed: boolean;
+  readonly alreadyConfigured: boolean;
+  readonly managedEntryCount: number;
+  readonly expectedEntryCount: number;
+  readonly projection?: {
+    readonly status: 'consistent' | 'drift';
+    readonly error?: string;
+    readonly mismatches: readonly { readonly kind: SetupHookMismatch['kind']; readonly event: string; readonly routeId?: string; readonly field?: SetupHookMismatch['field'] }[];
+  };
+}
+
+export interface SetupRawSkillRow {
+  readonly host: SetupHost;
+  readonly name: string;
+  readonly state: SkillProjectionState;
+  readonly ok: boolean;
+}
+
+/** One catalog package: its summary and the hosts it supports. */
+export interface SetupRawCatalogPackage {
+  readonly summary: string;
+  readonly hosts: readonly string[];
+}
+
+/** One host skill root as the collector read it. */
+export interface SetupRawSkillRoot {
+  readonly host: SetupHost;
+  /** Absolute root path. */
+  readonly root: string;
+  /** Names of the directories and links in the root; null when the root does not exist. */
+  readonly entries: readonly string[] | null;
+}
+
+/** One `ROUTES` entry. Route hosts can include hosts outside SETUP_HOSTS; the projection reads only SETUP_HOSTS. */
+export interface SetupRawRoute {
+  readonly event: string;
+  readonly routeId: string;
+  readonly matcher?: string;
+  readonly hosts?: readonly string[];
+}
+
+/** `parseFrontmatter` output of one agents/fleet/*.md file. */
+export interface SetupRawFleetRole {
+  readonly name: string | undefined;
+  readonly description: string | undefined;
+  readonly model: string | undefined;
+  readonly effort: string | undefined;
+}
+
+export interface SetupProjectionInput {
+  readonly collected_at: string;
+  readonly setup_status: SetupOverallStatus;
+  readonly summary: SetupSummary;
+  readonly checks: readonly SetupRawCheck[];
+  /** Check id -> command of the action the builder attached to it. */
+  readonly check_commands: ReadonlyMap<string, string | undefined>;
+  readonly adapters: readonly SetupRawAdapter[];
+  readonly cli_versions: Partial<Record<SetupHost, string>>;
+  /** Null when the skill projection check produced no judgments. */
+  readonly skill_rows: readonly SetupRawSkillRow[] | null;
+  /** Catalog packages by name; null when the catalog is unreadable. */
+  readonly skill_catalog: ReadonlyMap<string, SetupRawCatalogPackage> | null;
+  /** The HOME that the skill roots are under. */
+  readonly home: string;
+  /** One root per SETUP_HOSTS entry, in that order. */
+  readonly skill_roots: readonly SetupRawSkillRoot[];
+  /** The install ledger selection; null when the ledger is missing or invalid. */
+  readonly install_selection: 'all' | readonly string[] | null;
+  readonly routes: readonly SetupRawRoute[];
+  readonly fleet_roles: readonly SetupRawFleetRole[];
+  /** `tooling.tools.agent_fleet.hosts` exactly as the tooling report gave it. */
+  readonly fleet_hosts: unknown;
+  /** `summarizeHookUsage` output; null when the collector found no repository root. */
+  readonly hook_usage: SetupHookUsage | null;
+}
+
+const redact = (text: string): string => publicAgentConfigText(text);
+/** Package-owned text: verbatim, trimmed, null when absent. */
+const packageText = (text: string | undefined): string | null =>
+  (text === undefined || text.trim() === '' ? null : text.trim());
+
+function hostFacts(host: SetupHost, input: SetupProjectionInput, checks: ReadonlyMap<string, SetupRawCheck>): SetupHostFacts {
+  if (host === 'pi') {
+    const check = checks.get('doctor.pi-path');
+    return check === undefined
+      ? { host, reported: false, adapter_check: null, detected: null, adapter: null, cli_version: null, package_check: null }
+      : { host, reported: true, adapter_check: null, detected: check.status !== 'na', adapter: null, cli_version: input.cli_versions.pi ?? null,
+        package_check: checks.get('doctor.pi-package')?.status ?? null };
+  }
+  const check = checks.get(`status.adapter.${host}`);
+  const entry = input.adapters.find(adapter => adapter.id === host);
+  if (check === undefined || entry === undefined) {
+    return { host, reported: false, adapter_check: null, detected: null, adapter: null, cli_version: null };
+  }
+  return {
+    host,
+    reported: true,
+    adapter_check: check.status,
+    detected: entry.installed,
+    adapter: entry.installed
+      ? {
+        configured: entry.alreadyConfigured && entry.projection?.error === undefined,
+        managed_entries: entry.managedEntryCount,
+        expected_entries: entry.expectedEntryCount,
+        projection: entry.projection?.status ?? null,
+        projection_error: entry.projection?.error === undefined ? null : redact(entry.projection.error),
+        mismatches: (entry.projection?.mismatches ?? []).map(mismatch => ({
+          kind: mismatch.kind,
+          event: redact(mismatch.event),
+          route_id: mismatch.routeId ?? null,
+          field: mismatch.field ?? null,
+        })),
+      }
+      : null,
+    cli_version: input.cli_versions[host] ?? null,
+  };
+}
+
+function skills(input: SetupProjectionInput): SetupSkill[] {
+  const byName = new Map<string, { -readonly [H in SetupHost]: SetupSkill['hosts'][H] }>();
+  for (const row of input.skill_rows ?? []) {
+    const hosts = byName.get(row.name) ?? { claude: null, codex: null, pi: null };
+    hosts[row.host] = { state: row.state, ok: row.ok };
+    byName.set(row.name, hosts);
+  }
+  return [...byName].map(([name, hosts]) => {
+    const entry = input.skill_catalog?.get(name);
+    return { name, summary: packageText(entry?.summary), catalog_hosts: entry ? SETUP_HOSTS.filter(host => entry.hosts.includes(host)) : null, hosts };
+  });
+}
+
+/** `~` for HOME; any other absolute root is a private path. */
+function publicRoot(root: string, home: string): string {
+  const separator = root[home.length];
+  return redact(root.startsWith(home) && (separator === '/' || separator === '\\') ? `~${root.slice(home.length)}` : root);
+}
+
+/**
+ * Without a readable catalog no entry can be told apart from a repo-harness
+ * skill, so no root is listed rather than listing managed skills as other.
+ */
+function skillRoots(input: SetupProjectionInput): SetupHostSkillRoot[] {
+  const catalog = input.skill_catalog;
+  if (catalog === null) return [];
+  return input.skill_roots.map(({ host, root, entries }) => ({
+    host,
+    root: publicRoot(root, input.home),
+    other_skills: entries === null ? null : entries.filter(name => !name.startsWith('.') && !catalog.has(name)).map(redact).sort(),
+  }));
+}
+
+function hooks(routes: readonly SetupRawRoute[]): SetupHookEvent[] {
+  return SETUP_HOOK_EVENTS
+    .map(event => ({
+      event,
+      routes: routes.filter(route => route.event === event).map(route => ({
+        route_id: route.routeId,
+        matcher: route.matcher ?? null,
+        hosts: SETUP_HOSTS.filter(host => route.hosts === undefined || route.hosts.includes(host)),
+      })),
+    }))
+    .filter(event => event.routes.length > 0);
+}
+
+/** Reads `{ <host>: { installed_agents: string[], missing_agents: string[] } }`; anything else reports nothing for that host. */
+function fleetMembership(value: unknown): Map<SetupHost, { installed: Set<string>; missing: Set<string> }> {
+  const out = new Map<SetupHost, { installed: Set<string>; missing: Set<string> }>();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+  const strings = (list: unknown): string[] | null =>
+    (Array.isArray(list) && list.every(item => typeof item === 'string') ? list as string[] : null);
+  for (const host of ['claude', 'codex'] as const) {
+    const entry = (value as Record<string, unknown>)[host];
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const installed = strings((entry as Record<string, unknown>).installed_agents);
+    const missing = strings((entry as Record<string, unknown>).missing_agents);
+    if (installed !== null && missing !== null) out.set(host, { installed: new Set(installed), missing: new Set(missing) });
+  }
+  return out;
+}
+
+function fleet(input: SetupProjectionInput): SetupFleetRole[] {
+  const membership = fleetMembership(input.fleet_hosts);
+  const seen = new Set<string>();
+  const roles: SetupFleetRole[] = [];
+  for (const role of input.fleet_roles) {
+    if (role.name === undefined || seen.has(role.name)) continue;
+    seen.add(role.name);
+    const state = (host: SetupHost): 'installed' | 'missing' | null => {
+      const facts = membership.get(host);
+      if (facts?.installed.has(role.name!)) return 'installed';
+      if (facts?.missing.has(role.name!)) return 'missing';
+      return null;
+    };
+    roles.push({
+      name: role.name,
+      description: packageText(role.description),
+      model: packageText(role.model),
+      effort: packageText(role.effort),
+      hosts: { claude: state('claude'), codex: state('codex'), pi: null },
+    });
+  }
+  return roles;
+}
+
+export function projectSetupSnapshot(input: SetupProjectionInput): SetupSnapshotV2 {
+  const checks = new Map(input.checks.map(check => [check.id, check]));
+  const problems: SetupCheck[] = [];
+  for (const check of input.checks) {
+    if (check.status === 'ok' || check.status === 'na') continue;
+    const command = input.check_commands.get(check.id);
+    problems.push({
+      id: check.id,
+      status: check.status,
+      title: redact(check.title),
+      detail: redact(check.detail),
+      command: command === undefined || command.trim() === '' ? null : redact(command.trim()),
+    });
+  }
+  return {
+    projection_version: SETUP_PROJECTION,
+    status: 'ready',
+    reason: null,
+    collected_at: input.collected_at,
+    setup_status: input.setup_status,
+    summary: { ...input.summary },
+    checks: problems,
+    hosts: SETUP_HOSTS.map(host => hostFacts(host, input, checks)),
+    skills: skills(input),
+    skill_roots: skillRoots(input),
+    install_selection: input.install_selection === null || input.install_selection === 'all' ? input.install_selection : [...input.install_selection],
+    hooks: hooks(input.routes),
+    hook_usage: input.hook_usage,
+    fleet: fleet(input),
+  };
+}

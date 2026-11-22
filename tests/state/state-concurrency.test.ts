@@ -1,0 +1,692 @@
+import { describe, expect, test } from 'bun:test';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { basename, join } from 'path';
+import { spawn, spawnSync } from 'child_process';
+import { commitFixture, resolveFixtureState, createEffectiveStateFixture, writeFixture, writeFixtureStateLock } from './effective-state-fixture';
+import { ROOT } from './effective-state-fixture';
+import { stateVersionOwnerPath, type StateVersionWriteEffects } from '../../src/effects/state/git-state-version-store';
+import {
+  resolveEffectiveState,
+  StateResolutionUnstableError,
+} from '../../src/effects/state/resolve-effective-state';
+import { withStateLock } from '../../src/effects/state/state-lock';
+import { sourceHash } from '../../src/effects/state/collect-state-inputs';
+import { acquireExclusiveDirectoryLock } from '../../src/effects/locking/exclusive-directory-lock';
+
+function releaseLockAfter(ownerPath: string, lockPath: string, delaySeconds: string): void {
+  const child = spawn('sh', [
+    '-c',
+    'sleep "$1"; rm -f "$2"; rmdir "$3"',
+    'release-effective-state-lock',
+    delaySeconds,
+    ownerPath,
+    lockPath,
+  ], { stdio: 'ignore' });
+  child.unref();
+}
+
+function versionOwner(cwd: string): string {
+  return stateVersionOwnerPath(cwd);
+}
+
+describe('Effective State lock and source-stability characterization', () => {
+  test('a live lock waits for its owner to release instead of being reclaimed', () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const lockPath = join(fixture.cwd, '.ai/harness/state/effective.lock');
+      const { ownerPath } = writeFixtureStateLock(fixture.cwd, {
+        pid: process.pid,
+        created_at: Date.now() - 60_000,
+        token: `${process.pid}-0-00000000-0000-4000-8000-000000000005`,
+      });
+      releaseLockAfter(ownerPath, lockPath, '0.15');
+      const started = performance.now();
+      const state = resolveFixtureState(fixture.cwd);
+      const elapsedMs = performance.now() - started;
+      expect(state.protocol).toBe(2);
+      expect(elapsedMs).toBeGreaterThanOrEqual(80);
+      expect(elapsedMs).toBeLessThan(5_000);
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 10_000);
+
+  test('a stale lock with a dead owner is reclaimed', () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const lockPath = join(fixture.cwd, '.ai/harness/state/effective.lock');
+      writeFixtureStateLock(fixture.cwd, {
+        pid: 99999999,
+        start_time: 'fixture-exited-owner',
+        created_at: Date.now() - 60_000,
+        token: '99999999-0-00000000-0000-4000-8000-000000000001',
+      });
+      expect(resolveFixtureState(fixture.cwd).protocol).toBe(2);
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 30_000);
+
+  test('an owner killed while it writes its record leaves no unreadable owner and no wedged lock', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'repo-harness-owner-crash-')));
+    const relativeLockPath = 'locks/owner-crash.lock';
+    const lockPath = join(root, relativeLockPath);
+    try {
+      const child = spawnSync(process.execPath, [
+        join(ROOT, 'tests/fixtures/exclusive-lock-owner-crash-worker.ts'),
+        root,
+        relativeLockPath,
+      ], { cwd: ROOT, encoding: 'utf-8', timeout: 10_000 });
+      expect(child.signal, child.stderr).toBe('SIGKILL');
+      const owners = existsSync(lockPath) ? readdirSync(lockPath) : [];
+      expect(owners.length).toBeLessThanOrEqual(1);
+      for (const owner of owners) {
+        const bytes = readFileSync(join(lockPath, owner), 'utf-8');
+        expect(() => JSON.parse(bytes), `${owner} holds ${JSON.stringify(bytes)}`).not.toThrow();
+      }
+      const handle = acquireExclusiveDirectoryLock(root, relativeLockPath);
+      handle.release();
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test('a lock whose name is about 200 bytes long can be acquired and released', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'repo-harness-long-lock-')));
+    const relativeLockPath = `locks/${'l'.repeat(195)}.lock`;
+    try {
+      const handle = acquireExclusiveDirectoryLock(root, relativeLockPath);
+      handle.release();
+      expect(existsSync(join(root, relativeLockPath))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('a contender waiting on a held lock holds no staged owner record during the wait', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'repo-harness-held-lock-')));
+    const relativeLockPath = 'locks/held.lock';
+    const parent = join(root, 'locks');
+    const holder = acquireExclusiveDirectoryLock(root, relativeLockPath);
+    try {
+      const contender = Bun.spawn([process.execPath, '-e', `
+        const lock = await import(process.env.LOCK_MODULE);
+        try {
+          lock.acquireExclusiveDirectoryLock(process.env.LOCK_ROOT, process.env.LOCK_RELATIVE, { waitTimeoutMs: 1500 });
+        } catch (error) {
+          if (error instanceof lock.ExclusiveLockContentionError) {
+            process.stdout.write(error.kind);
+            process.exit(error.kind === 'timeout' ? 0 : 5);
+          }
+          process.stderr.write(String(error && error.stack || error));
+          process.exit(6);
+        }
+        process.exit(4);
+      `], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          LOCK_MODULE: join(ROOT, 'src/effects/locking/exclusive-directory-lock.ts'),
+          LOCK_ROOT: root,
+          LOCK_RELATIVE: relativeLockPath,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      let exited = false;
+      const outcome = Promise.all([
+        contender.exited,
+        new Response(contender.stdout).text(),
+        new Response(contender.stderr).text(),
+      ]).finally(() => { exited = true; });
+      // Any entry besides the lock is a staged record. This matches every
+      // staged-name format this lock has used.
+      const seen = new Set<string>();
+      const recordStaged = () => {
+        for (const entry of readdirSync(parent)) if (entry !== 'held.lock') seen.add(entry);
+      };
+      while (!exited) {
+        recordStaged();
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+      }
+      recordStaged();
+      const [exitCode, stdout, stderr] = await outcome;
+      expect(exitCode, stderr).toBe(0);
+      expect(stdout).toBe('timeout');
+      expect([...seen]).toEqual([]);
+    } finally {
+      holder.release();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test('concurrent stale reclaimers preserve exclusive critical-section ownership', async () => {
+    const fixture = createEffectiveStateFixture();
+    const startPath = join(fixture.cwd, '.ai/harness/state/reclaim-start');
+    const criticalDir = join(fixture.cwd, '.ai/harness/state/reclaim-critical');
+    const stateLockModule = join(ROOT, 'src/effects/state/state-lock.ts');
+    const workerCount = 12;
+    const workerScript = `
+      import { existsSync, unlinkSync, writeFileSync } from 'fs';
+      import { join } from 'path';
+      const lock = await import(process.env.STATE_LOCK_MODULE);
+      while (!existsSync(process.env.START_PATH)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+      lock.withStateLock(process.env.TEST_REPO, () => {
+        const marker = join(process.env.CRITICAL_DIR, process.env.WORKER_ID);
+        writeFileSync(marker, 'owned\\n');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+        unlinkSync(marker);
+      });
+    `;
+    try {
+      writeFixtureStateLock(fixture.cwd, {
+        pid: 99999999,
+        start_time: 'fixture-exited-owner',
+        created_at: Date.now() - 60_000,
+        token: '99999999-0-00000000-0000-4000-8000-000000000002',
+      });
+      mkdirSync(criticalDir, { recursive: true });
+      let completed = 0;
+      const workers = Array.from({ length: workerCount }, (_, index) => Bun.spawn(['bun', '-e', workerScript], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          STATE_LOCK_MODULE: stateLockModule,
+          START_PATH: startPath,
+          TEST_REPO: fixture.cwd,
+          CRITICAL_DIR: criticalDir,
+          WORKER_ID: `worker-${index}`,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }));
+      const results = workers.map(async (worker) => {
+        const [exitCode, stderr] = await Promise.all([
+          worker.exited,
+          new Response(worker.stderr).text(),
+        ]);
+        completed += 1;
+        return { exitCode, stderr };
+      });
+      writeFixture(fixture.cwd, '.ai/harness/state/reclaim-start', 'go\n');
+      let maxConcurrent = 0;
+      while (completed < workerCount) {
+        maxConcurrent = Math.max(maxConcurrent, readdirSync(criticalDir).length);
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
+      }
+      const settled = await Promise.all(results);
+      expect(settled.map((result) => result.exitCode), settled.map((result) => result.stderr).filter(Boolean).join('\n'))
+        .toEqual(Array(workerCount).fill(0));
+      expect(maxConcurrent).toBe(1);
+      expect(existsSync(join(fixture.cwd, '.ai/harness/state/effective.lock'))).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 20_000);
+
+  test('a delayed live creator in the aged empty pre-token window cannot overlap a contender', async () => {
+    const fixture = createEffectiveStateFixture();
+    const stateDir = join(fixture.cwd, '.ai/harness/state');
+    const lockPath = join(stateDir, 'effective.lock');
+    const readyPath = join(stateDir, 'empty-owner-ready');
+    const goPath = join(stateDir, 'empty-owner-go');
+    const finishedPath = join(stateDir, 'empty-owner-finished');
+    const criticalDir = join(stateDir, 'empty-owner-critical');
+    const ownerScript = `
+      import { closeSync, existsSync, mkdirSync, openSync, rmdirSync, unlinkSync, utimesSync, writeFileSync } from 'fs';
+      import { join } from 'path';
+      const token = \`\${process.pid}-0-00000000-0000-4000-8000-000000000004\`;
+      const ownerPath = join(process.env.LOCK_PATH, \`\${token}.json\`);
+      mkdirSync(process.env.LOCK_PATH, { mode: 0o700 });
+      const old = new Date(Date.now() - 60_000);
+      utimesSync(process.env.LOCK_PATH, old, old);
+      writeFileSync(process.env.READY_PATH, 'ready\\n');
+      while (!existsSync(process.env.GO_PATH)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      const fd = openSync(ownerPath, 'wx', 0o600);
+      writeFileSync(fd, \`\${JSON.stringify({ pid: process.pid, created_at: Date.now(), token })}\\n\`);
+      const marker = join(process.env.CRITICAL_DIR, 'empty-owner');
+      writeFileSync(marker, 'owned\\n');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+      unlinkSync(marker);
+      writeFileSync(process.env.FINISHED_PATH, 'finished\\n');
+      closeSync(fd);
+      try { unlinkSync(ownerPath); } catch {}
+      try { rmdirSync(process.env.LOCK_PATH); } catch {}
+    `;
+    try {
+      mkdirSync(criticalDir, { recursive: true });
+      const owner = Bun.spawn(['bun', '-e', ownerScript], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          LOCK_PATH: lockPath,
+          READY_PATH: readyPath,
+          GO_PATH: goPath,
+          FINISHED_PATH: finishedPath,
+          CRITICAL_DIR: criticalDir,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const readyDeadline = Date.now() + 5_000;
+      while (!existsSync(readyPath) && Date.now() < readyDeadline) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+      }
+      expect(existsSync(readyPath)).toBe(true);
+      expect(existsSync(lockPath)).toBe(true);
+      expect(readdirSync(criticalDir)).toEqual([]);
+      writeFileSync(goPath, 'go\n');
+      withStateLock(fixture.cwd, () => {
+        expect(existsSync(finishedPath)).toBe(true);
+        expect(readdirSync(criticalDir)).toEqual([]);
+      });
+      const [ownerExit, ownerStderr] = await Promise.all([
+        owner.exited,
+        new Response(owner.stderr).text(),
+      ]);
+      expect(ownerExit, ownerStderr).toBe(0);
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 15_000);
+
+  test('an aged token whose PID is live or reused stays fail-closed for manual recovery', async () => {
+    const fixture = createEffectiveStateFixture();
+    const stateLockModule = join(ROOT, 'src/effects/state/state-lock.ts');
+    const enteredPath = join(fixture.cwd, '.ai/harness/state/reused-pid-entered');
+    try {
+      const { lockPath, ownerPath } = writeFixtureStateLock(fixture.cwd, {
+        pid: process.pid,
+        created_at: Date.now() - 60_000,
+        token: `${process.pid}-0-00000000-0000-4000-8000-000000000006`,
+      });
+      const worker = Bun.spawn(['bun', '-e', `
+        const lock = await import(process.env.STATE_LOCK_MODULE);
+        const fs = await import('fs');
+        try {
+          lock.withStateLock(process.env.TEST_REPO, () => fs.writeFileSync(process.env.ENTERED_PATH, 'entered\\n'));
+        } catch (error) {
+          process.stderr.write(String(error.message));
+          process.exit(7);
+        }
+      `], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          STATE_LOCK_MODULE: stateLockModule,
+          TEST_REPO: fixture.cwd,
+          ENTERED_PATH: enteredPath,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stderr] = await Promise.all([
+        worker.exited,
+        new Response(worker.stderr).text(),
+      ]);
+      expect(exitCode).toBe(7);
+      expect(stderr).toContain('timed out waiting for exclusive lock');
+      expect(existsSync(enteredPath)).toBe(false);
+      expect(existsSync(ownerPath)).toBe(true);
+      expect(readdirSync(lockPath)).toEqual([basename(ownerPath)]);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 8_000);
+
+  test('linked worktrees share one Git common-dir version owner', () => {
+    const fixture = createEffectiveStateFixture();
+    const linked = `${fixture.cwd}-linked`;
+    let linkedCreated = false;
+    try {
+      const first = resolveFixtureState(fixture.cwd);
+      const add = spawnSync('git', ['worktree', 'add', '-b', 'linked-state-version', linked], {
+        cwd: fixture.cwd,
+        encoding: 'utf-8',
+      });
+      if (add.status !== 0) throw new Error(add.stderr);
+      linkedCreated = true;
+      writeFixture(linked, '.ai/harness/active-worktree', `${linked}\n`);
+      const second = resolveFixtureState(linked);
+      const third = resolveFixtureState(fixture.cwd);
+      expect(versionOwner(fixture.cwd)).toBe(versionOwner(linked));
+      expect(second.state_version).toBe(first.state_version + 1);
+      expect(third.state_version).toBe(second.state_version + 1);
+    } finally {
+      if (linkedCreated) {
+        spawnSync('git', ['worktree', 'remove', '--force', linked], {
+          cwd: fixture.cwd,
+          encoding: 'utf-8',
+        });
+      }
+      fixture.cleanup();
+    }
+  }, 10_000);
+
+  test('a linked-worktree owner publication failure does not consume the shared next version', () => {
+    const fixture = createEffectiveStateFixture();
+    const linked = `${fixture.cwd}-linked-publication-failure`;
+    let linkedCreated = false;
+    try {
+      const first = resolveFixtureState(fixture.cwd);
+      const add = spawnSync('git', ['worktree', 'add', '-b', 'linked-state-publication-failure', linked], {
+        cwd: fixture.cwd,
+        encoding: 'utf-8',
+      });
+      if (add.status !== 0) throw new Error(add.stderr);
+      linkedCreated = true;
+      writeFixture(linked, '.ai/harness/active-worktree', `${linked}\n`);
+      const version: StateVersionWriteEffects = {
+        writeTemp(path, content) { writeFileSync(path, content, { mode: 0o600 }); },
+        publish() { throw new Error('injected linked owner publish failure'); },
+        removeTemp(path) { rmSync(path, { force: true }); },
+      };
+      expect(() => resolveEffectiveState(linked, Date.now(), {
+        targetPaths: ['src/feature.ts'],
+        operationKind: 'feature',
+      }, { version })).toThrow('injected linked owner publish failure');
+      expect(JSON.parse(readFileSync(versionOwner(fixture.cwd), 'utf-8')).version)
+        .toBe(first.state_version);
+      expect(resolveFixtureState(linked).state_version).toBe(first.state_version + 1);
+      expect(versionOwner(fixture.cwd)).toBe(versionOwner(linked));
+    } finally {
+      if (linkedCreated) {
+        spawnSync('git', ['worktree', 'remove', '--force', linked], {
+          cwd: fixture.cwd,
+          encoding: 'utf-8',
+        });
+      }
+      fixture.cleanup();
+    }
+  }, 10_000);
+
+  test('linked worktrees serialize concurrent version allocations through the shared owner', async () => {
+    const fixture = createEffectiveStateFixture();
+    const linked = `${fixture.cwd}-linked-concurrent`;
+    const startPath = join(fixture.cwd, '.ai/harness/state/version-start');
+    let linkedCreated = false;
+    const versionStoreModule = join(ROOT, 'src/effects/state/git-state-version-store.ts');
+    const workerScript = `
+      import { existsSync } from 'fs';
+      const store = await import(process.env.VERSION_STORE_MODULE);
+      while (!existsSync(process.env.START_PATH)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+      const version = store.commitStateVersionAfter(process.env.TEST_REPO, process.env.REVISION);
+      process.stdout.write(String(version));
+    `;
+    try {
+      const add = spawnSync('git', ['worktree', 'add', '-b', 'linked-state-version-concurrent', linked], {
+        cwd: fixture.cwd,
+        encoding: 'utf-8',
+      });
+      if (add.status !== 0) throw new Error(add.stderr);
+      linkedCreated = true;
+      const workerCount = 12;
+      const workers = Array.from({ length: workerCount }, (_, index) => Bun.spawn(['bun', '-e', workerScript], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          VERSION_STORE_MODULE: versionStoreModule,
+          START_PATH: startPath,
+          TEST_REPO: index % 2 === 0 ? fixture.cwd : linked,
+          REVISION: `revision-${index}`,
+          WORKER_ID: String(index),
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }));
+      writeFixture(fixture.cwd, '.ai/harness/state/version-start', 'go\n');
+      const results = await Promise.all(workers.map(async (worker) => {
+        const [exitCode, stdout, stderr] = await Promise.all([
+          worker.exited,
+          new Response(worker.stdout).text(),
+          new Response(worker.stderr).text(),
+        ]);
+        return { exitCode, stdout, stderr };
+      }));
+      expect(results.map((result) => result.exitCode), results.map((result) => result.stderr).filter(Boolean).join('\n'))
+        .toEqual(Array(workerCount).fill(0));
+      const versions = results.map((result) => Number.parseInt(result.stdout, 10)).sort((a, b) => a - b);
+      expect(versions).toEqual(Array.from({ length: workerCount }, (_, index) => index + 1));
+      expect(JSON.parse(readFileSync(versionOwner(fixture.cwd), 'utf-8')).version).toBe(workerCount);
+      expect(versionOwner(fixture.cwd)).toBe(versionOwner(linked));
+    } finally {
+      if (linkedCreated) {
+        spawnSync('git', ['worktree', 'remove', '--force', linked], {
+          cwd: fixture.cwd,
+          encoding: 'utf-8',
+        });
+      }
+      fixture.cleanup();
+    }
+  }, 20_000);
+
+  test('continuous capability-registry mutation overlaps resolution and fails without a published version', async () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const registryPath = join(fixture.cwd, '.ai/context/capabilities.json');
+      writeFixture(fixture.cwd, '.ai/context/capabilities.json', '{"version":1,"capabilities":[]}\n');
+      commitFixture(fixture.cwd, 'seed capability registry mutation fixture');
+      const lockPath = join(fixture.cwd, '.ai/harness/state/effective.lock');
+      const startedPath = join(fixture.cwd, '.ai/harness/state/mutator-started');
+      const stopPath = join(fixture.cwd, '.ai/harness/state/mutator-stop');
+      const counterPath = join(fixture.cwd, '.ai/harness/state/mutator-count');
+      const { ownerPath } = writeFixtureStateLock(fixture.cwd, {
+        pid: process.pid,
+        created_at: Date.now(),
+        token: 'mutation-barrier',
+      });
+      const mutator = spawn('sh', [
+        '-c',
+        [
+          'i=0',
+          'printf " " >> "$1"',
+          'i=$((i + 1))',
+          'printf "%s\\n" "$i" > "$5"',
+          'printf "started\\n" > "$2"',
+          'rm -f "$3"',
+          'rmdir "$4"',
+          'while [ ! -f "$6" ]; do',
+          '  printf " " >> "$1"',
+          '  i=$((i + 1))',
+          'done',
+          'printf "%s\\n" "$i" > "$5"',
+        ].join('\n'),
+        'mutate-effective-state-source',
+        registryPath,
+        startedPath,
+        ownerPath,
+        lockPath,
+        counterPath,
+        stopPath,
+      ], { stdio: 'ignore' });
+      const mutatorDone = new Promise<void>((resolvePromise, rejectPromise) => {
+        mutator.once('exit', (code) => code === 0
+          ? resolvePromise()
+          : rejectPromise(new Error(`fixture mutator exited ${code}`)));
+        mutator.once('error', rejectPromise);
+      });
+      const barrier = spawnSync('sh', ['-c', 'i=0; while [ ! -f "$1" ]; do i=$((i + 1)); [ "$i" -lt 500 ] || exit 1; sleep 0.01; done', 'wait-mutator', startedPath]);
+      expect(barrier.status).toBe(0);
+      const beforeCount = Number.parseInt(readFileSync(counterPath, 'utf-8'), 10);
+      let failure: Error | null = null;
+      try {
+        resolveFixtureState(fixture.cwd);
+      } catch (error) {
+        failure = error as Error;
+      } finally {
+        writeFileSync(stopPath, 'stop\n');
+      }
+      await mutatorDone;
+
+      const afterCount = Number.parseInt(readFileSync(counterPath, 'utf-8'), 10);
+      expect(afterCount).toBeGreaterThan(beforeCount);
+      expect(failure).toBeInstanceOf(StateResolutionUnstableError);
+      expect(existsSync(stateVersionOwnerPath(fixture.cwd))).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 15_000);
+
+  // LSC-05: nothing currently re-checks the source snapshot between
+  // resolveStableEffectiveState's confirming read and commitStateVersionAfter
+  // consuming confirmed.state_revision. The retry-succeeds test below
+  // pre-holds the version lock (the same lock commitStateVersionAfter already
+  // acquires) with a live-pid owner file, so the main thread's
+  // resolveEffectiveState call blocks *after* its stability loop has already
+  // confirmed a snapshot but *before* commitStateVersionAfter's critical
+  // section can run. A detached shell process then mutates a source file and
+  // only afterwards releases the lock -- deterministically landing the
+  // mutation inside the confirm-to-commit window on every run, with no
+  // reliance on timing luck. Only one mutation ever happens, and the bounded
+  // single retry is designed to absorb exactly one authority change, so this
+  // test's assertions hold no matter which checkpoint (stability loop or
+  // commit confirm) ends up observing it.
+  //
+  // The exhaustion test below cannot reuse a single precisely-timed mutation:
+  // it needs every attempt (the initial one and the one bounded retry) to
+  // keep observing change, and a slow host can let a one-shot sleep-timed
+  // mutation miss its window -- the resolver's bounded retry then
+  // legitimately finds a stable snapshot and succeeds instead of exhausting.
+  // It instead reuses the continuous-mutation barrier technique from
+  // "continuous capability-registry mutation overlaps resolution and fails
+  // without a published version" above: a background mutator holds the outer
+  // state lock until it is already rewriting the plan file in a tight loop,
+  // then releases it, so both resolveStableEffectiveState's stability loop
+  // and every subsequent confirm check keep observing freshly-changed
+  // content for the whole call, regardless of host speed.
+
+  test('a source mutation exactly inside the version-allocation window is caught, retried once, and resolves against the new content with no version gap', async () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const risk = { targetPaths: ['src/feature.ts'], operationKind: 'feature' } as const;
+      const policyPath = '.ai/harness/policy.json';
+      writeFixture(fixture.cwd, policyPath, '{}\n');
+      const first = resolveEffectiveState(fixture.cwd, Date.now(), risk);
+      const ownerPath = stateVersionOwnerPath(fixture.cwd);
+      const lockDirPath = `${ownerPath}.lock`;
+      const policyAbsPath = join(fixture.cwd, policyPath);
+      const token = `${process.pid}-0-00000000-0000-4000-8000-000000000010`;
+      const ownerJsonPath = join(lockDirPath, `${token}.json`);
+      mkdirSync(lockDirPath, { recursive: true, mode: 0o700 });
+      writeFileSync(ownerJsonPath, `${JSON.stringify({ pid: process.pid, created_at: Date.now(), token })}\n`);
+
+      const mutator = spawn('sh', [
+        '-c',
+        'sleep "$1"; printf " " >> "$2"; rm -f "$3"; rmdir "$4"',
+        'confirm-window-single-mutation',
+        '0.2',
+        policyAbsPath,
+        ownerJsonPath,
+        lockDirPath,
+      ], { stdio: 'ignore' });
+      mutator.unref();
+
+      let ownerWriteTempCount = 0;
+      let ownerPublishCount = 0;
+      const version: StateVersionWriteEffects = {
+        writeTemp(path, content) { ownerWriteTempCount += 1; writeFileSync(path, content, { mode: 0o600 }); },
+        publish(tempPath, targetPath) { ownerPublishCount += 1; renameSync(tempPath, targetPath); },
+        removeTemp(path) { rmSync(path, { force: true }); },
+      };
+
+      const result = resolveEffectiveState(fixture.cwd, Date.now(), risk, { version });
+
+      expect(result.state_version).toBe(first.state_version + 1);
+      expect(ownerWriteTempCount).toBe(1);
+      expect(ownerPublishCount).toBe(1);
+      expect(result.source_hashes[policyPath]).toBe(sourceHash(fixture.cwd, policyPath));
+      expect(JSON.parse(readFileSync(ownerPath, 'utf-8')).revision).toBe(result.state_revision);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 10_000);
+
+  test('a source mutation on every confirm-window check exhausts the bounded retry and leaves no version owner', async () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const risk = { targetPaths: ['src/feature.ts'], operationKind: 'feature' } as const;
+      const policyPath = '.ai/harness/policy.json';
+      writeFixture(fixture.cwd, policyPath, '{}\n');
+      const policyAbsPath = join(fixture.cwd, policyPath);
+      const lockPath = join(fixture.cwd, '.ai/harness/state/effective.lock');
+      const startedPath = join(fixture.cwd, '.ai/harness/state/mutator-started');
+      const stopPath = join(fixture.cwd, '.ai/harness/state/mutator-stop');
+      const counterPath = join(fixture.cwd, '.ai/harness/state/mutator-count');
+      const { ownerPath } = writeFixtureStateLock(fixture.cwd, {
+        pid: process.pid,
+        created_at: Date.now(),
+        token: 'exhaustion-mutation-barrier',
+      });
+      const mutator = spawn('sh', [
+        '-c',
+        [
+          'i=0',
+          'printf " " >> "$1"',
+          'i=$((i + 1))',
+          'printf "%s\\n" "$i" > "$5"',
+          'printf "started\\n" > "$2"',
+          'rm -f "$3"',
+          'rmdir "$4"',
+          'while [ ! -f "$6" ]; do',
+          '  printf " " >> "$1"',
+          '  i=$((i + 1))',
+          'done',
+          'printf "%s\\n" "$i" > "$5"',
+        ].join('\n'),
+        'mutate-effective-state-source',
+        policyAbsPath,
+        startedPath,
+        ownerPath,
+        lockPath,
+        counterPath,
+        stopPath,
+      ], { stdio: 'ignore' });
+      const mutatorDone = new Promise<void>((resolvePromise, rejectPromise) => {
+        mutator.once('exit', (code) => code === 0
+          ? resolvePromise()
+          : rejectPromise(new Error(`fixture mutator exited ${code}`)));
+        mutator.once('error', rejectPromise);
+      });
+      const barrier = spawnSync('sh', ['-c', 'i=0; while [ ! -f "$1" ]; do i=$((i + 1)); [ "$i" -lt 500 ] || exit 1; sleep 0.01; done', 'wait-mutator', startedPath]);
+      expect(barrier.status).toBe(0);
+      const beforeCount = Number.parseInt(readFileSync(counterPath, 'utf-8'), 10);
+
+      let ownerWriteTempCount = 0;
+      const version: StateVersionWriteEffects = {
+        writeTemp(path, content) { ownerWriteTempCount += 1; writeFileSync(path, content, { mode: 0o600 }); },
+        publish(tempPath, targetPath) { renameSync(tempPath, targetPath); },
+        removeTemp(path) { rmSync(path, { force: true }); },
+      };
+
+      let failure: Error | null = null;
+      try {
+        resolveEffectiveState(fixture.cwd, Date.now(), risk, { version });
+      } catch (error) {
+        failure = error as Error;
+      } finally {
+        writeFileSync(stopPath, 'stop\n');
+      }
+      await mutatorDone;
+
+      const afterCount = Number.parseInt(readFileSync(counterPath, 'utf-8'), 10);
+      expect(afterCount).toBeGreaterThan(beforeCount);
+      expect(failure).toBeInstanceOf(StateResolutionUnstableError);
+      expect(ownerWriteTempCount).toBe(0);
+      expect(existsSync(stateVersionOwnerPath(fixture.cwd))).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 15_000);
+});

@@ -1,0 +1,336 @@
+import { copyHelpers } from "./helpers/helper-script-fixture";
+import { run, tmpWorkspace as scriptTmpWorkspace } from "./helpers/repo-fixture";
+
+import { describe, expect, test } from "bun:test";
+import { spawnSync } from "child_process";
+import { createHash } from "crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+
+const ROOT = join(import.meta.dir, "..");
+
+function tmpWorkspace(prefix: string): string {
+  const cwd = mkdtempSync(join(tmpdir(), `${prefix}-`));
+  return cwd;
+}
+
+function runResolver(cwd: string, args: string[], env: Record<string, string> = {}) {
+  return spawnSync("bun", [join(ROOT, "scripts/capability-resolver.ts"), ...args, "--repo", cwd], {
+    cwd,
+    encoding: "utf-8",
+    env: { ...process.env, ...env },
+  });
+}
+
+function runStandaloneResolver(cwd: string, args: string[]) {
+  mkdirSync(join(cwd, "scripts"), { recursive: true });
+  const helper = join(ROOT, "assets/templates/helpers/capability-resolver.ts");
+  const target = join(cwd, "scripts/capability-resolver.ts");
+  writeFileSync(target, readFileSync(helper));
+  return spawnSync("bun", [target, ...args, "--repo", cwd], {
+    cwd,
+    encoding: "utf-8",
+  });
+}
+
+function sha256(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+function writeRegistry(cwd: string, capabilities: unknown[]) {
+  mkdirSync(join(cwd, ".ai/context"), { recursive: true });
+  writeFileSync(
+    join(cwd, ".ai/context/capabilities.json"),
+    JSON.stringify({ version: 1, capabilities }, null, 2) + "\n"
+  );
+}
+
+const webCapability = {
+  id: "apps-web",
+  domain: "apps-web",
+  name: "web",
+  prefixes: ["apps/web"],
+  contract_files: {
+    agents: "apps/web/AGENTS.md",
+    claude: "apps/web/CLAUDE.md",
+  },
+  architecture_module: "docs/architecture/modules/apps-web/web.md",
+  lsp_profile: "typescript-lsp",
+  verification_hints: ["web checks"],
+};
+
+const accountCapability = {
+  id: "apps-web-account",
+  domain: "apps-web",
+  name: "account",
+  prefixes: ["apps/web/src/routes/account"],
+  contract_files: {
+    agents: "apps/web/src/routes/account/AGENTS.md",
+    claude: "apps/web/src/routes/account/CLAUDE.md",
+  },
+  architecture_module: "docs/architecture/modules/apps-web/account.md",
+  lsp_profile: "typescript-lsp",
+  verification_hints: ["account checks"],
+};
+
+describe("capability resolver", () => {
+  test("standalone projection is deterministic, source-bound, and runnable without repo internals", () => {
+    const cwd = tmpWorkspace("capability-standalone-projection");
+    try {
+      mkdirSync(join(cwd, "apps/web/src/routes/account"), { recursive: true });
+      writeRegistry(cwd, [webCapability, accountCapability]);
+      mkdirSync(join(cwd, ".ai/harness"), { recursive: true });
+      const policyPath = join(cwd, ".ai/harness/policy.json");
+      writeFileSync(policyPath, '{"context":{"capability_source":"registry"},"worktree_strategy":null}');
+
+      const source = runResolver(cwd, [
+        "match", "--path", "apps/web/src/routes/account/page.tsx", "--format", "json",
+      ]);
+      const standalone = runStandaloneResolver(cwd, [
+        "match", "--path", "apps/web/src/routes/account/page.tsx", "--format", "json",
+      ]);
+      expect(standalone.status).toBe(0);
+      expect(standalone.stdout).toBe(source.stdout);
+      expect(standalone.stderr).toBe(source.stderr);
+      const match = JSON.parse(standalone.stdout);
+      expect(match.capability_id).toBe("apps-web-account");
+      expect(match.matched_prefix).toBe("apps/web/src/routes/account");
+      const cli = join(ROOT, "src/cli/index.ts");
+      for (const inputPath of ["apps/web/src/routes/account/page.tsx", "unowned/file.ts"]) {
+        const args = ["match", "--path", inputPath, "--format", "json", "--repo", cwd];
+        const direct = runResolver(cwd, args);
+        const routed = run("bun", [cli, "capability", "resolve", ...args], cwd);
+        expect(routed.status, routed.stderr).toBe(direct.status);
+        expect(routed.stdout).toBe(direct.stdout);
+        expect(routed.stderr).toBe(direct.stderr);
+      }
+      const blocks = run("bun", [cli, "capability", "blocks"], cwd);
+      const directBlocks = run("bash", [join(ROOT, "scripts/select-agent-context-blocks.sh")], cwd);
+      expect(blocks.status, blocks.stderr).toBe(directBlocks.status);
+      expect(blocks.stdout).toBe(directBlocks.stdout);
+      expect(blocks.stderr).toBe(directBlocks.stderr);
+      for (const { text, status } of [
+        { text: undefined, status: 0 },
+        { text: '{}', status: 0 },
+        { text: 'null', status: 0 },
+        { text: '[]', status: 0 },
+        { text: '{', status: 2 },
+        { text: '{"context":{"capability_source":"unknown"}}', status: 2 },
+        // Last: a file ancestor (ENOTDIR) reads as an absent policy, as the existsSync probe did before #2398.
+        { text: 'harness-is-a-file', status: 0 },
+      ]) {
+        if (text === undefined) rmSync(policyPath);
+        else if (text === 'harness-is-a-file') {
+          rmSync(join(cwd, ".ai/harness"), { recursive: true });
+          writeFileSync(join(cwd, ".ai/harness"), "");
+        } else writeFileSync(policyPath, text);
+        const canonical = runResolver(cwd, ["list", "--format", "json"]);
+        const projected = runStandaloneResolver(cwd, ["list", "--format", "json"]);
+        expect(projected.status).toBe(status);
+        expect(projected.stdout).toBe(canonical.stdout);
+        expect(projected.stderr).toBe(canonical.stderr);
+        if (text === '{') {
+          // The parser message can quote text of the file, so the output names the file only (I1, #3164).
+          expect(projected.stderr).toContain('malformed harness policy: .ai/harness/policy.json: the file is not valid JSON');
+        }
+      }
+
+      const core = readFileSync(join(ROOT, "src/core/capabilities/registry.ts"), "utf-8");
+      const expectedHash = sha256(core);
+      const projected = readFileSync(
+        join(ROOT, "assets/templates/helpers/capability-resolver.ts"),
+        "utf-8",
+      );
+      expect(projected).toContain(
+        `// @generated-from src/core/capabilities/registry.ts sha256:${expectedHash}`,
+      );
+      expect(projected).not.toContain('from "../src/core/capabilities/registry"');
+
+      expect(projected).not.toMatch(/from ["']\.\.?\//);
+      expect(projected).toContain('export function gitSpawnSync');
+      expect(projected).toContain('export interface Capability');
+      expect(projected).toContain('export interface CapabilityRegistry');
+      const projectionCheck = spawnSync("bun", ["scripts/sync-helper-sources.ts", "--check"], {
+        cwd: ROOT,
+        encoding: "utf-8",
+      });
+      expect(projectionCheck.status, projectionCheck.stderr).toBe(0);
+      // scripts/capability-config.ts ships next to the standalone resolver, so check the shipped pair.
+      const pair = join(cwd, "pair");
+      mkdirSync(pair, { recursive: true });
+      writeFileSync(join(pair, "capability-resolver.ts"), readFileSync(join(ROOT, "assets/templates/helpers/capability-resolver.ts")));
+      writeFileSync(join(pair, "capability-config.ts"), readFileSync(join(ROOT, "scripts/capability-config.ts")));
+      symlinkSync(join(ROOT, "node_modules"), join(pair, "node_modules"));
+      const typecheck = spawnSync("node", [
+        join(ROOT, "node_modules/typescript/bin/tsc"),
+        "--ignoreConfig",
+        "--noEmit",
+        "--module", "Preserve",
+        "--moduleResolution", "Bundler",
+        "--target", "ES2022",
+        "--strict",
+        "--skipLibCheck",
+        "--types", "bun-types",
+        "capability-resolver.ts",
+        "capability-config.ts",
+      ], { cwd: pair, encoding: "utf-8" });
+      expect(typecheck.status, typecheck.stderr || typecheck.stdout).toBe(0);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("contract file pairs are required for every capability", () => {
+    const cwd = tmpWorkspace("capability-contract-pair");
+    try {
+      mkdirSync(join(cwd, "apps/web"), { recursive: true });
+      writeRegistry(cwd, [
+        {
+          ...webCapability,
+          contract_files: {
+            agents: "apps/web/AGENTS.md",
+          },
+        },
+      ]);
+
+      const res = runResolver(cwd, ["validate", "--format", "text"]);
+      expect(res.status).toBe(1);
+      expect(res.stdout).toContain("apps-web: contract_files.claude is required");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("missing registry fails closed instead of deriving legacy context blocks", () => {
+    const cwd = tmpWorkspace("capability-missing-registry");
+    try {
+      mkdirSync(join(cwd, "apps/web/src/routes/account"), { recursive: true });
+      mkdirSync(join(cwd, ".ai/context"), { recursive: true });
+      writeFileSync(join(cwd, ".ai/context/agent-context-blocks.txt"), "apps/web\napps/web/src/routes/account\n");
+
+      const res = runResolver(cwd, ["match", "--path", "apps/web/src/routes/account/page.tsx", "--format", "json"]);
+      expect(res.status).toBe(1);
+      expect(res.stdout).toBe("");
+      expect(res.stderr).toContain("missing capability registry: .ai/context/capabilities.json");
+      expect(res.stderr).toContain("rh capability register add --prefix <existing-path>");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("environment context blocks cannot replace the capability registry", () => {
+    const cwd = tmpWorkspace("capability-env-blocks");
+    try {
+      mkdirSync(join(cwd, "apps/current"), { recursive: true });
+      mkdirSync(join(cwd, "apps/legacy"), { recursive: true });
+
+      const env = {
+        REPO_HARNESS_CONTEXT_BLOCKS: "apps/current",
+        PROJECT_INITIALIZER_CONTEXT_BLOCKS: "apps/legacy",
+      };
+
+      const res = runResolver(
+        cwd,
+        ["match", "--path", "apps/current/page.tsx", "--format", "json"],
+        env
+      );
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("missing capability registry");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("malformed registry JSON fails with an authority-specific error", () => {
+    const cwd = tmpWorkspace("capability-malformed-registry");
+    try {
+      mkdirSync(join(cwd, ".ai/context"), { recursive: true });
+      writeFileSync(join(cwd, ".ai/context/capabilities.json"), "{\"version\":1,\n");
+
+      const res = runResolver(cwd, ["validate", "--format", "text"]);
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("malformed capability registry: .ai/context/capabilities.json");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("registered prefixes must exist", () => {
+    const cwd = tmpWorkspace("capability-missing-prefix");
+    try {
+      writeRegistry(cwd, [webCapability]);
+
+      const res = runResolver(cwd, ["validate", "--format", "text"]);
+      expect(res.status).toBe(1);
+      expect(res.stdout).toContain("apps-web: prefix does not exist: apps/web");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a projection manifest owns the module pages and the orphan check (#2707)", () => {
+    const cwd = tmpWorkspace("capability-projection-manifest");
+    try {
+      mkdirSync(join(cwd, "apps/web"), { recursive: true });
+      mkdirSync(join(cwd, "apps/api"), { recursive: true });
+      // The registry names pages that do not exist; the manifest projects one other page.
+      writeRegistry(cwd, [
+        webCapability,
+        { ...webCapability, id: "apps-api", name: "api", prefixes: ["apps/api"], architecture_module: "docs/architecture/modules/apps-api/api.md" },
+      ]);
+      const projected = "docs/architecture/modules/web/context.md";
+      mkdirSync(join(cwd, "docs/architecture/modules/web"), { recursive: true });
+      writeFileSync(join(cwd, projected), "# Web\n");
+      const manifest = (targets: unknown) => writeFileSync(join(cwd, "docs/architecture/.projection-manifest.json"), JSON.stringify({ targets }));
+      const webTarget = {
+        "projection_target.entity.capability-apps-web-web": {
+          type: "entity-summary", scope: { kind: "entity", id: "capability.apps-web.web", entityKind: "capability" }, path: projected,
+        },
+      };
+      manifest(webTarget);
+      const exportNodes = () => runResolver(cwd, ["export", "--format", "archcontext-nodes-v2"]);
+
+      expect(runResolver(cwd, ["validate", "--format", "text"]).stdout).toContain("[CapabilityResolver] OK");
+      expect(exportNodes().status).toBe(0);
+      const web = JSON.parse(runResolver(cwd, ["match", "--path", "apps/web/page.tsx", "--format", "json"]).stdout);
+      const api = JSON.parse(runResolver(cwd, ["match", "--path", "apps/api/route.ts", "--format", "json"]).stdout);
+      expect([web.architecture_module, api.architecture_module]).toEqual([projected, null]);
+
+      writeFileSync(join(cwd, "docs/architecture/modules/web/extra.md"), "# Extra\n");
+      expect(runResolver(cwd, ["validate", "--format", "text"]).stdout)
+        .toContain("orphan architecture module: docs/architecture/modules/web/extra.md");
+      // A manifest page with no capability is projected, not an orphan.
+      manifest({ ...webTarget, "projection_target.overview": { type: "overview", path: "docs/architecture/modules/web/extra.md" } });
+      expect(exportNodes().status).toBe(0);
+
+      manifest(undefined);
+      const invalid = runResolver(cwd, ["validate", "--format", "text"]);
+      expect(invalid.status).toBe(1);
+      expect(invalid.stdout).toContain("docs/architecture/.projection-manifest.json has no targets object");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+describe("capability-resolver helper integration", () => {
+  test("capability resolver rejects missing registry instead of synthesizing legacy discovery", () => {
+    const cwd = scriptTmpWorkspace("helper-capability-worktrees");
+    try {
+      mkdirSync(join(cwd, "apps/mobile"), { recursive: true });
+      mkdirSync(join(cwd, ".worktrees/codex/old/apps/mobile"), { recursive: true });
+      copyHelpers(cwd);
+      writeFileSync(join(cwd, "apps/mobile/AGENTS.md"), "# Mobile Contract\n");
+      writeFileSync(join(cwd, ".worktrees/codex/old/apps/mobile/AGENTS.md"), "# Old Worktree Contract\n");
+
+      const res = run("bun", ["scripts/capability-resolver.ts", "list", "--format", "prefixes"], cwd);
+      expect(res.status).toBe(1);
+      expect(res.stdout).toBe("");
+      expect(res.stderr).toContain("missing capability registry: .ai/context/capabilities.json");
+      expect(res.stderr).not.toContain("apps/mobile");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+});

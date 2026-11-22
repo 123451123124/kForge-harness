@@ -1,0 +1,66 @@
+import { sha256Prefixed } from "../evidence/sha256";
+import type { AdoptionOperation, AdoptionPlan } from "./operations";
+import { rollbackMetadataForOperation } from "./rollback";
+
+function contentPreview(content: string): string {
+  const firstLines = content.split("\n").slice(0, 3).join("\n").trimEnd();
+  return firstLines.length > 160 ? `${firstLines.slice(0, 157)}...` : firstLines;
+}
+
+function renderOperation(operation: AdoptionOperation): Record<string, unknown> {
+  const rollback = operation.rollback ?? rollbackMetadataForOperation(operation);
+  if (operation.kind === "writeFile") {
+    const { content: _content, ...rest } = operation;
+    return {
+      ...rest,
+      rollback,
+      contentHash: sha256Prefixed(operation.content),
+      contentPreview: contentPreview(operation.content),
+    };
+  }
+  if (operation.kind === "appendManagedBlock") {
+    const { content: _content, ...rest } = operation;
+    return {
+      ...rest,
+      rollback,
+      contentHash: sha256Prefixed(operation.content),
+      contentPreview: contentPreview(operation.content),
+    };
+  }
+  return { ...operation, rollback };
+}
+
+export function renderAdoptionPlanObject(plan: AdoptionPlan): Record<string, unknown> {
+  return {
+    protocol: plan.protocol,
+    command: plan.command,
+    repoRoot: plan.repoRoot,
+    mode: plan.mode,
+    apply: plan.apply,
+    operations: plan.operations.map(renderOperation),
+    summary: plan.summary,
+    warnings: plan.warnings,
+  };
+}
+
+export function renderAdoptionPlanJson(plan: AdoptionPlan): string {
+  return `${JSON.stringify(renderAdoptionPlanObject(plan), null, 2)}\n`;
+}
+
+export function renderAdoptionPlanText(plan: AdoptionPlan): string {
+  const lines = [
+    `[init-plan] repo: ${plan.repoRoot}`,
+    `[init-plan] mode: ${plan.mode}`,
+    `[init-plan] apply: ${plan.apply ? "yes" : "no"}`,
+    `[init-plan] operations: ${plan.summary.total} total, ${plan.summary.plannedTotal} planned, ${plan.summary.skippedTotal} skipped${
+      plan.summary.failedTotal > 0 ? `, ${plan.summary.failedTotal} failed` : ""
+    }`,
+  ];
+  for (const [kind, count] of Object.entries(plan.summary.byKind).sort()) {
+    lines.push(`[init-plan] ${kind}: ${count}`);
+  }
+  for (const warning of plan.warnings) {
+    lines.push(`[init-plan] warning(${warning.risk}): ${warning.message}`);
+  }
+  return `${lines.join("\n")}\n`;
+}

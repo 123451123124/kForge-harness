@@ -1,0 +1,631 @@
+import { bindTaskRuntimeFixture } from './helpers/engineer-runtime-fixture';
+import { describe, expect, test } from 'bun:test';
+import { execFileSync, spawnSync } from 'child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs';
+import { fixtureWrite } from './helpers/module-repository';
+import { recordPluginSelection } from './helpers/install-ownership';
+import { agentNoticeFixture, registryNoticeFixture, registryProjectedFixture, repeatUndeliveredNotice, streamNoticeAttempt, unignoreNoticeState } from './helpers/agent-notice';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { resolveCompatibleNodeRuntime } from '../src/effects/architecture/archctx-provider';
+import { runHook } from '../src/cli/hook/runtime';
+import { buildTaskMessageEvent } from '../src/core/fleet/admitted-task-message';
+import { sendTaskMessage } from '../src/effects/fleet/task-inbox';
+
+const RUNTIME_MODULE = join(import.meta.dir, '../src/cli/hook/runtime.ts');
+const GUARD_MODULE = join(import.meta.dir, '../src/cli/hook/mutation-guard.ts');
+
+function fixture(): string {
+  const root = mkdtempSync(join(tmpdir(), 'hrd09-hook-'));
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root });
+  execFileSync('git', ['config', 'user.name', 'Fixture'], { cwd: root });
+  execFileSync('git', ['config', 'user.email', 'fixture@example.com'], { cwd: root });
+  mkdirSync(join(root, '.ai/harness'), { recursive: true });
+  writeFileSync(join(root, '.ai/harness/workflow-contract.json'), '{}\n');
+  writeFileSync(join(root, '.ai/harness/policy.json'), '{}\n');
+  writeFileSync(join(root, 'README.md'), '# fixture\n');
+  execFileSync('git', ['add', '.'], { cwd: root });
+  execFileSync('git', ['commit', '-q', '-m', 'fixture'], { cwd: root });
+  return root;
+}
+
+function env(root: string, host: 'claude' | 'codex' = 'claude'): NodeJS.ProcessEnv {
+  return { ...process.env, HOOK_REPO_ROOT: root, HOOK_HOST: host, REPO_HARNESS_WORKFLOW_PROFILE: 'routine' };
+}
+
+function telemetry(root: string): Array<Record<string, unknown>> {
+  return readFileSync(join(root, '.ai/harness/runs/hook-events.jsonl'), 'utf8')
+    .trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+const EDIT_PAYLOAD = JSON.stringify({ tool_name: 'Write', tool_input: { file_path: 'README.md', content: 'safe' } });
+
+/** Run PreToolUse.edit in a child whose mutation guard throws. */
+function crashGuard(root: string, host: 'claude' | 'codex'): {
+  readonly result: Record<string, unknown>;
+  readonly hostStdout: string;
+  readonly hostStderr: string;
+} {
+  const worker = `
+    import { mock } from 'bun:test';
+    const guard = await import(process.env.GUARD_MODULE);
+    mock.module(process.env.GUARD_MODULE, () => ({
+      ...guard,
+      runMutationGuard() { throw new Error('injected guard crash'); },
+    }));
+    const { runHook } = await import(process.env.RUNTIME_MODULE);
+    const result = runHook({
+      event: 'PreToolUse',
+      routeId: 'edit',
+      cwd: process.env.FIXTURE_ROOT,
+      input: process.env.FIXTURE_INPUT,
+      env: { ...process.env, HOOK_REPO_ROOT: process.env.FIXTURE_ROOT, HOOK_HOST: process.env.FIXTURE_HOST },
+    });
+    process.stdout.write('@@RESULT@@' + JSON.stringify(result) + '\\n');
+  `;
+  const child = spawnSync(process.execPath, ['-e', worker], {
+    cwd: root,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      FIXTURE_ROOT: root,
+      FIXTURE_HOST: host,
+      FIXTURE_INPUT: EDIT_PAYLOAD,
+      GUARD_MODULE,
+      RUNTIME_MODULE,
+      REPO_HARNESS_WORKFLOW_PROFILE: 'routine',
+    },
+  });
+  if (child.status !== 0) throw new Error(child.stderr || child.stdout);
+  const [hostStdout, resultText] = child.stdout.split('@@RESULT@@');
+  return { result: JSON.parse(resultText.trim()), hostStdout, hostStderr: child.stderr };
+}
+
+describe('hook runtime typed dispatch', () => {
+  test('Bash skips Effective State and a tripwire crash blocks', () => {
+    const root = fixture();
+    try {
+      const worker = `
+        import { mock } from 'bun:test';
+        const state = await import(process.env.STATE_MODULE);
+        let calls = 0;
+        mock.module(process.env.STATE_MODULE, () => ({ ...state,
+          resolveEffectiveState() { calls++; throw new Error('unexpected state resolution'); }
+        }));
+        const guard = await import(process.env.BASH_MODULE);
+        const originalRun = guard.runBashMutationGuard;
+        let crash = false;
+        mock.module(process.env.BASH_MODULE, () => ({ ...guard,
+          runBashMutationGuard(opts) { if (crash) throw new Error('injected tripwire crash'); return originalRun(opts); }
+        }));
+        const { runHook } = await import(process.env.RUNTIME_MODULE);
+        const opts = { event: 'PreToolUse', routeId: 'bash', cwd: process.env.FIXTURE_ROOT,
+          env: { ...process.env, HOOK_HOST: 'claude', HOOK_REPO_ROOT: process.env.FIXTURE_ROOT },
+          input: JSON.stringify({ cwd: process.env.FIXTURE_ROOT, tool_input: { command: 'git status --short' } }) };
+        const ordinary = runHook(opts);
+        crash = true;
+        const failed = runHook(opts);
+        console.log(JSON.stringify({ ordinary, failed, calls }));
+      `;
+      const child = spawnSync(process.execPath, ['-e', worker], { cwd: root, encoding: 'utf8', timeout: 10_000, env: {
+        ...process.env, FIXTURE_ROOT: root, RUNTIME_MODULE,
+        STATE_MODULE: join(import.meta.dir, '../src/effects/state/resolve-effective-state.ts'),
+        BASH_MODULE: join(import.meta.dir, '../src/cli/hook/mutation-bash.ts'),
+      } });
+      expect(child.status, child.stderr).toBe(0);
+      expect(JSON.parse(child.stdout)).toMatchObject({
+        ordinary: { exitCode: 0, handler: 'bash-mutation-guard' },
+        failed: { exitCode: 2, reason: 'handler-failed' }, calls: 0,
+      });
+      expect(child.stderr).toContain('repo-harness-hook: bash-mutation-guard failed (handler-failed)');
+      expect(child.stderr).not.toContain('injected tripwire crash');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('an edit guard crash exits 2 on Claude and Codex', () => {
+    const root = fixture();
+    try {
+      for (const host of ['claude', 'codex'] as const) {
+        const crashed = crashGuard(root, host);
+        expect(crashed.result).toMatchObject({ exitCode: 2, reason: 'handler-failed', handler: 'mutation-guard' });
+        expect(crashed.hostStderr).toContain('repo-harness-hook: mutation-guard failed (handler-failed)');
+        expect(crashed.hostStderr).not.toContain('injected guard crash');
+        expect(crashed.hostStdout).toBe('');
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  // #3267: `cd` through a file throws ENOTDIR in the parser, before the credential check runs.
+  test.skipIf(process.platform === 'win32')('a Bash guard crash on a real command exits 2, so Claude does not run it unguarded', () => {
+    const root = fixture();
+    try {
+      const command = `cd ${join(root, 'README.md', 'x')} && true; cat ~/.ssh/id_rsa`;
+      const result = runHook({ event: 'PreToolUse', routeId: 'bash', cwd: root, env: env(root),
+        input: JSON.stringify({ tool_name: 'Bash', tool_input: { command } }) });
+      expect(result).toMatchObject({ exitCode: 2, reason: 'handler-failed', handler: 'bash-mutation-guard' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test('a Stop with a symlinked retired handoff directory stays non-blocking and writes nothing', () => {
+    const root = fixture();
+    const outside = mkdtempSync(join(tmpdir(), 'hrd09-stop-outside-'));
+    try {
+      symlinkSync(outside, join(root, '.ai/harness/handoff'));
+      const result = runHook({
+        event: 'Stop',
+        routeId: 'default',
+        cwd: root,
+        input: JSON.stringify({ stop_hook_active: false }),
+        env: env(root),
+      });
+      expect(result).toMatchObject({ exitCode: 0, reason: 'ok', handler: 'stop' });
+      expect(existsSync(join(outside, 'current.md'))).toBe(false);
+      expect(existsSync(join(outside, 'resume.md'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test.skipIf(process.platform === 'win32')('telemetry gives a policy denial and a crash different reasons', () => {
+    const root = fixture();
+    try {
+      const denied = runHook({ event: 'PreToolUse', routeId: 'edit', cwd: root, env: env(root),
+        input: JSON.stringify({ tool_name: 'Write', tool_input: { file_path: '/etc/hosts', content: 'forbidden' } }) });
+      expect(denied).toMatchObject({ exitCode: 2, reason: 'blocked' });
+      crashGuard(root, 'claude');
+      const [denial, crash] = telemetry(root);
+      expect(denial).toMatchObject({ exit_code: 2, blocked: true, reason: 'blocked' });
+      expect(crash).toMatchObject({ exit_code: 2, blocked: true, reason: 'handler-failed' });
+      expect(denial.fingerprint).not.toBe(crash.fingerprint);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('a malformed payload is refused before any handler runs', () => {
+    const root = fixture();
+    try {
+      const result = runHook({ event: 'PreToolUse', routeId: 'edit', cwd: root, env: env(root), input: 'not json{' });
+      expect(result).toMatchObject({ exitCode: 2, reason: 'invalid-payload' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('one SessionStart writes the payload session_id and run_id to telemetry', () => {
+    const root = fixture();
+    try {
+      const result = runHook({
+        event: 'SessionStart',
+        routeId: 'default',
+        cwd: root,
+        env: env(root),
+        input: JSON.stringify({ session_id: 'sess-claude-1', run_id: 'run-claude-1' }),
+      });
+      expect(result.exitCode).toBe(0);
+      const sessionStart = telemetry(root).find((record) => record.event === 'SessionStart');
+      expect(sessionStart?.session_id).toBe('sess-claude-1');
+      expect(sessionStart?.run_id).toBe('run-claude-1');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test('typed handlers do not consult a route filesystem and write one v2 record', () => {
+    const root = fixture();
+    try {
+      const result = runHook({
+        event: 'PreToolUse',
+        routeId: 'edit',
+        cwd: root,
+        input: EDIT_PAYLOAD,
+        env: env(root),
+      });
+      expect(result.handler).toBe('mutation-guard');
+      const [record] = telemetry(root);
+      expect(Object.keys(record).sort()).toEqual([
+        'blocked', 'command_names', 'completed_at', 'elapsed_ms', 'event', 'event_id', 'exit_code', 'fingerprint', 'host',
+        'protocol', 'reason', 'route_id', 'run_id', 'session_id', 'started_at', 'turn_id',
+      ]);
+      expect(record.command_names).toEqual([]);
+      expect(existsSync(join(root, '.ai/hooks'))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 30_000);
+});
+
+describe('host envelopes on the real hook entry (#678)', () => {
+  const HOOK_ENTRY = join(import.meta.dir, '../src/cli/hook-entry.ts');
+
+  /** Registry-mode repo: `src/owned` belongs to `core-owned`; `feature` changed it after the manifest. */
+  function owedFixture(): string {
+    const root = fixture();
+    const gitIn = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+    writeFileSync(join(root, '.gitignore'), '.ai/harness/state/\n.ai/harness/runs/\n.ai/harness/handoff/\n.ai/harness/journal/\n.ai/harness/checks/\n.ai/harness/events.jsonl\nhome/\n');
+    writeFileSync(join(root, '.ai/harness/policy.json'), `${JSON.stringify({ context: { capability_registry_file: '.ai/context/capabilities.json' } })}\n`);
+    mkdirSync(join(root, '.ai/context'), { recursive: true });
+    writeFileSync(join(root, '.ai/context/capabilities.json'), `${JSON.stringify({
+      version: 1,
+      capabilities: [{
+        id: 'core-owned', domain: 'core', name: 'owned', prefixes: ['src/owned'],
+        contract_files: { agents: 'AGENTS.md', claude: 'CLAUDE.md' },
+        architecture_module: 'docs/architecture/modules/core/owned.md',
+        lsp_profile: 'typescript-lsp', verification_hints: [],
+      }],
+    })}\n`);
+    mkdirSync(join(root, 'src/owned'), { recursive: true });
+    mkdirSync(join(root, 'docs/architecture'), { recursive: true });
+    writeFileSync(join(root, 'src/owned/a.ts'), 'export const a = 1;\n');
+    writeFileSync(join(root, 'src/owned/a.test.ts'), 'export {};\n');
+    writeFileSync(join(root, 'docs/architecture/.projection-manifest.json'), '{"profile":"repo-harness/v1","targets":{"t":{"type":"entity-summary","path":"docs/architecture/modules/core/owned.md","scope":{"kind":"entity","id":"capability.core.owned","entityKind":"capability"}}}}\n');
+    fixtureWrite(root, 'docs/architecture/modules/core/owned.md', '## 3. Decisions\nRead `src/owned/a.ts:999`.\n');
+    fixtureWrite(root, '.archcontext/manifest.yaml', 'schemaVersion: archcontext.manifest/v1\nmodel:\n  layout: split\n  root: .archcontext/model\n');
+    fixtureWrite(root, '.archcontext/product.yaml', 'schemaVersion: archcontext.product/v1\nid: product.test\nname: Test\n');
+    fixtureWrite(root, '.archcontext/model/nodes/capability.core.owned.yaml', JSON.stringify({
+      schemaVersion: 'archcontext.node/v2', id: 'capability.core.owned', kind: 'capability', name: 'Owned', status: 'active', summary: 'Own source.', responsibilities: ['Own source.'],
+      source: { include: ['src/owned/**'] }, extensions: { contractFiles: { agents: 'AGENTS.md', claude: 'CLAUDE.md' }, lspProfile: 'typescript-lsp', verification: [] },
+    }));
+    gitIn('add', '-A'); gitIn('commit', '-q', '-m', 'projected');
+    gitIn('checkout', '-q', '-b', 'feature');
+    writeFileSync(join(root, 'src/owned/a.ts'), 'export const a = 2;\n');
+    gitIn('commit', '-q', '-am', 'change owned code');
+    fixtureWrite(root, 'home/.repo-harness/config.json', JSON.stringify({ architecture: { projection_provider: 'archctx', projection_apply: 'manual', projection_timeout_ms: 120000 } }));
+    return root;
+  }
+
+  /** The bytes the host reads from fd 1 and fd 2 of `repo-harness-hook`. */
+  function host(root: string, hostName: 'claude' | 'codex', event: string, route: string, input: unknown, extraEnv: NodeJS.ProcessEnv = {}) {
+    // These hosts exercise the architecture notices, so the fixture HOME selects the architecture plugin.
+    recordPluginSelection({ HOME: join(root, 'home') });
+    const result = spawnSync(process.execPath, [HOOK_ENTRY, event, '--route', route], {
+      cwd: root,
+      input: JSON.stringify(input),
+      encoding: 'utf8',
+      env: {
+        PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, HOME: join(root, 'home'),
+        HOOK_HOST: hostName, HOOK_REPO_ROOT: root, REPO_HARNESS_TOOLING_ADVISORY: '0', ...extraEnv,
+      },
+    });
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  const HUMAN_DEBT = 'Architecture: 1 debt item in capability.core.owned; run rh arch debt --json.';
+
+  /** One SessionStart run; an expired, undelivered notice budget repeats at most twice (#3118). */
+  function sessionStart(root: string, hostName: 'claude' | 'codex', input: unknown) {
+    return repeatUndeliveredNotice(() => host(root, hostName, 'SessionStart', 'default', input), streamNoticeAttempt);
+  }
+
+  function context(stdout: string, event: string, systemMessage?: string): string {
+    expect(stdout.endsWith('\n')).toBe(true);
+    const envelope = JSON.parse(stdout) as { systemMessage?: string; hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+    expect(Object.keys(envelope)).toEqual(systemMessage ? ['hookSpecificOutput', 'systemMessage'] : ['hookSpecificOutput']);
+    expect(envelope.systemMessage).toBe(systemMessage);
+    expect(envelope.hookSpecificOutput.hookEventName).toBe(event);
+    return envelope.hookSpecificOutput.additionalContext;
+  }
+
+  test('edit and session advisories reach both hosts as additionalContext', () => {
+    const root = owedFixture();
+    try {
+      for (const hostName of ['claude', 'codex'] as const) {
+        const edit = host(root, hostName, 'PreToolUse', 'edit', { tool_name: 'Edit', tool_input: { file_path: 'src/owned/a.ts' } });
+        expect(edit.status).toBe(0);
+        expect(context(edit.stdout, 'PreToolUse'))
+          .toBe('[CapabilityOwner] src/owned/a.ts belongs to core-owned (docs/architecture/modules/core/owned.md).');
+
+        const session = sessionStart(root, hostName, { session_id: `owed-${hostName}` });
+        expect(session.status).toBe(0);
+        const sessionContext = context(session.stdout, 'SessionStart', hostName === 'claude' ? HUMAN_DEBT : undefined);
+        if (hostName === 'claude') {
+          expect(sessionContext).toContain('[ArchitectureDebt]');
+          expect(sessionContext).toContain('capability.core.owned');
+        } else expect(sessionContext).not.toContain('[ArchitectureDebt]');
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
+
+  /** Archcontext-mode fixture whose Node runtime shim logs every archctx argv. */
+  function archcontextFixture(): { root: string; shim: string; resetCalls: () => void; calls: () => string[][] } {
+    const root = owedFixture();
+    writeFileSync(join(root, '.ai/harness/policy.json'), JSON.stringify({ context: { capability_source: 'archcontext' } }));
+    mkdirSync(join(root, '.archcontext/model/nodes'), { recursive: true });
+    // archctx 0.8.1 resolve needs a complete native model.
+    writeFileSync(join(root, '.archcontext/manifest.yaml'), 'schemaVersion: archcontext.manifest/v1\nmodel:\n  layout: split\n  root: .archcontext/model\n');
+    writeFileSync(join(root, '.archcontext/model/nodes/capability.core.owned.yaml'), JSON.stringify({
+      schemaVersion: 'archcontext.node/v2', id: 'capability.core.owned', kind: 'capability',
+      name: 'Owned', status: 'active', summary: 'Own the test source.', responsibilities: ['Own the source.'],
+      source: { include: ['src/owned/**'] },
+      extensions: { contractFiles: { agents: 'AGENTS.md', claude: 'CLAUDE.md' }, lspProfile: 'typescript-lsp', verification: [] },
+    }));
+    execFileSync('git', ['add', '.ai/harness/policy.json', '.archcontext'], { cwd: root });
+    execFileSync('git', ['commit', '-q', '-m', 'archcontext authority'], { cwd: root });
+    const node = resolveCompatibleNodeRuntime(process.env);
+    const shim = join(root, 'home/node-probe');
+    const log = join(root, 'home/node-argv.jsonl');
+    writeFileSync(shim, `#!${node}
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');
+const child = spawnSync(${JSON.stringify(node)}, args, { stdio: 'inherit' });
+process.exit(child.status ?? 1);
+`, { mode: 0o755 });
+    return { root, shim, resetCalls: () => writeFileSync(log, ''), calls: () => readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[]) };
+  }
+
+  test('archcontext hooks use resolve once and never export native context', () => {
+    const { root, shim, resetCalls, calls: archctxCalls } = archcontextFixture();
+    try {
+      // `checkout -B main` keeps the same HEAD, so every later edit reads the first edit's cached answer.
+      let editResolved = false;
+      for (const checkout of ['feature', 'main', 'dirty-main']) {
+        if (checkout === 'main') execFileSync('git', ['checkout', '-q', '-B', 'main'], { cwd: root });
+        if (checkout === 'dirty-main') writeFileSync(join(root, 'src/owned/new.ts'), 'export const added = 1;\n');
+        for (const hostName of ['claude', 'codex'] as const) {
+          for (const [event, route, input] of [
+            ['PreToolUse', 'edit', { tool_name: 'Edit', tool_input: { file_path: 'src/owned/a.ts' } }],
+            ['SessionStart', 'default', { session_id: `archcontext-${hostName}` }],
+            ['Stop', 'default', { stop_hook_active: false }],
+            ['UserPromptSubmit', 'inbox', { prompt: 'continue' }],
+          ] as const) {
+            const { status, stdout, stderr, calls } = repeatUndeliveredNotice(() => {
+              resetCalls();
+              const run = host(root, hostName, event, route, input, { REPO_HARNESS_NODE_BIN: shim });
+              return { ...run, calls: archctxCalls() };
+            }, streamNoticeAttempt);
+            expect(status, stderr).toBe(0);
+            const exports = calls.filter((argv) => argv.includes('export')).length;
+            const resolves = calls.filter((argv) => argv.includes('resolve')).length;
+            expect(exports, `${hostName} ${event}`).toBe(0);
+            expect(resolves, `${hostName} ${event}`).toBeLessThanOrEqual(1);
+            if (event === 'PreToolUse') {
+              expect(resolves, `${checkout} ${hostName} edit`).toBe(editResolved ? 0 : 1);
+              editResolved = true;
+              expect(context(stdout, event)).toBe('[CapabilityOwner] src/owned/a.ts belongs to core-owned (docs/architecture/modules/core/owned.md).');
+            }
+            if (event === 'SessionStart' || (event === 'Stop' && hostName === 'claude') || (event === 'UserPromptSubmit' && hostName === 'codex')) expect(resolves).toBe(1);
+            const checkpoints = calls.filter(argv => argv.includes('checkpoint')).length;
+            const delivers = event === 'SessionStart' || (event === 'Stop' && hostName === 'claude') || (event === 'UserPromptSubmit' && hostName === 'codex');
+            expect(checkpoints).toBe(delivers && checkout !== 'main' ? 1 : 0);
+            expect(calls.some(argv => argv.includes('complete') || argv.includes('doctor') || argv.includes('apply'))).toBe(false);
+            if (event === 'SessionStart') {
+              const firstNotice = checkout !== 'main' && hostName === 'claude';
+              const body = context(stdout, event, firstNotice ? HUMAN_DEBT : undefined);
+              expect(body.includes('[ArchitectureDebt]')).toBe(firstNotice);
+            }
+            console.log(`[ArchctxHookProbe] ${checkout} ${hostName} ${event}: export=${exports} resolve=${resolves}`);
+          }
+        }
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('an allowed edit resolves its owner once per HEAD and model digest', () => {
+    const { root, shim, resetCalls, calls } = archcontextFixture();
+    const nodePath = join(root, '.archcontext/model/nodes/capability.core.owned.yaml');
+    const owned = readFileSync(nodePath, 'utf8');
+    const OWNER_LINE = '[CapabilityOwner] src/owned/a.ts belongs to core-owned (docs/architecture/modules/core/owned.md).';
+    const edit = () => {
+      resetCalls();
+      const result = host(root, 'claude', 'PreToolUse', 'edit', { tool_name: 'Edit', tool_input: { file_path: 'src/owned/a.ts' } }, { REPO_HARNESS_NODE_BIN: shim });
+      expect(result.status, result.stderr).toBe(0);
+      return { stdout: result.stdout, resolves: calls().filter((argv) => argv.includes('resolve')).length };
+    };
+    try {
+      const first = edit();
+      expect(first.resolves).toBe(1);
+      expect(context(first.stdout, 'PreToolUse')).toBe(OWNER_LINE);
+      const second = edit();
+      expect(second.resolves).toBe(0);
+      expect(context(second.stdout, 'PreToolUse')).toBe(OWNER_LINE);
+
+      writeFileSync(nodePath, owned.replace('src/owned/**', 'src/other/**'));
+      const moved = edit();
+      expect(moved.resolves).toBe(1);
+      expect(moved.stdout).toBe('');
+
+      writeFileSync(nodePath, owned);
+      writeFileSync(join(root, 'README.md'), '# moved head\n');
+      execFileSync('git', ['commit', '-q', '-am', 'move HEAD'], { cwd: root });
+      const newHead = edit();
+      expect(newHead.resolves).toBe(1);
+      expect(context(newHead.stdout, 'PreToolUse')).toBe(OWNER_LINE);
+      expect(edit().resolves).toBe(0);
+      expect(execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: root, encoding: 'utf8' })).toBe('');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('a changed owned path gets no owner line, and a patch batch keeps its clean owned path', () => {
+    const root = owedFixture();
+    try {
+      writeFileSync(join(root, 'src/owned/b.ts'), 'export const b = 1;\n');
+      execFileSync('git', ['add', 'src/owned/b.ts'], { cwd: root });
+      execFileSync('git', ['commit', '-q', '-m', 'add b'], { cwd: root });
+      writeFileSync(join(root, 'src/owned/a.ts'), 'export const a = 3;\n');
+
+      const edit = host(root, 'claude', 'PreToolUse', 'edit', { tool_name: 'Edit', tool_input: { file_path: 'src/owned/a.ts' } });
+      expect(edit.status).toBe(0);
+      expect(edit.stdout).toBe('');
+
+      const command = '*** Begin Patch\n*** Update File: src/owned/a.ts\n@@\n-x\n+y\n*** Update File: src/owned/b.ts\n@@\n-x\n+y\n*** End Patch';
+      const patch = host(root, 'codex', 'PreToolUse', 'edit', { tool_name: 'apply_patch', tool_input: { command } });
+      expect(patch.status).toBe(0);
+      expect(context(patch.stdout, 'PreToolUse'))
+        .toBe('[CapabilityOwner] src/owned/b.ts belongs to core-owned (docs/architecture/modules/core/owned.md).');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('PreToolUse.subagent keeps its updatedInput prompt rewrite on Claude', () => {
+    const root = owedFixture();
+    try {
+      for (const hostName of ['claude'] as const) {
+        const spawn = host(root, hostName, 'PreToolUse', 'subagent', { tool_name: 'Agent', tool_input: { description: 'probe', prompt: 'inspect the repo' } });
+        expect(spawn.status).toBe(0);
+        const envelope = JSON.parse(spawn.stdout) as { hookSpecificOutput: Record<string, unknown> };
+        expect(Object.keys(envelope)).toEqual(['hookSpecificOutput']);
+        expect(envelope.hookSpecificOutput).toMatchObject({ hookEventName: 'PreToolUse', permissionDecision: 'allow' });
+        expect(envelope.hookSpecificOutput).not.toHaveProperty('additionalContext');
+        const updated = envelope.hookSpecificOutput.updatedInput as { description: string; prompt: string };
+        expect(updated.description).toBe('probe');
+        expect(updated.prompt.startsWith('inspect the repo')).toBe(true);
+        expect(updated.prompt).toContain('[repo-harness:return-channel]');
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('Codex UserPromptSubmit.inbox stays installed and does not deliver admitted messages without an explicit session source', async () => {
+    const root = owedFixture();
+    const authorityHome = realpathSync(mkdtempSync(join(tmpdir(), 'hook-inbox-authority-')));
+    try {
+      const bound = await bindTaskRuntimeFixture(realpathSync(root), { authorityHome });
+      const admitted = bound.admission;
+      sendTaskMessage({ repo_root: root, source: bound.source,
+        event: buildTaskMessageEvent({ message_id: '66666666-6666-4666-8666-666666666666', task_id: bound.source.session.task,
+          task_identity: { repository_id: admitted.identity.repository_id, issue_id: admitted.identity.issue_id, campaign_id: admitted.identity.campaign_id },
+          admission_sha256: admitted.approval.admission_sha256, scope: 'claim', target_claim: admitted.identity.claim,
+          sender_kind: 'operator', sender_id: 'inbox-test', sender_trust: 'local_operator', audience: 'owner',
+          body: 'peer body for the owner', created_at: '2026-10-13T01:00:00.000Z', in_reply_to: null }) });
+
+      const inbox = host(root, 'codex', 'UserPromptSubmit', 'inbox', { prompt: 'continue' });
+      expect(inbox.status).toBe(0);
+      expect(context(inbox.stdout, 'UserPromptSubmit')).toContain('[ArchitectureDebt]');
+      expect(inbox.stdout).not.toContain('peer body for the owner');
+      expect(host(root, 'codex', 'UserPromptSubmit', 'inbox', { prompt: 'continue' }).stdout).toBe('');
+      expect(host(root, 'claude', 'UserPromptSubmit', 'inbox', { prompt: 'continue' }).stdout).toBe('');
+      expect(inbox.stderr).toBe('');
+    } finally { rmSync(root, { recursive: true, force: true }); rmSync(authorityHome, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('Stop: Claude gets one envelope per id set across events; Codex Stop writes no bytes', () => {
+    const root = owedFixture();
+    try {
+      const codex = host(root, 'codex', 'Stop', 'default', { stop_hook_active: false });
+      expect(codex.status).toBe(0);
+      expect(codex.stdout).toBe('');
+
+      const claude = host(root, 'claude', 'Stop', 'default', { stop_hook_active: false });
+      expect(claude.status).toBe(0);
+      expect(context(claude.stdout, 'Stop', HUMAN_DEBT)).toContain('[ArchitectureDebt]');
+      expect(host(root, 'claude', 'Stop', 'default', { stop_hook_active: false }).stdout).toBe('');
+      // The notice marker dedupes the same ids across Stop and SessionStart.
+      for (const sessionId of ['owed-session-one', 'owed-session-two']) {
+        const session = sessionStart(root, 'claude', { session_id: sessionId });
+        expect(session.status).toBe(0);
+        expect(context(session.stdout, 'SessionStart')).not.toContain('[ArchitectureDebt]');
+      }
+      expect(host(root, 'claude', 'Stop', 'default', { stop_hook_active: false }).stdout).toBe('');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('#3190: a corrupt archctx resolve on Claude Stop reaches only stderr and the hook event log', () => {
+    const root = agentNoticeFixture();
+    try {
+      // archctx runs under REPO_HARNESS_NODE_BIN; this wrapper corrupts only the resolve output.
+      const node = join(root, 'home/corrupt-resolve-node');
+      writeFileSync(node, `#!/bin/sh\nfor a in "$@"; do [ "$a" = resolve ] && { printf '{"owners":'; exit 0; }; done\nexec '${resolveCompatibleNodeRuntime(process.env)}' "$@"\n`, { mode: 0o755 });
+      const stop = host(root, 'claude', 'Stop', 'default', { stop_hook_active: false }, { REPO_HARNESS_NODE_BIN: node });
+      expect([stop.status, stop.stdout]).toEqual([0, '']);
+      expect(stop.stderr.trim().split('\n')).toEqual([expect.stringContaining('ARCHCONTEXT_RESOLVE_FAILED: RH_ARCHCTX_RESOLVE_CORRUPT_JSON')]);
+      expect(telemetry(root).at(-1)).toMatchObject({ event: 'Stop', exit_code: 0, reason: 'architecture-notice-quiet:ARCHCONTEXT_RESOLVE_FAILED' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('manifest refresh alone does not resolve citation debt', () => {
+    const root = owedFixture();
+    try {
+      writeFileSync(join(root, 'docs/architecture/.projection-manifest.json'), '{"profile":"repo-harness/v1","refreshed":true,"targets":{"t":{"type":"entity-summary","path":"docs/architecture/modules/core/owned.md","scope":{"kind":"entity","id":"capability.core.owned","entityKind":"capability"}}}}\n');
+      execFileSync('git', ['commit', '-q', '-am', 'refresh the projection'], { cwd: root });
+      for (const hostName of ['claude', 'codex'] as const) {
+        const session = sessionStart(root, hostName, { session_id: `clear-${hostName}` });
+        expect(session.status).toBe(0);
+        expect(session.stdout.includes('ArchitectureDebt')).toBe(hostName === 'claude');
+        expect(JSON.parse(session.stdout).systemMessage).toBe(hostName === 'claude' ? HUMAN_DEBT : undefined);
+      }
+      expect(host(root, 'claude', 'Stop', 'default', { stop_hook_active: false }).stdout).toBe('');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('a registry consumer without code facts or a projection manifest gets one architecture line (#850)', () => {
+    const root = registryNoticeFixture();
+    const INACTIVE = '[Architecture] inactive: no ArchContext model (.archcontext/manifest.yaml is missing). Run: rh arch projection status --json';
+    const architectureLines = /\[Architecture\] inactive|\[ArchitectureDebt\]|Architecture: inactive/;
+    try {
+      // Codex Stop is silent and does not consume the dedupe markers.
+      const codex = host(root, 'codex', 'Stop', 'default', { stop_hook_active: false });
+      expect(codex.status, codex.stderr).toBe(0);
+      expect(codex.stdout).toBe('');
+
+      const session = sessionStart(root, 'claude', { session_id: 'consumer-session' });
+      expect(session.status, session.stderr).toBe(0);
+      const systemMessage = (JSON.parse(session.stdout) as { systemMessage?: string }).systemMessage;
+      expect(systemMessage).toContain('Architecture: inactive (');
+      const sessionContext = context(session.stdout, 'SessionStart', systemMessage);
+      expect(sessionContext).toContain(INACTIVE);
+      expect(sessionContext).toMatch(/^\[ArchitectureDebt\] .*unowned changed path/m);
+      expect(sessionContext).toContain('- unowned-path packages/new-core/index.ts;');
+      expect(session.stderr).not.toContain('architecture notice unavailable');
+
+      const stop = host(root, 'claude', 'Stop', 'default', { stop_hook_active: false });
+      expect(stop.status, stop.stderr).toBe(0);
+      expect(stop.stdout).not.toMatch(architectureLines);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('a clean registry consumer still gets the inactive line at SessionStart (#850)', () => {
+    const root = registryNoticeFixture();
+    try {
+      // Effective State leaves capability ownership null on a clean tree.
+      rmSync(join(root, 'packages'), { recursive: true, force: true });
+      const session = sessionStart(root, 'claude', { session_id: 'clean-consumer-session' });
+      expect(session.status, session.stderr).toBe(0);
+      const systemMessage = (JSON.parse(session.stdout) as { systemMessage?: string }).systemMessage;
+      expect(systemMessage).toContain('Architecture: inactive (');
+      const sessionContext = context(session.stdout, 'SessionStart', systemMessage);
+      expect(sessionContext).toContain('[Architecture] inactive: no ArchContext model (.archcontext/manifest.yaml is missing).');
+      expect(sessionContext).not.toContain('[ArchitectureDebt]');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('a clean branch does not report unowned paths that main changed after the last projection (#852)', () => {
+    const root = registryProjectedFixture();
+    try {
+      const session = sessionStart(root, 'claude', { session_id: 'clean-branch-session' });
+      expect(session.status, session.stderr).toBe(0);
+      const systemMessage = (JSON.parse(session.stdout) as { systemMessage?: string }).systemMessage;
+      expect(systemMessage).toBe('Architecture: inactive (no ArchContext model (.archcontext/manifest.yaml is missing)); run rh arch projection status --json.');
+      const sessionContext = context(session.stdout, 'SessionStart', systemMessage);
+      expect(sessionContext).toContain('[Architecture] inactive: no ArchContext model (.archcontext/manifest.yaml is missing).');
+      expect(sessionContext).not.toContain('[ArchitectureDebt]');
+      expect(sessionContext).not.toContain('packages/old-core');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  test('a consumer whose state directory is not Git-ignored sees one SessionStart line and no turn text (#852)', () => {
+    const root = registryNoticeFixture();
+    const UNIGNORED = '[Architecture] notice unavailable: .ai/harness/state/ is not Git-ignored. Fix: run rh init to register this repository, then rh update; update writes the runtime-state block to the repository\'s .git/info/exclude.';
+    const HUMAN_UNIGNORED = 'Architecture: notice unavailable (.ai/harness/state/ is not Git-ignored); run rh update.';
+    try {
+      unignoreNoticeState(root);
+      for (const sessionId of ['unignored-one', 'unignored-two']) {
+        const session = sessionStart(root, 'claude', { session_id: sessionId });
+        expect(session.status, session.stderr).toBe(0);
+        expect(context(session.stdout, 'SessionStart', HUMAN_UNIGNORED)).toContain(UNIGNORED);
+      }
+      const codexSession = sessionStart(root, 'codex', { session_id: 'unignored-codex' });
+      expect(codexSession.status, codexSession.stderr).toBe(0);
+      expect(context(codexSession.stdout, 'SessionStart')).toContain(UNIGNORED);
+
+      const stop = host(root, 'claude', 'Stop', 'default', { stop_hook_active: false });
+      expect(stop.status, stop.stderr).toBe(0);
+      expect(stop.stdout).toBe('');
+      expect(stop.stderr).toContain('is not Git-ignored');
+      const inbox = host(root, 'codex', 'UserPromptSubmit', 'inbox', { prompt: 'continue' });
+      expect(inbox.status, inbox.stderr).toBe(0);
+      expect(inbox.stdout).toBe('');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 60_000);
+});

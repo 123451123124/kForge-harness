@@ -1,0 +1,143 @@
+# repo-harness 0.25.0 publication record
+
+## Scope and authority
+
+- Publish candidate: `aa01147103647326e70829046d244b4b111a33b2` on
+  `origin/main` (#1290, lessons evidence).
+- Previous release: 0.24.3 on npm and in Git. Tag `v0.24.3`, annotated tag
+  object `357673f5fd4e0686c59866496b573a22c5d4eacb`, target
+  `bd3a40bd5c874a20c55916238f120e7cd884ca75` (#976).
+- Merged range: `v0.24.3..aa011471`; 181 commits
+  (`git rev-list --count v0.24.3..aa011471`). Each subject ends with a PR
+  number.
+- The record PR moves `origin/main` past `aa011471`. It changes only this
+  record and the changelog. If any other commit lands before publish, the
+  owner updates the candidate and the range.
+- The npm package goes from 0.24.3 to 0.25.0. `package.json`,
+  `assets/skill-version.json` (version and template version), README and the
+  operator bot fixture show 0.25.0.
+- `archctx` and `archctx-contracts` stay at their locked versions.
+
+### Owner decision
+
+The owner authorized the backlog takeover and the 0.25.0 release preparation.
+The owner runs `npm publish`; the agent does not publish.
+
+## Cause of the minor
+
+- IPDD cleanup: the local plan, sprint, contract, review, notes and workstream
+  flow is removed; issue/PR state is the only task source. Init/upgrade stop
+  seeding `plans/`, `tasks/todos.md`, `tasks/current.md`, `check:task-*`
+  and the retired policy keys. Existing PRDs move to `docs/prds/`
+  (#1177-#1184, #1225).
+- Architecture: the issue/PR architecture map is added and the generated
+  outputs are refreshed (#1184, #1209).
+- IPDD single source: the issue-flow skill is the only flow source (#1223);
+  the root rules are cross-layer invariants only (#1226); the duplicated flow
+  reference docs are retired (#1227); the handoff session recovery is retired
+  (#1228); init ships the IPDD root context and the registered upgrade
+  migrates the retired copies (#1229); only the coordinator posts claims
+  (#1278); review has one hazard list and a High tier on a hit (#1274); CI
+  repair issues are keyed by the failing test identity (#1275); research and
+  durable decisions have one home (#1250); the fleet known-gaps table is
+  recorded (#1272); publication regenerates generated artifacts and its P1
+  fix requires the result on the PR head (#1257, #1288); the archimap is
+  refreshed (#1291).
+- DSH plugin: the package ships `dist/dsh-plugin.js` and
+  `cordis.patch.yml`; `prepack` builds the plugin. Registry install
+  verification and release-note claims are deferred (#1206).
+- `contract-worktree start` and `cleanup` use one branch metadata source
+  (#1230).
+
+## Upgrade steps for users
+
+- From 0.24.3: run `repo-harness update`. It refreshes the global runtime and
+  skills. It prints a read-only registered-repo upgrade summary and does not
+  change project files.
+- Run `repo-harness upgrade --registered` to preview each registered
+  repository and its registry revision.
+- Confirm the repository and the revision, then run
+  `repo-harness upgrade --registered --apply --expected-revision <revision>`
+  to apply the IPDD root-context and reference-config migration (#1229). It
+  writes `CLAUDE.md` and `AGENTS.md` from
+  `assets/templates/root-context.md` only when their bytes match a shipped
+  generated version. It removes the six retired flow reference docs and the
+  empty `docs/architecture/domains` and `docs/architecture/snapshots`
+  placeholders. A modified file is kept and reported.
+- The local plan/sprint/contract/review/notes/workstream files are no longer
+  read. Move any PRDs to `docs/prds/`; task identity now lives in GitHub
+  issues and PRs.
+- Remove local `check:task-*` scripts. The upgrade removes the exact legacy
+  `repo-harness run check-task-workflow --strict` entry and does not seed
+  `check:task-sync`.
+- The Stop hook no longer writes, and Effective State no longer reads,
+  `.ai/harness/handoff/current.md` and `resume.md` (#1228). Resume from Git
+  state, the GitHub issue and the PR.
+
+## Hosted daily CI
+
+- Dispatch: `gh workflow run ci.yml --repo Ancienttwo/repo-harness --ref main`
+  at 2026-10-31T18:58:10Z on `30bca275`.
+- Run 41231939960. Result: success at 2026-10-31T19:08:31Z. Daily architecture
+  freshness, both MCP path matrices, Daily full tests and package, Daily
+  governance and Native OAR acceptance (macOS) passed. PR-only jobs were
+  skipped by design.
+- Daily mode runs Daily architecture freshness and both MCP path matrices.
+  PR-only jobs are skipped by design.
+- The hosted daily did not run on `aa011471`. PR CI run 41265787200 passed
+  on the #1290 head `341228632`, whose tree `79cbd7d4` is the tree of
+  `aa011471`.
+
+## Acceptance environment
+
+- macOS 26 arm64, Bun 1.4.3, Node 24.22.1.
+- `bun install --frozen-lockfile` in a fresh worktree.
+- `bun run check:release` on `aa011471` at 2026-11-01: `[release] OK`.
+  Tarball smoke: `repo-harness-0.25.0.tgz` installs, serves the packaged
+  Operator, and the packaged CLI bins start.
+- `bash scripts/check-npm-release.sh --prepublish`: version must be unpublished
+  and helpers must pass.
+- `bash scripts/check-ci.sh architecture`: `noop`, `renderEquivalent: true`.
+- Registered upgrade: `repo-harness update` leaves a registered project
+  unchanged. `repo-harness upgrade --registered` lists the pending migration
+  and the registry revision. `--apply --expected-revision` then migrates the
+  project and reports each removed, refreshed or kept file.
+- Package smoke: `npm pack --dry-run` includes `dist/oar-review-host.js` and
+  the DSH plugin, and excludes `tasks/` and `plans/`. The docs host is closed
+  (#1149), so its bundle is not in the package.
+
+## Publication
+
+- Owner command: `npm publish` from the release branch after the release PR
+  merges.
+- Run the #987 local upgrade test from 0.24.3. Registry install verification
+  and release-note claims for the DSH plugin are deferred (#1206).
+- The owner records the npm version, the Git tag, and the published tarball
+  digest here.
+
+  - npm version: `repo-harness@0.25.0`, `latest`, published
+    2026-11-01T03:47:40Z. The first `npm publish` failed with E404 because the
+    local npm token had expired (`npm whoami`: E401); the second ran after
+    `npm login`.
+  - Git tag: `v0.25.0`, annotated tag object
+    `1a188c7e3998af0409e06352019259d05a41be40`, target
+    `aa01147103647326e70829046d244b4b111a33b2`.
+  - published tarball digest: shasum
+    `705520c08a51c4e2ce9d7c3b18723f7825adc652`, integrity
+    `sha512-BHmYR/y3WlF76Wy38QdkJmKLRt5GWRrNziCbRCR/jVcPCtFaVRtoTPQU3SJNIPOKCIsTaueyL8csw+VBfCZ6jQ==`.
+  - `bun run check:release-published`: `[release-published] OK`. The first
+    run failed on a CDN-cached 404 for the tarball URL; a rerun some minutes
+    later passed.
+
+## Local upgrade test from 0.24.3 (#987)
+
+- `repo-harness update --version 0.25.0` on the Max host, from 0.24.3:
+  install and candidate reconcile passed; `repo-harness --version` is 0.25.0.
+  The global working rules block in `~/.claude/CLAUDE.md` and
+  `~/.codex/AGENTS.md` was refreshed; text outside the managed markers was kept.
+- The update ended with a false `Leftover check failed` line. The 0.24.3
+  updater parses the `upgrade --json` array shape that #983 replaced with an
+  object (#1301). `repo-harness upgrade --json` on 0.25.0 returns the list.
+- `repo-harness upgrade --registered --apply` refreshed aiphabee, 97app and
+  DeVision. Repos with a dirty worktree or off the default branch were
+  skipped. Follow-ups: #1302, #1304, #1305.

@@ -1,0 +1,700 @@
+import { randomUUID } from 'crypto';
+import { cpSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync } from 'fs';
+import { requireHome } from '../../effects/repo-harness-home';
+import { dirname, join, resolve } from 'path';
+import { fileURLToPath } from 'url';
+import { Command } from 'commander';
+import {
+  formatLegacyLeftoverSummary,
+  isLegacyPathSafe,
+  hashUpgradeSource,
+  legacyPathSnapshot,
+  hookFileRemovals,
+  hookLocation,
+  planLegacyLeftovers,
+  type LeftoverItem,
+} from '../../effects/upgrade/legacy-inventory';
+import {
+  applyUpgradeDecisions,
+  decisionSnapshot,
+  isRepoRelativeDecisionPath,
+  mergeUpgradeDecisions,
+  readUpgradeDecisions,
+  repoRelativeDecisionPath,
+  upgradeDecisionRejection,
+  UPGRADE_DECISIONS_PATH,
+  type DecidedUpgradePlan,
+  type UpgradeDecision,
+  type UpgradeDecisionKind,
+} from '../../effects/upgrade/operator-decisions';
+import {
+  formatLegacyWorktreeOutcome,
+  runLegacyWorktreeCleanup,
+  type LegacyWorktreeCandidate,
+  type LegacyWorktreeOutcome,
+} from '../../effects/upgrade/legacy-worktree-cleanup';
+import { ensureCheckoutBackupDirectory, FS_TRANSACTION_BACKUP_ROOT, withTargetLock } from '../../effects/fs-transaction';
+import {
+  beginLegacyCleanupBackup,
+  beginInstallHostTransaction,
+  commitInstallHostTransaction,
+  rollbackInstallHostTransaction,
+  readInstallState,
+  ownerForInstallPath,
+  rollbackLegacyCleanupBackup,
+  refreshInstallStateVersions,
+  type InstallHostTransaction,
+} from '../installer/install-profile';
+import { ownedPath, pathRecordIsCurrent, pathRecordKey, readPathRecords } from '../../effects/host-config/path-records';
+import { stageInstalledSkillCopy } from '../installer/skill-sync';
+import { openHostConfigGate, sameApartFromIdentity } from '../../effects/host-config/gate';
+import { stripRepositoryHookFiles, type HookStripRecord } from '../../effects/upgrade/repository-hooks';
+import { hostConfigPaths, replaceTarget, resolveHostPath } from '../../effects/host-config/store';
+import type { OwnedPathLookup } from '../../effects/upgrade/legacy-inventory';
+import { HostConfigError, type Sha256 } from '../../core/host-config/types';
+import {
+  installProfileStatePath,
+} from '../installer/install-state';
+import { globalRuntimeScope, withRuntimeTransactionLock, type RuntimeTransactionContext } from '../../effects/locking/runtime-transaction-lock';
+import { atomicWriteFileSync, formatJson } from '../installer/shared';
+import { removeJsonHookCommand, type HookCommandPosition } from '../../core/host-config/json-fragment';
+import { redactProcessOutput } from '../../effects/process-runner';
+import { gitExecFileSync } from '../../effects/git/runner';
+import { formatRegisteredUpgradeResult, runRegisteredUpgrade } from './upgrade-registered';
+
+/** The audit file is rewritten whole on each cleanup, so it keeps the newest records only. */
+export const UPGRADE_AUDIT_MAX_RECORDS = 100;
+
+export interface UpgradeOptions {
+  /** Selects the repository. */
+  readonly cwd?: string;
+  /** The caller's checkout; legacy worktree cleanup never removes it. Defaults to the process cwd. */
+  readonly callerCwd?: string;
+  readonly home?: string;
+  readonly packageRoot?: string;
+  readonly scope?: 'project' | 'global' | 'all';
+  readonly apply?: boolean;
+  readonly includeStateArtifacts?: boolean;
+  /** False skips the legacy sibling worktree check and removal. Default true. */
+  readonly legacyWorktreeCleanup?: boolean;
+  /** Where a stripped repository hook file is recorded (#2854 D7). Default `ledger`. */
+  readonly repositoryHookRecord?: HookStripRecord;
+  readonly env?: NodeJS.ProcessEnv;
+}
+
+export interface UpgradeDependencies {
+  /** Runs after backup and before the final ownership check. */
+  readonly beforeRemove?: (item: LeftoverItem) => void;
+  /** Runs after the real copy, before staging and source fences. */
+  readonly afterStage?: (item: LeftoverItem, staging: string) => void;
+  /** Runs before each legacy worktree removal. */
+  readonly beforeLegacyWorktreeRemove?: (candidate: LegacyWorktreeCandidate) => void;
+}
+
+export interface UpgradeResult {
+  readonly status?: 'partial';
+  readonly next?: string;
+  readonly items: readonly LeftoverItem[];
+  readonly apply: boolean;
+  readonly exitCode: 0 | 1;
+  readonly removedPaths: readonly string[];
+  readonly refreshedPaths: readonly string[];
+  readonly keptPaths: readonly string[];
+  /** Project report items that a current operator keep decision covers. They do not count as leftovers. */
+  readonly operatorKept: readonly LeftoverItem[];
+  readonly transactionId?: string;
+  readonly backupPath?: string;
+  readonly legacyWorktrees?: LegacyWorktreeOutcome;
+  readonly error?: string;
+}
+
+type PlannerOptions = Parameters<typeof planLegacyLeftovers>[0];
+
+/**
+ * The ledger's path records classify leftovers; without an install state there is no install to own them.
+ * A leftover inside `~/.repo-harness` (a hook shim, a state artifact) has no record key, so no record owns it.
+ */
+export function installOwnershipReader(env: NodeJS.ProcessEnv): () => OwnedPathLookup {
+  return () => {
+    readInstallState(env);
+    const records = readPathRecords(env);
+    return (path) => {
+      try { return ownedPath(env, path, records); } catch (error) {
+        if (error instanceof HostConfigError && error.code === 'host_config_invalid_path') return null;
+        throw error;
+      }
+    };
+  };
+}
+
+/**
+ * Puts back a hook file that the gate cleaned in this run. It runs before the
+ * gate transaction rollback restores the ledger, which keeps the cleanup record
+ * of a file that does not hold its backup again. A file that changed after the
+ * cleanup keeps its bytes, and the error names the retained copy.
+ */
+function restoreGateHookEdit(env: NodeJS.ProcessEnv, path: string, backupPath: string, written: Sha256): void {
+  try { replaceTarget(resolveHostPath(hostConfigPaths(env), path), readFileSync(backupPath), { existed: true, sha256: written }); }
+  catch (error) {
+    throw new Error(`${path}: ${error instanceof Error ? error.message : String(error)}; the ledger keeps the cleanup record, and the file before the cleanup is kept at ${backupPath}`);
+  }
+}
+
+function removable(item: LeftoverItem): boolean {
+  return item.action !== 'report' && (item.ownership === 'owned-clean' || item.operatorDecision?.status === 'applied');
+}
+
+function itemKey(item: LeftoverItem): string {
+  return JSON.stringify([item.location, item.surface, item.path, item.hookEvent, item.hookCommand]);
+}
+
+function supportedItems(items: readonly LeftoverItem[]): LeftoverItem[] {
+  return items.map((item) => item.location === 'project' && removable(item)
+    && item.surface !== 'hook-entry' && legacyPathSnapshot(item.path)?.kind !== 'file'
+    ? { ...item, action: 'report', reason: 'Project rollback supports regular files only.' }
+    : item);
+}
+
+export function planUpgrade(options: PlannerOptions, decisions: readonly UpgradeDecision[]): DecidedUpgradePlan {
+  const owned = options.installOwnership();
+  const items = planLegacyLeftovers(options).items.map(item => {
+    if (item.location !== 'global' || item.action !== 'refresh') return item;
+    const record = owned(item.path);
+    if (!record) return { ...item, action: 'report' as const, reason: 'No ledger record. Run rh update first. If the path stays unrecorded, move it to a backup directory before running rh install.' };
+    return record.kind !== 'user_managed' && pathRecordIsCurrent(item.path, record) ? item
+      : { ...item, action: 'report' as const, reason: 'The skill changed since rh recorded it. Preserve this path or move it to a backup directory before running rh update.' };
+  });
+  return applyUpgradeDecisions(supportedItems(items), decisions, options.cwd);
+}
+
+function unchanged(item: LeftoverItem, options: PlannerOptions): boolean {
+  const root = item.location === 'global' ? options.home : options.cwd;
+  if (!isLegacyPathSafe(root, item.path)) return false;
+  const current = legacyPathSnapshot(item.path);
+  if (!current) return false;
+  if (item.expectedSymlinkTarget !== undefined) return current.symlinkTarget === item.expectedSymlinkTarget;
+  return item.expectedContentHash !== undefined && current.contentHash === item.expectedContentHash;
+}
+
+function backupMatches(item: LeftoverItem, backup: InstallHostTransaction | undefined): boolean {
+  const path = backup?.snapshots.find((snapshot) => snapshot.path === item.path)?.backup_path;
+  if (!path) return false;
+  const snapshot = legacyPathSnapshot(path);
+  return item.expectedSymlinkTarget !== undefined
+    ? snapshot?.symlinkTarget === item.expectedSymlinkTarget
+    : item.expectedContentHash !== undefined && snapshot?.contentHash === item.expectedContentHash;
+}
+
+function sourceUnchanged(item: LeftoverItem, options: PlannerOptions): boolean {
+  return item.sourcePath !== undefined && item.expectedSourceHash !== undefined
+    && (resolve(item.sourcePath) === resolve(options.packageRoot)
+      || isLegacyPathSafe(options.packageRoot, item.sourcePath, false))
+    && hashUpgradeSource(item.sourcePath, options.packageRoot, item.sourceSurface) === item.expectedSourceHash;
+}
+
+/**
+ * An owned link stays a link and points at the current source. The install
+ * receipt then keeps its symlink type. Other targets become verified copies.
+ */
+function refreshedTargetMatches(item: LeftoverItem, path: string): boolean {
+  const snapshot = legacyPathSnapshot(path);
+  return item.expectedSymlinkTarget !== undefined
+    ? snapshot?.symlinkTarget === item.sourcePath
+    : snapshot?.contentHash === item.expectedSourceHash;
+}
+
+function refreshDirectory(
+  item: LeftoverItem, options: PlannerOptions, env: NodeJS.ProcessEnv,
+  onMutation: () => void, dependencies: UpgradeDependencies, transaction: string,
+): boolean {
+  const stagingRoot = mkdtempSync(join(transaction, 'upgrade-'));
+  const staging = join(stagingRoot, 'replacement');
+  try {
+    if (!sourceUnchanged(item, options)) return false;
+    if (item.expectedSymlinkTarget !== undefined) {
+      symlinkSync(item.sourcePath!, staging, process.platform === 'win32' ? 'junction' : 'dir');
+    } else {
+      const contract = JSON.parse(readFileSync(join(options.packageRoot, 'assets', 'workflow-contract.v1.json'), 'utf8'));
+      renameSync(stageInstalledSkillCopy(item.sourcePath!, item.sourceSurface!, transaction, contract), staging);
+    }
+    dependencies.afterStage?.(item, staging);
+    if (!refreshedTargetMatches(item, staging)
+      || !sourceUnchanged(item, options) || !unchanged(item, options)
+      || !planLegacyLeftovers(options).items.some(current => itemKey(current) === itemKey(item)
+        && current.action === 'refresh' && removable(current))) return false;
+    const record = options.installOwnership()(item.path);
+    if (!record || !pathRecordIsCurrent(item.path, record)) return false;
+    const owner = ownerForInstallPath(item.path, env);
+    if (owner === null) throw new Error('no owner for refresh: ' + item.path);
+    onMutation();
+    openHostConfigGate({ env }).writePaths([{ path: item.path, owner,
+      entry: item.expectedSymlinkTarget !== undefined ? { type: 'symlink', target: item.sourcePath! } : { type: 'directory', source: staging } }], { transaction });
+    return true;
+  } finally { rmSync(stagingRoot, { recursive: true, force: true }); }
+}
+
+function withProjectLocks<T>(paths: readonly string[], run: () => T): T {
+  const [first, ...rest] = paths;
+  return first === undefined ? run() : withTargetLock(first, () => withProjectLocks(rest, run));
+}
+
+/**
+ * The in-run copies of the project files that the cleanup removes or
+ * refreshes, in a guarded directory of the checkout. The run's rollback reads
+ * them; the run deletes them at its end, and keeps them only after a failure
+ * (#2903). Each file holds proved rh bytes (the legacy inventory).
+ */
+function backupProject(cwd: string, paths: readonly string[], id: string): InstallHostTransaction | undefined {
+  if (paths.length === 0) return undefined;
+  const backupRoot = join(cwd, FS_TRANSACTION_BACKUP_ROOT, `upgrade-${id}`);
+  if (!isLegacyPathSafe(cwd, backupRoot, false)) throw new Error(`unsafe project backup path: ${backupRoot}`);
+  ensureCheckoutBackupDirectory(cwd, `${FS_TRANSACTION_BACKUP_ROOT}/upgrade-${id}`);
+  const snapshots = paths.map((path, index) => {
+    if (!isLegacyPathSafe(cwd, path, false) || legacyPathSnapshot(path)?.kind !== 'file') {
+      throw new Error(`unsafe project cleanup target: ${path}`);
+    }
+    const backupPath = join(backupRoot, String(index));
+    cpSync(path, backupPath, { force: false, errorOnExist: true });
+    return { path, existed: true, backup_path: backupPath };
+  });
+  return { protocol: 1, backup_root: backupRoot, snapshots };
+}
+
+function applyLocked(
+  options: PlannerOptions,
+  env: NodeJS.ProcessEnv,
+  dependencies: UpgradeDependencies,
+  assertHostLock: () => void,
+  lockedProjectPaths: ReadonlySet<string>,
+  runtimeLock: RuntimeTransactionContext,
+  decisions: readonly UpgradeDecision[],
+  repositoryHookRecord: HookStripRecord,
+): UpgradeResult {
+  const planned = planUpgrade(options, decisions);
+  const operatorKept = planned.operatorKept;
+  const items = planned.items.map((item): LeftoverItem => (
+    item.location === 'project' && removable(item) && !lockedProjectPaths.has(item.path)
+      ? { ...item, action: 'report', reason: 'Target appeared after project locks were taken.' }
+      : item
+  ));
+  const candidates = items.filter(removable);
+  const removedPaths: string[] = [];
+  const refreshedPaths: string[] = [];
+  const keptPaths = [...new Set(items.filter((item) => !removable(item)).map((item) => item.path))];
+  if (candidates.length === 0) return { items, apply: true, exitCode: 0, removedPaths, refreshedPaths, keptPaths, operatorKept };
+  const transactionId = randomUUID();
+  const globalPaths = [...new Set(candidates.filter((item) => item.location === 'global').map((item) => item.path))];
+  // A repository hook file goes through the repository gate after the other targets, so no copy of it lands in the working tree.
+  const repositoryHooks = [...new Set(candidates.filter((item) => item.location === 'project' && item.surface === 'hook-entry').map((item) => item.path))];
+  const projectPaths = [...new Set(candidates.filter((item) => item.location === 'project' && item.surface !== 'hook-entry').map((item) => item.path))];
+  const gateRefreshPaths = new Set(candidates.filter(item => item.location === 'global' && item.action === 'refresh').map(item => item.path));
+  const globalHookEdits = candidates.some(item => item.location === 'global' && item.surface === 'hook-entry');
+  const earlierRecords = options.installOwnership();
+  const statePath = installProfileStatePath(env);
+  // The gate writes path records during each refresh and a file record for each hook edit.
+  const ledgerPath = hostConfigPaths(env).ledger;
+  const stateBefore = legacyPathSnapshot(statePath)?.contentHash ?? null;
+  let hostBackup: InstallHostTransaction | undefined;
+  let gateTransaction: InstallHostTransaction | undefined;
+  let projectBackup: InstallHostTransaction | undefined;
+  const mutatedPaths = new Set<string>();
+  // The hash that the gate wrote to each hook file: a rollback restores the file only while it still holds it.
+  const gateEdits = new Map<string, Sha256>();
+  const rolledBackPaths: string[] = [];
+  const auditPath = join(options.home, '.repo-harness', 'upgrade-cleanup.log.jsonl');
+  let error: string | undefined;
+  const audit = () => {
+    if (!isLegacyPathSafe(options.home, auditPath, false)) throw new Error(`unsafe audit path: ${auditPath}`);
+    // The host transaction lock also serializes project-only cleanup audits.
+    const prior = legacyPathSnapshot(auditPath) ? readFileSync(auditPath, 'utf-8').split('\n').filter(Boolean) : [];
+    const record = { transaction_id: transactionId, removed_paths: removedPaths, refreshed_paths: refreshedPaths, kept_paths: keptPaths,
+      attempted_paths: [...mutatedPaths], rolled_back_paths: rolledBackPaths,
+      backup_path: hostBackup?.backup_root ?? (error ? projectBackup?.backup_root : undefined), ...(error ? { error } : {}) };
+    const kept = [...prior, JSON.stringify(record)].slice(-UPGRADE_AUDIT_MAX_RECORDS);
+    atomicWriteFileSync(auditPath, `${kept.join('\n')}\n`, { mode: 0o600 });
+  };
+  try {
+    assertHostLock();
+    for (const item of candidates) {
+      const root = item.location === 'global' ? options.home : options.cwd;
+      if (!isLegacyPathSafe(root, item.path)) throw new Error(`unsafe cleanup target: ${item.path}`);
+    }
+    if (!isLegacyPathSafe(options.home, auditPath, false)) throw new Error(`unsafe audit path: ${auditPath}`);
+    const hostPaths = globalPaths.filter(path => !gateRefreshPaths.has(path));
+    if (gateRefreshPaths.size || globalHookEdits) gateTransaction = beginInstallHostTransaction([statePath, ledgerPath], env, { runtimeLock });
+    if (hostPaths.length > 0) hostBackup = beginLegacyCleanupBackup(hostPaths, env, runtimeLock);
+    projectBackup = backupProject(options.cwd, projectPaths, transactionId);
+    for (const path of [...globalPaths, ...projectPaths]) {
+      const targetItems = candidates.filter((item) => item.path === path);
+      for (const item of targetItems) dependencies.beforeRemove?.(item);
+      assertHostLock();
+      const fresh = planUpgrade(options, decisions).items;
+      const eligible = targetItems.filter((item) => unchanged(item, options)
+        && (gateRefreshPaths.has(path) || backupMatches(item, item.location === 'global' ? hostBackup : projectBackup))
+        && fresh.some((current) => itemKey(current) === itemKey(item) && removable(current)));
+      if (eligible.length !== targetItems.length) {
+        if (!keptPaths.includes(path)) keptPaths.push(path);
+        for (const item of targetItems) {
+          const index = items.indexOf(item);
+          items[index] = { ...item, action: 'report', reason: 'Target changed after backup.' };
+        }
+        continue;
+      }
+      const root = targetItems[0]!.location === 'global' ? options.home : options.cwd;
+      if (!isLegacyPathSafe(root, path)) throw new Error(`unsafe cleanup target: ${path}`);
+      let nextContent: string | undefined;
+      const refreshing = targetItems[0]!.action === 'refresh';
+      let directoryRefresh = false;
+      if (refreshing) {
+        if (!sourceUnchanged(targetItems[0]!, options)) {
+          keptPaths.push(path);
+          for (const item of targetItems) items[items.indexOf(item)] = { ...item, action: 'report', reason: 'Refresh source changed or is unsafe.' };
+          continue;
+        }
+        directoryRefresh = lstatSync(targetItems[0]!.sourcePath!).isDirectory();
+        if (!directoryRefresh) nextContent = readFileSync(targetItems[0]!.sourcePath!, 'utf-8');
+      }
+      // A global hook file is a gate file: the gate removes the legacy commands and records the file.
+      let gateRemovals: readonly HookCommandPosition[] | undefined;
+      if (targetItems[0]!.surface === 'hook-entry') {
+        const hookFile = hookFileRemovals(readFileSync(path), path, hookLocation('global', options));
+        if ('refused' in hookFile) throw new Error(`hook settings can no longer be edited: ${path}`);
+        if (hookFile.removals.length === 0) continue;
+        gateRemovals = hookFile.removals;
+      }
+      // Check the full target snapshot immediately before the destructive write.
+      if (!targetItems.every((item) => unchanged(item, options))
+        || (refreshing && !sourceUnchanged(targetItems[0]!, options))) {
+        if (!keptPaths.includes(path)) keptPaths.push(path);
+        for (const item of targetItems) {
+          items[items.indexOf(item)] = { ...item, action: 'report', reason: 'Target changed before mutation.' };
+        }
+        continue;
+      }
+      if (directoryRefresh) {
+        if (!targetItems[0]!.sourceSurface
+          || !refreshDirectory(targetItems[0]!, options, env, () => { mutatedPaths.add(path); mutatedPaths.add(ledgerPath); }, dependencies, gateTransaction!.backup_root)) {
+          keptPaths.push(path);
+          for (const item of targetItems) items[items.indexOf(item)] = { ...item, action: 'report', reason: 'Source or target changed during staging.' };
+          continue;
+        }
+      } else if (gateRemovals) {
+        // A refused gate write leaves the file as it is, so only a written file joins the rollback.
+        const written = openHostConfigGate({ env }).removeUnrecordedText(path, targetItems[0]!.expectedContentHash!,
+          gateRemovals.map((position) => (content: string) => removeJsonHookCommand(content, position)));
+        if (written === null) continue;
+        gateEdits.set(path, written);
+        mutatedPaths.add(path);
+        mutatedPaths.add(ledgerPath);
+      } else {
+        mutatedPaths.add(path);
+        if (nextContent === undefined) rmSync(path, { recursive: true });
+        else atomicWriteFileSync(path, nextContent, { mode: lstatSync(path).mode & 0o777 });
+      }
+      if (refreshing) refreshedPaths.push(path);
+      else removedPaths.push(path);
+    }
+    if (repositoryHooks.length) {
+      const stripped = new Set(stripRepositoryHookFiles(options.cwd, { env, record: repositoryHookRecord, runtimeLock }).map((path) => join(options.cwd, path)));
+      for (const path of repositoryHooks) {
+        if (stripped.has(path)) { removedPaths.push(path); continue; }
+        keptPaths.push(path);
+        for (const item of candidates.filter((candidate) => candidate.path === path)) items[items.indexOf(item)] = { ...item, action: 'report', reason: 'Target changed before mutation.' };
+      }
+    }
+    if ([...gateRefreshPaths].some(path => refreshedPaths.includes(path))) {
+      if ((legacyPathSnapshot(statePath)?.contentHash ?? null) !== stateBefore) throw new Error('install ownership state changed before refresh: ' + statePath);
+      mutatedPaths.add(statePath);
+      refreshInstallStateVersions(env);
+    }
+    audit();
+    if (gateTransaction) commitInstallHostTransaction(gateTransaction);
+    if (projectBackup) rmSync(projectBackup.backup_root, { recursive: true, force: true });
+  } catch (failure) {
+    error = failure instanceof Error ? failure.message : String(failure);
+    const rollBack = (backup: InstallHostTransaction, snapshot: InstallHostTransaction['snapshots'][number]): void => {
+      const root = projectBackup === backup ? options.cwd : options.home;
+      try {
+        if (!isLegacyPathSafe(root, snapshot.path)
+          || !isLegacyPathSafe(root, backup.backup_root, false)
+          || !snapshot.backup_path || !isLegacyPathSafe(backup.backup_root, snapshot.backup_path)) {
+          throw new Error(`unsafe rollback target or backup: ${snapshot.path}`);
+        }
+        const written = gateEdits.get(snapshot.path);
+        if (written) restoreGateHookEdit(env, snapshot.path, snapshot.backup_path, written);
+        else rollbackLegacyCleanupBackup({ ...backup, snapshots: [snapshot] }, runtimeLock);
+        rolledBackPaths.push(snapshot.path);
+        const removedIndex = removedPaths.indexOf(snapshot.path);
+        if (removedIndex >= 0) removedPaths.splice(removedIndex, 1);
+        const refreshedIndex = refreshedPaths.indexOf(snapshot.path);
+        if (refreshedIndex >= 0) refreshedPaths.splice(refreshedIndex, 1);
+      } catch (rollbackError) {
+        error += `; ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+      }
+    };
+    // Hook files first: the gate transaction rollback then keeps the record of each file that did not go back.
+    for (const snapshot of hostBackup?.snapshots ?? []) if (gateEdits.has(snapshot.path)) rollBack(hostBackup!, snapshot);
+    if (gateTransaction) {
+      try {
+        // A state changed by another writer stays when this refresh never wrote it.
+        rollbackInstallHostTransaction({ ...gateTransaction,
+          snapshots: gateTransaction.snapshots.filter(snapshot => snapshot.path !== statePath || mutatedPaths.has(statePath)) }, { runtimeLock });
+      } catch (rollbackError) { error += '; ' + String((rollbackError as Error).message ?? rollbackError); }
+      try {
+        const restored = readPathRecords(env);
+        for (const path of [...refreshedPaths]) {
+          const record = restored[pathRecordKey(env, path)];
+          const earlier = earlierRecords(path);
+          if (!record || !earlier || !sameApartFromIdentity(record, earlier) || !pathRecordIsCurrent(path, record)) continue;
+          rolledBackPaths.push(path);
+          refreshedPaths.splice(refreshedPaths.indexOf(path), 1);
+        }
+      } catch (recordError) { error += '; rollback records: ' + String((recordError as Error).message ?? recordError); }
+    }
+    for (const backup of [projectBackup, hostBackup]) {
+      if (!backup) continue;
+      for (const snapshot of [...backup.snapshots].reverse()) {
+        if (mutatedPaths.has(snapshot.path) && !gateEdits.has(snapshot.path)) rollBack(backup, snapshot);
+      }
+    }
+    for (const item of candidates) {
+      if (!removedPaths.includes(item.path) && !refreshedPaths.includes(item.path) && !keptPaths.includes(item.path)) keptPaths.push(item.path);
+    }
+    try { audit(); } catch (auditError) { error += `; audit failed: ${String(auditError)}`; }
+  }
+  return { items, apply: true, exitCode: error ? 1 : 0, removedPaths, refreshedPaths, keptPaths, operatorKept, transactionId,
+    backupPath: hostBackup?.backup_root ?? (error ? projectBackup?.backup_root : undefined), ...(error ? { error } : {}) };
+}
+
+function withLegacyWorktrees(result: UpgradeResult, outcome: LegacyWorktreeOutcome | undefined): UpgradeResult {
+  if (!outcome || (outcome.candidates.length === 0 && !outcome.error)) return result;
+  const pending = !result.apply && outcome.candidates.some((candidate) => candidate.verdict === 'remove' || candidate.verdict === 'deferred');
+  const error = result.error ?? outcome.error;
+  return { ...result, legacyWorktrees: outcome, exitCode: result.exitCode === 1 || pending || outcome.error ? 1 : 0, ...(error ? { error } : {}) };
+}
+
+export function runUpgrade(opts: UpgradeOptions = {}, dependencies: UpgradeDependencies = {}): UpgradeResult {
+  const apply = opts.apply === true;
+  try {
+    let scope = opts.scope ?? 'all';
+    if (!['project', 'global', 'all'].includes(scope)) throw new Error(`invalid upgrade scope: ${scope}`);
+    let cwd = resolve(opts.cwd ?? process.cwd());
+    if (scope !== 'global') {
+      try { cwd = gitExecFileSync(['-C', cwd, 'rev-parse', '--show-toplevel'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); }
+      catch { if (scope === 'project') throw new Error('project upgrade needs a git repository'); scope = 'global'; }
+    }
+    const home = resolve(opts.home ?? requireHome(opts.env ?? process.env));
+    const packageRoot = resolve(opts.packageRoot ?? join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..'));
+    const env: NodeJS.ProcessEnv = { ...process.env, ...opts.env, HOME: home };
+    const options: PlannerOptions = { scope, cwd, home, packageRoot, installOwnership: installOwnershipReader(env),
+      // Raw value on purpose: it matches the shim path the retired installer wrote verbatim, not a resolved home.
+      ...(env.REPO_HARNESS_HOME ? { repoHarnessHome: env.REPO_HARNESS_HOME } : {}),
+      ...(apply && opts.includeStateArtifacts === true ? { includeStateArtifacts: true } : {}) };
+    // Read once: every later plan in this run uses the same decisions. An invalid file fails the run.
+    const decisions = scope === 'global' ? [] : readUpgradeDecisions(cwd);
+    const { items, operatorKept } = planUpgrade(options, decisions);
+    const emptyResult: UpgradeResult = { items, apply, exitCode: apply ? 0 : items.some((item) => item.advisory !== true || item.action !== 'report') ? 1 : 0,
+      removedPaths: [], refreshedPaths: [], keptPaths: [...new Set(items.filter((item) => !removable(item)).map((item) => item.path))], operatorKept };
+    const callerCwd = resolve(opts.callerCwd ?? process.cwd());
+    // A failed leftover apply leaves the legacy worktrees in place and reports them.
+    const finish = (result: UpgradeResult): UpgradeResult => {
+      const owned = installOwnershipReader(env)();
+      const unrecorded = result.items.some(item => item.location === 'global' && item.action === 'report' && item.sourcePath !== undefined && !owned(item.path));
+      const outcome = withLegacyWorktrees(result, scope === 'global' || opts.legacyWorktreeCleanup === false ? undefined
+        : runLegacyWorktreeCleanup(cwd, callerCwd, env, apply && !result.error, { beforeRemove: dependencies.beforeLegacyWorktreeRemove }));
+      return unrecorded ? { ...outcome, status: 'partial', next: 'Run rh update. Back up any skill path that stays unrecorded before running rh install.' } : outcome;
+    };
+    if (!apply || !items.some(removable)) return finish(emptyResult);
+    return finish(withRuntimeTransactionLock(globalRuntimeScope(env), (lock) => {
+      const underHostLock = planUpgrade(options, decisions).items;
+      const paths = [...new Set(underHostLock.filter((item) => item.location === 'project' && removable(item)).map((item) => item.path))].sort();
+      return withProjectLocks(paths, () => applyLocked(options, env, dependencies, () => lock.assertOwned(), new Set(paths), lock, decisions, opts.repositoryHookRecord ?? 'ledger'));
+    }));
+  } catch (error) {
+    return { items: [], apply, exitCode: 1, removedPaths: [], refreshedPaths: [], keptPaths: [], operatorKept: [], error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export function formatUpgradeResult(result: UpgradeResult, asJson = false): string {
+  if (asJson) return formatJson(result);
+  const lines = [result.apply ? 'Upgrade cleanup apply.' : 'Upgrade cleanup check.'];
+  const groups = new Map<string, LeftoverItem[]>();
+  for (const item of result.items) {
+    const key = `${item.location} ${item.surface}`;
+    groups.set(key, [...(groups.get(key) ?? []), item]);
+  }
+  for (const [group, items] of groups) {
+    lines.push(`${group}:`);
+    for (const item of items) lines.push(`  ${item.path}: ${item.ownership}; proof=${item.proof ?? 'none'}; ${item.action}${item.reason ? `; ${item.reason}` : ''}`);
+  }
+  if (result.items.length === 0) lines.push('No leftovers.');
+  if (result.operatorKept.length > 0) {
+    lines.push(`Operator kept (${UPGRADE_DECISIONS_PATH}):`);
+    for (const item of result.operatorKept) lines.push(`  ${item.path}`);
+  }
+  if (result.legacyWorktrees) lines.push(...formatLegacyWorktreeOutcome(result.legacyWorktrees));
+  if (result.backupPath) lines.push(`Backup: ${result.backupPath}`);
+  if (result.status === 'partial') lines.push('Partial: unrecorded skill paths were kept. ' + result.next);
+  if (result.error) lines.push(`Failed: ${result.error}`);
+  return `${lines.join('\n')}\n`;
+}
+
+export function leftoverCheckWarning(reason: string): string {
+  return `Leftover check failed: ${reason}. Run: rh upgrade`;
+}
+
+/**
+ * The one line that `rh update` prints after an install. The package
+ * that ran the check writes it, so an updater from an older release never
+ * parses this release's result shape. Paths stay out of the line; only counts
+ * and the redacted error appear.
+ */
+export function formatUpgradeSummaryLine(result: UpgradeResult): string {
+  if (result.error) return leftoverCheckWarning(redactProcessOutput(result.error.trim()));
+  const parts = [formatLegacyLeftoverSummary(result.items)];
+  const candidates = result.legacyWorktrees?.candidates ?? [];
+  const deferred = candidates.filter((candidate) => candidate.verdict === 'deferred').length;
+  const total = candidates.filter((candidate) => candidate.verdict === 'remove').length + deferred;
+  if (total > 0) {
+    const proof = deferred > 0 ? ` (${deferred} need${deferred === 1 ? 's' : ''} provider proof)` : '';
+    parts.push(`${total} legacy sibling worktree${total === 1 ? '' : 's'} can be removed${proof}; run rh upgrade --scope project --apply`);
+  }
+  return parts.join('; ');
+}
+
+export interface UpgradeDecideOptions {
+  readonly cwd?: string;
+  readonly home?: string;
+  readonly packageRoot?: string;
+  readonly decision: UpgradeDecisionKind;
+  readonly paths: readonly string[];
+}
+
+export interface UpgradeDecideResult {
+  readonly exitCode: 0 | 1;
+  readonly decisionsPath?: string;
+  readonly recorded: readonly UpgradeDecision[];
+  readonly rejected: readonly { readonly path: string; readonly reason: string }[];
+  readonly error?: string;
+}
+
+/**
+ * Record decisions for current project report items. The decision binds the
+ * current content hash. Each path is judged alone: one atomic write records
+ * every valid path, and any rejected path makes the exit code 1. Nothing is
+ * deleted here.
+ */
+export function runUpgradeDecide(opts: UpgradeDecideOptions): UpgradeDecideResult {
+  try {
+    const start = resolve(opts.cwd ?? process.cwd());
+    let cwd: string;
+    try { cwd = gitExecFileSync(['-C', start, 'rev-parse', '--show-toplevel'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); }
+    catch { throw new Error('upgrade decide needs a git repository'); }
+    if (opts.paths.length === 0) throw new Error('upgrade decide needs at least one path');
+    const home = resolve(opts.home ?? requireHome(process.env));
+    const packageRoot = resolve(opts.packageRoot ?? join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..'));
+    const existing = readUpgradeDecisions(cwd);
+    // Decide against the raw report list, so an operator can replace a stale or earlier decision.
+    const reportItems = supportedItems(planLegacyLeftovers({ scope: 'project', cwd, home, packageRoot, installOwnership: installOwnershipReader({ ...process.env, HOME: home }) }).items)
+      .filter((item) => item.location === 'project' && item.action === 'report');
+    const recorded: UpgradeDecision[] = [];
+    const rejected: { path: string; reason: string }[] = [];
+    for (const input of opts.paths) {
+      const path = repoRelativeDecisionPath(cwd, resolve(start, input));
+      if (!isRepoRelativeDecisionPath(path)) { rejected.push({ path: input, reason: 'Path is outside the repository.' }); continue; }
+      const item = reportItems.find((candidate) => repoRelativeDecisionPath(cwd, candidate.path) === path);
+      const snapshot = item ? decisionSnapshot(cwd, item) : null;
+      const reason = item ? upgradeDecisionRejection(item, opts.decision, snapshot) : 'Path is not a current project upgrade report item.';
+      if (reason) rejected.push({ path, reason });
+      else recorded.push({ path, decision: opts.decision, contentHash: snapshot!.contentHash! });
+    }
+    const exitCode = rejected.length > 0 ? 1 : 0;
+    if (recorded.length === 0) return { exitCode, recorded, rejected };
+    const target = join(cwd, UPGRADE_DECISIONS_PATH);
+    if (!isLegacyPathSafe(cwd, target, false)) throw new Error(`unsafe upgrade decision path: ${target}`);
+    mkdirSync(dirname(target), { recursive: true });
+    if (!isLegacyPathSafe(cwd, target, false)) throw new Error(`unsafe upgrade decision path: ${target}`);
+    atomicWriteFileSync(target, formatJson({ version: 1, decisions: mergeUpgradeDecisions(existing, recorded) }));
+    return { exitCode, decisionsPath: target, recorded, rejected };
+  } catch (error) {
+    return { exitCode: 1, recorded: [], rejected: [], error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export function formatUpgradeDecideResult(result: UpgradeDecideResult, asJson = false): string {
+  if (asJson) return formatJson(result);
+  const lines = result.recorded.map((decision) => `Recorded ${decision.decision}: ${decision.path}`);
+  if (result.decisionsPath) lines.push(`Decisions: ${result.decisionsPath}`);
+  for (const rejection of result.rejected) lines.push(`Rejected ${rejection.path}: ${rejection.reason}`);
+  if (result.rejected.length > 0 && result.recorded.length === 0) lines.push('No decisions were written.');
+  if (result.error) lines.push(`Failed: ${result.error}`);
+  return `${lines.join('\n')}\n`;
+}
+
+function buildUpgradeDecideCommand(): Command {
+  return new Command('decide')
+    .description(`Record keep or remove for project upgrade report items in ${UPGRADE_DECISIONS_PATH}`)
+    .argument('<paths...>', 'Paths that upgrade --scope project reports')
+    .option('--keep', 'Keep the items; upgrade stops reporting them while their bytes stay the same')
+    .option('--remove', 'Remove the regular files on the next upgrade --scope project --apply')
+    .action((paths: string[], opts: { keep?: boolean; remove?: boolean }, command: Command) => {
+      // The parent upgrade command owns --json, and commander gives it options after the subcommand too.
+      const json = command.optsWithGlobals<{ json?: boolean }>().json === true;
+      if (opts.keep === opts.remove) {
+        process.stderr.write('rh upgrade decide: choose exactly one of --keep or --remove\n');
+        process.exitCode = 2;
+        return;
+      }
+      const result = runUpgradeDecide({ decision: opts.keep ? 'keep' : 'remove', paths });
+      process.stdout.write(formatUpgradeDecideResult(result, json));
+      process.exitCode = result.exitCode;
+    });
+}
+
+type UpgradeCommandOptions = UpgradeOptions & { json?: boolean; summaryLine?: boolean; registered?: boolean; expectedRevision?: string; pr?: boolean };
+
+function runRegisteredUpgradeCommand(opts: UpgradeCommandOptions, command: Command): void {
+  // Each registered repo always runs at project scope; the global surfaces belong to plain `upgrade`.
+  const conflict = command.getOptionValueSource('scope') === 'cli' ? '--scope'
+    : opts.includeStateArtifacts === true ? '--include-state-artifacts' : undefined;
+  if (conflict) {
+    process.stderr.write(`rh upgrade --registered: ${conflict} is not supported; each registered repo runs at project scope\n`);
+    process.exitCode = 2;
+    return;
+  }
+  const result = runRegisteredUpgrade({ apply: opts.apply, expectedRevision: opts.expectedRevision, pr: opts.pr, callerCwd: process.cwd() });
+  process.stdout.write(formatRegisteredUpgradeResult(result, opts.json));
+  if (result.error && opts.json) process.stderr.write(`${result.error}\n`);
+  process.exitCode = result.exitCode;
+}
+
+export function buildUpgradeCommand(): Command {
+  return new Command('upgrade')
+    .description('Check retired repo-harness surfaces and remove only verified owned copies')
+    .option('--scope <scope>', 'project|global|all', 'all')
+    .option('--apply', 'Back up and remove verified owned leftovers')
+    .option('--include-state-artifacts', 'Include proven owned obsolete state artifacts with --apply')
+    .option('--registered', 'Preview init refresh and project upgrade for every registered repo; commits only with --pr')
+    .option('--expected-revision <digest>', 'With --registered --apply: exact plan revision from the preview')
+    .option('--pr', 'With --registered --apply: refresh each repo in a temporary worktree, push repo-harness/refresh and open or update its PR; never merges')
+    .option('--json', 'Print JSON')
+    .option('--summary-line', 'Print the one-line check summary that rh update shows')
+    .action((opts: UpgradeCommandOptions, command: Command) => {
+      if (opts.registered === true) {
+        runRegisteredUpgradeCommand(opts, command);
+        return;
+      }
+      if (opts.expectedRevision !== undefined || opts.pr === true) {
+        process.stderr.write(`rh upgrade: ${opts.pr === true ? '--pr' : '--expected-revision'} needs --registered\n`);
+        process.exitCode = 2;
+        return;
+      }
+      const result = runUpgrade(opts, {
+        beforeLegacyWorktreeRemove: (candidate) => process.stderr.write(`Removing legacy worktree ${candidate.path}; rebuild: ${candidate.rebuild}\n`),
+      });
+      process.stdout.write(opts.summaryLine === true ? `${formatUpgradeSummaryLine(result)}\n` : formatUpgradeResult(result, opts.json));
+      if (result.error && opts.json && !result.apply) process.stderr.write(`${result.error}\n`);
+      process.exitCode = result.exitCode;
+    })
+    .addCommand(buildUpgradeDecideCommand());
+}

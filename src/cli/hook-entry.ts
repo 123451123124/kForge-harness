@@ -1,0 +1,109 @@
+#!/usr/bin/env bun
+/**
+ * Minimal hook-only CLI entrypoint for host adapters.
+ *
+ * Host hooks run after almost every tool call and may be invoked concurrently.
+ * Keep this file self-contained so the hot hook path does not cold-load the
+ * full commander CLI or non-hook command modules.
+ */
+
+import { readFileSync } from 'fs';
+import { declareArchitectureAbsent } from '../core/architecture/contracts';
+import { antigravityEnvironment } from './hook/host-adapter';
+import { HOOK_COMMAND_NAME, runHook } from './hook/runtime';
+import type { HookEvent, RouteId } from './hook/route-registry';
+import { parseHookPayload } from './hook/hook-input';
+import { writeAllSync } from './runtime/write-all-sync';
+import { PROCESS_GROUP_LAUNCHER_FLAG, runProcessGroupLauncherCli } from '../effects/process-group-launcher';
+import { PROCESS_SUPERVISOR_FLAG, runProcessSupervisorCli } from '../effects/process-supervisor';
+import { readRecordedSelection, registerSelectedArchitecturePorts } from './installer/architecture-selection';
+import { createdPaths } from '../effects/host-config/path-records';
+// The installer registers the install surfaces that a path record may name; without them no record counts as rh-created.
+import './installer/install-profile';
+import { registerInstallLedger } from './hook/safety-hook';
+
+const antigravity = process.env.HOOK_HOST === 'antigravity';
+if (antigravity) {
+  // Bootstrap readers and their children also use process.env directly.
+  const allowed = antigravityEnvironment(process.env);
+  for (const key of Object.keys(process.env)) {
+    if (!Object.hasOwn(allowed, key)) delete process.env[key];
+  }
+}
+
+registerInstallLedger(createdPaths);
+
+// The hook process root reads the recorded selection once. Core hook code
+// reaches the architecture code only through the ports, which load only for a
+// selected plugin. A read failure registers nothing and changes no core guard.
+try {
+  await registerSelectedArchitecturePorts(readRecordedSelection(process.env), async () => {
+    const [{ ARCHITECTURE_PROVIDERS }, { AGENT_NOTICE_PROVIDER }] = await Promise.all([
+      import('../effects/architecture/providers'),
+      import('./hook/agent-notice'),
+    ]);
+    return { ...ARCHITECTURE_PROVIDERS, notice: AGENT_NOTICE_PROVIDER };
+  });
+} catch (error) {
+  if (!antigravity) throw error;
+  declareArchitectureAbsent('ARCHITECTURE_PROVIDER_UNAVAILABLE', 'Hook architecture providers unavailable.');
+}
+
+export { runHook };
+
+function parseCliArgs(argv: readonly string[]): { event: HookEvent; routeId: RouteId } | null {
+  if (argv.length !== 3 || argv[1] !== '--route' || !argv[0] || !argv[2]) return null;
+  return { event: argv[0] as HookEvent, routeId: argv[2] as RouteId };
+}
+
+/** The hook dispatch path for `repo-harness-hook`. */
+export function runHookCli(argv: readonly string[]): number {
+  const parsed = parseCliArgs(argv);
+  if (!parsed) {
+    writeAllSync(2, `${HOOK_COMMAND_NAME}: usage: ${HOOK_COMMAND_NAME} <event> --route <route>\n`);
+    return 2;
+  }
+  let input: Buffer | undefined;
+  try {
+    input = readFileSync(0);
+  } catch {
+    input = undefined;
+  }
+  return runHook({ ...parsed, input }).exitCode;
+}
+
+if (import.meta.main) {
+  const argv = process.argv.slice(2);
+  if (argv[0] === PROCESS_SUPERVISOR_FLAG) {
+    process.exit(await runProcessSupervisorCli(argv.slice(1)));
+  }
+
+  if (argv[0] === PROCESS_GROUP_LAUNCHER_FLAG) {
+    process.exit(await runProcessGroupLauncherCli(argv.slice(1)));
+  }
+
+  if (argv[0] === 'state-snapshot') {
+    const { runStateSnapshotCli } = await import('./hook/state-snapshot');
+    const result = runStateSnapshotCli(argv.slice(1));
+    if (result.stdout) writeAllSync(1, result.stdout);
+    if (result.stderr) writeAllSync(2, result.stderr);
+    process.exit(result.exitCode);
+  }
+
+  // The Claude Code status line command. It is not a hook event, so it has no
+  // route and runs in any cwd: quota belongs to the account, and the capture
+  // file is in HOME. The handler is core Board code, so no plugin gate applies.
+  if (argv[0] === 'statusline') {
+    if (argv.length !== 1) {
+      writeAllSync(2, `${HOOK_COMMAND_NAME}: usage: ${HOOK_COMMAND_NAME} statusline\n`);
+      process.exit(2);
+    }
+    const { runClaudeStatusLine } = await import('../effects/board/quota');
+    const result = runClaudeStatusLine(parseHookPayload(readFileSync(0)).rate_limits);
+    if (result.stdout) writeAllSync(1, result.stdout);
+    if (result.stderr) writeAllSync(2, result.stderr);
+    process.exit(result.exitCode);
+  }
+
+  process.exit(runHookCli(argv));
+}

@@ -1,0 +1,13 @@
+schemaVersion: archcontext.node/v2
+id: component.publication.provider-feedback-core
+kind: component
+name: Feedback Records (core)
+status: active
+parent: capability.organization.publication
+layer: core
+summary: The core-layer feedback fact and delivery receipt types of Publication Observations. Responsibilities stay with the parent node.
+responsibilities:
+  - Hold the core-layer feedback record files so layer direction is checked per directory.
+source:
+  include:
+    - src/core/publication/feedback.ts

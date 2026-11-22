@@ -1,0 +1,2067 @@
+import { requireHome } from "../../effects/repo-harness-home";
+import { parseJsonText } from "../../core/evidence/file-syntax";
+import { syncInstalledSkillCopies } from "../installer/skill-sync";
+import { openHostConfigGate } from "../../effects/host-config/gate";
+import { importBunBootstrapRecord, recordedToolIsCurrent, windowsPowershellPath, windowsUserPathPort } from "../../effects/host-config/tools";
+import { hostConfigPaths, readLedger } from "../../effects/host-config/store";
+import { configureRequiredHerdrSkill } from "./herdr-skill";
+import type { RuntimeTransactionContext } from '../../effects/locking/runtime-transaction-lock';
+import { bunGlobalPackageRoot, isBunGlobalPackageSource } from "../installer/skill-projection";
+import { installPiPackage } from '../installer/pi-package';
+import { revertItem } from '../installer/uninstall';
+import { realPathOrResolved } from '../../effects/path-identity';
+import type { SkillHost } from '../../effects/host-skill-roots';
+import { pathRecordIsCurrent, pathRecordKey, readPathRecords } from '../../effects/host-config/path-records';
+import { architecturePort, isArchitectureUnavailable } from '../../core/architecture/contracts';
+import { globalConfigurationWriter, mutateGlobalConfiguration } from '../../effects/configuration/global-configuration';
+import { DEFAULT_SEATS_CONFIG, INTRODUCED_ROUTING_DEFAULTS, ROUTING_CLASSES, SeatsConfigMigrationRequiredError, decodeSeatsConfig, migrateLegacySeatsRecord, seatModelShapeValid, stripRetiredSeatFleetRoles } from '../../core/board/seats-settings';
+import { checkSeatRoutingModels, seatsRanges } from '../../effects/board/seats-configuration';
+import { chmodSync, closeSync, constants, cpSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync } from "fs";
+import { syncDirectoryDurably, writeAllSync } from '../../effects/atomic-append';
+import { renderJsonObjectUpdate } from "../../effects/adoption/standard-plan";
+import { retireUserExcludesBlock, writeRepositoryExcludes } from "../installer/repository-excludes";
+import { sha256Hex } from "../../core/evidence/sha256";
+import { tmpdir, userInfo } from "os";
+import { basename, delimiter, dirname, join, relative, resolve, sep } from "path";
+import { fileURLToPath } from "url";
+import { syncWazaSharedRules } from "../installer/waza-rules";
+import { applyGlobalContextRefresh, GLOBAL_RULES_BEGIN, GLOBAL_RULES_END, globalContextPath, preflightGlobalContextRefresh, type GlobalContextRefreshPlan, type ReportLanguageFlag } from "../installer/global-context";
+import { CLI_NAME, namesRetiredCli, RETIRED_CLI_NAME } from "../../core/skill-surface/cli-name";
+import { shellQuote } from "../../core/shell-quote";
+import { syncCrossReviewSkills } from "./init";
+import { runInstall, type InstallTargetSpec } from "./install";
+import type { OverrideSelection } from "../../core/host-config/override";
+import { jsonFragment } from "../../core/host-config/json-fragment";
+import { compareVersions, readLatestPackageVersion } from "./doctor";
+import { DEFAULT_PROCESS_MAX_BUFFER_BYTES, redactProcessOutput, runProcess as runBoundedProcess } from "../../effects/process-runner";
+import { gitChildEnv } from "../../effects/git/runner";
+import { leftoverCheckWarning } from "./upgrade";
+import { skillTreeSha256 } from "../../effects/skill-tree-integrity";
+import {
+  ownerForInstallPath,
+  withHostConfigTransaction,
+  migrateRuntimeHostConfig,
+  recoverRetiredAgentFleet,
+  requireInstallState,
+  retireAgentFleet,
+} from "../installer/install-profile";
+import {
+  enabledPlugins,
+} from "../installer/install-state";
+import { installSelectionCommand, OPERATOR_WEB_PACKAGE_NAME, ownerEnabled, type PluginId } from "../../core/skill-surface/plugin-manifest";
+import { compareHcVersions, HC_MIN_VERSION, HC_RELEASE_ASSETS, type HcReleaseAsset } from "../../core/terminal/herdr-pin";
+import {
+  parseSkillSurfaceCatalog,
+  requiredExplicitExternalDependencyInstallGroups,
+  type SkillSurfaceCatalog,
+} from "../../core/skill-surface/catalog";
+import { hostSkillRoot, providerSkillLock, stagedSkillRoot } from "../../effects/host-skill-roots";
+import { MEASURED_INSTALLERS } from "../../effects/host-config/delegated";
+import {
+  discoverWindowsProtectedHelperContract,
+  resolveProtectedHelperPlatform,
+  writeWindowsProtectedHelperContract,
+} from "../../effects/runtime/protected-helper-platform";
+import {
+  CANDIDATE_RECONCILIATION_PROTOCOL,
+  assertReceiptSelection,
+  candidatePackageIdentity,
+  encodeCandidateRequest,
+  parseCandidateReceipt,
+  type CandidateReconciliationRequest,
+} from './candidate-reconciliation';
+
+export interface CandidateHandoffContext {
+  /** Created by the parent transaction; never accepted from the public CLI. */
+  readonly transactionId: string;
+  readonly transactionBackupRoot: string;
+  readonly parentToken: string;
+}
+
+export interface GlobalRuntimeOptions {
+  transaction?: string;
+  runtimeLock?: RuntimeTransactionContext;
+  sourceRoot?: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  target?: InstallTargetSpec;
+  installCli?: boolean;
+  installSpec?: string;
+  syncSkill?: boolean;
+  hostAdapters?: boolean;
+  externalSkills?: boolean;
+  obsidianSkills?: boolean;
+  codegraph?: boolean;
+  /** The plugin selection to project. Omitted, the recorded selection of the install state. */
+  plugins?: readonly PluginId[];
+  updateMode?: boolean;
+  /** Render inputs for a Global Working Rules block that records none. A recorded header wins. */
+  reportLanguage?: ReportLanguageFlag;
+  /** The user's `--override` selection, checked by the caller before any write. */
+  overrides?: OverrideSelection;
+  /** Internal-only capability proving that the caller owns the outer transaction. */
+  candidateHandoff?: CandidateHandoffContext;
+  mcpLocalConfigCheck?: McpLocalConfigCheck;
+}
+
+/** The mcp plugin's read-only check of its local config; its code is loaded only by the CLI root. A refusal detail holds no file content. */
+export type McpLocalConfigCheck = (env: NodeJS.ProcessEnv) => { readonly status: 'ok' | 'skipped' | 'failed'; readonly detail: string };
+
+export interface GlobalRuntimeStep {
+  /** The host path that the gate refused to replace; the selection commit counts the user's copy as present. */
+  refused_path?: string;
+  step: string;
+  status: "ok" | "skipped" | "failed";
+  command?: readonly string[];
+  detail?: string;
+  stdout?: string;
+  stderr?: string;
+}
+
+export interface GlobalRuntimeResult {
+  exitCode: number;
+  steps: GlobalRuntimeStep[];
+  lines: string[];
+  stdout: string;
+  stderr: string;
+}
+
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+export const MIN_BUN_VERSION = "1.4.0";
+const PACKED_RELEASE_TARBALL = /^repo-harness-\d+\.\d+\.\d+\.tgz$/;
+export const CANDIDATE_RECONCILE_STEP = 'reconcile installed candidate runtime';
+
+export function bunVersionIsSupported(version: string | undefined): boolean {
+  if (!version) return false;
+  const comparison = compareVersions(version, MIN_BUN_VERSION);
+  return comparison !== null && comparison >= 0;
+}
+
+/**
+ * Reads and parses sourceRoot's skill-surface manifest. Parameterized by
+ * sourceRoot (mirrors init.ts's identically-purposed helper; duplicated
+ * rather than shared, matching this file's existing pattern of keeping its
+ * own small local copies of init.ts-shaped helpers like hostIds/
+ * homeDir/withProcessEnv). Does not pass an `exists` callback (pre-catalog
+ * behavior here never checked package source paths on disk either).
+ */
+function loadSkillSurfaceCatalog(sourceRoot: string): SkillSurfaceCatalog {
+  const manifestPath = join(sourceRoot, "assets", "skill-commands", "manifest.json");
+  const source = existsSync(manifestPath) ? readFileSync(manifestPath, "utf-8") : null;
+  const resolution = parseSkillSurfaceCatalog(source, { declared: true });
+  if (resolution.status !== "valid") {
+    const detail = resolution.diagnostics.map((d) => `${d.code} ${d.path}: ${d.message}`).join("; ");
+    throw new Error(`invalid skill-surface catalog at ${manifestPath}: ${detail}`);
+  }
+  return resolution.catalog;
+}
+
+/** Groups external catalog packages by provider for the managed Waza/Mermaid refresh path. */
+function externalSkillGroupsFromCatalog(catalog: SkillSurfaceCatalog): ReadonlyMap<string, readonly string[]> {
+  const groups = new Map<string, string[]>();
+  for (const pkg of catalog.packages) {
+    if (pkg.kind !== "external" || pkg.provider === null) continue;
+    const list = groups.get(pkg.provider) ?? [];
+    list.push(pkg.name);
+    groups.set(pkg.provider, list);
+  }
+  return groups;
+}
+
+function defaultSourceRoot(): string {
+  return join(SCRIPT_DIR, "..", "..", "..");
+}
+
+function runProcess(
+  command: string,
+  args: string[],
+  cwd: string,
+  env?: NodeJS.ProcessEnv,
+  inheritEnv = true,
+): GlobalRuntimeStep {
+  const result = runBoundedProcess(command, args, { cwd, env, inheritEnv });
+
+  return {
+    step: "",
+    status: result.ok ? "ok" : "failed",
+    command: [...result.command],
+    stdout: result.stdout,
+    stderr: result.stderr || result.error,
+  };
+}
+
+function withStepName(step: GlobalRuntimeStep, name: string, detail?: string): GlobalRuntimeStep {
+  return { ...step, step: name, detail: detail ?? step.detail };
+}
+
+/** The first `name` executable on `env.PATH`, or null. */
+function findOnPath(name: string, env: NodeJS.ProcessEnv): string | null {
+  if (!env.PATH) return null;
+  const extensions = process.platform === "win32"
+    ? (env.PATHEXT ?? process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)
+    : [""];
+  for (const directory of env.PATH.split(delimiter)) {
+    if (!directory) continue;
+    for (const extension of extensions) {
+      const candidate = join(directory, `${name}${extension}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function resolveBunExecutable(env?: NodeJS.ProcessEnv): string {
+  const explicit = env?.REPO_HARNESS_BUN_EXECUTABLE ?? process.env.REPO_HARNESS_BUN_EXECUTABLE;
+  if (explicit) return resolve(explicit);
+  return (env && findOnPath("bun", env)) ?? process.execPath;
+}
+
+function bindBunRuntimeEnv(env: NodeJS.ProcessEnv | undefined, bunExecutable: string): NodeJS.ProcessEnv {
+  const activePath = env?.PATH ?? process.env.PATH ?? "";
+  return {
+    ...(env ?? process.env),
+    PATH: [dirname(bunExecutable), activePath].filter(Boolean).join(delimiter),
+  };
+}
+
+function pathIsWithin(candidate: string, root: string): boolean {
+  const normalize = (value: string) => process.platform === "win32" ? value.toLowerCase() : value;
+  const normalizedCandidate = normalize(realPathOrResolved(candidate));
+  const normalizedRoot = normalize(realPathOrResolved(root));
+  return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(`${normalizedRoot}${sep}`);
+}
+
+function isSelfManagedBun(bunExecutable: string, env?: NodeJS.ProcessEnv): boolean {
+  const bunInstall = env?.BUN_INSTALL ?? process.env.BUN_INSTALL ?? join(homeDir(env), ".bun");
+  return pathIsWithin(bunExecutable, join(bunInstall, "bin"));
+}
+
+function packageManagerUpgradeInstruction(bunExecutable: string): string {
+  const normalized = realPathOrResolved(bunExecutable).replace(/\\/g, "/").toLowerCase();
+  if (normalized.includes("/cellar/bun/")) return "run `brew upgrade bun`, then retry";
+  if (normalized.includes("/scoop/apps/bun/")) return "run `scoop update bun`, then retry";
+  if (normalized.includes("/node_modules/bun/")) return "run `npm install -g bun`, then retry";
+  return `upgrade Bun with the package manager that owns ${bunExecutable}, then retry`;
+}
+
+function ensureSupportedBunRuntime(
+  cwd: string,
+  env: NodeJS.ProcessEnv | undefined,
+  bunExecutable: string,
+): GlobalRuntimeStep {
+  const current = runProcess(bunExecutable, ["--version"], cwd, env);
+  const currentVersion = current.stdout?.trim().split(/\s+/)[0] ?? "";
+  const comparison = compareVersions(currentVersion, MIN_BUN_VERSION);
+  if (current.status === "ok" && bunVersionIsSupported(currentVersion)) {
+    return {
+      ...current,
+      step: "ensure Bun runtime",
+      status: "skipped",
+      detail: `current=${currentVersion}; minimum=${MIN_BUN_VERSION}`,
+    };
+  }
+
+  if (current.status === "failed" || comparison === null) {
+    return {
+      ...current,
+      step: "ensure Bun runtime",
+      status: "failed",
+      detail: `unable to verify Bun runtime; minimum=${MIN_BUN_VERSION}; executable=${bunExecutable}`,
+    };
+  }
+
+  if (!isSelfManagedBun(bunExecutable, env)) {
+    const instruction = packageManagerUpgradeInstruction(bunExecutable);
+    return {
+      ...current,
+      step: "ensure Bun runtime",
+      status: "failed",
+      detail: `upgrade required; current=${currentVersion}; minimum=${MIN_BUN_VERSION}; executable=${bunExecutable}`,
+      stderr: appendOutput(current.stderr, `Bun is not owned by the Bun self-installer; ${instruction}.`),
+    };
+  }
+
+  const upgrade = runProcess(bunExecutable, ["upgrade"], cwd, env);
+  if (upgrade.status === "failed") {
+    return withStepName(upgrade, "ensure Bun runtime", `upgrade required; current=${currentVersion}; minimum=${MIN_BUN_VERSION}`);
+  }
+
+  const readback = runProcess(bunExecutable, ["--version"], cwd, env);
+  const upgradedVersion = readback.stdout?.trim().split(/\s+/)[0] ?? "";
+  const upgradedComparison = compareVersions(upgradedVersion, MIN_BUN_VERSION);
+  if (readback.status === "failed" || upgradedComparison === null || upgradedComparison < 0) {
+    return {
+      ...readback,
+      step: "ensure Bun runtime",
+      status: "failed",
+      detail: `upgrade did not reach minimum=${MIN_BUN_VERSION}; found=${upgradedVersion || "unknown"}`,
+    };
+  }
+
+  return {
+    ...upgrade,
+    step: "ensure Bun runtime",
+    status: "ok",
+    detail: `upgraded=${upgradedVersion}; minimum=${MIN_BUN_VERSION}`,
+    stdout: appendOutput(upgrade.stdout, readback.stdout),
+    stderr: appendOutput(upgrade.stderr, readback.stderr),
+  };
+}
+
+function renderStep(step: GlobalRuntimeStep): string[] {
+  const lines = [`[runtime] ${step.status}: ${step.step}${step.detail ? ` - ${step.detail}` : ""}`];
+  if (step.status === "failed" && step.stderr?.trim()) lines.push(step.stderr.trim());
+  return lines;
+}
+
+function finalizeRuntimeResult(steps: GlobalRuntimeStep[]): GlobalRuntimeResult {
+  const lines = steps.flatMap(renderStep);
+  const failed = steps.filter((step) => step.status === "failed");
+  return {
+    exitCode: failed.length > 0 ? 1 : 0,
+    steps,
+    lines,
+    stdout: lines.join("\n"),
+    stderr: failed.map((step) => step.stderr ?? "").filter(Boolean).join("\n"),
+  };
+}
+
+function withProcessEnv<T>(env: NodeJS.ProcessEnv | undefined, fn: () => T): T {
+  if (!env) return fn();
+  const previous = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(env)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+/**
+ * The Skills CLI agent for every `skills add`. `codex` is a universal agent:
+ * its global skills root is `stagedSkillRoot()`, so the provider writes the
+ * staging copy in copy and symlink mode alike. `claude-code` alone selects
+ * copy mode into `~/.claude/skills` and writes no staging copy.
+ * `projectStagedSkills` links the host roots from staging.
+ */
+const STAGING_PROVIDER_AGENT = "codex";
+
+function hostIds(target: InstallTargetSpec): Array<"codex" | "claude"> {
+  if (target === "codex") return ["codex"];
+  if (target === "claude") return ["claude"];
+  return ["claude", "codex"];
+}
+
+function targetFromHostIds(hosts: readonly SkillHost[]): InstallTargetSpec {
+  const first = hosts[0];
+  if (first !== 'codex' && first !== 'claude') throw new Error('No install host selected');
+  return hosts.includes('codex') && hosts.includes('claude') ? "both" : first;
+}
+
+function homeDir(env?: NodeJS.ProcessEnv): string {
+  return requireHome(env ?? process.env);
+}
+
+function isNpxCacheSource(sourceRoot: string): boolean {
+  return /[\\/]_npx[\\/]/.test(sourceRoot);
+}
+
+function commandEnv(sourceRoot: string, env?: NodeJS.ProcessEnv): NodeJS.ProcessEnv | undefined {
+  if (!isNpxCacheSource(sourceRoot)) return env;
+  if (env?.REPO_HARNESS_LINK_INSTALLED_COPIES !== undefined) return env;
+  return { ...(env ?? process.env), REPO_HARNESS_LINK_INSTALLED_COPIES: "0" };
+}
+
+function packageVersion(sourceRoot: string): string | null {
+  try {
+    const pkg = JSON.parse(readFileSync(join(sourceRoot, "package.json"), "utf-8"));
+    return typeof pkg.version === "string" ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
+function packageName(sourceRoot: string): string | null {
+  try {
+    const pkg = JSON.parse(readFileSync(join(sourceRoot, "package.json"), "utf-8"));
+    return typeof pkg.name === "string" ? pkg.name : null;
+  } catch {
+    return null;
+  }
+}
+
+function isBunDependencyLoop(step: GlobalRuntimeStep): boolean {
+  return /DependencyLoop|dependency loop/i.test(`${step.stdout ?? ""}\n${step.stderr ?? ""}`);
+}
+
+function parsePackedTarballFilename(stdout: string): string | null {
+  try {
+    const parsed = JSON.parse(stdout);
+    const entry = Array.isArray(parsed) ? parsed[0] : parsed;
+    return typeof entry?.filename === "string" ? entry.filename : null;
+  } catch {
+    return null;
+  }
+}
+
+function appendOutput(...values: Array<string | undefined>): string | undefined {
+  const output = values.filter((value) => value && value.trim()).join("\n");
+  return output || undefined;
+}
+
+export interface PackageManifest {
+  name?: unknown;
+  version?: unknown;
+  dependencies?: unknown;
+  engines?: unknown;
+  bin?: unknown;
+}
+
+interface ManagedRuntimeReadback {
+  status: "ready" | "package-mismatch" | "runtime-mismatch";
+  detail: string;
+}
+
+export function readPackageManifest(packageRoot: string): PackageManifest {
+  const path = join(packageRoot, "package.json");
+  return parseJsonText(readFileSync(path, "utf-8"), path) as PackageManifest;
+}
+
+export function recordValue(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+export function findInstalledPackageRoot(consumerRoot: string, packageName: string): string | null {
+  let current = resolve(consumerRoot);
+  while (true) {
+    const candidate = join(current, "node_modules", packageName);
+    if (existsSync(join(candidate, "package.json"))) return candidate;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+/** The archctx part runs only when the architecture plugin runs in this setup. */
+function readManagedRuntime(
+  globalPackageRoot: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  expectedHarnessVersion: string | null,
+  plugins: readonly PluginId[],
+): ManagedRuntimeReadback {
+  if (!existsSync(join(globalPackageRoot, "package.json"))) {
+    return { status: "package-mismatch", detail: `installed repo-harness package is missing: ${globalPackageRoot}` };
+  }
+  const harness = readPackageManifest(globalPackageRoot);
+  if (expectedHarnessVersion !== null && harness.version !== expectedHarnessVersion) {
+    return { status: "package-mismatch", detail: `repo-harness version mismatch: expected ${expectedHarnessVersion}, got ${String(harness.version)}` };
+  }
+  const versions = [`repo-harness@${String(harness.version)}`];
+  if (!plugins.includes('architecture')) return { status: "ready", detail: versions.join("; ") };
+  const setup = architecturePort('setup');
+  if (isArchitectureUnavailable(setup)) return { status: "runtime-mismatch", detail: setup.message };
+  const archctx = setup.readManagedPackages(globalPackageRoot, cwd, env);
+  if (archctx.status !== "ready") return archctx;
+  return { status: "ready", detail: [...versions, ...archctx.versions].join("; ") };
+}
+
+function safeReadManagedRuntime(
+  globalPackageRoot: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  expectedHarnessVersion: string | null,
+  plugins: readonly PluginId[],
+): ManagedRuntimeReadback {
+  try {
+    return readManagedRuntime(globalPackageRoot, cwd, env, expectedHarnessVersion, plugins);
+  } catch (error) {
+    return { status: "package-mismatch", detail: `managed dependency readback failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+function reconcileManagedRuntime(
+  cwd: string,
+  bunExecutable: string,
+  env: NodeJS.ProcessEnv,
+  installSpec: string,
+  plugins: readonly PluginId[],
+  linkArchctx = false,
+): GlobalRuntimeStep {
+  const globalPackageRoot = bunGlobalPackageRoot(env);
+  if (globalPackageRoot === null) {
+    return { step: "verify managed runtime dependencies", status: "failed", detail: "unable to resolve Bun global package root" };
+  }
+  const requested = installSpec.startsWith("repo-harness@") ? installSpec.slice("repo-harness@".length) : null;
+  const expectedHarnessVersion = requested && requested !== "latest" && requested !== "next" ? requested : null;
+  const initial = safeReadManagedRuntime(globalPackageRoot, cwd, env, expectedHarnessVersion, plugins);
+  if (initial.status === "ready") {
+    if (linkArchctx && plugins.includes('architecture')) {
+      const bunRoot = env.BUN_INSTALL ?? join(homeDir(env), '.bun');
+      const link = join(bunRoot, 'bin', 'archctx');
+      // `bun add -g archctx` installs this package and links its bin. Bun can keep another copy nested
+      // under repo-harness, which repo-harness imports; the link never points there.
+      const managedRoot = join(bunRoot, 'install', 'global', 'node_modules', 'archctx');
+      const managedPackage = (): { version: unknown; target: string } => {
+        const manifest = readPackageManifest(managedRoot);
+        const bin = recordValue(manifest.bin).archctx;
+        if (typeof bin !== 'string') throw new Error('archctx does not declare bin.archctx');
+        return { version: manifest.version, target: realpathSync(join(managedRoot, bin)) };
+      };
+      try {
+        const version = recordValue(readPackageManifest(globalPackageRoot).dependencies).archctx;
+        if (typeof version !== 'string') throw new Error('repo-harness does not pin archctx');
+        const globalManifest = readPackageManifest(join(bunRoot, 'install', 'global'));
+        const existing = lstatSync(link, { throwIfNoEntry: false });
+        if (existing) {
+          let linkTarget: string | null = null;
+          try { linkTarget = realpathSync(link); } catch { /* A dangling link is also a conflict. */ }
+          // A link into the Bun global archctx package is managed, whatever its version; the install below moves it to the pin.
+          const managed = linkTarget !== null && existsSync(managedRoot) && linkTarget.startsWith(realpathSync(managedRoot) + sep);
+          if (!managed) return { step: 'verify managed runtime dependencies', status: 'failed', detail: `RH_ARCHCTX_BIN_CONFLICT: ${link} is not the managed archctx link. Move or remove it, then rerun rh update.` };
+          const current = managedPackage();
+          if (linkTarget === current.target && current.version === version && recordValue(globalManifest.dependencies).archctx === version) return { step: 'verify managed runtime dependencies', status: 'ok', detail: initial.detail };
+        }
+        const install = runProcess(bunExecutable, ['add', '-g', `archctx@${version}`], cwd, env);
+        if (install.status !== 'ok') return withStepName(install, 'verify managed runtime dependencies', `archctx@${version}`);
+        try {
+          const installed = managedPackage();
+          if (installed.version !== version || realpathSync(link) !== installed.target) throw new Error('installed version or link target does not match');
+        } catch (error) {
+          return { step: 'verify managed runtime dependencies', status: 'failed', detail: `RH_ARCHCTX_BIN_READBACK: ${link}: ${error instanceof Error ? error.message : String(error)}` };
+        }
+        return { step: 'verify managed runtime dependencies', status: 'ok', detail: `${initial.detail}; archctx@${version}` };
+      } catch (error) {
+        return { step: 'verify managed runtime dependencies', status: 'failed', detail: `RH_ARCHCTX_BIN_INVALID: ${link}: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    }
+    return { step: "verify managed runtime dependencies", status: "ok", detail: initial.detail };
+  }
+  if (initial.status === "runtime-mismatch") {
+    return { step: "verify managed runtime dependencies", status: "failed", detail: initial.detail };
+  }
+  return {
+    step: "verify managed runtime dependencies",
+    status: "failed",
+    detail: `managed runtime mismatch: ${initial.detail}`,
+    stderr: `Automatic remove/reinstall is disabled because a failed reinstall could remove the working CLI. Run \`${bunExecutable} remove -g repo-harness\`, then \`${bunExecutable} add -g ${installSpec}\`, and rerun rh update.`,
+  };
+}
+
+function inspectManagedDaemonRuntime(cwd: string, env: NodeJS.ProcessEnv, plugins: readonly PluginId[]): GlobalRuntimeStep {
+  const step = 'check shared ArchContext daemon';
+  if (!plugins.includes('architecture')) return { step, status: 'skipped', detail: 'architecture plugin not selected' };
+  const setup = architecturePort('setup');
+  if (isArchitectureUnavailable(setup)) return { step, status: 'failed', detail: setup.message };
+  try {
+    setup.verifyDaemon(cwd, env);
+    return { step, status: 'ok', detail: 'daemon is compatible or cleanly stopped' };
+  } catch (error) {
+    return { step, status: 'failed', detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** The global architecture projection section follows the architecture plugin; without it the section stays as it is. */
+function configureArchitectureProjection(env: NodeJS.ProcessEnv, plugins: readonly PluginId[], runtimeLock: RuntimeTransactionContext | undefined): GlobalRuntimeStep {
+  const step = 'global architecture projection';
+  if (!plugins.includes('architecture')) return { step, status: 'skipped', detail: 'architecture plugin not selected' };
+  const setup = architecturePort('setup');
+  if (isArchitectureUnavailable(setup)) return { step, status: 'failed', detail: setup.message };
+  return setup.ensureGlobalConfiguration(env, globalConfigurationWriter(env, runtimeLock));
+}
+
+export function verifyInstalledManagedRuntime(
+  opts: Pick<GlobalRuntimeOptions, 'sourceRoot' | 'cwd' | 'env'> & { readonly plugins: readonly PluginId[] },
+): GlobalRuntimeStep {
+  const sourceRoot = opts.sourceRoot ?? defaultSourceRoot();
+  const version = packageVersion(sourceRoot);
+  if (!version) {
+    return { step: 'verify managed runtime dependencies', status: 'failed', detail: `package version is unavailable from ${sourceRoot}` };
+  }
+  const cwd = opts.cwd ?? process.cwd();
+  const bunExecutable = resolveBunExecutable(opts.env);
+  const env = bindBunRuntimeEnv(commandEnv(sourceRoot, opts.env), bunExecutable);
+  const packages = reconcileManagedRuntime(cwd, bunExecutable, env, `repo-harness@${version}`, opts.plugins);
+  if (packages.status !== 'ok') return packages;
+  const daemon = inspectManagedDaemonRuntime(cwd, env, opts.plugins);
+  return daemon.status === 'failed' ? { ...packages, status: 'failed', detail: daemon.detail } : packages;
+}
+
+// Best-effort: readLatestPackageVersion() already swallows offline/npm-missing/
+// timeout failures into `.error`, so any lookup failure just yields no hint —
+// this must never turn the "skipped" step into a "failed" one.
+function updateAvailableHint(version: string | null, env?: NodeJS.ProcessEnv): string {
+  if (!version) return "";
+  const activeEnv = env ?? process.env;
+  if (activeEnv.REPO_HARNESS_CHECK_UPDATES !== "1") return "";
+  const latest = readLatestPackageVersion(env);
+  if (!latest.version) return "";
+  const comparison = compareVersions(version, latest.version);
+  if (comparison === null || comparison >= 0) return "";
+  return `; latest=${latest.version} available — run: rh update`;
+}
+
+function isCheckoutSource(sourceRoot: string): boolean {
+  return existsSync(join(sourceRoot, 'packages', 'operator-web', 'package.json'));
+}
+
+function installCli(
+  sourceRoot: string,
+  cwd: string,
+  bunExecutable: string,
+  env?: NodeJS.ProcessEnv,
+  installSpec?: string,
+): GlobalRuntimeStep {
+  const version = packageVersion(sourceRoot);
+  const name = packageName(sourceRoot);
+  if (installSpec === undefined && isBunGlobalPackageSource(sourceRoot, env)) {
+    const base = version
+      ? `already installed from Bun global package source; version=${version}`
+      : "already installed from Bun global package source";
+    return {
+      step: "install repo-harness CLI",
+      status: "skipped",
+      detail: `${base}${updateAvailableHint(version, env)}`,
+    };
+  }
+  if (installSpec === "repo-harness@latest" || installSpec === "repo-harness@next") {
+    return installCliFromRegistry(cwd, bunExecutable, env, installSpec);
+  }
+  if (installSpec === undefined && !isCheckoutSource(sourceRoot)) {
+    if (!version) return { step: 'install repo-harness CLI', status: 'failed', detail: `package version is unavailable from ${sourceRoot}` };
+    const spec = `repo-harness@${version}`;
+    const install = runProcess(bunExecutable, ['add', '-g', spec, '--no-cache'], cwd, env);
+    if (install.status !== 'ok') return withStepName(install, 'install repo-harness CLI', `spec=${spec}`);
+    const root = bunGlobalPackageRoot(env);
+    const actual = root === null ? null : packageVersion(root);
+    if (actual !== version) return withStepName({ ...install, status: 'failed' }, 'install repo-harness CLI', `installed CLI version mismatch: expected=${version}; actual=${actual ?? 'unavailable'}`);
+    return withStepName(install, 'install repo-harness CLI', `spec=${spec}`);
+  }
+  const spec = installSpec ?? (existsSync(join(sourceRoot, "package.json")) ? sourceRoot : "repo-harness");
+  const step = runProcess(bunExecutable, ["add", "-g", spec, ...(installSpec?.startsWith("repo-harness@") ? ["--no-cache"] : [])], cwd, env);
+  if (installSpec === undefined && name === "repo-harness" && step.status === "failed" && isBunDependencyLoop(step)) {
+    return installCliFromPackedTarball(sourceRoot, cwd, bunExecutable, env, version, step);
+  }
+  return withStepName(
+    step,
+    "install repo-harness CLI",
+    installSpec ? `spec=${installSpec}` : version ? `version=${version}` : undefined,
+  );
+}
+
+function installCliFromRegistry(
+  cwd: string,
+  bunExecutable: string,
+  env: NodeJS.ProcessEnv | undefined,
+  installSpec: string,
+): GlobalRuntimeStep {
+  const name = "install repo-harness CLI";
+  const globalRoot = bunGlobalPackageRoot(env);
+  if (globalRoot === null) return { step: name, status: "failed", detail: "unable to resolve Bun global package root" };
+  // `bun pm view` exits non-zero in a directory without package.json, so the
+  // lookup runs in the global package root that the install and readback use.
+  const lookup = runProcess(bunExecutable, ["pm", "view", installSpec, "version", "--json", "--no-cache"], globalRoot, env);
+  if (lookup.status !== "ok") return withStepName(lookup, name, `unable to resolve ${installSpec} from registry`);
+  let expected: unknown;
+  try {
+    expected = JSON.parse(lookup.stdout ?? "");
+  } catch {
+    return withStepName({ ...lookup, status: "failed" }, name, `invalid registry version for ${installSpec}: expected a JSON version string`);
+  }
+  // Reject tags, ranges and paths before they can become an install argument.
+  if (typeof expected !== "string" || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(expected)) {
+    return withStepName({ ...lookup, status: "failed" }, name, `invalid registry version for ${installSpec}: expected an exact version`);
+  }
+  const previous = packageVersion(globalRoot);
+  const spec = `repo-harness@${expected}`;
+  const install = runProcess(bunExecutable, ["add", "-g", spec, "--no-cache"], cwd, env);
+  if (install.status !== "ok") return withStepName(install, name, `spec=${spec}`);
+
+  const readback = runProcess(bunExecutable, [join(globalRoot, "src", "cli", "index.ts"), "--version"], cwd, env);
+  const actual = readback.stdout?.trim();
+  const packageReadback = packageVersion(globalRoot);
+  if (readback.status !== "ok" || actual !== expected || packageReadback !== expected) {
+    return withStepName({
+      ...install,
+      status: "failed",
+      stderr: appendOutput(install.stderr, readback.stderr),
+    }, name, `spec=${spec}; installed CLI version mismatch: expected=${expected}; actual=${actual || "unavailable"}; package=${packageReadback ?? "unavailable"}`);
+  }
+  const result = previous === actual ? `already at ${actual}` : `${previous ?? "unavailable"} -> ${actual}`;
+  return withStepName(install, name, `spec=${spec}; ${result}`);
+}
+
+function installCliFromPackedTarball(
+  sourceRoot: string,
+  cwd: string,
+  bunExecutable: string,
+  env: NodeJS.ProcessEnv | undefined,
+  version: string | null,
+  dependencyLoopStep: GlobalRuntimeStep,
+): GlobalRuntimeStep {
+  const packDir = join(homeDir(env), ".repo-harness", "packages");
+  const detailPrefix = version ? `version=${version}; ` : "";
+  mkdirSync(packDir, { recursive: true });
+
+  const pack = runProcess("npm", ["pack", "--json", "--pack-destination", packDir], sourceRoot, env);
+  if (pack.status !== "ok") {
+    return withStepName(
+      {
+        ...pack,
+        stderr: appendOutput(dependencyLoopStep.stderr, pack.stderr),
+      },
+      "install repo-harness CLI",
+      `${detailPrefix}dependency-loop repair pack failed`,
+    );
+  }
+  const filename = parsePackedTarballFilename(pack.stdout ?? "");
+  if (filename === null) {
+    return {
+      step: "install repo-harness CLI",
+      status: "failed",
+      command: pack.command,
+      detail: `${detailPrefix}dependency-loop repair pack output invalid`,
+      stdout: dependencyLoopStep.stdout,
+      stderr: appendOutput(dependencyLoopStep.stderr, pack.stderr, "npm pack --json did not return a tarball filename"),
+    };
+  }
+  const remove = runProcess(bunExecutable, ["remove", "-g", "repo-harness"], cwd, env);
+  if (remove.status !== "ok") {
+    return withStepName(
+      {
+        ...remove,
+        stdout: appendOutput(dependencyLoopStep.stdout, remove.stdout),
+        stderr: appendOutput(dependencyLoopStep.stderr, pack.stderr, remove.stderr),
+      },
+      "install repo-harness CLI",
+      `${detailPrefix}dependency-loop repair remove failed`,
+    );
+  }
+  const add = runProcess(bunExecutable, ["add", "-g", join(packDir, filename)], cwd, env);
+  if (add.status === "ok") removeSupersededPackedTarballs(packDir, filename);
+  return withStepName(add, "install repo-harness CLI", `${detailPrefix}repaired=packed-tarball`);
+}
+
+/**
+ * The global install references the tarball it installed, so that one stays.
+ * Only release names that `npm pack` writes are removed; a suffixed name such
+ * as a 0.10.0 archive has no ownership proof and stays for `upgrade`.
+ */
+function removeSupersededPackedTarballs(packDir: string, installed: string): void {
+  for (const name of readdirSync(packDir)) {
+    if (name === installed || !PACKED_RELEASE_TARBALL.test(name)) continue;
+    const path = join(packDir, name);
+    if (lstatSync(path).isFile()) rmSync(path);
+  }
+}
+
+function syncRuntimeSkill(sourceRoot: string, plugins: readonly PluginId[], target: InstallTargetSpec, env: NodeJS.ProcessEnv = process.env, transaction?: string): GlobalRuntimeStep {
+  const script = join(sourceRoot, 'scripts', 'sync-codex-installed-copies.sh');
+  if (!existsSync(script)) return { step: 'sync repo-harness skill runtime', status: 'skipped', detail: 'script not found: ' + script };
+  try {
+    const result = syncInstalledSkillCopies(sourceRoot, { ...env, REPO_HARNESS_INSTALL_PLUGINS: plugins.join(','), REPO_HARNESS_INCLUDE_PI: target === 'both' && plugins.includes('pi') ? '1' : '0' }, transaction);
+    return { step: 'sync repo-harness skill runtime', status: result.ok ? 'ok' : 'failed', stdout: result.stdout, stderr: result.stderr };
+  } catch (error) { return { step: 'sync repo-harness skill runtime', status: 'failed', detail: (error as Error).message }; }
+}
+
+function installHostAdapters(target: InstallTargetSpec, env: NodeJS.ProcessEnv | undefined, overrides: OverrideSelection | undefined): GlobalRuntimeStep {
+  const installed = withProcessEnv(env, () => runInstall({ target, location: "global", overrides }));
+  return {
+    step: "install host adapters",
+    status: installed.exitCode === 0 ? "ok" : "failed",
+    detail: installed.lines.join("; "),
+  };
+}
+
+function reconcileWithInstalledCandidate(
+  opts: GlobalRuntimeOptions,
+  cwd: string,
+  bunExecutable: string,
+  env: NodeJS.ProcessEnv,
+  target: InstallTargetSpec,
+): GlobalRuntimeStep {
+  const handoff = opts.candidateHandoff;
+  if (!handoff) {
+    return {
+      step: CANDIDATE_RECONCILE_STEP,
+      status: 'failed',
+      detail: 'candidate reconciliation requires an active parent runtime transaction',
+    };
+  }
+  const candidateRoot = bunGlobalPackageRoot(env);
+  if (candidateRoot === null) {
+    return { step: CANDIDATE_RECONCILE_STEP, status: 'failed', detail: 'unable to resolve candidate package root' };
+  }
+  let candidate;
+  try {
+    candidate = candidatePackageIdentity(candidateRoot);
+  } catch (error) {
+    return {
+      step: CANDIDATE_RECONCILE_STEP,
+      status: 'failed',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+  const requested = opts.installSpec?.startsWith('repo-harness@') ? opts.installSpec.slice('repo-harness@'.length) : null;
+  if (requested && requested !== 'latest' && requested !== 'next' && candidate.version !== requested) {
+    return {
+      step: CANDIDATE_RECONCILE_STEP,
+      status: 'failed',
+      detail: `repo-harness version mismatch: expected ${requested}, got ${candidate.version}`,
+    };
+  }
+  const candidateEntrypoint = join(candidate.root, 'src', 'cli', 'index.ts');
+  if (!existsSync(candidateEntrypoint)) {
+    return {
+      step: CANDIDATE_RECONCILE_STEP,
+      status: 'failed',
+      detail: `candidate entrypoint is missing: ${candidateEntrypoint}`,
+    };
+  }
+  const request: CandidateReconciliationRequest = {
+    protocol: CANDIDATE_RECONCILIATION_PROTOCOL,
+    transaction_id: handoff.transactionId,
+    transaction_backup_root: handoff.transactionBackupRoot,
+    parent_token: handoff.parentToken,
+    candidate,
+    cwd,
+    target,
+    sync_skill: opts.syncSkill !== false,
+    host_adapters: opts.hostAdapters !== false,
+    external_skills: opts.externalSkills === true,
+    obsidian_skills: opts.obsidianSkills === true,
+    codegraph: opts.codegraph ?? true,
+    report_language: opts.reportLanguage,
+    ...(opts.overrides?.length ? { overrides: opts.overrides } : {}),
+  };
+  const child = runProcess(
+    bunExecutable,
+    [candidateEntrypoint, '__reconcile-installed-runtime', '--request', encodeCandidateRequest(request)],
+    cwd,
+    {
+      ...env,
+      REPO_HARNESS_RUNTIME_RECONCILIATION_PARENT: '1',
+      REPO_HARNESS_RUNTIME_RECONCILIATION_TOKEN: handoff.parentToken,
+    },
+  );
+  if (child.status === 'failed') return withStepName(child, CANDIDATE_RECONCILE_STEP, `candidate=${candidate.version}`);
+  try {
+    const receipt = parseCandidateReceipt(child.stdout ?? '');
+    if (
+      receipt.transaction_id !== handoff.transactionId
+      || receipt.candidate_package_root !== candidate.root
+      || receipt.candidate_version !== candidate.version
+      || receipt.candidate_package_digest !== candidate.package_digest
+      || receipt.selected_target !== target
+    ) {
+      throw new Error('candidate receipt binding mismatch');
+    }
+    const completeRequired = request.sync_skill && request.host_adapters;
+    if (completeRequired && receipt.reconciliation_scope !== 'complete') {
+      throw new Error('candidate receipt is partial while full reconciliation was requested');
+    }
+    if (completeRequired && receipt.ownership_manifest_digest === null) {
+      throw new Error('candidate receipt omitted the ownership ledger digest');
+    }
+    assertReceiptSelection(request.overrides, receipt);
+    return {
+      step: CANDIDATE_RECONCILE_STEP,
+      status: 'ok',
+      detail: appendOutput(`candidate=${receipt.candidate_version}; scope=${receipt.reconciliation_scope}; receipt=${receipt.route_registry_digest}`, child.stderr),
+      stderr: child.stderr,
+    };
+  } catch (error) {
+    return {
+      step: CANDIDATE_RECONCILE_STEP,
+      status: 'failed',
+      detail: error instanceof Error ? error.message : String(error),
+      stdout: child.stdout,
+      stderr: child.stderr,
+    };
+  }
+}
+
+/**
+ * Run the installed package's read-only `upgrade` check. Bun replaces the
+ * package files in place, but the updater keeps its predecessor modules. Old
+ * modules cannot be trusted to parse new assets or output shapes, so the
+ * package that now owns the runtime runs the check. Output stays raw: a JSON
+ * payload is parsed before any redaction or cap, because a path such as
+ * token=x would otherwise lose its closing quote.
+ */
+function runInstalledUpgrade(args: readonly string[], cwd: string, installedCli: boolean, timeoutMs?: number):
+  { readonly stdout: string; readonly stderr: string } | { readonly failure: string } {
+  const bunExecutable = resolveBunExecutable();
+  const env = bindBunRuntimeEnv(commandEnv(defaultSourceRoot()), bunExecutable);
+  const packageRoot = installedCli ? bunGlobalPackageRoot(env) : defaultSourceRoot();
+  if (packageRoot === null) return { failure: 'unable to resolve the installed package root' };
+  const check = runBoundedProcess(bunExecutable, [join(realPathOrResolved(packageRoot), 'src', 'cli', 'index.ts'), 'upgrade', ...args], {
+    cwd,
+    env,
+    redactions: [],
+    maxOutputBytes: DEFAULT_PROCESS_MAX_BUFFER_BYTES,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  });
+  return { stdout: check.stdout, stderr: (check.stderr || check.error || '').trim() };
+}
+
+/**
+ * The installed package writes its own leftover summary line, and the updater
+ * forwards it unparsed. The check exits 1 when work is pending, so only a
+ * missing line is a failed check.
+ */
+export function updateLeftoverSummary(cwd: string, installedCli: boolean): string {
+  const run = runInstalledUpgrade(['--summary-line'], cwd, installedCli);
+  if ('failure' in run) return leftoverCheckWarning(run.failure);
+  const line = run.stdout.trim();
+  if (line === '') return leftoverCheckWarning(redactProcessOutput(run.stderr) || 'upgrade --summary-line printed no summary line');
+  return line;
+}
+
+/** `update` must not wait the default two minutes on a hung git probe. */
+const REGISTERED_PREVIEW_TIMEOUT_MS = 30_000;
+
+/**
+ * One read-only line: how many registered repos have pending project upgrade
+ * work. It runs the `upgrade --registered` preview only and never fails update.
+ * When the count cannot be computed, the line says so instead of a number.
+ */
+export function updateRegisteredUpgradeSummary(cwd: string, installedCli: boolean): string {
+  const hint = 'Preview: rh upgrade --registered';
+  const unavailable = (reason: string) => `Registered repo upgrade check could not be computed: ${reason}. ${hint}`;
+  const run = runInstalledUpgrade(['--registered', '--json'], cwd, installedCli, REGISTERED_PREVIEW_TIMEOUT_MS);
+  if ('failure' in run) return unavailable(run.failure);
+  let payload: unknown;
+  try {
+    payload = JSON.parse(run.stdout);
+  } catch {
+    payload = null;
+  }
+  const record = payload !== null && typeof payload === 'object' && !Array.isArray(payload)
+    ? payload as { repos?: unknown; error?: unknown; revision?: unknown } : null;
+  const reportedError = typeof record?.error === 'string' ? record.error.trim() : '';
+  if (!record || !Array.isArray(record.repos) || reportedError !== '') {
+    return unavailable(redactProcessOutput(reportedError || run.stderr) || 'upgrade --registered --json returned no repo list');
+  }
+  const repos = record.repos.map((repo) => (repo !== null && typeof repo === 'object' ? repo : {}) as { path?: unknown; status?: unknown; pending?: unknown });
+  const pending = repos.filter((repo) => repo.status === 'ready' && repo.pending === true);
+  const skipped = repos.filter((repo) => repo.status === 'skipped').length;
+  const failed = repos.filter((repo) => repo.status === 'failed').length;
+  // Update writes no project file. The registered apply, bound to this preview revision, rewrites the managed references.
+  const apply = pending.length > 0 && typeof record.revision === 'string'
+    ? `. Apply: ${CLI_NAME} upgrade --registered --apply --expected-revision ${record.revision}` : '';
+  const names = pending.map((repo) => String(repo.path));
+  return `Registered repos: ${pending.length} of ${repos.length} have pending project upgrade work`
+    + `${names.length > 0 ? ` (${names.join(', ')})` : ''}`
+    + `${skipped > 0 ? `; ${skipped} skipped` : ''}${failed > 0 ? `; ${failed} failed` : ''}. ${hint}${apply}`;
+}
+
+export const RETIRED_CLI_LINK_STEP = `retire the ${RETIRED_CLI_NAME} command link`;
+export const RETIRED_CLI_REFERENCES_STEP = `find ${RETIRED_CLI_NAME} command calls in user files`;
+
+/**
+ * Bun keeps the bin launcher of a name that the new package version no longer declares, and that
+ * launcher runs the new package. Update removes only what an exact proof shows as the package's:
+ * a symlink whose realpath equals the installed CLI entry. Every other file at the launcher paths,
+ * the Windows .exe/.bunx pair included, gets a notice with its removal command and no change.
+ */
+function retireCliLink(env: NodeJS.ProcessEnv): GlobalRuntimeStep {
+  const step = RETIRED_CLI_LINK_STEP;
+  const bin = join(env.BUN_INSTALL ?? join(homeDir(env), '.bun'), 'bin');
+  const link = join(bin, RETIRED_CLI_NAME);
+  const windows = [`${RETIRED_CLI_NAME}.exe`, `${RETIRED_CLI_NAME}.bunx`].map(name => join(bin, name))
+    .filter(path => lstatSync(path, { throwIfNoEntry: false }) !== undefined);
+  const linkStat = lstatSync(link, { throwIfNoEntry: false });
+  if (!linkStat && windows.length === 0) return { step, status: 'skipped', detail: 'No retired command launcher.' };
+  const details: string[] = [];
+  if (linkStat) {
+    const packageRoot = bunGlobalPackageRoot(env);
+    const entry = packageRoot === null ? null : join(packageRoot, 'src', 'cli', 'index.ts');
+    let proved = false;
+    try { proved = linkStat.isSymbolicLink() && entry !== null && realpathSync(link) === realpathSync(entry); } catch { /* A dangling link or a missing entry is no proof. */ }
+    if (!proved) details.push(`${link} is not proved to be this package's launcher; it stays. Remove it by hand when you do not need it: rm ${shellQuote(link)}.`);
+    else {
+      try {
+        unlinkSync(link);
+        details.push(`Removed ${link}.`);
+      } catch (error) {
+        details.push(`${link} could not be removed (${(error as NodeJS.ErrnoException).code ?? 'error'}); it stays. Remove it by hand: rm ${shellQuote(link)}.`);
+      }
+    }
+  }
+  // Bun on Windows writes a .exe launcher and a .bunx record. No exact proof exists for them, so they stay.
+  if (windows.length > 0) {
+    details.push(`${windows.join(', ')} stays: update does not remove Windows launchers. Remove them in PowerShell: Remove-Item -LiteralPath ${windows.map(path => `'${path.replaceAll("'", "''")}'`).join(', ')}.`);
+  }
+  return { step, status: 'ok', detail: `${details.join(' ')} The command is ${CLI_NAME}.` };
+}
+
+/** Update rewrites only the files that it manages; a user-owned call of the retired command gets a notice. */
+function findRetiredCliCalls(env: NodeJS.ProcessEnv, target: InstallTargetSpec, globalRules: GlobalContextRefreshPlan): GlobalRuntimeStep {
+  const step = RETIRED_CLI_REFERENCES_STEP;
+  const home = homeDir(env);
+  const hosts = hostIds(target);
+  const files = [
+    ...hosts.map(host => globalContextPath(home, host)),
+    ...(hosts.includes('claude') ? [join(home, '.claude', 'settings.json')] : []),
+  ];
+  const unread: string[] = [];
+  const calls = files.flatMap((path) => {
+    if (!existsSync(path)) return [];
+    let text: string;
+    try { text = readFileSync(path, 'utf8'); } catch (error) {
+      unread.push(`${path} (${(error as NodeJS.ErrnoException).code ?? 'unreadable'})`);
+      return [];
+    }
+    // The refresh writes a proved rules block, so the scan skips its span. A block that the
+    // refresh keeps unwritten (edited, or without a recorded language) is user text.
+    const kept = globalRules.files.some((file) => file.path === path && file.outcome === 'skipped'
+      && (file.state === 'managed-stale' || file.state === 'managed-unrecorded'));
+    let managed = false;
+    return text.split('\n').flatMap((line, index) => {
+      const skip = !kept && (managed || line.includes(GLOBAL_RULES_BEGIN));
+      managed = skip && !line.includes(GLOBAL_RULES_END);
+      return !skip && namesRetiredCli(line) ? [`${path}:${index + 1}`] : [];
+    });
+  });
+  const notRead = unread.length > 0 ? ` Not read: ${unread.join(', ')}.` : '';
+  if (calls.length === 0) return { step, status: 'skipped', detail: `No user file names ${RETIRED_CLI_NAME}.${notRead}` };
+  return {
+    step, status: 'ok',
+    detail: `${calls.length} line(s) in files that you own name ${RETIRED_CLI_NAME}; update does not change them. Change each line that calls it to ${CLI_NAME}: ${calls.join(', ')}.${notRead}`,
+  };
+}
+
+const AGENT_FLEET_STEP = 'install agent fleet';
+export const RETIRED_AGENT_FLEET_STEP = 'retire former fleet agents';
+
+function retireFleet(env: NodeJS.ProcessEnv, transaction: string): GlobalRuntimeStep | null {
+  const step = RETIRED_AGENT_FLEET_STEP;
+  try {
+    const entries = retireAgentFleet(env, transaction);
+    if (!entries.length) return null;
+    const detail = entries.map(entry => {
+      if (entry.action === 'kept_edited') {
+        return `${entry.path}: ${revertItem(entry).reason}${entry.vault ? '' : '. Ownership record released'}.`;
+      }
+      const action = entry.action === 'restored' ? 'restored the original from the vault'
+        : entry.action === 'removed' ? 'removed the unchanged managed file' : 'released the ownership record';
+      return `${entry.path}: ${action}.`;
+    }).join(' ');
+    return { step, status: 'ok', detail };
+  } catch (error) {
+    return { step, status: 'failed', detail: (error as Error).message };
+  }
+}
+export const GLOBAL_RULES_REFRESH_STEP = 'refresh global working rules';
+
+export const RUNTIME_IGNORE_RULES_STEP = 'write runtime ignore rules';
+const RETIRE_USER_EXCLUDES_STEP = 'retire user-level runtime ignore block';
+
+/**
+ * Writes the runtime-state block into each adopted repository's `.git/info/exclude`.
+ * Update then runs the one-shot removal of the block that earlier releases wrote to the user-level Git excludes file.
+ */
+function writeRuntimeIgnoreRules(env: NodeJS.ProcessEnv, updateMode: boolean): GlobalRuntimeStep[] {
+  const repositories = writeRepositoryExcludes(env);
+  const step: GlobalRuntimeStep = { step: RUNTIME_IGNORE_RULES_STEP, status: repositories.status, detail: repositories.detail };
+  return updateMode ? [step, { step: RETIRE_USER_EXCLUDES_STEP, ...retireUserExcludesBlock(env, repositories) }] : [step];
+}
+
+function installAgentFleet(sourceRoot: string, bunExecutable: string, env: NodeJS.ProcessEnv, transaction?: string): GlobalRuntimeStep {
+  const script = join(sourceRoot, 'scripts', 'install-agent-fleet.sh');
+  if (!existsSync(script)) {
+    return { step: AGENT_FLEET_STEP, status: 'failed', detail: `script not found: ${script}` };
+  }
+  return withStepName(
+    runProcess('bash', [script], sourceRoot, { ...env, REPO_HARNESS_BUN_BIN: bunExecutable, REPO_HARNESS_RUNTIME_TRANSACTION: transaction }),
+    AGENT_FLEET_STEP,
+  );
+}
+
+const WAZA_RULES_STEP = "sync Waza shared rules";
+
+/** True when the installed candidate process ran the host writes and committed its own install state. */
+export function reconciledByCandidate(result: Pick<GlobalRuntimeResult, 'steps'>): boolean {
+  return result.steps.some((step) => step.step === CANDIDATE_RECONCILE_STEP);
+}
+
+
+
+function externalSkillStepName(provider: string): string {
+  if (provider === "tw93/Waza") return "configure Waza skills";
+  if (provider === "BfdCampos/dotfiles") return "configure Mermaid skill";
+  if (provider.startsWith("kepano/obsidian-skills#")) return "configure Obsidian companion Skills";
+  return `configure external skills ${provider}`;
+}
+
+/** The path with the links of its nearest existing ancestor followed. */
+function canonicalOfNearestAncestor(path: string): string {
+  let ancestor = path;
+  while (!pathEntryExists(ancestor)) {
+    const parent = dirname(ancestor);
+    if (parent === ancestor) return path;
+    ancestor = parent;
+  }
+  return join(realpathSync(ancestor), relative(ancestor, path));
+}
+
+/** The Skills CLI at the version whose write set was measured (#2852); rh pins it, so the table is the version check. */
+const SKILLS_CLI = `skills@${MEASURED_INSTALLERS.skills}`;
+
+function skillsAddArgs(provider: string, skills: readonly string[]): string[] {
+  return [SKILLS_CLI, "add", provider, "-g", "-a", STAGING_PROVIDER_AGENT, "-s", ...skills, "-y"];
+}
+
+/** True when the staged skill is absent, or is rh's current entry of its owner: only then may the Skills CLI write it. */
+function stagedSkillWritable(path: string, env: NodeJS.ProcessEnv): boolean {
+  if (!pathEntryExists(path)) return true;
+  const key = pathRecordKey(env, path);
+  const record = readPathRecords(env)[key];
+  return record !== undefined && record.kind !== 'user_managed' && record.owner === ownerForInstallPath(path, env) && pathRecordIsCurrent(key, record);
+}
+
+/**
+ * `skills add` as a delegated writer: the gate records the staged skill
+ * directories and their lock entries (`skills.<name>`) that the call created
+ * or refreshed, and reports a change outside them. A staged skill that rh does
+ * not own stays out of the call and keeps its bytes.
+ */
+function addStagedSkills(sourceRoot: string, provider: string, requested: readonly string[], env: NodeJS.ProcessEnv | undefined, transaction: string | undefined, stepName: string):
+  { readonly step: GlobalRuntimeStep; readonly notes: readonly string[] } {
+  const environment = env ?? process.env;
+  const home = homeDir(env);
+  const root = stagedSkillRoot(home);
+  const skills = requested.filter((skill) => stagedSkillWritable(join(root, skill), environment));
+  const kept = requested.filter((skill) => !skills.includes(skill)).map((skill) => `kept unowned staged skill ${join(root, skill)}`);
+  if (!skills.length) return { step: { step: stepName, status: "ok" }, notes: kept };
+  const owners = [...new Set(skills.map((skill) => ownerForInstallPath(join(root, skill), environment)))];
+  if (owners.length !== 1 || owners[0] === null) return { step: { step: stepName, status: "failed", detail: `the staged skills ${skills.join(',')} have no single owner` }, notes: [] };
+  const owner = owners[0];
+  const lockPath = providerSkillLock(home, environment).path;
+  let run: GlobalRuntimeStep | null = null as GlobalRuntimeStep | null;
+  try {
+    const gate = openHostConfigGate({ env });
+    const { unattributed } = withHostConfigTransaction(environment, transaction, (txRoot) => gate.delegate([
+      ...skills.map((skill) => ({ path: join(root, skill), owner })),
+      { path: lockPath, owner, selectors: skills.map((skill) => `skills.${skill}`) },
+    ], () => {
+      run = runProcess("bunx", skillsAddArgs(provider, skills), sourceRoot, env);
+      if (run.status === "failed") throw new Error(`${SKILLS_CLI} add ${provider} failed`);
+    }, { transaction: txRoot }));
+    // A lock entry that was there before the call (an rh killed mid-call, or the user) gets no record: report it, claim nothing (D4b).
+    const lock = existsSync(lockPath) ? readFileSync(lockPath, 'utf8') : null;
+    const recorded = new Set(gate.recorded(lockPath).map((record) => record.selector));
+    const unowned = lock === null ? [] : skills.filter((skill) => !recorded.has(`skills.${skill}`) && jsonFragment.locate(lock, `skills.${skill}`))
+      .map((skill) => `kept unowned lock entry skills.${skill} in ${lockPath}`);
+    return { step: run!, notes: [...kept, ...unowned, ...unattributed.map((diff) => `${diff.code}: ${diff.path} ${diff.sha256 ?? 'removed'}`)] };
+  } catch (error) {
+    return { step: run?.status === "failed" ? run : { step: stepName, status: "failed", detail: (error as Error).message }, notes: [] };
+  }
+}
+
+/** The projection result carries the notes of the Skills CLI call before it. */
+function withNotes(step: GlobalRuntimeStep, notes: readonly string[]): GlobalRuntimeStep {
+  return notes.length && step.status === "ok" ? { ...step, detail: [step.detail, ...notes].filter(Boolean).join('; ') } : step;
+}
+
+function installExternalSkillGroup(
+  sourceRoot: string,
+  target: InstallTargetSpec,
+  piSelected: boolean,
+  provider: string,
+  skills: readonly string[],
+  integrityBySkill: Readonly<Record<string, string | null>>,
+  env?: NodeJS.ProcessEnv,
+  refresh = false,
+  transaction?: string,
+): GlobalRuntimeStep {
+  const stepName = externalSkillStepName(provider);
+  const home = homeDir(env);
+  const skillsRoot = stagedSkillRoot(home);
+  const canonicalSkillsRoot = stagedSkillRoot(realpathSync(home));
+  const preflight = preflightStagedSkillProjection(skills, target, piSelected, env, stepName);
+  if (preflight) return preflight;
+  const missing = skills.filter((skill) => !existsSync(join(skillsRoot, skill, 'SKILL.md')));
+  const selected = refresh ? skills : missing;
+  const ordinaryMissing = selected.filter((skill) => integrityBySkill[skill] == null);
+  let notes: readonly string[] = [];
+  if (ordinaryMissing.length > 0) {
+    const added = addStagedSkills(sourceRoot, provider, ordinaryMissing, env, transaction, stepName);
+    if (added.step.status === 'failed') return withStepName(added.step, stepName, `target=${target}; missing=${ordinaryMissing.join(',')}`);
+    notes = added.notes;
+  }
+
+  const integrityMissing = selected.filter((skill) => integrityBySkill[skill] != null);
+  if (integrityMissing.length > 0) {
+    const isolatedHome = mkdtempSync(join(tmpdir(), "repo-harness-skill-stage-"));
+    const isolatedEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(env ?? {}),
+      HOME: isolatedHome,
+      USERPROFILE: isolatedHome,
+      XDG_CONFIG_HOME: join(isolatedHome, ".config"),
+      XDG_CACHE_HOME: join(isolatedHome, ".cache"),
+      XDG_STATE_HOME: join(isolatedHome, ".local", "state"),
+      BUN_INSTALL: join(isolatedHome, ".bun"),
+      BUN_INSTALL_CACHE_DIR: join(isolatedHome, ".bun", "install", "cache"),
+      NPM_CONFIG_CACHE: join(isolatedHome, ".npm"),
+      npm_config_cache: join(isolatedHome, ".npm"),
+    };
+    // Custom host roots would defeat isolation even with HOME redirected.
+    for (const key of ["CODEX_HOME", "CLAUDE_CONFIG_DIR", "AGENTS_HOME", "SKILLS_HOME"]) {
+      delete isolatedEnv[key];
+    }
+    try {
+      const step = runProcess("bunx", skillsAddArgs(provider, integrityMissing), sourceRoot, isolatedEnv);
+      if (step.status === "failed") {
+        return withStepName(step, stepName, `isolated target=${target}; missing=${integrityMissing.join(',')}`);
+      }
+
+      for (const skill of integrityMissing) {
+        const expected = integrityBySkill[skill]!;
+        const isolatedSkill = join(stagedSkillRoot(isolatedHome), skill);
+        let actual: string;
+        try {
+          actual = skillTreeSha256(isolatedSkill);
+        } catch (error) {
+          return { step: stepName, status: "failed", detail: `cannot verify isolated staging integrity for ${skill}: ${(error as Error).message}` };
+        }
+        if (actual !== expected) {
+          return { step: stepName, status: "failed", detail: `isolated staging integrity mismatch for ${skill}: expected=${expected}; actual=${actual}` };
+        }
+      }
+      // A linked staging root would put the verified trees outside HOME: the write stops first.
+      let parent: string;
+      try {
+        parent = canonicalOfNearestAncestor(skillsRoot);
+      } catch (error) {
+        return { step: stepName, status: "failed", detail: `staging parent escapes canonical authority: expected=${canonicalSkillsRoot}; ${(error as Error).message}` };
+      }
+      if (parent !== canonicalSkillsRoot) {
+        return { step: stepName, status: "failed", detail: `staging parent escapes canonical authority: expected=${canonicalSkillsRoot}; actual=${parent}` };
+      }
+      // The verified trees reach staging through the gate: an unowned or changed entry stops the write, and the
+      // transaction rollback puts back what the gate replaced.
+      const environment = env ?? process.env;
+      try {
+        withHostConfigTransaction(environment, transaction, (txRoot) => openHostConfigGate({ env }).writePaths(integrityMissing.map((skill) => {
+          const path = join(skillsRoot, skill);
+          const owner = ownerForInstallPath(path, environment);
+          if (owner === null) throw new Error(`no skill owner: ${path}`);
+          return { path, owner, entry: { type: 'directory' as const, source: join(stagedSkillRoot(isolatedHome), skill) } };
+        }), { transaction: txRoot }));
+      } catch (error) {
+        return { step: stepName, status: "failed", detail: (error as Error).message };
+      }
+    } finally {
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
+  }
+  for (const skill of skills) {
+    const expected = integrityBySkill[skill];
+    if (expected === null || expected === undefined) continue;
+    const installed = join(skillsRoot, skill);
+    try {
+      const stat = lstatSync(installed);
+      const canonicalRoot = realpathSync(skillsRoot);
+      if (
+        canonicalRoot !== canonicalSkillsRoot
+        || !stat.isDirectory()
+        || stat.isSymbolicLink()
+        || realpathSync(installed) !== join(canonicalRoot, skill)
+      ) {
+        return { step: stepName, status: "failed", detail: `refusing non-canonical integrity staging root for ${skill}: ${installed}` };
+      }
+      const actual = skillTreeSha256(installed);
+      if (actual !== expected) {
+        return { step: stepName, status: "failed", detail: `staging integrity mismatch for ${skill}: expected=${expected}; actual=${actual}` };
+      }
+    } catch (error) {
+      return { step: stepName, status: "failed", detail: `cannot verify staging integrity for ${skill}: ${(error as Error).message}` };
+    }
+  }
+  return withNotes(projectStagedSkills(skills, target, piSelected, env, stepName, transaction), notes);
+}
+
+function installWazaSkills(sourceRoot: string, target: InstallTargetSpec, piSelected: boolean, env?: NodeJS.ProcessEnv, refresh = false, transaction?: string): GlobalRuntimeStep {
+  const wazaSkills = externalSkillGroupsFromCatalog(loadSkillSurfaceCatalog(sourceRoot)).get("tw93/Waza") ?? [];
+  const skillsRoot = stagedSkillRoot(homeDir(env));
+  const selected = refresh ? wazaSkills : wazaSkills.filter((skill) => !existsSync(join(skillsRoot, skill, 'SKILL.md')));
+  const preflight = preflightStagedSkillProjection(wazaSkills, target, piSelected, env, 'configure Waza skills');
+  if (preflight) return preflight;
+  let notes: readonly string[] = [];
+  if (selected.length > 0) {
+    const added = addStagedSkills(sourceRoot, "tw93/Waza", selected, env, transaction, "configure Waza skills");
+    if (added.step.status === 'failed') {
+      return withStepName(added.step, "configure Waza skills", `target=${target}; selected=${selected.join(',')}`);
+    }
+    notes = added.notes;
+  }
+  return withNotes(projectStagedSkills(wazaSkills, target, piSelected, env, 'configure Waza skills', transaction), notes);
+}
+
+/**
+ * Each selected host skill root, with the canonical path it must resolve to.
+ * The ledger owns every Pi-root path under the `pi` plugin, so the Pi root is
+ * a projection root only when `pi` runs.
+ */
+function stagedProjectionRoots(home: string, target: InstallTargetSpec, piSelected: boolean, env: NodeJS.ProcessEnv | undefined): Array<{ path: string; expected: string }> {
+  const canonicalHome = realpathSync(home);
+  const hosts = target === 'both' && piSelected ? [...hostIds(target), 'pi' as const] : hostIds(target);
+  return hosts.map((host) => ({ path: hostSkillRoot(home, host, env), expected: hostSkillRoot(canonicalHome, host, env) }));
+}
+
+function preflightStagedSkillProjection(
+  skills: readonly string[],
+  target: InstallTargetSpec,
+  piSelected: boolean,
+  env: NodeJS.ProcessEnv | undefined,
+  step: string,
+): GlobalRuntimeStep | null {
+  const home = homeDir(env);
+  const roots = stagedProjectionRoots(home, target, piSelected, env);
+  const records = readPathRecords(env ?? process.env);
+  for (const skill of skills) for (const root of roots) {
+    const destination = join(root.path, skill);
+    if (!pathEntryExists(destination)) continue;
+    const key = pathRecordKey(env ?? process.env, destination);
+    const record = records[key];
+    if (!record || record.kind === 'user_managed' || record.owner !== ownerForInstallPath(destination, env)
+      || !pathRecordIsCurrent(key, record)) return { step, status: 'failed', detail: 'refusing to refresh unowned host skill ' + destination + '; preserve or move this path, then run: rh install --target ' + target };
+  }
+  return null;
+}
+
+function projectStagedSkills(
+  skills: readonly string[], target: InstallTargetSpec, piSelected: boolean,
+  env: NodeJS.ProcessEnv | undefined, step: string, transaction?: string,
+): GlobalRuntimeStep {
+  const home = homeDir(env);
+  const roots = stagedProjectionRoots(home, target, piSelected, env);
+  try {
+    const writes = skills.flatMap(skill => {
+      const source = join(stagedSkillRoot(home), skill);
+      if (!existsSync(join(source, 'SKILL.md'))) throw new Error('staging skill missing after install: ' + source);
+      return roots.map(root => {
+        const path = join(root.path, skill);
+        const owner = ownerForInstallPath(path, env);
+        if (owner === null) throw new Error('no skill owner: ' + path);
+        return { path, owner, entry: { type: 'symlink' as const, target: source } };
+      });
+    });
+    withHostConfigTransaction(env ?? process.env, transaction, root => openHostConfigGate({ env }).writePaths(writes, { transaction: root }));
+    return { step, status: 'ok', detail: 'projected ' + writes.length + ' host skills' };
+  } catch (error) { return { step, status: 'failed', detail: (error as Error).message }; }
+}
+
+function pathEntryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function installMermaidSkill(sourceRoot: string, target: InstallTargetSpec, piSelected: boolean, env?: NodeJS.ProcessEnv, refresh = false, transaction?: string): GlobalRuntimeStep {
+  const mermaidSkills = externalSkillGroupsFromCatalog(loadSkillSurfaceCatalog(sourceRoot)).get("BfdCampos/dotfiles") ?? [];
+  const installed = join(stagedSkillRoot(homeDir(env)), 'mermaid', 'SKILL.md');
+  const preflight = preflightStagedSkillProjection(mermaidSkills, target, piSelected, env, 'configure Mermaid skill');
+  if (preflight) return preflight;
+  let notes: readonly string[] = [];
+  if (refresh || !existsSync(installed)) {
+    const added = addStagedSkills(sourceRoot, "BfdCampos/dotfiles", mermaidSkills, env, transaction, "configure Mermaid skill");
+    if (added.step.status === 'failed') return withStepName(added.step, "configure Mermaid skill", `target=${target}`);
+    notes = added.notes;
+  }
+  return withNotes(projectStagedSkills(mermaidSkills, target, piSelected, env, 'configure Mermaid skill', transaction), notes);
+}
+export function configureProtectedHelperPlatform(
+  cwd: string,
+  bunExecutable: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  runtimeLock?: RuntimeTransactionContext,
+): GlobalRuntimeStep {
+  if (platform !== 'win32') {
+    return {
+      step: 'configure protected helper platform',
+      status: 'skipped',
+      detail: `native ${platform} system toolchain`,
+    };
+  }
+  try {
+    const account = userInfo();
+    const contract = discoverWindowsProtectedHelperContract({ env });
+    const runtime = resolveProtectedHelperPlatform({
+      platform,
+      accountHome: account.homedir,
+      accountUsername: account.username,
+      bunExecutable,
+      contract,
+    });
+    const probeEnv: NodeJS.ProcessEnv = {
+      HOME: runtime.accountHome,
+      USER: runtime.accountUsername,
+      LOGNAME: runtime.accountUsername,
+      OS: 'Windows_NT',
+      USERPROFILE: runtime.accountHome,
+      USERNAME: runtime.accountUsername,
+      SystemRoot: runtime.systemRoot,
+      WINDIR: runtime.systemRoot,
+      PATHEXT: '.COM;.EXE;.BAT;.CMD',
+      PATH: runtime.pathEntries.join(runtime.pathDelimiter),
+      TMPDIR: runtime.tempDir,
+      TEMP: runtime.tempDir,
+      TMP: runtime.tempDir,
+    };
+    const git = runProcess(contract.git_bin, ['--version'], cwd, gitChildEnv(['--version'], probeEnv), false);
+    if (git.status !== 'ok') {
+      return { ...git, step: 'configure protected helper platform', detail: 'Git for Windows probe failed' };
+    }
+    const bash = runProcess(contract.bash_bin, ['--version'], cwd, probeEnv, false);
+    if (bash.status !== 'ok') {
+      return { ...bash, step: 'configure protected helper platform', detail: 'Git for Windows Bash probe failed' };
+    }
+    const taskkill = runProcess(runtime.taskkillBin!, ['/?'], cwd, probeEnv, false);
+    if (taskkill.status !== 'ok') {
+      return { ...taskkill, step: 'configure protected helper platform', detail: 'Windows taskkill probe failed' };
+    }
+    const written = writeWindowsProtectedHelperContract(contract, account.homedir, runtimeLock);
+    return {
+      step: 'configure protected helper platform',
+      status: 'ok',
+      detail: `${written.changed ? 'pinned' : 'verified'} ${contract.distribution} at ${contract.git_root}`,
+    };
+  } catch (error) {
+    return {
+      step: 'configure protected helper platform',
+      status: 'failed',
+      stderr: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function ensureOperatorConsole(sourceRoot: string, cwd: string, bunExecutable: string, env: NodeJS.ProcessEnv, registry: boolean): GlobalRuntimeStep {
+  const step = 'ensure operator console';
+  const localPackage = join(sourceRoot, 'packages', 'operator-web');
+  if (!registry && !existsSync(join(localPackage, 'dist', 'index.html'))) {
+    return { step, status: 'failed', detail: `console build missing; run bun run build:operator-web in ${sourceRoot}` };
+  }
+  const globalRoot = bunGlobalPackageRoot(env);
+  let cliRoot: string;
+  let cliVersion: unknown;
+  try {
+    if (globalRoot === null) return { step, status: 'failed', detail: 'unable to resolve Bun global package root' };
+    cliRoot = dirname(realpathSync(join(globalRoot, 'package.json')));
+    cliVersion = readPackageManifest(cliRoot).version;
+  } catch (error) {
+    return { step, status: 'failed', detail: `CLI readback failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (typeof cliVersion !== 'string' || !cliVersion) return { step, status: 'failed', detail: 'installed CLI version is unavailable' };
+  let install: GlobalRuntimeStep = { step, status: 'ok' };
+  try {
+    if (registry) {
+      const spec = `${OPERATOR_WEB_PACKAGE_NAME}@${cliVersion}`;
+      install = runProcess(bunExecutable, ['add', '-g', spec, '--no-cache'], cwd, env);
+      if (install.status !== 'ok') return withStepName(install, step, spec);
+    } else {
+      try {
+        const modules = join(cliRoot, 'node_modules');
+        const target = join(modules, OPERATOR_WEB_PACKAGE_NAME);
+        mkdirSync(modules, { recursive: true });
+        try {
+          if (!lstatSync(target).isSymbolicLink()) return { step, status: 'failed', detail: `console path is not a symlink: ${target}` };
+          rmSync(target);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        symlinkSync(resolve(localPackage), target, 'dir');
+      } catch (error) {
+        return { step, status: 'failed', detail: `console link failed: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    }
+    const consoleRoot = findInstalledPackageRoot(cliRoot, OPERATOR_WEB_PACKAGE_NAME);
+    const version = consoleRoot === null ? null : readPackageManifest(consoleRoot).version;
+    if (version !== cliVersion) return { ...install, step, status: 'failed', detail: `console readback mismatch: expected ${cliVersion}, got ${String(version)}` };
+    return withStepName(install, step, `version=${version}`);
+  } catch (error) {
+    return { ...install, step, status: 'failed', detail: `console readback failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+function ensureCodegraphCli(cwd: string, bunExecutable: string, codegraphVersion: string, env?: NodeJS.ProcessEnv, refresh = false): GlobalRuntimeStep {
+  const codegraphPackage = `@colbymchenry/codegraph@${codegraphVersion}`;
+  const check = runProcess("codegraph", ["--version"], cwd, env);
+  if (!refresh && check.status === "ok") return withStepName(check, "ensure CodeGraph CLI", "present");
+  const install = runProcess(bunExecutable, ["add", "-g", codegraphPackage], cwd, env);
+  if (install.status !== "ok") return withStepName(install, "ensure CodeGraph CLI", codegraphPackage);
+  const recheck = runProcess("codegraph", ["--version"], cwd, env);
+  if (recheck.status === "ok") {
+    if (refresh) {
+      let installedVersion: unknown = null;
+      try {
+        const globalPackageRoot = bunGlobalPackageRoot(env);
+        const codegraphRoot = globalPackageRoot === null
+          ? null
+          : findInstalledPackageRoot(globalPackageRoot, "@colbymchenry/codegraph");
+        installedVersion = codegraphRoot === null ? null : readPackageManifest(codegraphRoot).version;
+      } catch (error) {
+        return {
+          ...recheck,
+          step: "ensure CodeGraph CLI",
+          status: "failed",
+          detail: `CodeGraph package readback failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      if (installedVersion !== codegraphVersion) {
+        return {
+          ...recheck,
+          step: "ensure CodeGraph CLI",
+          status: "failed",
+          detail: `CodeGraph readback mismatch: expected ${codegraphVersion}, got ${String(installedVersion)}`,
+        };
+      }
+    }
+    return withStepName(recheck, "ensure CodeGraph CLI", refresh ? `updated=${codegraphVersion}` : "installed");
+  }
+  return {
+    ...recheck,
+    step: "ensure CodeGraph CLI",
+    status: "failed",
+    detail: `${codegraphPackage} installed, but codegraph is not on PATH`,
+  };
+}
+
+export const HERDR_CORE_STEP = "ensure herdr-core (hc)";
+export const BUN_BOOTSTRAP_STEP = "import Bun bootstrap record";
+
+/** Node `<platform>-<arch>` to the pin's release asset name. */
+const HC_ASSET_NAMES: Readonly<Record<string, string>> = {
+  "darwin-arm64": "macos-aarch64",
+  "darwin-x64": "macos-x86_64",
+  "linux-arm64": "linux-aarch64",
+  "linux-x64": "linux-x86_64",
+  "win32-x64": "windows-x86_64",
+};
+
+export interface HerdrCoreInstallInput {
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  /** The command to rerun after a manual install. */
+  readonly command: "install" | "update";
+  /** Node `<platform>-<arch>`. */
+  readonly platform: string;
+  readonly minVersion: string;
+  readonly assets: Readonly<Record<string, HcReleaseAsset>>;
+}
+
+function processFailure(result: { readonly stderr: string; readonly error?: string; readonly status: number | null }): string {
+  return (result.stderr || result.error || "").trim() || `exit ${result.status}`;
+}
+
+function hcVersionOf(hc: string, cwd: string, env: NodeJS.ProcessEnv): { version: string } | { failure: string } {
+  const result = runBoundedProcess(hc, ["--version"], { cwd, env, timeoutMs: 5_000 });
+  const version = /^hc ([0-9]+\.[0-9]+\.[0-9]+)$/u.exec(result.stdout.trim())?.[1];
+  if (result.ok && version !== undefined) return { version };
+  return { failure: `${hc} --version failed: ${processFailure(result)}` };
+}
+
+/**
+ * The official install layout of one platform (releases.herdr.dev/core
+ * install.sh and install.ps1): the install directory, the archive members it
+ * copies, and the hc link. Windows extracts the zip with its own tar.exe;
+ * the Git Bash tar cannot open a zip.
+ */
+interface HcInstallLayout {
+  readonly dir: string;
+  readonly binary: string;
+  readonly members: readonly string[];
+  readonly link: string;
+  readonly linkKind: "symlink" | "hardlink";
+  readonly tar: string;
+  /** Windows only: the PowerShell that adds `dir` to the user PATH (owner M62). Unix edits no shell profile. */
+  readonly powershell: string | null;
+}
+
+function hcInstallLayout(assetName: string, env: NodeJS.ProcessEnv): HcInstallLayout | { failure: string } {
+  if (assetName !== "windows-x86_64") {
+    const dir = join(homeDir(env), ".local", "bin");
+    return { dir, binary: "herdr-core", members: ["herdr-core"], link: "hc", linkKind: "symlink", tar: "tar", powershell: null };
+  }
+  if (!env.LOCALAPPDATA) return { failure: "LOCALAPPDATA is not set; it names the herdr-core install directory" };
+  if (!env.SystemRoot) return { failure: "SystemRoot is not set; it names the Windows tar.exe that opens the herdr-core zip" };
+  const tar = join(env.SystemRoot, "System32", "tar.exe");
+  if (!existsSync(tar)) return { failure: `${tar} is missing; it opens the herdr-core zip (Windows 10 1803 or newer)` };
+  const powershell = windowsPowershellPath(env)!;
+  if (!existsSync(powershell)) return { failure: `${powershell} is missing; it adds the herdr-core directory to the user PATH` };
+  return { dir: join(env.LOCALAPPDATA, "Programs", "herdr-core"), binary: "herdr-core.exe", members: ["herdr-core.exe", "conpty"], link: "hc.exe", linkKind: "hardlink", tar, powershell };
+}
+
+export interface HerdrCoreInstallResult {
+  readonly step: GlobalRuntimeStep;
+  /** The install directory when it is not on PATH: the later steps of this run put it first on their PATH. */
+  readonly pathEntry: string | null;
+}
+
+/**
+ * Bring hc on PATH to the package floor. Missing: download the pinned asset,
+ * check its sha256 and the downloaded hc, then install it in the official
+ * layout; the ledger records each entry that the install created as a tool
+ * record (#2853), and an existing hc install file is never overwritten. Below
+ * the floor: `hc update --version <floor>`; the record follows the update only
+ * for the hc that rh recorded and that still holds its recorded bytes. At or
+ * above: no change.
+ */
+export function ensureHerdrCore(input: HerdrCoreInstallInput): HerdrCoreInstallResult {
+  const { cwd, env, minVersion } = input;
+  const done = (step: Omit<GlobalRuntimeStep, "step">, pathEntry: string | null = null): HerdrCoreInstallResult => ({ step: { step: HERDR_CORE_STEP, ...step }, pathEntry });
+  const fail = (detail: string): HerdrCoreInstallResult => done({ status: "failed", detail });
+  // A recorded entry that is gone loses its record now, so an hc that comes back there later is not rh's.
+  try { openHostConfigGate({ env }).releaseAbsentTools(null); }
+  catch (error) { return fail(`the herdr-core tool record could not be read: ${(error as Error).message}`); }
+  const hc = findOnPath("hc", env);
+  if (hc !== null) {
+    const current = hcVersionOf(hc, cwd, env);
+    if ("failure" in current) return fail(current.failure);
+    if (compareHcVersions(current.version, minVersion) >= 0) {
+      return done({ status: "ok", detail: `hc ${current.version} at ${hc} is at or above ${minVersion}; no change` });
+    }
+    const ran: { update?: ReturnType<typeof runBoundedProcess> } = {};
+    const runUpdate = () => { ran.update = runBoundedProcess(hc, ["update", "--version", minVersion], { cwd, env, timeoutMs: 300_000 }); };
+    try {
+      if (!recordedToolIsCurrent(env, "herdr-core", hc)) runUpdate();
+      else {
+        const keys = Object.keys(readLedger(hostConfigPaths(env)).tools["herdr-core"]!.paths);
+        openHostConfigGate({ env }).delegate([{ tool: "herdr-core", version: minVersion, directory: dirname(keys[0]!), entries: keys.map(key => basename(key)) }], runUpdate);
+      }
+    } catch (error) { return fail(`hc update --version ${minVersion} could not be recorded: ${(error as Error).message}`); }
+    const update = ran.update!;
+    if (!update.ok) return fail(`hc client ${current.version} is below the repo-harness floor ${minVersion}; hc update --version ${minVersion} failed: ${processFailure(update)}`);
+    const updated = hcVersionOf(hc, cwd, env);
+    if ("failure" in updated) return fail(updated.failure);
+    if (compareHcVersions(updated.version, minVersion) < 0) return fail(`hc update --version ${minVersion} left hc client ${updated.version} below the repo-harness floor ${minVersion}`);
+    return done({ status: "ok", detail: `hc client ${current.version} was below the repo-harness floor ${minVersion}; hc update --version ${minVersion} updated it to ${updated.version} at ${hc}` });
+  }
+
+  const assetName = HC_ASSET_NAMES[input.platform];
+  const asset = assetName === undefined ? undefined : input.assets[assetName];
+  if (assetName === undefined || asset === undefined) {
+    return fail(`no herdr-core release asset for ${input.platform}; install hc >=${minVersion} manually (Herdr.app or a herdr-core release), then run rh ${input.command}`);
+  }
+  const layout = hcInstallLayout(assetName, env);
+  if ("failure" in layout) return fail(layout.failure);
+  for (const name of [...layout.members, layout.link]) {
+    const path = join(layout.dir, name);
+    // An earlier run may have installed it into a dir that is still off PATH.
+    if (pathEntryExists(path)) return fail(`hc is not on PATH, and ${path} exists; refusing to overwrite it; add ${layout.dir} to PATH, then rerun rh ${input.command}`);
+  }
+  const scratch = mkdtempSync(join(tmpdir(), "repo-harness-hc-"));
+  try {
+    const archive = join(scratch, assetName === "windows-x86_64" ? "herdr-core.zip" : "herdr-core.tar.gz");
+    const download = runBoundedProcess("curl", ["--fail", "--location", "--silent", "--show-error", "--output", archive, asset.url], { cwd, env, timeoutMs: 300_000 });
+    if (!download.ok) return fail(`download of ${asset.url} failed: ${processFailure(download)}`);
+    const actual = sha256Hex(readFileSync(archive));
+    if (actual !== asset.sha256) return fail(`sha256 mismatch for ${asset.url}: expected ${asset.sha256}, got ${actual}; nothing installed`);
+    const extract = join(scratch, "extract");
+    mkdirSync(extract);
+    const unpack = runBoundedProcess(layout.tar, ["-xf", archive, "-C", extract], { cwd, env });
+    if (!unpack.ok) return fail(`extract of ${asset.url} failed: ${processFailure(unpack)}`);
+    const missing = layout.members.filter(name => !existsSync(join(extract, name)));
+    if (assetName === "windows-x86_64" && !existsSync(join(extract, "conpty", "conpty.dll"))) missing.push(join("conpty", "conpty.dll"));
+    if (missing.length > 0) return fail(`${asset.url} holds no complete hc (missing ${missing.join(", ")}); nothing installed`);
+    const downloaded = hcVersionOf(join(extract, layout.binary), cwd, env);
+    if ("failure" in downloaded) return fail(`the downloaded hc does not run on this machine: ${downloaded.failure}`);
+    if (downloaded.version !== minVersion) return fail(`the downloaded hc reports ${downloaded.version}, expected ${minVersion}; nothing installed`);
+
+    const gate = openHostConfigGate({ env });
+    try {
+      gate.delegate([{ tool: "herdr-core", version: downloaded.version, directory: layout.dir, entries: [...layout.members, layout.link] }], ([dir]) => {
+        mkdirSync(dir!, { recursive: true });
+        const binary = join(dir!, layout.binary);
+        for (const name of layout.members) cpSync(join(extract, name), join(dir!, name), { recursive: true, force: false, errorOnExist: true });
+        chmodSync(binary, 0o755);
+        if (layout.linkKind === "symlink") symlinkSync(layout.binary, join(dir!, layout.link));
+        else linkSync(binary, join(dir!, layout.link));
+      });
+    } catch (error) { return fail(`installing hc into ${layout.dir} failed: ${(error as Error).message}`); }
+    const installed = `installed hc ${downloaded.version} (sha256 verified) into ${layout.dir}: ${[...layout.members, layout.link].join(", ")}`;
+    let pathNote: string | null = null;
+    if (layout.powershell !== null) {
+      let outcome: "listed" | "added";
+      try { outcome = gate.addUserPathEntry("herdr-core", layout.dir, windowsUserPathPort(layout.powershell, cwd, env)); }
+      catch (error) { return fail(`${installed}; adding ${layout.dir} to the user PATH failed: ${(error as Error).message}`); }
+      pathNote = outcome === "added" ? `added ${layout.dir} to the user PATH: new terminals have hc` : `${layout.dir} is already on the user PATH`;
+    }
+    // Windows paths compare without case, as install.ps1 does.
+    const samePath = (left: string) => process.platform === "win32" ? resolve(left).toLowerCase() === resolve(layout.dir).toLowerCase() : resolve(left) === resolve(layout.dir);
+    const onPath = (env.PATH ?? "").split(delimiter).some(entry => entry !== "" && samePath(entry));
+    const runNote = onPath ? null : `${pathNote === null ? `add ${layout.dir} to PATH to use hc; ` : ""}this run uses it for its later steps`;
+    return done({ status: "ok", detail: [installed, pathNote, runNote].filter(note => note !== null).join("; ") }, onPath ? null : layout.dir);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+function withPlugin(plugins: readonly PluginId[], id: PluginId): readonly PluginId[] {
+  return [...new Set([...plugins, id])].sort() as PluginId[];
+}
+
+/** Update fills introduced keys and removes retired routing keys and fleet roles. */
+export function migrateSeatsConfiguration(env: NodeJS.ProcessEnv, runtimeLock?: RuntimeTransactionContext, beforeWrite?: (path: string, text: string) => void): boolean {
+  return mutateGlobalConfiguration(env, config => {
+    try {
+      decodeSeatsConfig(config.seats);
+      return { value: false };
+    } catch (error) {
+      if (!(error instanceof SeatsConfigMigrationRequiredError)) throw error;
+    }
+    const { orchestrator: _orchestrator, advisor: _advisor, worker: _worker, ...introduced } = DEFAULT_SEATS_CONFIG;
+    const { record: legacyMigrated } = migrateLegacySeatsRecord(config.seats as Record<string, unknown>);
+    const stored = stripRetiredSeatFleetRoles(legacyMigrated);
+    let routing = stored.routing;
+    if (typeof routing === 'object' && routing !== null && ('mode' in routing || 'hyper' in routing)) {
+      const row = routing as Record<string, unknown>;
+      const keys = [...ROUTING_CLASSES, 'mode', 'low_quota_explorer', 'hyper'];
+      const invalid = (): never => { throw new Error('seats_config_invalid'); };
+      if (keys.some(key => !Object.hasOwn(row, key)) || Object.keys(row).some(key => !keys.includes(key))
+        || (row.mode !== 'standard' && row.mode !== 'hyper')) invalid();
+      const hyper = row.hyper as Record<string, unknown> | null;
+      const targets = ['claude', 'advisor', 'codex'];
+      if (typeof hyper !== 'object' || hyper === null || Array.isArray(hyper)
+        || Object.keys(hyper).length !== targets.length || targets.some(key => !Object.hasOwn(hyper, key))) invalid();
+      const ranges = seatsRanges([]);
+      for (const target of targets) {
+        const value = hyper![target] as Record<string, unknown> | null;
+        if (typeof value !== 'object' || value === null || Array.isArray(value) || Object.keys(value).length !== 2
+          || !Object.hasOwn(value, 'model') || !Object.hasOwn(value, 'effort')
+          || value.model !== null && !seatModelShapeValid(target === 'codex' ? 'codex' : 'claude', value.model)
+          || value.effort !== null && !ranges.efforts.includes(value.effort as string)) invalid();
+      }
+      const { mode: _mode, hyper: _hyper, ...kept } = row;
+      routing = { ...kept, claude_saving_below_remaining: DEFAULT_SEATS_CONFIG.routing.claude_saving_below_remaining };
+    }
+    if (typeof routing === 'object' && routing !== null && !Array.isArray(routing)) {
+      const { codex_hyper_at_or_above_remaining: _codexHyper, ...kept } = routing as Record<string, unknown>;
+      routing = { ...INTRODUCED_ROUTING_DEFAULTS, ...kept };
+    }
+    const base = { ...introduced, 'worker-light': null, ...stored };
+    const effectiveRouting = routing ?? (base['worker-light'] === null
+      ? {
+          ...introduced.routing,
+          important_fast: introduced.routing.important_fast.filter(id => id !== 'worker-light'),
+          simple_fast: introduced.routing.simple_fast.filter(id => id !== 'worker-light'),
+        }
+      : introduced.routing);
+    const seats = decodeSeatsConfig({ ...base, routing: effectiveRouting });
+    checkSeatRoutingModels(seats.routing);
+    return { config: { ...config, seats }, value: true };
+  }, { runtimeLock, beforeWrite }).value;
+}
+
+/** Update removes the retired `brainRoot` key once. That key is the only member it edits; every other byte stays. */
+export function removeBrainRootConfiguration(env: NodeJS.ProcessEnv, runtimeLock?: RuntimeTransactionContext, beforeWrite?: (path: string, text: string) => void): boolean {
+  return mutateGlobalConfiguration(env, config => (Object.hasOwn(config, 'brainRoot')
+    ? { config: Object.fromEntries(Object.entries(config).filter(([key]) => key !== 'brainRoot')), value: true }
+    : { value: false }), { runtimeLock, beforeWrite, render: renderJsonObjectUpdate }).value;
+}
+
+class RuntimeSetupFailure extends Error {
+  constructor(readonly result: GlobalRuntimeResult) { super('runtime setup failed'); }
+}
+
+export function runGlobalRuntimeSetup(opts: GlobalRuntimeOptions = {}): GlobalRuntimeResult {
+  const env = opts.env ?? process.env;
+  requireHome(env);
+  if (opts.transaction !== undefined) return runGlobalRuntimeSetupInTransaction(opts);
+  if (opts.plugins === undefined) requireInstallState(env);
+  try {
+    return withHostConfigTransaction(env, undefined, (transaction, runtimeLock) => {
+      const result = runGlobalRuntimeSetupInTransaction({ ...opts, transaction, runtimeLock });
+      if (result.exitCode !== 0) throw new RuntimeSetupFailure(result);
+      return result;
+    }, () => {
+      recoverRetiredAgentFleet(env);
+      if (opts.hostAdapters !== false) migrateRuntimeHostConfig(env);
+    });
+  } catch (error) {
+    if (error instanceof RuntimeSetupFailure) return error.result;
+    throw error;
+  }
+}
+
+function runGlobalRuntimeSetupInTransaction(opts: GlobalRuntimeOptions): GlobalRuntimeResult {
+  const sourceRoot = opts.sourceRoot ?? defaultSourceRoot();
+  const cwd = opts.cwd ?? process.cwd();
+  const target = opts.target ?? "both";
+  const bunExecutable = resolveBunExecutable(opts.env);
+  let env = bindBunRuntimeEnv(commandEnv(sourceRoot, opts.env), bunExecutable);
+  const plugins = opts.plugins ?? enabledPlugins(requireInstallState(env));
+  const piSelected = plugins.includes('pi');
+  const updateMode = opts.updateMode === true;
+  const steps: GlobalRuntimeStep[] = [];
+
+  // Before any host write, Bun upgrade included: a refused file stops the update and changes nothing.
+  if (updateMode) {
+    const step = 'check MCP local config';
+    const mcp = !plugins.includes('mcp') ? { status: 'skipped' as const, detail: 'mcp plugin not selected' }
+      : opts.mcpLocalConfigCheck?.(env) ?? { status: 'skipped' as const, detail: 'no MCP local config check was given' };
+    steps.push({ step, ...mcp });
+    if (mcp.status === 'failed') return finalizeRuntimeResult(steps);
+  }
+
+  const bunRuntime = ensureSupportedBunRuntime(cwd, env, bunExecutable);
+  steps.push(bunRuntime);
+  if (bunRuntime.status === "failed") {
+    return finalizeRuntimeResult(steps);
+  }
+
+  // A bootstrap Bun is at the measured version, so the runtime step above never upgrades it before the import.
+  try {
+    const imported = importBunBootstrapRecord(env);
+    steps.push({ step: BUN_BOOTSTRAP_STEP, status: imported === 'none' ? 'skipped' : 'ok',
+      detail: { none: 'no Bun bootstrap record', imported: 'recorded the Bun that the bootstrap installed; no command removes it',
+        already_recorded: 'the ledger already records this Bun', changed: 'the Bun binary changed since the bootstrap measured it, so rh records no Bun' }[imported] });
+  } catch (error) {
+    steps.push({ step: BUN_BOOTSTRAP_STEP, status: 'failed', detail: (error as Error).message });
+    return finalizeRuntimeResult(steps);
+  }
+
+  // Read-only plan before any host write. A file that cannot be synced is
+  // reported as skipped and never stops the run, because an older parent CLI
+  // hands update to this candidate without --report-language. The process
+  // that reaches the host-write section below applies this plan.
+  const globalRules = preflightGlobalContextRefresh(sourceRoot, homeDir(env), hostIds(target), opts.reportLanguage);
+
+  if (updateMode) {
+    let backupPath: string | undefined;
+    const beforeWrite = (path: string, text: string): void => {
+      if (backupPath !== undefined) return;
+      const backup = `${path}.bak-${new Date().toISOString().replace(/[:.]/g, '-')}-update`;
+      let fd: number;
+      try {
+        fd = openSync(backup, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+          throw new Error(`Cannot create backup ${backup}: path already exists. Move or remove it and retry the update.`);
+        }
+        throw error;
+      }
+      try {
+        try {
+          writeAllSync(fd, Buffer.from(text, 'utf8'));
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+      } catch (error) {
+        try { unlinkSync(backup); } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], `Cannot remove incomplete backup ${backup}: ${String(cleanupError)}`);
+        }
+        throw error;
+      }
+      syncDirectoryDurably(dirname(backup));
+      backupPath = backup;
+      steps.push({ step: 'back up global configuration', status: 'ok', detail: `Saved the configuration before update migrations to ${backup}.` });
+    };
+    const step = 'migrate seats configuration';
+    try {
+      const migrated = migrateSeatsConfiguration(env, opts.runtimeLock, beforeWrite);
+      steps.push({ step, status: migrated ? 'ok' : 'skipped', detail: migrated ? 'Wrote the complete seats section.' : 'No seats migration required.' });
+    } catch (error) {
+      steps.push({ step, status: 'failed', detail: error instanceof Error ? error.message : String(error) });
+      return finalizeRuntimeResult(steps);
+    }
+    const brainStep = 'remove the retired brainRoot configuration key';
+    try {
+      const removed = removeBrainRootConfiguration(env, opts.runtimeLock, beforeWrite);
+      steps.push({ step: brainStep, status: removed ? 'ok' : 'skipped', detail: removed ? 'Removed brainRoot; every other configuration byte stays.' : 'No brainRoot key.' });
+    } catch (error) {
+      steps.push({ step: brainStep, status: 'failed', detail: error instanceof Error ? error.message : String(error) });
+      return finalizeRuntimeResult(steps);
+    }
+  }
+
+  const protectedHelperPlatform = configureProtectedHelperPlatform(cwd, bunExecutable, env, process.platform, opts.runtimeLock);
+  steps.push(protectedHelperPlatform);
+  if (protectedHelperPlatform.status === 'failed') return finalizeRuntimeResult(steps);
+
+  if (opts.installCli !== false) {
+    const install = installCli(sourceRoot, cwd, bunExecutable, env, opts.installSpec);
+    steps.push(install);
+    if (updateMode && install.status === 'failed') return finalizeRuntimeResult(steps);
+    // The parent has loaded predecessor contracts. The installed candidate owns
+    // dependency and daemon verification as well as later host writes.
+    if (updateMode && install.status === 'ok' && opts.installSpec && opts.candidateHandoff) {
+      steps.push(reconcileWithInstalledCandidate(opts, cwd, bunExecutable, env, target));
+      return finalizeRuntimeResult(steps);
+    }
+    if (updateMode && install.status === "ok" && opts.installSpec) {
+      steps.push(reconcileManagedRuntime(cwd, bunExecutable, env, opts.installSpec, plugins, true));
+    }
+    if (updateMode && steps.some((step) => step.status === "failed")) return finalizeRuntimeResult(steps);
+  }
+  else {
+    steps.push({ step: "install repo-harness CLI", status: "skipped", detail: "disabled" });
+    if (updateMode && opts.installSpec) steps.push(reconcileManagedRuntime(cwd, bunExecutable, env, opts.installSpec, plugins, true));
+    if (updateMode && steps.some((step) => step.status === "failed")) return finalizeRuntimeResult(steps);
+  }
+
+  const consoleStep = plugins.includes('operator')
+    ? ensureOperatorConsole(sourceRoot, cwd, bunExecutable, env, (opts.installSpec?.startsWith('repo-harness@') ?? false) || !isCheckoutSource(sourceRoot))
+    : { step: 'ensure operator console', status: 'skipped' as const, detail: 'operator plugin not selected' };
+  steps.push(consoleStep);
+  if (consoleStep.status === 'failed') return finalizeRuntimeResult(steps);
+
+  if (updateMode && opts.installSpec) {
+    const daemon = inspectManagedDaemonRuntime(cwd, env, plugins);
+    // Package installation succeeded. Shared-daemon maintenance must not roll
+    // that candidate back and strand hoisted dependencies at a newer version.
+    // The strict installed-runtime verifier above still fails on this state.
+    steps.push(daemon.status === 'failed'
+      ? { ...daemon, status: 'skipped', detail: `Daemon readiness pending; verified packages retained. ${daemon.detail}` }
+      : daemon);
+  }
+
+  const architectureConfiguration = configureArchitectureProjection(env, plugins, opts.runtimeLock);
+  steps.push(architectureConfiguration);
+  if (architectureConfiguration.status === 'failed') return finalizeRuntimeResult(steps);
+
+  if (opts.syncSkill !== false) steps.push(syncRuntimeSkill(sourceRoot, plugins, target, env, opts.transaction));
+  else steps.push({ step: "sync repo-harness skill runtime", status: "skipped", detail: "disabled" });
+
+  if (opts.hostAdapters !== false) steps.push(installHostAdapters(target, env, opts.overrides));
+  else steps.push({ step: "install host adapters", status: "skipped", detail: "disabled" });
+
+  steps.push(installAgentFleet(sourceRoot, bunExecutable, env, opts.transaction));
+
+  steps.push({ step: GLOBAL_RULES_REFRESH_STEP, ...applyGlobalContextRefresh(globalRules, homeDir(env)) });
+  if (steps.at(-1)?.status === "failed") return finalizeRuntimeResult(steps);
+  // After the refresh, so the managed block is current and every remaining call is in user text.
+  if (updateMode) steps.push(findRetiredCliCalls(env, target, globalRules));
+
+  const refreshExternalSkills = opts.externalSkills === true;
+  if (refreshExternalSkills) {
+    const waza = installWazaSkills(sourceRoot, target, piSelected, env, updateMode, opts.transaction);
+    steps.push(waza);
+    if (waza.status === "failed") return finalizeRuntimeResult(steps);
+    steps.push(waza.status === "ok"
+      ? { step: WAZA_RULES_STEP, ...syncWazaSharedRules(homeDir(env), hostIds(target), env, updateMode ? true : 'missing', opts.transaction) }
+      : { step: WAZA_RULES_STEP, status: "skipped", detail: "Waza install failed" });
+    if (steps.at(-1)?.status === "failed") return finalizeRuntimeResult(steps);
+    const mermaid = installMermaidSkill(sourceRoot, target, piSelected, env, updateMode, opts.transaction);
+    steps.push(mermaid);
+    if (mermaid.status === "failed") return finalizeRuntimeResult(steps);
+  } else {
+    steps.push({ step: "configure Waza skills", status: "skipped", detail: "disabled" });
+    steps.push({ step: "configure Mermaid skill", status: "skipped", detail: "disabled" });
+  }
+
+  if (opts.obsidianSkills === true && !plugins.includes('strategy-memory')) {
+    steps.push({
+      step: "configure Obsidian companion Skills",
+      status: "failed",
+      detail: `--with-obsidian-skills needs the strategy-memory plugin; run: ${installSelectionCommand(withPlugin(plugins, 'strategy-memory'))} --with-obsidian-skills`,
+    });
+  } else if (opts.obsidianSkills === true) {
+    const catalog = loadSkillSurfaceCatalog(sourceRoot);
+    const selection = requiredExplicitExternalDependencyInstallGroups(
+      catalog,
+      "obsidian-memory",
+      hostIds(target),
+    );
+    if (selection.status !== "selected") {
+      steps.push({
+        step: "configure Obsidian companion Skills",
+        status: "failed",
+        detail: selection.status === "missing"
+          ? `required Obsidian dependency ${selection.name} is missing for the selected host target`
+          : selection.status === "not_explicit_only"
+            ? `catalog package ${selection.name} must remain explicit-only`
+            : `catalog package ${selection.name} requires a pinned tree integrity digest`,
+      });
+    } else {
+      for (const { provider, hosts, skills, integrityBySkill } of selection.groups) {
+        steps.push(installExternalSkillGroup(
+          sourceRoot,
+          targetFromHostIds(hosts),
+          piSelected,
+          provider,
+          skills,
+          integrityBySkill,
+          env,
+          updateMode,
+          opts.transaction,
+        ));
+        if (steps.at(-1)?.status === "failed") break;
+      }
+    }
+  } else {
+    steps.push({
+      step: "configure Obsidian companion Skills",
+      status: "skipped",
+      detail: "requires explicit --with-obsidian-skills opt-in",
+    });
+  }
+
+  if (plugins.includes('cross-review') || plugins.includes('peer-runtime')) {
+    steps.push(...syncCrossReviewSkills(sourceRoot, target, env, plugins, opts.transaction));
+  } else {
+    steps.push({ step: "cross-review skills", status: "skipped", detail: "cross-review and peer-runtime plugins not selected" });
+  }
+
+  // CodeGraph follows the architecture plugin; `codegraph` only allows it.
+  if (!plugins.includes('architecture')) {
+    steps.push({ step: "ensure CodeGraph CLI", status: "skipped", detail: "architecture plugin not selected" });
+    steps.push({ step: "configure CodeGraph MCP", status: "skipped", detail: "architecture plugin not selected" });
+  } else if (opts.codegraph ?? updateMode) {
+    const setup = architecturePort('setup');
+    const codegraphPort = architecturePort('codegraph');
+    const ensure = isArchitectureUnavailable(setup)
+      ? { step: "ensure CodeGraph CLI", status: "failed" as const, detail: setup.message }
+      : isArchitectureUnavailable(codegraphPort)
+        ? { step: "ensure CodeGraph CLI", status: "failed" as const, detail: codegraphPort.message }
+        : ensureCodegraphCli(cwd, bunExecutable, setup.codegraphVersion, env, updateMode);
+    steps.push(ensure);
+    if (ensure.status === "ok" && !isArchitectureUnavailable(codegraphPort)) steps.push(codegraphPort.configureMcp(cwd, target, env));
+    else steps.push({ step: "configure CodeGraph MCP", status: "skipped", detail: "CodeGraph CLI install failed" });
+  } else {
+    steps.push({ step: "ensure CodeGraph CLI", status: "skipped", detail: "disabled" });
+    steps.push({ step: "configure CodeGraph MCP", status: "skipped", detail: "disabled" });
+  }
+
+  if (steps.every((step) => step.status !== "failed")) {
+    const herdr = loadSkillSurfaceCatalog(sourceRoot).packages.find((pkg) => pkg.name === "herdr");
+    if (herdr === undefined) steps.push({ step: HERDR_CORE_STEP, status: "failed", detail: "the skill-surface catalog has no herdr package" });
+    else if (!ownerEnabled(herdr.owner, plugins)) steps.push({ step: HERDR_CORE_STEP, status: "skipped", detail: `no selected plugin needs hc (herdr owner ${herdr.owner})` });
+    else {
+      const hc = ensureHerdrCore({ cwd, env, command: updateMode ? "update" : "install", platform: `${process.platform}-${process.arch}`, minVersion: HC_MIN_VERSION, assets: HC_RELEASE_ASSETS });
+      steps.push(hc.step);
+      // The directory that this run wrote, never a searched one; the user PATH stays unchanged.
+      if (hc.pathEntry !== null) env = { ...env, PATH: [hc.pathEntry, env.PATH].filter(Boolean).join(delimiter) };
+    }
+  }
+  if (steps.every((step) => step.status !== "failed")) steps.push(configureRequiredHerdrSkill(target, env, opts.transaction, piSelected));
+  if (steps.every((step) => step.status !== 'failed')) {
+    steps.push(installPiPackage(bunGlobalPackageRoot(env)!, plugins.includes('pi') && target === 'both' && opts.hostAdapters !== false, env));
+  }
+  steps.push(...writeRuntimeIgnoreRules(env, updateMode));
+  if (opts.transaction !== undefined && steps.every(step => step.status !== 'failed')) {
+    const retirement = retireFleet(env, opts.transaction);
+    if (retirement) steps.push(retirement);
+  }
+  // Last, and only after every other step passed: a failed update keeps the previous command.
+  if (updateMode && steps.every(step => step.status !== 'failed')) steps.push(retireCliLink(env));
+  return finalizeRuntimeResult(steps);
+}

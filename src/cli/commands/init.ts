@@ -1,0 +1,376 @@
+import { bunGlobalPackageRoot, isBunGlobalPackageSource } from "../installer/skill-projection";
+import { architecturePort, isArchitectureUnavailable } from '../../core/architecture/contracts';
+/**
+ * Existing-repo harness adoption implementation.
+ *
+ * This backs the public `rh init` command and
+ * `repo-harness-setup`'s init mode: default the target repo to cwd, apply the
+ * repo-local workflow migration, register the repo, then verify the installed
+ * harness. Under HOME, init writes only the registry entry. Install-managed
+ * host files belong to the locked `install`/`update` transaction; init only
+ * reports what is missing.
+ */
+
+import { userInfo } from "os";
+import { requireHome } from "../../effects/repo-harness-home";
+import { spawnSync } from "child_process";
+import {
+  existsSync,
+  readFileSync,
+} from "fs";
+import { dirname, join, resolve } from "path";
+import { fileURLToPath } from "url";
+import type { InstallTargetSpec } from "./install";
+import {
+  hostSkillPlacements as catalogHostSkillPlacements,
+  parseSkillSurfaceCatalog,
+  type SkillSurfaceCatalog,
+} from "../../core/skill-surface/catalog";
+import type { PluginId } from "../../core/skill-surface/plugin-manifest";
+import { hostSkillRoot, SKILL_HOSTS, type SkillHost } from "../../effects/host-skill-roots";
+import { pathRecordKey } from "../../effects/host-config/path-records";
+import { openHostConfigGate } from "../../effects/host-config/gate";
+import { assertArchitecturePolicySelection, hostPathReplacementRefused, withHostConfigTransaction } from "../installer/install-profile";
+import { runProcess as runBoundedProcess } from "../../effects/process-runner";
+import { validateRepoAdoptionTarget } from "../repo-adoption/target";
+import { runAdoptionApply, runAdoptionPlan } from "./adoption-plan";
+import type { AdoptionMode } from "../../core/adoption/modes";
+
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(SCRIPT_DIR, "..", "..", "..");
+
+/**
+ * Host-scoped skills bundled under `assets/skills/<skill>`. The cross-review
+ * skill is host-aware; task-agent owns persistent plan consultation.
+ */
+type BundledHostSkill = { skill: string; host: SkillHost; step: string; owner: string };
+
+/**
+ * Reads and parses sourceRoot's skill-surface manifest. Parameterized by
+ * sourceRoot (not a fixed path) because this command backs `rh
+ * init`, which can target a package tree other than the currently-running
+ * code (npx cache extraction, a different installed copy); tests routinely
+ * override sourceRoot to a synthetic fixture tree for hermetic runs. Does
+ * not pass an `exists` callback (pre-catalog behavior here never checked
+ * package source paths on disk either), so behavior stays byte-identical to
+ * the literals it replaces.
+ */
+function loadSkillSurfaceCatalog(sourceRoot: string): SkillSurfaceCatalog {
+  const manifestPath = join(sourceRoot, "assets", "skill-commands", "manifest.json");
+  const source = existsSync(manifestPath) ? readFileSync(manifestPath, "utf-8") : null;
+  const resolution = parseSkillSurfaceCatalog(source, { declared: true });
+  if (resolution.status !== "valid") {
+    const detail = resolution.diagnostics.map((d) => `${d.code} ${d.path}: ${d.message}`).join("; ");
+    throw new Error(`invalid skill-surface catalog at ${manifestPath}: ${detail}`);
+  }
+  return resolution.catalog;
+}
+
+/**
+ * The provider-skill bundle: repo-harness-cross-review and the herdr portal
+ * (host-aware provider mode selection lives inside each package). Without
+ * `plugins` it is the unconditional bundle of the `rh init` flow,
+ * which has no install-state concept; with `plugins` it is the part that the
+ * selection's owners project.
+ */
+function crossReviewSkillsFromCatalog(catalog: SkillSurfaceCatalog, plugins?: readonly PluginId[]): ReadonlyArray<BundledHostSkill> {
+  const placements = catalogHostSkillPlacements(catalog, plugins);
+  const entries: BundledHostSkill[] = [];
+  for (const host of SKILL_HOSTS) {
+    for (const skill of placements[host]) entries.push({ skill, host, step: `cross-review skill ${skill}`, owner: host === "pi" ? "pi" : catalog.packages.find(pkg => pkg.name === skill)!.owner });
+  }
+  return entries;
+}
+
+export interface InitCommandOptions {
+  repo?: string;
+  sourceRoot?: string;
+  apply?: boolean;
+  verify?: boolean;
+  codegraph?: boolean;
+  syncCodegraph?: boolean;
+  target?: InstallTargetSpec;
+  mode?: AdoptionMode;
+  env?: NodeJS.ProcessEnv;
+  /** The recorded plugins. CodeGraph and the architecture readiness follow `architecture`. */
+  plugins: readonly PluginId[];
+}
+
+export interface InitStep {
+  /** The host path that the gate refused to replace; the selection commit counts the user's copy as present. */
+  refused_path?: string;
+  step: string;
+  status: "ok" | "skipped" | "failed";
+  command?: string[];
+  detail?: string;
+  stdout?: string;
+  stderr?: string;
+}
+
+export interface InitCommandResult {
+  exitCode: number;
+  repoRoot: string;
+  steps: InitStep[];
+  lines: string[];
+}
+
+/** The CodeGraph index step; this name also labels its skipped row. */
+const CODEGRAPH_INDEX_STEP = "ensure codegraph index";
+
+function runProcess(command: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv): InitStep {
+  const result = runBoundedProcess(command, args, { cwd, env });
+
+  return {
+    step: "",
+    status: result.ok ? "ok" : "failed",
+    command: [...result.command],
+    stdout: result.stdout,
+    stderr: result.stderr || result.error,
+  };
+}
+
+function withStepName(step: InitStep, name: string, detail?: string): InitStep {
+  return { ...step, step: name, detail: detail ?? step.detail };
+}
+
+function renderStep(step: InitStep): string[] {
+  const lines = [`[init] ${step.status}: ${step.step}${step.detail ? ` - ${step.detail}` : ""}`];
+  if (step.status === "failed" && step.stderr?.trim()) {
+    lines.push(step.stderr.trim());
+  }
+  return lines;
+}
+
+function hostIds(target: InstallTargetSpec): Array<"codex" | "claude"> {
+  if (target === "codex") return ["codex"];
+  if (target === "claude") return ["claude"];
+  return ["claude", "codex"];
+}
+
+function homeDir(env?: NodeJS.ProcessEnv): string | null {
+  return requireHome(env ?? process.env);
+}
+
+/**
+ * Adopted repos route agent collaboration through Herdr. The skill is a host
+ * projection owned by the locked install/update transaction, so init only
+ * reads it and names the command that projects it.
+ */
+function requiredHerdrSkillReadiness(target: InstallTargetSpec, env?: NodeJS.ProcessEnv): InitStep {
+  const step = "required Herdr skill";
+  const home = homeDir(env);
+  const missing = hostIds(target).filter((host) =>
+    !home || !existsSync(join(hostSkillRoot(home, host), "herdr", "SKILL.md")));
+  if (missing.length === 0) return { step, status: "ok", detail: "present" };
+  return {
+    step,
+    status: "skipped",
+    detail: `missing for ${missing.join(",")}; run: rh update --target ${target}`,
+  };
+}
+
+export function resolveOsAccountHome(): string | null {
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (process.platform === "darwin" && uid !== undefined) {
+    const identity = spawnSync("/usr/bin/id", ["-un", String(uid)], { encoding: "utf-8" });
+    const username = identity.status === 0 ? identity.stdout.trim() : "";
+    if (!/^[A-Za-z0-9._-]+$/.test(username)) return null;
+    const directory = spawnSync("/usr/bin/dscl", [".", "-read", `/Users/${username}`, "NFSHomeDirectory"], { encoding: "utf-8" });
+    const match = directory.status === 0 ? directory.stdout.match(/^NFSHomeDirectory:\s*(.+)$/m) : null;
+    return match?.[1]?.trim() || null;
+  }
+  if (process.platform === "linux" && uid !== undefined) {
+    for (const getent of ["/usr/bin/getent", "/bin/getent"]) {
+      if (!existsSync(getent)) continue;
+      const account = spawnSync(getent, ["passwd", String(uid)], { encoding: "utf-8" });
+      const accountHome = account.status === 0 ? account.stdout.trim().split(":")[5] : "";
+      if (accountHome) return accountHome;
+    }
+    const account = readFileSync("/etc/passwd", "utf-8")
+      .split("\n")
+      .find((line) => line.split(":")[2] === String(uid));
+    return account?.split(":")[5] || null;
+  }
+  return userInfo().homedir || null;
+}
+
+export { validateRepoAdoptionTarget } from "../repo-adoption/target";
+
+/**
+ * Install each bundled skill into its one declared host. Respects `target`, is
+ * idempotent (identical SKILL.md → "already present"), and treats a missing
+ * bundled source as `skipped`.
+ */
+function syncBundledItemsAtHome(
+  sourceRoot: string,
+  target: InstallTargetSpec,
+  home: string | null,
+  skills: ReadonlyArray<BundledHostSkill>,
+  env?: NodeJS.ProcessEnv,
+  transaction?: string,
+): InitStep[] {
+  const steps: InitStep[] = [];
+  const ownerEnv: NodeJS.ProcessEnv = { ...(env ?? process.env), HOME: home ?? undefined };
+  const globalRoot = bunGlobalPackageRoot(env);
+  const useLinks = isBunGlobalPackageSource(sourceRoot, env)
+    && (env ?? process.env).REPO_HARNESS_LINK_INSTALLED_COPIES !== '0';
+  try {
+    withHostConfigTransaction(ownerEnv, transaction, root => {
+      const gate = openHostConfigGate({ env: ownerEnv });
+      for (const { skill, host, step, owner } of skills) {
+        if (target !== 'both' && target !== host) continue;
+        if (!home) throw new Error('HOME is required to resolve host skill roots');
+        const destinationRoot = hostSkillRoot(home, host, env);
+        if (host === 'pi' && !existsSync(destinationRoot)) continue;
+        const source = join(sourceRoot, 'assets', 'skills', skill);
+        if (!existsSync(join(source, 'SKILL.md'))) {
+          steps.push({ step, status: 'skipped', detail: 'bundled source not found at ' + source });
+          continue;
+        }
+        const path = join(destinationRoot, skill);
+        try {
+          const written = gate.writePaths([{ path, owner,
+            entry: useLinks ? { type: 'symlink', target: join(globalRoot!, 'assets', 'skills', skill) } : { type: 'directory', source }
+          }], { transaction: root });
+          steps.push({ step, status: 'ok', detail: written.includes(pathRecordKey(ownerEnv, path)) ? 'synced ' + path : 'already present' });
+        } catch (error) {
+          if (!hostPathReplacementRefused(error)) throw error;
+          // An ownership refusal leaves this skill untouched and need not abort setup.
+          const status = transaction === undefined ? 'failed' : 'skipped';
+          steps.push(status === 'skipped' ? { step, status, detail: error.message, refused_path: path } : { step, status, detail: error.message });
+          // A candidate sends a receipt on stdout. Its parent displays stderr.
+          if (status === 'skipped' && ownerEnv.REPO_HARNESS_RUNTIME_RECONCILIATION_PARENT === '1') {
+            process.stderr.write(`[runtime] ${status}: ${step} - ${error.message}\n`);
+          }
+        }
+      }
+    });
+  } catch (error) {
+    return [{ step: 'cross-review skills', status: 'failed', detail: String(error) }];
+  }
+  return steps;
+}
+
+export function syncCrossReviewSkills(
+  sourceRoot: string,
+  target: InstallTargetSpec,
+  env?: NodeJS.ProcessEnv,
+  plugins?: readonly PluginId[],
+  transaction?: string,
+): InitStep[] {
+  const catalog = loadSkillSurfaceCatalog(sourceRoot);
+  return syncBundledItemsAtHome(sourceRoot, target, homeDir(env), crossReviewSkillsFromCatalog(catalog, plugins), env, transaction);
+}
+
+const READINESS_STEP = 'architecture projection readiness';
+
+function architectureReadinessStep(repoRoot: string, selected: boolean, env: NodeJS.ProcessEnv | undefined): InitStep {
+  if (!selected) return { step: READINESS_STEP, status: 'skipped', detail: 'architecture plugin not selected' };
+  const setup = architecturePort('setup');
+  if (isArchitectureUnavailable(setup)) return { step: READINESS_STEP, status: 'failed', detail: setup.message };
+  try {
+    const { initialized } = setup.configuration(env);
+    const readiness = setup.readiness(repoRoot, env);
+    const provider = readiness.projectionProvider;
+    return {
+      step: READINESS_STEP,
+      status: !initialized ? 'skipped' : provider.state === 'ready' || provider.state === 'disabled' ? 'ok' : 'failed',
+      detail: !initialized ? 'global architecture is not initialized; run rh update once for this account' : provider.state === 'ready' && !readiness.apply.enabled
+        ? readiness.next
+          ? `global provider ready; ${readiness.next}`
+          : 'global provider ready; global architecture.projection_apply=disabled'
+        : provider.reason,
+    };
+  } catch (error) {
+    return { step: READINESS_STEP, status: 'failed', detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export function runInit(
+  opts: InitCommandOptions,
+): InitCommandResult {
+  const sourceRoot = resolve(opts.sourceRoot ?? REPO_ROOT);
+  const repoRoot = resolve(opts.repo ?? process.cwd());
+  const commandEnv = opts.env;
+  const apply = opts.apply !== false;
+  const verify = opts.verify !== false;
+  const codegraph = opts.codegraph !== false;
+  const syncCodegraph = opts.syncCodegraph === true;
+  const target = opts.target ?? "both";
+  const mode = opts.mode ?? "standard";
+  const architecture = opts.plugins.includes('architecture');
+  const steps: InitStep[] = [];
+
+  const targetError = validateRepoAdoptionTarget(repoRoot, opts.repo !== undefined, commandEnv);
+  if (targetError) {
+    const steps = [targetError];
+    return {
+      exitCode: 2,
+      repoRoot,
+      steps,
+      lines: steps.flatMap(renderStep),
+    };
+  }
+
+  if (apply) assertArchitecturePolicySelection(repoRoot, opts.plugins, commandEnv);
+  steps.push(requiredHerdrSkillReadiness(target, commandEnv));
+
+  const adoptionApply = apply
+    ? runAdoptionApply({ repo: repoRoot, mode, explicitRepo: true, env: commandEnv })
+    : undefined;
+  const adoption = adoptionApply ?? runAdoptionPlan({ repo: repoRoot, mode, explicitRepo: true, env: commandEnv });
+  const migrate: InitStep = {
+    step: apply ? "apply repo harness" : "plan repo harness",
+    status: adoption.exitCode === 0 ? "ok" : "failed",
+    detail: repoRoot,
+    stdout: adoption.output,
+  };
+  steps.push(migrate);
+
+  const registration = adoptionApply?.report.registration;
+  if (apply && migrate.status === "ok" && registration) {
+    steps.push({
+      step: "register repo harness repo",
+      status: registration.registered ? "ok" : "skipped",
+      detail: registration.registered ? registration.path : registration.reason,
+    });
+  } else {
+    steps.push({
+      step: "register repo harness repo",
+      status: "skipped",
+      detail: apply ? "repo harness did not apply cleanly or registry effect was unavailable" : "dry-run",
+    });
+  }
+
+  if (codegraph && apply && architecture) {
+    const codegraphPort = architecturePort('codegraph');
+    if (isArchitectureUnavailable(codegraphPort)) steps.push({ step: CODEGRAPH_INDEX_STEP, status: "failed", detail: codegraphPort.message });
+    else steps.push(...codegraphPort.indexSteps({ repoRoot, sync: syncCodegraph, env: commandEnv, target }));
+  } else if (codegraph && apply) {
+    steps.push({ step: CODEGRAPH_INDEX_STEP, status: "skipped", detail: "architecture plugin not selected" });
+  } else {
+    steps.push({
+      step: CODEGRAPH_INDEX_STEP,
+      status: "skipped",
+      detail: codegraph ? "dry-run" : "disabled",
+    });
+  }
+
+  if (apply && verify) {
+    const verifyEnv = { ...(commandEnv ?? process.env), REPO_HARNESS_SOURCE_ROOT: sourceRoot };
+    const verifyStep = runProcess("bun", [join(REPO_ROOT, "src/cli/index.ts"), "run", "check-context-files"], repoRoot, verifyEnv);
+    steps.push(withStepName(verifyStep, "verify repo harness", "rh run check-context-files"));
+  } else {
+    steps.push({ step: "verify repo harness", status: "skipped" });
+  }
+
+  if (apply && adoption.exitCode === 0 && mode !== 'minimal') steps.push(architectureReadinessStep(repoRoot, architecture, commandEnv));
+
+  const failed = steps.some((step) => step.status === "failed");
+  return {
+    exitCode: failed ? 1 : 0,
+    repoRoot,
+    steps,
+    lines: steps.flatMap(renderStep),
+  };
+}

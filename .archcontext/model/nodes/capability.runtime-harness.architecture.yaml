@@ -1,0 +1,85 @@
+schemaVersion: archcontext.node/v2
+id: capability.runtime-harness.architecture
+kind: capability
+name: Architecture
+status: active
+layer: effects
+summary: "The Architecture plugin: the rh arch command tree, the pinned archctx closure, architecture reads and checks, the task posture notice and the architecture skills."
+responsibilities:
+  - "Run the pinned package-local archctx on a trusted Node runtime, and apply and check the architecture projection."
+  - "Provide the ownership, display, notice, runtime, setup and CodeGraph doctor ports that core reads; the roots register them only when the install selection includes architecture."
+  - "Own rh arch: pass commands to the pinned package-local archctx by disposition, and expose projection, debt, module, refactor and codegraph under one command tree."
+  - "Run rh arch verify over validate, flows, state machines, constraints, document anchors, projection and debt; retain each check result in one verdict."
+  - "Read task posture at SessionStart from the local issue branch within the shared notice deadline; emit only complete blocks and record only delivered notices."
+  - "Own the archctx part of the managed runtime readback and the global architecture projection configuration."
+  - Resolve path ownership under capability_source archcontext and keep the resolve answer cache of a worktree.
+  - "Own the state-boundaries Check, the test capability projection Check and the standalone capability resolver projection."
+  - Own the repo-harness-architecture and repo-harness-archimap skills.
+  - "Own the rh arch module command and the read contracts of the committed model: the module views, the module review prompt and the model reader."
+source:
+  include:
+    - src/effects/architecture/**
+    - src/core/architecture/projection.ts
+    - src/core/architecture/module-view.ts
+    - src/core/review/module-review-prompt.ts
+    - src/cli/commands/module.ts
+    - src/cli/hook/agent-notice.ts
+    - scripts/axr5-archctx-clean-room.ts
+    - scripts/check-state-boundaries.ts
+    - scripts/project-test-capabilities.ts
+    - scripts/sync-helper-sources.ts
+    - assets/skills/repo-harness-archimap/**
+    - assets/skill-commands/repo-harness-architecture/**
+    - docs/verification/**
+  exclude:
+    - src/effects/architecture/capability-resolver.ts
+  entrypoints:
+    - id: entrypoint.architecture.command
+      path: src/cli/commands/arch-actions.ts
+      symbols:
+        - name: runArch
+          sinks:
+            - id: sink.architecture.command
+              path: src/effects/architecture/archctx-provider.ts
+              symbol: runArchctxPassThrough
+    - id: entrypoint.architecture.verify
+      path: src/cli/commands/arch-verify.ts
+      symbols:
+        - name: archVerify
+          sinks:
+            - id: sink.architecture.verify
+              path: src/effects/architecture/architecture-read.ts
+              symbol: readArchVerification
+    - id: entrypoint.architecture.helper-projection
+      path: scripts/sync-helper-sources.ts
+      symbols:
+        - name: main
+          sinks:
+            - id: sink.architecture.capability-projection
+              path: scripts/sync-helper-sources.ts
+              symbol: buildCapabilityProjection
+            - id: sink.architecture.projection-write
+              path: src/effects/source-projection.ts
+              symbol: writeProjectionFileAtomic
+            - id: sink.architecture.projection-compare
+              path: src/effects/source-projection.ts
+              symbol: sameProjectionBytes
+    - id: entrypoint.architecture.writer
+      path: src/cli/commands/architecture-projection-actions.ts
+      symbols:
+        - name: publish
+          sinks:
+            - id: sink.architecture.writer
+              path: src/effects/architecture/projection-writer.ts
+              symbol: runArchitectureWriter
+extensions:
+  harnessTier: plugin
+  harnessContract: Check
+  contractFiles:
+    agents: AGENTS.md
+    claude: CLAUDE.md
+  lspProfile: typescript-lsp
+  verification:
+    - bun run check:state-boundaries
+    - bun run check:helpers
+    - bun run test:files tests/architecture-projection-provider.test.ts tests/architecture-debt.test.ts tests/agent-notice.test.ts tests/capability-archcontext-source.test.ts --timeout 60000 --max-concurrency 1

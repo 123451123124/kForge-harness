@@ -1,0 +1,6 @@
+schemaVersion: archcontext.relation/v1
+id: relation.publication.primary
+kind: calls
+source: capability.organization.publication
+target: component.publication.primary
+intent: "Derive fenced PR readiness, collect provider integration evidence and share the digest helpers without task ownership mutation"

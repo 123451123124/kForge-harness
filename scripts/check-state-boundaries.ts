@@ -1,0 +1,1272 @@
+#!/usr/bin/env bun
+
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, relative, resolve } from 'node:path';
+import { API, type Checker, type Project, type Snapshot } from 'typescript/unstable/async';
+import { ARCHCTX_REQUIRED_VERSION } from '../src/core/architecture/projection';
+import { runPackageLocalArchctxJson } from '../src/effects/architecture/archctx-provider';
+import { readArchitectureNativeContext } from '../src/effects/architecture/architecture-read';
+import {
+  NodeFlags,
+  SyntaxKind,
+  isAssignmentOperator,
+  isArrayBindingPattern,
+  isBinaryExpression,
+  isCallExpression,
+  isClassDeclaration,
+  isEnumDeclaration,
+  isExportDeclaration,
+  isExternalModuleReference,
+  isFunctionDeclaration,
+  isForInStatement,
+  isForOfStatement,
+  isIdentifier,
+  isImportDeclaration,
+  isImportEqualsDeclaration,
+  isImportTypeNode,
+  isInterfaceDeclaration,
+  isLiteralTypeNode,
+  isMethodDeclaration,
+  isNamedImports,
+  isNamespaceImport,
+  isNewExpression,
+  isObjectBindingPattern,
+  isPropertyAccessExpression,
+  isPropertyAssignment,
+  isPrefixUnaryExpression,
+  isPostfixUnaryExpression,
+  isRegularExpressionLiteral,
+  isShorthandPropertyAssignment,
+  isStringLiteralLikeNode,
+  isStringLiteral,
+  isTaggedTemplateExpression,
+  isTypeAliasDeclaration,
+  isVariableDeclaration,
+  isVariableStatement,
+  type BindingName,
+  type CallExpression,
+  type Identifier,
+  type Node,
+  type SourceFile,
+} from 'typescript/unstable/ast';
+
+const CORE_ROOTS = ['src/core'] as const;
+
+const INTRA_LAYER_ROOTS = ['src/cli', 'src/core', 'src/effects'] as const;
+
+// The core/plugin rule reads every non-test source file in these roots.
+const TIER_ROOTS = ['src', 'scripts'] as const;
+const HARNESS_TIERS = new Set(['core', 'plugin', 'composition']);
+const HARNESS_CONTRACTS = new Set(['Host', 'Event', 'Review', 'Surface', 'Check']);
+const ARCHCTX_RESOLVE_TIMEOUT_MS = 30_000;
+
+// Keyed by "<dir> <-> <dir>" in sorted order; each value states why the cycle remains.
+// Remove an entry when its cycle is gone; the checker reports a stale entry.
+export const INTRA_LAYER_CYCLE_ALLOWANCES: Readonly<Record<string, string>> = {};
+
+// Loads the Pi SDK selected on PATH at runtime.
+const RUNTIME_SDK_LOADS: Readonly<Record<string, string>> = {
+  'src/effects/pi-capability-child.ts':
+    "import(pathToFileURL(join(process.argv[2]!, 'dist/index.js')).href)",
+  'src/effects/pi-model-child.ts':
+    "import(pathToFileURL(join(root, 'dist/index.js')).href)",
+};
+
+const CAPABILITY_SOURCE = 'src/core/capabilities/registry.ts';
+const CAPABILITY_SCRIPT = 'scripts/capability-resolver.ts';
+const CAPABILITY_PROJECTION = 'assets/templates/helpers/capability-resolver.ts';
+const STATE_SNAPSHOT_ADAPTER = 'src/cli/hook/state-snapshot.ts';
+const RETIRED_WORKFLOW_PROFILE_ADAPTER = 'src/cli/hook/workflow-profile.ts';
+
+const CANONICAL_SYMBOL_OWNERS: Readonly<Record<string, string>> = {
+  WorkflowProfile: 'src/core/workflow/profile.ts',
+  WorkflowOperationKind: 'src/core/workflow/profile.ts',
+  WorkflowProfileInput: 'src/core/workflow/profile.ts',
+  WorkflowProfileSignals: 'src/core/workflow/profile.ts',
+  WorkflowProfileResolution: 'src/core/workflow/profile.ts',
+  WorkflowProfileError: 'src/core/workflow/profile.ts',
+  WorkflowProfileResult: 'src/core/workflow/profile.ts',
+  StrictRiskCategory: 'src/core/workflow/profile.ts',
+  resolveWorkflowProfile: 'src/core/workflow/profile.ts',
+  CAPABILITY_REGISTRY_VERSION: CAPABILITY_SOURCE,
+  ContractFiles: CAPABILITY_SOURCE,
+  Capability: CAPABILITY_SOURCE,
+  CapabilityRegistry: CAPABILITY_SOURCE,
+  CapabilityRegistryDiagnosticCode: CAPABILITY_SOURCE,
+  CapabilityRegistryDiagnostic: CAPABILITY_SOURCE,
+  CapabilityRegistryResolution: CAPABILITY_SOURCE,
+  CapabilityPathMatch: CAPABILITY_SOURCE,
+  CapabilityPathMatchResult: CAPABILITY_SOURCE,
+  CapabilityPathResolution: CAPABILITY_SOURCE,
+  normalizeCapabilityPath: CAPABILITY_SOURCE,
+  validateCapabilityRegistryValue: CAPABILITY_SOURCE,
+  parseCapabilityRegistry: CAPABILITY_SOURCE,
+  matchCapabilityPath: CAPABILITY_SOURCE,
+  resolveCapabilityPaths: CAPABILITY_SOURCE,
+  CAPABILITY_SOURCE_MODES: CAPABILITY_SOURCE,
+  CapabilitySourceMode: CAPABILITY_SOURCE,
+  ArchcontextPathOwner: CAPABILITY_SOURCE,
+  architectureModulePathFor: CAPABILITY_SOURCE,
+  capabilityPathResolutionFromArchcontextOwners: CAPABILITY_SOURCE,
+  stripWrappingQuotes: 'src/core/state/artifact-parsers.ts',
+  markdownHeader: 'src/core/state/artifact-parsers.ts',
+  markdownBullet: 'src/core/state/artifact-parsers.ts',
+  markdownSection: 'src/core/state/artifact-parsers.ts',
+  markdownSectionHeader: 'src/core/state/artifact-parsers.ts',
+  parseAllowedPaths: 'src/core/state/artifact-parsers.ts',
+  firstOpenTask: 'src/core/state/artifact-parsers.ts',
+  parseIsoOrLocalTimestamp: 'src/core/state/artifact-parsers.ts',
+  planStatusFromText: 'src/core/state/artifact-parsers.ts',
+  planSlugFromPath: 'src/core/state/artifact-parsers.ts',
+  artifactStemFromPlan: 'src/core/state/artifact-parsers.ts',
+  evidenceContractComplete: 'src/core/state/artifact-parsers.ts',
+  EffectiveStateV2: 'src/core/state/types.ts',
+  EffectiveState: 'src/core/state/types.ts',
+  EffectiveStateInputs: 'src/core/state/project-effective-state.ts',
+  projectEffectiveState: 'src/core/state/project-effective-state.ts',
+} as const;
+
+const REQUIRED_CAPABILITY_IMPORTS = new Set([
+  'matchCapabilityPath',
+  'normalizeCapabilityPath',
+  'parseCapabilityRegistry',
+]);
+
+const FORBIDDEN_CORE_MODULES = [
+  'fs',
+  'path',
+  'child_process',
+  'process',
+  'commander',
+  '@modelcontextprotocol/sdk',
+] as const;
+
+const PROCESS_EXECUTION_CALLS = new Set([
+  'Bun.$',
+  'Bun.spawn',
+  'Bun.spawnSync',
+  'Deno.Command',
+  '$',
+  'exec',
+  'execFile',
+  'execFileSync',
+  'execSync',
+  'fork',
+  'process.abort',
+  'process.chdir',
+  'process.exit',
+  'process.kill',
+  'spawn',
+  'spawnSync',
+]);
+
+const CLI_AUTHORITY_NAME = /^(?:(?:calculate|compute|derive|parse|validate|match|resolve).*WorkflowProfile|(?:parse|validate|match|resolve).*Capability(?:Registry|Path|Paths)|(?:extract|parse).*(?:AllowedPaths|ArtifactAuthority|WorkflowArtifact)|(?:get|parse|resolve).*PlanStatus|artifactStemFromPlan(?:Path)?|evidenceContractComplete|markdown(?:Header|Bullet|Section|SectionHeader)|firstOpenTask|parseIsoOrLocalTimestamp)$/i;
+const SNAPSHOT_AUTHORITY_NAME = /(?:markdown|allowedpaths|parseiso|firstopentask|state(?:lock|cache|version)|git(?:common|dir|head|rev|status)|readfilesync|writefilesync|renameSync|spawnSync|execSync)/i;
+const SNAPSHOT_FORBIDDEN_IMPORT = /(?:artifact-parsers|workflow\/profile|capabilities\/registry|state-lock|git-state-version-store|collect-state-inputs)/;
+
+export interface StateBoundaryViolation {
+  readonly code: string;
+  readonly file: string;
+  readonly line: number;
+  readonly column: number;
+  readonly message: string;
+}
+
+export interface StateBoundaryCheckResult {
+  readonly ok: boolean;
+  readonly filesChecked: number;
+  readonly violations: readonly StateBoundaryViolation[];
+}
+
+interface ParsedSources {
+  readonly sources: ReadonlyMap<string, SourceFile>;
+  readonly references: ReadonlyMap<SourceFile, ModuleReferences>;
+  readonly violations: readonly StateBoundaryViolation[];
+}
+
+function normalizePath(value: string): string {
+  return value.replaceAll('\\', '/').replace(/^\.\//, '');
+}
+
+function relPath(repoRoot: string, absolutePath: string): string {
+  return normalizePath(relative(repoRoot, absolutePath));
+}
+
+function violation(
+  code: string,
+  file: string,
+  message: string,
+  line = 1,
+  column = 1,
+): StateBoundaryViolation {
+  return { code, file, line, column, message };
+}
+
+function nodeViolation(
+  repoRoot: string,
+  source: SourceFile,
+  node: Node,
+  code: string,
+  message: string,
+): StateBoundaryViolation {
+  const position = source.getLineAndCharacterOfPosition(node.getStart(source));
+  return violation(
+    code,
+    relPath(repoRoot, source.fileName),
+    message,
+    position.line + 1,
+    position.character + 1,
+  );
+}
+
+function collectTypeScriptFiles(
+  repoRoot: string,
+  relativeRoot: string,
+  violations: StateBoundaryViolation[],
+): string[] {
+  const absoluteRoot = resolve(repoRoot, relativeRoot);
+  if (!existsSync(absoluteRoot)) {
+    violations.push(violation(
+      'REQUIRED_PATH_MISSING',
+      relativeRoot,
+      `required architecture path is missing: ${relativeRoot}`,
+    ));
+    return [];
+  }
+  if (!lstatSync(absoluteRoot).isDirectory()) {
+    violations.push(violation(
+      'REQUIRED_PATH_INVALID',
+      relativeRoot,
+      `required architecture path is not a directory: ${relativeRoot}`,
+    ));
+    return [];
+  }
+
+  const files: string[] = [];
+  const stack = [absoluteRoot];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const absoluteEntry = resolve(current, entry.name);
+      if (entry.isSymbolicLink()) {
+        violations.push(violation(
+          'SOURCE_SYMLINK_FORBIDDEN',
+          relPath(repoRoot, absoluteEntry),
+          'source-boundary checks do not follow symbolic links',
+        ));
+      } else if (entry.isDirectory()) {
+        stack.push(absoluteEntry);
+      } else if (entry.isFile() && /\.tsx?$/.test(entry.name)) {
+        files.push(absoluteEntry);
+      }
+    }
+  }
+  return files.sort((left, right) => relPath(repoRoot, left).localeCompare(relPath(repoRoot, right)));
+}
+
+function visit(node: Node, callback: (node: Node) => void): void {
+  callback(node);
+  node.forEachChild((child) => {
+    visit(child, callback);
+    return undefined;
+  });
+}
+
+function importSpecifier(node: Node): string | null {
+  if (isImportDeclaration(node) || isExportDeclaration(node)) {
+    return node.moduleSpecifier && isStringLiteralLikeNode(node.moduleSpecifier)
+      ? node.moduleSpecifier.text
+      : null;
+  }
+  if (isImportEqualsDeclaration(node) && isExternalModuleReference(node.moduleReference)) {
+    const expression = node.moduleReference.expression;
+    return expression && isStringLiteralLikeNode(expression) ? expression.text : null;
+  }
+  return null;
+}
+
+interface ModuleReference {
+  readonly node: Node;
+  readonly specifier: string;
+}
+
+interface ModuleReferences {
+  readonly resolved: readonly ModuleReference[];
+  readonly unresolvedLoads: readonly Node[];
+}
+
+function isAssignedIdentifier(identifier: Identifier): boolean {
+  let target: Node = identifier;
+  while (target.parent) {
+    const parent = target.parent;
+    if (isPropertyAssignment(parent)) {
+      if (parent.initializer !== target) return false;
+      target = parent;
+      continue;
+    }
+    if (isBinaryExpression(parent)) {
+      return parent.left === target && isAssignmentOperator(parent.operatorToken.kind);
+    }
+    if (isPrefixUnaryExpression(parent) || isPostfixUnaryExpression(parent)) {
+      return parent.operator === SyntaxKind.PlusPlusToken || parent.operator === SyntaxKind.MinusMinusToken;
+    }
+    if (isForInStatement(parent) || isForOfStatement(parent)) return parent.initializer === target;
+    switch (parent.kind) {
+      case SyntaxKind.ParenthesizedExpression:
+      case SyntaxKind.ArrayLiteralExpression:
+      case SyntaxKind.ObjectLiteralExpression:
+      case SyntaxKind.SpreadElement:
+      case SyntaxKind.SpreadAssignment:
+      case SyntaxKind.ShorthandPropertyAssignment:
+      case SyntaxKind.NonNullExpression:
+        target = parent;
+        continue;
+      default:
+        return false;
+    }
+  }
+  return false;
+}
+
+async function constImportSpecifiers(
+  source: SourceFile,
+  loads: readonly Node[],
+  checker: Checker,
+): Promise<ReadonlyMap<Node, string>> {
+  const imports = loads.filter((node): node is CallExpression => isCallExpression(node)
+    && node.expression.kind === SyntaxKind.ImportKeyword
+    && node.arguments.length === 1
+    && isIdentifier(node.arguments[0]!));
+  if (imports.length === 0) return new Map();
+  const candidates: { name: Identifier; specifier: string }[] = [];
+  for (const statement of source.statements) {
+    if (!isVariableStatement(statement) || (statement.declarationList.flags & NodeFlags.Const) === 0) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (isIdentifier(declaration.name) && declaration.initializer && isStringLiteral(declaration.initializer)) {
+        candidates.push({ name: declaration.name, specifier: declaration.initializer.text });
+      }
+    }
+  }
+  if (candidates.length === 0) return new Map();
+
+  const names = new Set(candidates.map(declaration => declaration.name.text));
+  const writes: Identifier[] = [];
+  visit(source, node => {
+    if (isIdentifier(node) && names.has(node.text) && isAssignedIdentifier(node)) writes.push(node);
+  });
+  const nodes = [
+    ...candidates.map(declaration => declaration.name),
+    ...imports.map(node => node.arguments[0]!),
+    ...writes,
+  ];
+  // The compiler binding distinguishes a file const from shadowing parameters and locals.
+  const symbols = await checker.getSymbolAtLocation(nodes);
+  await Promise.all(writes.map(async (node, index) => {
+    if (isShorthandPropertyAssignment(node.parent)) {
+      symbols[candidates.length + imports.length + index] = await checker.getShorthandAssignmentValueSymbol(node.parent);
+    }
+  }));
+  const values = new Map<number, string>();
+  candidates.forEach((declaration, index) => {
+    const symbol = symbols[index];
+    if (symbol?.declarations.length === 1) {
+      values.set(symbol.id, declaration.specifier);
+    }
+  });
+  for (const symbol of symbols.slice(candidates.length + imports.length)) {
+    if (symbol) values.delete(symbol.id);
+  }
+  const specifiers = new Map<Node, string>();
+  imports.forEach((node, index) => {
+    const symbol = symbols[candidates.length + index];
+    const specifier = symbol ? values.get(symbol.id) : undefined;
+    if (specifier !== undefined) specifiers.set(node, specifier);
+  });
+  return specifiers;
+}
+
+async function moduleReferences(source: SourceFile, checker: Checker): Promise<ModuleReferences> {
+  const resolved: ModuleReference[] = [];
+  const unresolvedLoads: Node[] = [];
+  visit(source, (node) => {
+    const staticSpecifier = importSpecifier(node);
+    if (staticSpecifier !== null) {
+      resolved.push({ node, specifier: staticSpecifier });
+      return;
+    }
+    if (isImportTypeNode(node)) {
+      if (isLiteralTypeNode(node.argument) && isStringLiteralLikeNode(node.argument.literal)) {
+        resolved.push({ node, specifier: node.argument.literal.text });
+      }
+      return;
+    }
+    if (!isCallExpression(node)) return;
+    const dynamicImport = node.expression.kind === SyntaxKind.ImportKeyword;
+    const requireCall = isIdentifier(node.expression) && node.expression.text === 'require';
+    if (!dynamicImport && !requireCall) return;
+    const argument = node.arguments[0];
+    if (argument && isStringLiteralLikeNode(argument)) {
+      resolved.push({ node, specifier: argument.text });
+    } else {
+      unresolvedLoads.push(node);
+    }
+  });
+  const specifiers = await constImportSpecifiers(source, unresolvedLoads, checker);
+  for (const [node, specifier] of specifiers) resolved.push({ node, specifier });
+  return { resolved, unresolvedLoads: unresolvedLoads.filter(node => !specifiers.has(node)) };
+}
+
+function callName(node: Node): string | null {
+  if (isIdentifier(node)) return node.text;
+  if (!isPropertyAccessExpression(node)) return null;
+  const receiver = callName(node.expression);
+  return receiver ? `${receiver}.${node.name.text}` : node.name.text;
+}
+
+function forbiddenCoreModule(specifier: string): string | null {
+  const normalized = specifier.startsWith('node:') ? specifier.slice('node:'.length) : specifier;
+  return FORBIDDEN_CORE_MODULES.find(
+    (candidate) => normalized === candidate || normalized.startsWith(`${candidate}/`),
+  ) ?? null;
+}
+
+function reverseLayerImport(repoRoot: string, source: SourceFile, specifier: string): string | null {
+  let target = normalizePath(specifier);
+  if (specifier.startsWith('.')) {
+    target = relPath(repoRoot, resolve(dirname(source.fileName), specifier));
+  }
+  for (const forbidden of ['src/cli', 'src/effects']) {
+    if (target === forbidden || target.startsWith(`${forbidden}/`)) return forbidden;
+  }
+  return null;
+}
+
+function checkCoreDependencies(
+  repoRoot: string,
+  source: SourceFile,
+  references: ModuleReferences,
+  violations: StateBoundaryViolation[],
+): void {
+  const inspectModule = (node: Node, specifier: string): void => {
+    const forbidden = forbiddenCoreModule(specifier);
+    if (forbidden) {
+      violations.push(nodeViolation(
+        repoRoot,
+        source,
+        node,
+        'CORE_FORBIDDEN_IMPORT',
+        `pure core cannot import ${specifier} (forbidden runtime authority: ${forbidden})`,
+      ));
+    }
+    const reverse = reverseLayerImport(repoRoot, source, specifier);
+    if (reverse) {
+      violations.push(nodeViolation(
+        repoRoot,
+        source,
+        node,
+        'CORE_REVERSE_IMPORT',
+        `pure core cannot depend on adapter/effect layer ${reverse}: ${specifier}`,
+      ));
+    }
+  };
+
+  for (const reference of references.resolved) inspectModule(reference.node, reference.specifier);
+  for (const node of references.unresolvedLoads) {
+    violations.push(nodeViolation(
+      repoRoot,
+      source,
+      node,
+      'CORE_DYNAMIC_IMPORT_UNRESOLVED',
+      'pure core dynamic module loads must use a literal so the boundary can be verified',
+    ));
+  }
+
+  visit(source, (node) => {
+    if (isCallExpression(node)) {
+      const name = callName(node.expression);
+      if (
+        name &&
+        PROCESS_EXECUTION_CALLS.has(name) &&
+        (isIdentifier(node.expression) || name.includes('.'))
+      ) {
+        violations.push(nodeViolation(
+          repoRoot,
+          source,
+          node,
+          'CORE_PROCESS_EXECUTION',
+          `pure core cannot execute processes or terminate/change the host process: ${name}`,
+        ));
+      }
+    }
+
+    if (isNewExpression(node) && callName(node.expression) === 'Deno.Command') {
+      violations.push(nodeViolation(
+        repoRoot,
+        source,
+        node,
+        'CORE_PROCESS_EXECUTION',
+        'pure core cannot execute processes: Deno.Command',
+      ));
+    }
+
+    if (isTaggedTemplateExpression(node)) {
+      const name = callName(node.tag);
+      if (name === '$' || name === 'Bun.$') {
+        violations.push(nodeViolation(
+          repoRoot,
+          source,
+          node,
+          'CORE_PROCESS_EXECUTION',
+          `pure core cannot execute shell templates: ${name}`,
+        ));
+      }
+    }
+  });
+}
+
+function resolvesToScriptsLayer(repoRoot: string, source: SourceFile, specifier: string): boolean {
+  let target = normalizePath(specifier);
+  if (specifier.startsWith('.')) {
+    target = relPath(repoRoot, resolve(dirname(source.fileName), specifier));
+  }
+  return target === 'scripts' || target.startsWith('scripts/');
+}
+
+function checkSrcScriptImports(
+  repoRoot: string,
+  source: SourceFile,
+  references: ModuleReferences,
+  violations: StateBoundaryViolation[],
+): void {
+  const report = (node: Node, specifier: string): void => {
+    if (!resolvesToScriptsLayer(repoRoot, source, specifier)) return;
+    violations.push(nodeViolation(
+      repoRoot,
+      source,
+      node,
+      'SRC_SCRIPT_IMPORT',
+      `src cannot import scripts/: ${specifier}`,
+    ));
+  };
+
+  for (const { node, specifier } of references.resolved) report(node, specifier);
+}
+
+function checkEffectDependencies(
+  repoRoot: string,
+  source: SourceFile,
+  references: ModuleReferences,
+  violations: StateBoundaryViolation[],
+): void {
+  const inspectModule = (node: Node, specifier: string): void => {
+    if (reverseLayerImport(repoRoot, source, specifier) !== 'src/cli') return;
+    violations.push(nodeViolation(
+      repoRoot,
+      source,
+      node,
+      'EFFECTS_REVERSE_IMPORT',
+      `effect modules cannot depend on CLI adapters: ${specifier}`,
+    ));
+  };
+
+  for (const reference of references.resolved) inspectModule(reference.node, reference.specifier);
+  const runtimeSdkLoad = RUNTIME_SDK_LOADS[relPath(repoRoot, source.fileName)];
+  for (const node of references.unresolvedLoads) {
+    if (runtimeSdkLoad !== undefined && node.getText(source) === runtimeSdkLoad) continue;
+    violations.push(nodeViolation(
+      repoRoot,
+      source,
+      node,
+      'EFFECTS_DYNAMIC_IMPORT_UNRESOLVED',
+      'effect dynamic module loads must resolve to a literal or match the exact runtime SDK load so reverse CLI dependencies can be verified',
+    ));
+  }
+}
+
+function layerDirectoryOf(path: string, directories: ReadonlySet<string>): string | null {
+  for (const root of INTRA_LAYER_ROOTS) {
+    if (!path.startsWith(`${root}/`)) continue;
+    const directory = `${root}/${path.slice(root.length + 1).split('/')[0]}`;
+    return directories.has(directory) ? directory : null;
+  }
+  return null;
+}
+
+function layerOf(directory: string): string {
+  return directory.slice(0, directory.lastIndexOf('/'));
+}
+
+interface DirectoryEdge {
+  readonly node: Node;
+  readonly source: SourceFile;
+  readonly file: string;
+  readonly specifier: string;
+}
+
+function edgeLocation(edge: DirectoryEdge): string {
+  const position = edge.source.getLineAndCharacterOfPosition(edge.node.getStart(edge.source));
+  return `${edge.file}:${position.line + 1} imports ${edge.specifier}`;
+}
+
+function checkIntraLayerCycles(
+  repoRoot: string,
+  sources: ReadonlyMap<string, SourceFile>,
+  references: ReadonlyMap<SourceFile, ModuleReferences>,
+  allowances: Readonly<Record<string, string>>,
+  violations: StateBoundaryViolation[],
+): void {
+  const directories = new Set<string>();
+  for (const file of sources.keys()) {
+    for (const root of INTRA_LAYER_ROOTS) {
+      const segments = file.startsWith(`${root}/`) ? file.slice(root.length + 1).split('/') : [];
+      if (segments.length > 1) directories.add(`${root}/${segments[0]}`);
+    }
+  }
+
+  const edges = new Map<string, DirectoryEdge>();
+  for (const [file, source] of [...sources].sort(([left], [right]) => left.localeCompare(right))) {
+    const from = layerDirectoryOf(file, directories);
+    if (!from) continue;
+    for (const { node, specifier } of references.get(source)!.resolved) {
+      if (!specifier.startsWith('.')) continue;
+      const to = layerDirectoryOf(relPath(repoRoot, resolve(dirname(source.fileName), specifier)), directories);
+      if (!to || to === from || layerOf(to) !== layerOf(from)) continue;
+      const key = `${from} -> ${to}`;
+      if (!edges.has(key)) edges.set(key, { node, source, file, specifier });
+    }
+  }
+
+  const reported = new Set<string>();
+  for (const [key, forward] of edges) {
+    const [from, to] = key.split(' -> ');
+    if (from > to) continue;
+    const backward = edges.get(`${to} -> ${from}`);
+    if (!backward) continue;
+    const pair = `${from} <-> ${to}`;
+    reported.add(pair);
+    if (allowances[pair]) continue;
+    violations.push(nodeViolation(
+      repoRoot,
+      forward.source,
+      forward.node,
+      'INTRA_LAYER_CYCLE',
+      `intra-layer directory cycle ${pair}: ${edgeLocation(forward)}; ${edgeLocation(backward)}`,
+    ));
+  }
+  for (const pair of Object.keys(allowances).sort()) {
+    // An allowance only goes stale against a tree that contains both directories.
+    if (reported.has(pair) || !pair.split(' <-> ').every((directory) => directories.has(directory))) continue;
+    violations.push(violation(
+      'INTRA_LAYER_CYCLE_ALLOWANCE_STALE',
+      pair.split(' <-> ')[0],
+      `intra-layer cycle allowance ${pair} no longer matches a cycle; remove it`,
+    ));
+  }
+}
+
+function bindingNames(name: BindingName): string[] {
+  if (isIdentifier(name)) return [name.text];
+  if (!isObjectBindingPattern(name) && !isArrayBindingPattern(name)) return [];
+  return name.elements.flatMap((element) =>
+    element.name ? bindingNames(element.name) : []);
+}
+
+function declarationNames(node: Node): string[] {
+  if (isVariableDeclaration(node)) return bindingNames(node.name);
+  if (
+    isFunctionDeclaration(node) ||
+    isClassDeclaration(node) ||
+    isInterfaceDeclaration(node) ||
+    isTypeAliasDeclaration(node) ||
+    isEnumDeclaration(node)
+  ) {
+    return node.name ? [node.name.text] : [];
+  }
+  if (isMethodDeclaration(node) && node.name) {
+    return isIdentifier(node.name) ? [node.name.text] : [node.name.getText()];
+  }
+  return [];
+}
+
+function checkCanonicalDeclarations(
+  repoRoot: string,
+  sources: ReadonlyMap<string, SourceFile>,
+  violations: StateBoundaryViolation[],
+): void {
+  const ownerCounts = new Map<string, number>();
+  for (const [file, source] of sources) {
+    visit(source, (node) => {
+      for (const name of declarationNames(node)) {
+        const owner = CANONICAL_SYMBOL_OWNERS[name];
+        if (owner) {
+          if (file === owner) {
+            ownerCounts.set(name, (ownerCounts.get(name) ?? 0) + 1);
+          } else {
+            violations.push(nodeViolation(
+              repoRoot,
+              source,
+              node,
+              'CANONICAL_SYMBOL_OWNER',
+              `${name} may only be declared by ${owner}; found a competing declaration`,
+            ));
+          }
+          continue;
+        }
+        if (file.startsWith('src/cli/') && CLI_AUTHORITY_NAME.test(name)) {
+          violations.push(nodeViolation(
+            repoRoot,
+            source,
+            node,
+            'CLI_AUTHORITY_REDECLARATION',
+            `CLI adapter declaration ${name} appears to reimplement workflow, capability, or artifact authority`,
+          ));
+        }
+      }
+    });
+  }
+
+  for (const [name, owner] of Object.entries(CANONICAL_SYMBOL_OWNERS)) {
+    const count = ownerCounts.get(name) ?? 0;
+    if (count !== 1) {
+      violations.push(violation(
+        'CANONICAL_SYMBOL_MISSING',
+        owner,
+        `${owner} must declare canonical symbol ${name} exactly once; found ${count}`,
+      ));
+    }
+  }
+}
+
+function checkCapabilityScript(
+  repoRoot: string,
+  source: SourceFile | undefined,
+  violations: StateBoundaryViolation[],
+): void {
+  if (!source) return;
+  const imported = new Set<string>();
+  for (const statement of source.statements) {
+    if (!isImportDeclaration(statement) || !isStringLiteralLikeNode(statement.moduleSpecifier)) continue;
+    if (statement.moduleSpecifier.text !== '../src/core/capabilities/registry') continue;
+    const bindings = statement.importClause?.namedBindings;
+    if (bindings && isNamespaceImport(bindings)) {
+      for (const name of REQUIRED_CAPABILITY_IMPORTS) imported.add(name);
+    } else if (bindings && isNamedImports(bindings)) {
+      for (const element of bindings.elements) imported.add(element.propertyName?.text ?? element.name.text);
+    }
+  }
+  const missing = [...REQUIRED_CAPABILITY_IMPORTS].filter((name) => !imported.has(name)).sort();
+  if (missing.length > 0) {
+    violations.push(violation(
+      'CAPABILITY_HELPER_NOT_CANONICAL',
+      CAPABILITY_SCRIPT,
+      `standalone helper source must import canonical registry operations from ${CAPABILITY_SOURCE}; missing ${missing.join(', ')}`,
+    ));
+  }
+}
+
+function checkStateSnapshotAdapter(
+  repoRoot: string,
+  source: SourceFile | undefined,
+  violations: StateBoundaryViolation[],
+): void {
+  if (!source) return;
+  visit(source, (node) => {
+    const specifier = importSpecifier(node);
+    if (specifier && (forbiddenCoreModule(specifier) || SNAPSHOT_FORBIDDEN_IMPORT.test(specifier))) {
+      violations.push(nodeViolation(
+        repoRoot,
+        source,
+        node,
+        'STATE_SNAPSHOT_AUTHORITY',
+        `state-snapshot adapter cannot import parser, Git, lock, cache, or host-I/O authority: ${specifier}`,
+      ));
+    }
+    if (isRegularExpressionLiteral(node)) {
+      violations.push(nodeViolation(
+        repoRoot,
+        source,
+        node,
+        'STATE_SNAPSHOT_AUTHORITY',
+        'state-snapshot adapter cannot own regular-expression artifact parsing',
+      ));
+    }
+    if (isCallExpression(node)) {
+      const name = callName(node.expression);
+      if (name && (['match', 'exec', 'test'].includes(name.split('.').at(-1) ?? '') || SNAPSHOT_AUTHORITY_NAME.test(name))) {
+        violations.push(nodeViolation(
+          repoRoot,
+          source,
+          node,
+          'STATE_SNAPSHOT_AUTHORITY',
+          `state-snapshot adapter cannot own parser, Git, lock, or cache behavior: ${name}`,
+        ));
+      }
+    }
+    if (isNewExpression(node) && callName(node.expression) === 'RegExp') {
+      violations.push(nodeViolation(
+        repoRoot,
+        source,
+        node,
+        'STATE_SNAPSHOT_AUTHORITY',
+        'state-snapshot adapter cannot construct artifact parsers',
+      ));
+    }
+    for (const name of declarationNames(node)) {
+      if (SNAPSHOT_AUTHORITY_NAME.test(name)) {
+        violations.push(nodeViolation(
+          repoRoot,
+          source,
+          node,
+          'STATE_SNAPSHOT_AUTHORITY',
+          `state-snapshot adapter cannot declare parser, Git, lock, or cache authority: ${name}`,
+        ));
+      }
+    }
+  });
+}
+
+function checkGeneratedCapabilityProjection(
+  repoRoot: string,
+  violations: StateBoundaryViolation[],
+): void {
+  const sourcePath = resolve(repoRoot, CAPABILITY_SOURCE);
+  const projectionPath = resolve(repoRoot, CAPABILITY_PROJECTION);
+  for (const [file, absolutePath] of [
+    [CAPABILITY_SOURCE, sourcePath],
+    [CAPABILITY_PROJECTION, projectionPath],
+  ] as const) {
+    if (!existsSync(absolutePath) || !lstatSync(absolutePath).isFile()) {
+      violations.push(violation(
+        'REQUIRED_PATH_MISSING',
+        file,
+        `required capability projection path is missing or not a file: ${file}`,
+      ));
+      return;
+    }
+  }
+
+  const sourceHash = createHash('sha256').update(readFileSync(sourcePath)).digest('hex');
+  const projection = readFileSync(projectionPath, 'utf8');
+  const markers = [...projection.matchAll(/^\/\/ @generated-from (\S+) sha256:([0-9a-f]{64})$/gm)];
+  if (markers.length !== 1) {
+    violations.push(violation(
+      'CAPABILITY_PROJECTION_MARKER',
+      CAPABILITY_PROJECTION,
+      `generated capability helper must contain exactly one @generated-from marker; found ${markers.length}`,
+    ));
+  } else {
+    const [, markerSource, markerHash] = markers[0];
+    if (markerSource !== CAPABILITY_SOURCE) {
+      violations.push(violation(
+        'CAPABILITY_PROJECTION_SOURCE',
+        CAPABILITY_PROJECTION,
+        `generated capability helper points to ${markerSource}; expected ${CAPABILITY_SOURCE}`,
+      ));
+    }
+    if (markerHash !== sourceHash) {
+      violations.push(violation(
+        'CAPABILITY_PROJECTION_HASH',
+        CAPABILITY_PROJECTION,
+        `generated capability helper hash ${markerHash} does not match canonical source sha256:${sourceHash}`,
+      ));
+    }
+  }
+
+  // This arbitrary-root checker treats the target as data and never invokes a
+  // target-owned script or bundler macro. Canonical byte-for-byte regeneration
+  // remains owned by the separately wired, trusted-root `check:helpers` gate.
+  if ((lstatSync(projectionPath).mode & 0o111) === 0) {
+    violations.push(violation(
+      'HELPER_PROJECTION_MODE',
+      CAPABILITY_PROJECTION,
+      'generated capability helper must be executable (mode 100755)',
+    ));
+  }
+}
+
+function isTierSource(file: string): boolean {
+  return !file.endsWith('.d.ts') && !/\.test\.tsx?$/.test(file);
+}
+
+interface TierEdge {
+  readonly source: SourceFile;
+  readonly node: Node;
+  readonly specifier: string;
+  readonly from: string;
+  readonly to: string;
+}
+
+function tierEdges(
+  repoRoot: string,
+  files: ReadonlySet<string>,
+  sources: ReadonlyMap<string, SourceFile>,
+  references: ReadonlyMap<SourceFile, ModuleReferences>,
+): TierEdge[] {
+  const edges: TierEdge[] = [];
+  for (const from of [...files].sort()) {
+    const source = sources.get(from);
+    if (!source) continue;
+    for (const { node, specifier } of references.get(source)!.resolved) {
+      if (!specifier.startsWith('.')) continue;
+      const base = relPath(repoRoot, resolve(dirname(source.fileName), specifier)).replace(/\.js$/, '');
+      const to = [base, `${base}.ts`, `${base}.tsx`, `${base}/index.ts`, `${base}/index.tsx`].find((candidate) => files.has(candidate));
+      if (to && to !== from) edges.push({ source, node, specifier, from, to });
+    }
+  }
+  return edges;
+}
+
+type TierOwner =
+  | { readonly kind: 'owned'; readonly nodeId: string; readonly capabilityId: string; readonly candidates: readonly string[] }
+  | { readonly kind: 'unowned' }
+  | { readonly kind: 'ambiguous'; readonly candidates: readonly string[] };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * The capability resolver keeps only the owning capability. The tier rule
+ * also needs the matched node (`stableId`), because a component can carry its
+ * own tier. Both come from one package-local `archctx resolve` batch.
+ */
+function resolveTierOwners(repoRoot: string, paths: readonly string[]): Map<string, TierOwner> {
+  const dir = mkdtempSync(join(tmpdir(), 'repo-harness-tier-resolve-'));
+  try {
+    const listPath = join(dir, 'paths.txt');
+    writeFileSync(listPath, `${paths.join('\n')}\n`, { mode: 0o600 });
+    // Exit 2 means at least one ambiguous path; the envelope still carries every result.
+    const { value } = runPackageLocalArchctxJson(repoRoot, ARCHCTX_REQUIRED_VERSION, ['resolve', '--paths-from', listPath, '--json'], {}, ARCHCTX_RESOLVE_TIMEOUT_MS, true);
+    if (!isRecord(value) || value.ok !== true) {
+      const error = isRecord(value) && isRecord(value.error) ? `${String(value.error.code)}: ${String(value.error.message)}` : 'invalid envelope';
+      throw new Error(`archctx resolve rejected the model: ${error}`);
+    }
+    const results = isRecord(value.data) ? value.data.results : undefined;
+    if (!Array.isArray(results) || results.length !== paths.length) throw new Error('archctx resolve returned a result count that does not match the request');
+    return new Map(results.map((result: unknown, index): [string, TierOwner] => {
+      const path = paths[index]!;
+      if (!isRecord(result) || result.path !== path || typeof result.ambiguous !== 'boolean'
+        || (result.candidates !== undefined && (!Array.isArray(result.candidates) || result.candidates.some((entry) => typeof entry !== 'string')))) {
+        throw new Error(`archctx resolve returned an invalid result for ${path}`);
+      }
+      const candidates = (result.candidates ?? []) as string[];
+      const capabilityId = result.owningCapabilityId;
+      if (capabilityId === null || capabilityId === undefined) {
+        return [path, result.ambiguous ? { kind: 'ambiguous', candidates } : { kind: 'unowned' }];
+      }
+      // An ambiguous result between components of one capability names no matched node.
+      const nodeId = result.ambiguous ? capabilityId : result.stableId;
+      if (typeof capabilityId !== 'string' || typeof nodeId !== 'string') throw new Error(`archctx resolve returned an invalid owner for ${path}`);
+      return [path, { kind: 'owned', nodeId, capabilityId, candidates }];
+    }));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+interface NodeTier {
+  readonly tier: string;
+  readonly contract: string | null;
+}
+
+/** Tiers come only from `extensions.harnessTier` and `extensions.harnessContract` in the model. */
+function readNodeTiers(repoRoot: string, violations: StateBoundaryViolation[]): Map<string, NodeTier> {
+  const { model } = readArchitectureNativeContext(repoRoot, { kind: 'worktree' });
+  const tiers = new Map<string, NodeTier>();
+  for (const node of model.nodes) {
+    const id = String(node.id);
+    const file = model.sourcePaths.nodes[id] ?? `.archcontext/model/nodes/${id}.yaml`;
+    const extensions = isRecord(node.extensions) ? node.extensions : {};
+    const tier = extensions.harnessTier;
+    if (tier === undefined) {
+      if (node.kind === 'capability') violations.push(violation('HARNESS_TIER_MISSING', file, `${id} has no extensions.harnessTier (core, plugin or composition)`));
+      continue;
+    }
+    if (typeof tier !== 'string' || !HARNESS_TIERS.has(tier)) {
+      violations.push(violation('HARNESS_TIER_INVALID', file, `${id} has an unknown extensions.harnessTier: ${JSON.stringify(tier)}`));
+      continue;
+    }
+    const contract = extensions.harnessContract;
+    if (tier === 'plugin' && (typeof contract !== 'string' || !HARNESS_CONTRACTS.has(contract))) {
+      violations.push(violation('HARNESS_CONTRACT_INVALID', file, `plugin ${id} needs extensions.harnessContract (Host, Event, Review, Surface or Check); found ${JSON.stringify(contract ?? null)}`));
+      continue;
+    }
+    tiers.set(id, { tier, contract: tier === 'plugin' ? contract as string : null });
+  }
+  return tiers;
+}
+
+/**
+ * Core files may import only core files. The tier of a file is the tier of
+ * the node that ArchContext matched, else the tier of its owning capability.
+ * Plugins and the composition root may import core.
+ */
+function checkCoreTierImports(
+  repoRoot: string,
+  files: ReadonlySet<string>,
+  sources: ReadonlyMap<string, SourceFile>,
+  references: ReadonlyMap<SourceFile, ModuleReferences>,
+  violations: StateBoundaryViolation[],
+): void {
+  const edges = tierEdges(repoRoot, files, sources, references);
+  const endpoints = [...new Set(edges.flatMap((edge) => [edge.from, edge.to]))].sort();
+  if (endpoints.length === 0) return;
+  let owners: Map<string, TierOwner>;
+  let tiers: Map<string, NodeTier>;
+  try {
+    tiers = readNodeTiers(repoRoot, violations);
+    owners = resolveTierOwners(repoRoot, endpoints);
+  } catch (error) {
+    violations.push(violation(
+      'HARNESS_TIER_AUTHORITY_UNAVAILABLE',
+      '.archcontext/model/nodes',
+      `core/plugin tiers need the ArchContext model: ${error instanceof Error ? error.message : String(error)}${existsSync(join(repoRoot, 'node_modules')) ? '' : '; node_modules is missing, run `bun install` first'}`,
+    ));
+    return;
+  }
+
+  const fileTier = new Map<string, NodeTier & { readonly nodeId: string; readonly capabilityId: string }>();
+  for (const path of endpoints) {
+    const owner = owners.get(path)!;
+    if (owner.kind === 'unowned') {
+      violations.push(violation('HARNESS_TIER_OWNER_MISSING', path, 'no ArchContext node owns this file, so its core/plugin tier is unknown'));
+    } else if (owner.kind === 'ambiguous' || owner.candidates.some((candidate) => tiers.has(candidate) && candidate !== owner.capabilityId)) {
+      violations.push(violation('HARNESS_TIER_OWNER_AMBIGUOUS', path, `ambiguous ArchContext owner, so its core/plugin tier is unknown: ${owner.candidates.join(', ')}`));
+    } else {
+      // A missing or invalid tier is already reported on its node.
+      const tier = tiers.get(owner.nodeId) ?? tiers.get(owner.capabilityId);
+      if (tier) fileTier.set(path, { ...tier, nodeId: owner.nodeId, capabilityId: owner.capabilityId });
+    }
+  }
+
+  for (const edge of edges) {
+    if (fileTier.get(edge.from)?.tier !== 'core') continue;
+    const target = fileTier.get(edge.to);
+    if (!target || target.tier === 'core') continue;
+    const owner = target.nodeId === target.capabilityId ? target.capabilityId : `${target.nodeId} in ${target.capabilityId}`;
+    violations.push(nodeViolation(
+      repoRoot,
+      edge.source,
+      edge.node,
+      target.tier === 'plugin' ? 'CORE_IMPORTS_PLUGIN' : 'CORE_IMPORTS_COMPOSITION',
+      target.tier === 'plugin'
+        ? `core imports ${edge.to} (plugin ${owner}) through ${edge.specifier}; depend on the core ${target.contract} contract, or move or re-own the code`
+        : `core imports the composition root ${edge.to} (${owner}) through ${edge.specifier}; only the composition root may import plugins`,
+    ));
+  }
+}
+
+async function parseSources(
+  repoRoot: string,
+  relativeFiles: readonly string[],
+): Promise<ParsedSources> {
+  const configPath = resolve(repoRoot, 'tsconfig.json');
+  if (!existsSync(configPath)) {
+    return {
+      sources: new Map(),
+      references: new Map(),
+      violations: [violation(
+        'TYPESCRIPT_CONFIG_MISSING',
+        'tsconfig.json',
+        'TypeScript AST boundary analysis requires the repository tsconfig.json',
+      )],
+    };
+  }
+
+  const api = new API();
+  let snapshot: Snapshot | undefined;
+  try {
+    const absoluteFiles = relativeFiles.map((file) => resolve(repoRoot, file));
+    // tsconfig.json covers src/; scripts/ files get their default project.
+    const scriptFiles = absoluteFiles.filter((file) => !relPath(repoRoot, file).startsWith('src/'));
+    snapshot = await api.updateSnapshot({
+      openProjects: [configPath],
+      openFiles: scriptFiles,
+    });
+    const configuredProject = snapshot.getProjects().find(
+      (project) => resolve(project.configFileName) === configPath,
+    );
+    if (!configuredProject) {
+      throw new Error(`TypeScript did not load configured project ${configPath}`);
+    }
+
+    const projectsByFile = new Map<string, Project>();
+    for (const file of absoluteFiles) projectsByFile.set(file, configuredProject);
+    const rootFiles = new Set(configuredProject.rootFiles.map((file) => resolve(file)));
+    for (const scriptFile of scriptFiles) {
+      if (rootFiles.has(scriptFile)) continue;
+      const scriptProject = await snapshot.getDefaultProjectForFile(scriptFile);
+      if (!scriptProject) throw new Error(`TypeScript did not assign a project to ${relPath(repoRoot, scriptFile)}`);
+      projectsByFile.set(scriptFile, scriptProject);
+    }
+
+    const violations: StateBoundaryViolation[] = [];
+    const projectFiles = new Map<Project, Set<string>>();
+    for (const [file, project] of projectsByFile) {
+      const files = projectFiles.get(project) ?? new Set<string>();
+      files.add(file);
+      projectFiles.set(project, files);
+    }
+    for (const [project, checkedFiles] of projectFiles) {
+      const diagnostics = await project.program.getSyntacticDiagnostics();
+      for (const diagnostic of diagnostics) {
+        if (!diagnostic.fileName || !checkedFiles.has(resolve(diagnostic.fileName))) continue;
+        const file = relPath(repoRoot, diagnostic.fileName);
+        const source = await project.program.getSourceFile(diagnostic.fileName);
+        const position = source
+          ? source.getLineAndCharacterOfPosition(Math.max(0, diagnostic.pos))
+          : { line: 0, character: 0 };
+        violations.push(violation(
+          'TYPESCRIPT_SYNTAX_ERROR',
+          file,
+          `TypeScript AST parse failed (TS${diagnostic.code}): ${diagnostic.text}`,
+          position.line + 1,
+          position.character + 1,
+        ));
+      }
+    }
+
+    const sourceEntries = await Promise.all([...projectsByFile].map(async ([absoluteFile, project]) => {
+      const source = await project.program.getSourceFile(absoluteFile);
+      if (!source) {
+        violations.push(violation(
+          'TYPESCRIPT_SOURCE_UNAVAILABLE',
+          relPath(repoRoot, absoluteFile),
+          'TypeScript AST service did not return the requested source file',
+        ));
+        return null;
+      }
+      return [relPath(repoRoot, absoluteFile), source] as const;
+    }));
+    const sources = new Map(sourceEntries.filter((entry) => entry !== null));
+    const references = new Map(await Promise.all([...sources.values()].map(async source =>
+      [source, await moduleReferences(source, projectsByFile.get(resolve(source.fileName))!.checker)] as const)));
+    return {
+      sources,
+      references,
+      violations,
+    };
+  } finally {
+    if (snapshot) await snapshot.dispose();
+    await api.close();
+  }
+}
+
+function sortedViolations(violations: readonly StateBoundaryViolation[]): StateBoundaryViolation[] {
+  return [...violations].sort((left, right) =>
+    left.file.localeCompare(right.file) ||
+    left.line - right.line ||
+    left.column - right.column ||
+    left.code.localeCompare(right.code) ||
+    left.message.localeCompare(right.message));
+}
+
+export async function checkStateBoundaries(
+  repoInput = '.',
+  intraLayerCycleAllowances = INTRA_LAYER_CYCLE_ALLOWANCES,
+): Promise<StateBoundaryCheckResult> {
+  const repoRoot = resolve(repoInput);
+  const violations: StateBoundaryViolation[] = [];
+  try {
+    const coreFiles = CORE_ROOTS.flatMap((root) => collectTypeScriptFiles(repoRoot, root, violations));
+    const cliFiles = collectTypeScriptFiles(repoRoot, 'src/cli', violations);
+    const effectsFiles = collectTypeScriptFiles(repoRoot, 'src/effects', violations);
+    const requiredFiles = [CAPABILITY_SCRIPT, STATE_SNAPSHOT_ADAPTER];
+    for (const file of requiredFiles) {
+      const absolutePath = resolve(repoRoot, file);
+      if (!existsSync(absolutePath) || !lstatSync(absolutePath).isFile()) {
+        violations.push(violation('REQUIRED_PATH_MISSING', file, `required architecture file is missing: ${file}`));
+      }
+    }
+    if (existsSync(resolve(repoRoot, RETIRED_WORKFLOW_PROFILE_ADAPTER))) {
+      violations.push(violation(
+        'RETIRED_ADAPTER_PATH',
+        RETIRED_WORKFLOW_PROFILE_ADAPTER,
+        'temporary workflow-profile adapter/re-export is forbidden at Sprint close',
+      ));
+    }
+
+    const sourceFiles = [...new Set([
+      ...coreFiles,
+      ...cliFiles,
+      ...effectsFiles,
+      resolve(repoRoot, CAPABILITY_SCRIPT),
+    ].filter((file) => existsSync(file)))].map((file) => relPath(repoRoot, file));
+    // The layer roots above already report their own path problems.
+    const tierScanViolations: StateBoundaryViolation[] = [];
+    const tierFiles = new Set(TIER_ROOTS.flatMap((root) => collectTypeScriptFiles(repoRoot, root, tierScanViolations))
+      .map((file) => relPath(repoRoot, file)).filter(isTierSource));
+    violations.push(...tierScanViolations.filter((item) =>
+      !INTRA_LAYER_ROOTS.some((root) => item.file === root || item.file.startsWith(`${root}/`))));
+    const parsed = await parseSources(repoRoot, [...new Set([...sourceFiles, ...tierFiles])]);
+    violations.push(...parsed.violations);
+    const layerSourceFiles = new Set(sourceFiles);
+    const layerSources = new Map([...parsed.sources].filter(([file]) => layerSourceFiles.has(file)));
+
+    const coreSet = new Set(coreFiles.map((file) => relPath(repoRoot, file)));
+    for (const file of coreSet) {
+      const source = parsed.sources.get(file);
+      if (!source) continue;
+      checkSrcScriptImports(repoRoot, source, parsed.references.get(source)!, violations);
+      checkCoreDependencies(repoRoot, source, parsed.references.get(source)!, violations);
+    }
+    const effectsSet = new Set(effectsFiles.map((file) => relPath(repoRoot, file)));
+    for (const file of effectsSet) {
+      const source = parsed.sources.get(file);
+      if (!source) continue;
+      checkSrcScriptImports(repoRoot, source, parsed.references.get(source)!, violations);
+      checkEffectDependencies(repoRoot, source, parsed.references.get(source)!, violations);
+    }
+    const cliSet = new Set(cliFiles.map((file) => relPath(repoRoot, file)));
+    for (const file of cliSet) {
+      const source = parsed.sources.get(file);
+      if (source) checkSrcScriptImports(repoRoot, source, parsed.references.get(source)!, violations);
+    }
+    checkIntraLayerCycles(repoRoot, layerSources, parsed.references, intraLayerCycleAllowances, violations);
+    checkCanonicalDeclarations(repoRoot, layerSources, violations);
+    checkCoreTierImports(repoRoot, tierFiles, parsed.sources, parsed.references, violations);
+    checkCapabilityScript(repoRoot, parsed.sources.get(CAPABILITY_SCRIPT), violations);
+    checkStateSnapshotAdapter(repoRoot, parsed.sources.get(STATE_SNAPSHOT_ADAPTER), violations);
+    checkGeneratedCapabilityProjection(repoRoot, violations);
+
+    const sorted = sortedViolations(violations);
+    return { ok: sorted.length === 0, filesChecked: parsed.sources.size, violations: sorted };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const sorted = sortedViolations([
+      ...violations,
+      violation('BOUNDARY_CHECKER_FAILURE', '(checker)', `state boundary analysis failed closed: ${message}`),
+    ]);
+    return { ok: false, filesChecked: 0, violations: sorted };
+  }
+}
+
+function usage(): never {
+  process.stderr.write('Usage: bun scripts/check-state-boundaries.ts [--repo <path>]\n');
+  process.exit(2);
+}
+
+function parseRepoArg(argv: readonly string[]): string {
+  if (argv.length === 0) return '.';
+  if (argv.length === 2 && argv[0] === '--repo' && argv[1]) return argv[1];
+  return usage();
+}
+
+if (import.meta.main) {
+  const result = await checkStateBoundaries(parseRepoArg(process.argv.slice(2)));
+  if (result.ok) {
+    process.stdout.write(
+      `[state-boundaries] OK: ${result.filesChecked} TypeScript files checked; canonical helper projection verified\n`,
+    );
+  } else {
+    for (const item of result.violations) {
+      process.stderr.write(
+        `[state-boundaries] ${item.code} ${item.file}:${item.line}:${item.column} ${item.message}\n`,
+      );
+    }
+    process.stderr.write(`[state-boundaries] failed: ${result.violations.length} violation(s)\n`);
+    process.exitCode = 1;
+  }
+}

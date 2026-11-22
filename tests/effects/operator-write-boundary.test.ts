@@ -1,0 +1,173 @@
+import { describe, expect, test } from 'bun:test';
+
+import { OPERATOR_ARCHITECTURE_MAP_ROUTE } from '../../src/core/operator/architecture-map';
+import {
+  OPERATOR_API_PATH_PREFIX,
+  OPERATOR_ARCHITECTURE_MODULES_ROUTE,
+  OPERATOR_ARCHITECTURE_MODULE_ROUTE,
+  OPERATOR_ARCHITECTURE_REVIEW_PROMPT_ROUTE,
+  OPERATOR_ARCHITECTURE_HISTORY_ROUTE,
+  OPERATOR_ARCHITECTURE_REFACTOR_ROUTE,
+  OPERATOR_TESTS_ROUTE,
+  OPERATOR_RULES_ROUTE,
+  OPERATOR_BOARD_SEATS_ROUTE,
+  OPERATOR_BOARD_PARENTS_ROUTE,
+  OPERATOR_BOARD_ROUTE,
+  OPERATOR_EXECUTION_STATE_ROUTE,
+  OPERATOR_TASK_MESSAGES_ROUTE,
+  OPERATOR_DEV_ACTIVITY_PATH,
+  OPERATOR_REPOSITORIES_PATH,
+  OPERATOR_SETUP_PATH,
+  OPERATOR_BOT_ACCESS_PATH,
+  OPERATOR_BOT_REVIEWS_PATH,
+  OPERATOR_CLI_INVENTORY_PATH,
+  OPERATOR_DOCS_TREE_ROUTE,
+  OPERATOR_DOCS_FILE_ROUTE,
+  OPERATOR_HEALTH_PATH,
+  OPERATOR_NOTIFY_STATUS_PATH,
+  OPERATOR_RUNTIME_STATUS_PATH,
+  OPERATOR_ROUTES,
+  OPERATOR_STATIC_ASSET_PATTERN,
+  type OperatorRouteV1,
+} from '../../src/effects/operator/server';
+import { OPERATOR_SETTINGS_AGENTS_PATH, OPERATOR_SETTINGS_AGENTS_ROUTE } from '../../src/effects/operator/agents-settings-route';
+import { OPERATOR_SETTINGS_SEATS_PATH, OPERATOR_SETTINGS_SEATS_ROUTE } from '../../src/effects/operator/seats-settings-route';
+import { OPERATOR_QUOTA_PATH } from '../../src/core/board/quota';
+import { OPERATOR_WORKTREES_CLEANUP_ROUTE } from '../../src/effects/operator/worktree-cleanup';
+import { OPERATOR_WORKTREES_CLEANUP_INVESTIGATION_ROUTE, OPERATOR_WORKTREES_CLEANUP_INVESTIGATION_STATUS_ROUTE } from '../../src/effects/operator/worktree-cleanup-investigation';
+import { OPERATOR_RULES_PROMOTIONS_ROUTE, OPERATOR_RULES_RECONCILE_ROUTE } from '../../src/effects/operator/rules-promote-route';
+import { OPERATOR_ADVISOR_BOSS_COMMANDS_ROUTE, OPERATOR_ADVISOR_MESSAGES_ROUTE, OPERATOR_ADVISOR_TRANSCRIPT_PATH } from '../../src/effects/operator/advisor-seat-route';
+
+/**
+ * The inventory claim under test is "zero browser writes". Probing a
+ * running server proves how the routes that exist behave, never which routes
+ * exist, so the gate is applied to the declared inventory as a value.
+ */
+function writeRouteIds(routes: readonly OperatorRouteV1[]): readonly string[] {
+  return routes.filter((route) => route.write || !['GET', 'HEAD'].includes(route.method)).map((route) => route.id);
+}
+
+describe('operator structural write boundary', () => {
+  test('declares only the admitted write routes and rejects every mutation verb even when mislabeled read-only', () => {
+    expect(writeRouteIds(OPERATOR_ROUTES)).toEqual(['worktrees_cleanup', 'worktrees_cleanup_plan', 'worktrees_cleanup_execute', 'worktrees_cleanup_investigation', 'rules_promote', 'rules_reconcile', 'advisor_seat_messages', 'advisor_boss_commands', 'settings_report_language_write', 'repository_documentation_language_write', 'settings_agents_write', 'settings_seats_write']);
+    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE'] as const) {
+      const mutation: OperatorRouteV1 = { id: 'fake_write', method, pattern: '/api/v1/fleet/tasks/anything', write: false };
+      expect(writeRouteIds([...OPERATOR_ROUTES, mutation])).toEqual(['worktrees_cleanup', 'worktrees_cleanup_plan', 'worktrees_cleanup_execute', 'worktrees_cleanup_investigation', 'rules_promote', 'rules_reconcile', 'advisor_seat_messages', 'advisor_boss_commands', 'settings_report_language_write', 'repository_documentation_language_write', 'settings_agents_write', 'settings_seats_write', 'fake_write']);
+    }
+    expect(writeRouteIds([...OPERATOR_ROUTES, { id: 'get_write', method: 'GET', pattern: '/api/write', write: true }])).toEqual(['worktrees_cleanup', 'worktrees_cleanup_plan', 'worktrees_cleanup_execute', 'worktrees_cleanup_investigation', 'rules_promote', 'rules_reconcile', 'advisor_seat_messages', 'advisor_boss_commands', 'settings_report_language_write', 'repository_documentation_language_write', 'settings_agents_write', 'settings_seats_write', 'get_write']);
+  });
+
+  test('the dispatcher admits only GET, HEAD and, for a write route, POST', async () => {
+    const source = await Bun.file(new URL('../../src/effects/operator/server.ts', import.meta.url)).text();
+    // Scan executable method comparisons as well as the declared inventory.
+    // This catches a mutation branch omitted from OPERATOR_ROUTES.
+    const methods = [...source.matchAll(/\bmethod\s*(?:!==|===|!=|==)\s*['"]([A-Z]+)['"]/gu)].map(match => match[1]);
+    expect(methods.length).toBeGreaterThan(0);
+    expect([...new Set(methods)].sort()).toEqual(['GET', 'HEAD', 'POST']);
+    // POST has one branch, and it reaches only a matched write route.
+    expect(source.match(/handleOperatorWrite\(/gu)).toHaveLength(1);
+    expect(source).toMatch(/if \(write\) \{\n\s+if \(writeMatch === null\) \{/u);
+  });
+
+  test('pins every inventory pattern to the value the dispatcher matches on', () => {
+    const patterns = new Map(OPERATOR_ROUTES.map((route) => [route.id, route.pattern]));
+    expect(patterns.size).toBe(OPERATOR_ROUTES.length);
+    expect([...patterns.keys()]).toEqual([
+      'health',
+      'runtime_status',
+      'notify_status',
+      'dev_activity',
+      'repositories',
+      'worktrees',
+      'worktrees_cleanup',
+      'worktrees_cleanup_plan',
+      'worktrees_cleanup_execute',
+      'worktrees_cleanup_investigation',
+      'worktrees_cleanup_investigation_status',
+      'setup',
+      'bot_access',
+      'bot_reviews',
+      'cli_inventory',
+      'tests',
+      'rules',
+      'rules_promote',
+      'rules_reconcile',
+      'board',
+      'board_seats',
+      'board_parents',
+      'advisor_seat_messages',
+      'advisor_boss_commands',
+      'advisor_seat_transcript',
+      'execution_state',
+      'task_messages',
+      'docs_tree',
+      'docs_file',
+      'docs_diagram',
+      'docs_diagram_image',
+      'settings_agents',
+      'settings_report_language',
+      'settings_report_language_write',
+      'repository_documentation_language',
+      'repository_documentation_language_write',
+      'settings_agents_write',
+      'settings_seats',
+      'quota',
+      'settings_seats_write',
+      'architecture_modules',
+      'architecture_module',
+      'architecture_review_prompt',
+      'architecture_history',
+      'architecture_refactor',
+      'architecture_map',
+      'static_asset',
+    ]);
+    expect(patterns.get('health')).toBe(OPERATOR_HEALTH_PATH);
+    expect(patterns.get('runtime_status')).toBe(OPERATOR_RUNTIME_STATUS_PATH);
+    expect(patterns.get('notify_status')).toBe(OPERATOR_NOTIFY_STATUS_PATH);
+    expect(patterns.get('dev_activity')).toBe(OPERATOR_DEV_ACTIVITY_PATH);
+    expect(OPERATOR_ROUTES.find(route => route.id === 'dev_activity')).toEqual({ id: 'dev_activity', method: 'GET', pattern: '/api/v1/dev-activity', write: false });
+    expect(patterns.get('repositories')).toBe(OPERATOR_REPOSITORIES_PATH);
+    expect(OPERATOR_ROUTES.find(route => route.id === 'repositories')).toEqual({ id: 'repositories', method: 'GET', pattern: '/api/v1/repositories', write: false });
+    expect(patterns.get('setup')).toBe(OPERATOR_SETUP_PATH);
+    expect(OPERATOR_ROUTES.find(route => route.id === 'setup')).toEqual({ id: 'setup', method: 'GET', pattern: '/api/v1/setup', write: false });
+    expect(patterns.get('bot_access')).toBe(OPERATOR_BOT_ACCESS_PATH);
+    expect(OPERATOR_ROUTES.find(route => route.id === 'bot_access')).toEqual({ id: 'bot_access', method: 'GET', pattern: '/api/v1/bot-access', write: false });
+    expect(patterns.get('bot_reviews')).toBe(OPERATOR_BOT_REVIEWS_PATH);
+    expect(OPERATOR_ROUTES.find(route => route.id === 'bot_reviews')).toEqual({ id: 'bot_reviews', method: 'GET', pattern: '/api/v1/bot-reviews', write: false });
+    expect(patterns.get('cli_inventory')).toBe(OPERATOR_CLI_INVENTORY_PATH);
+    expect(OPERATOR_ROUTES.find(route => route.id === 'cli_inventory')).toEqual({ id: 'cli_inventory', method: 'GET', pattern: '/api/v1/cli-inventory', write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'rules')).toEqual({ id: 'rules', method: 'GET', pattern: OPERATOR_RULES_ROUTE.source, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'rules_promote')).toEqual({ id: 'rules_promote', method: 'POST', pattern: OPERATOR_RULES_PROMOTIONS_ROUTE.source, write: true });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'rules_reconcile')).toEqual({ id: 'rules_reconcile', method: 'POST', pattern: OPERATOR_RULES_RECONCILE_ROUTE.source, write: true });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'tests')).toEqual({ id: 'tests', method: 'GET', pattern: OPERATOR_TESTS_ROUTE.source, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'board')).toEqual({ id: 'board', method: 'GET', pattern: OPERATOR_BOARD_ROUTE.source, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'board_seats')).toEqual({ id: 'board_seats', method: 'GET', pattern: OPERATOR_BOARD_SEATS_ROUTE.source, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'board_parents')).toEqual({ id: 'board_parents', method: 'GET', pattern: OPERATOR_BOARD_PARENTS_ROUTE.source, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'advisor_seat_messages')).toEqual({ id: 'advisor_seat_messages', method: 'POST', pattern: OPERATOR_ADVISOR_MESSAGES_ROUTE.source, write: true });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'advisor_boss_commands')).toEqual({ id: 'advisor_boss_commands', method: 'POST', pattern: OPERATOR_ADVISOR_BOSS_COMMANDS_ROUTE.source, write: true });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'advisor_seat_transcript')).toEqual({ id: 'advisor_seat_transcript', method: 'GET', pattern: OPERATOR_ADVISOR_TRANSCRIPT_PATH, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'execution_state')).toEqual({ id: 'execution_state', method: 'GET', pattern: OPERATOR_EXECUTION_STATE_ROUTE.source, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'task_messages')).toEqual({ id: 'task_messages', method: 'GET', pattern: OPERATOR_TASK_MESSAGES_ROUTE.source, write: false });
+    expect(patterns.get('docs_tree')).toBe(OPERATOR_DOCS_TREE_ROUTE.source);
+    expect(patterns.get('docs_file')).toBe(OPERATOR_DOCS_FILE_ROUTE.source);
+    expect(OPERATOR_ROUTES.filter(route => route.id.startsWith('docs_')).every(route => route.method === 'GET' && !route.write)).toBe(true);
+    expect(OPERATOR_ROUTES.find(route => route.id === 'settings_agents')).toEqual({ id: 'settings_agents', method: 'GET', pattern: OPERATOR_SETTINGS_AGENTS_PATH, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'settings_agents_write')).toEqual({ id: 'settings_agents_write', method: 'POST', pattern: OPERATOR_SETTINGS_AGENTS_ROUTE.source, write: true });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'settings_seats')).toEqual({ id: 'settings_seats', method: 'GET', pattern: OPERATOR_SETTINGS_SEATS_PATH, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'quota')).toEqual({ id: 'quota', method: 'GET', pattern: OPERATOR_QUOTA_PATH, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'settings_seats_write')).toEqual({ id: 'settings_seats_write', method: 'POST', pattern: OPERATOR_SETTINGS_SEATS_ROUTE.source, write: true });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'worktrees_cleanup')).toEqual({ id: 'worktrees_cleanup', method: 'POST', pattern: OPERATOR_WORKTREES_CLEANUP_ROUTE.source, write: true });
+    // The start is a write route; its status is a read of the job record.
+    expect(OPERATOR_ROUTES.find(route => route.id === 'worktrees_cleanup_investigation')).toEqual({ id: 'worktrees_cleanup_investigation', method: 'POST', pattern: OPERATOR_WORKTREES_CLEANUP_INVESTIGATION_ROUTE.source, write: true });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'worktrees_cleanup_investigation_status')).toEqual({ id: 'worktrees_cleanup_investigation_status', method: 'GET', pattern: OPERATOR_WORKTREES_CLEANUP_INVESTIGATION_STATUS_ROUTE.source, write: false });
+    expect(patterns.get('architecture_modules')).toBe(OPERATOR_ARCHITECTURE_MODULES_ROUTE.source);
+    expect(patterns.get('architecture_module')).toBe(OPERATOR_ARCHITECTURE_MODULE_ROUTE.source);
+    expect(patterns.get('architecture_review_prompt')).toBe(OPERATOR_ARCHITECTURE_REVIEW_PROMPT_ROUTE.source);
+    expect(OPERATOR_ROUTES.find(route => route.id === 'architecture_history')).toEqual({ id: 'architecture_history', method: 'GET', pattern: OPERATOR_ARCHITECTURE_HISTORY_ROUTE.source, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'architecture_refactor')).toEqual({ id: 'architecture_refactor', method: 'GET', pattern: OPERATOR_ARCHITECTURE_REFACTOR_ROUTE.source, write: false });
+    expect(OPERATOR_ROUTES.find(route => route.id === 'architecture_map')).toEqual({ id: 'architecture_map', method: 'GET', pattern: OPERATOR_ARCHITECTURE_MAP_ROUTE.source, write: false });
+    expect(patterns.get('static_asset')).toBe(OPERATOR_STATIC_ASSET_PATTERN);
+
+    expect(OPERATOR_REPOSITORIES_PATH.startsWith(OPERATOR_API_PATH_PREFIX)).toBe(true);
+  });
+});

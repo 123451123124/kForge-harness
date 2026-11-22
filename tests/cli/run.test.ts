@@ -1,0 +1,547 @@
+import { describe, expect, test } from "bun:test";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { spawnSync } from "child_process";
+import { listHelpers, listInternalHelperIds, protectedChildEnv, resolveHelper, runHelper, runInternalHelper } from "../../src/effects/runtime/helper-runner";
+import { INTERNAL_HELPER_COMMANDS, RUN_HELP_GROUPS, RUN_HELP_MAX_HELPERS, RUN_HELP_MAX_LINES } from "../../src/cli/commands/run";
+
+const ROOT = join(import.meta.dir, "..", "..");
+const CLI = join(ROOT, "src/cli/index.ts");
+
+function packageRuntimeEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, REPO_HARNESS_SOURCE_ROOT: undefined };
+}
+
+function writeSourceHelper(tmp: string, fileName: string, content: string, internal: readonly string[] = []): string {
+  const sourceRoot = join(tmp, "source-root");
+  mkdirSync(join(sourceRoot, "assets"), { recursive: true });
+  mkdirSync(join(sourceRoot, "scripts"), { recursive: true });
+  writeFileSync(
+    join(sourceRoot, "assets", "workflow-contract.v1.json"),
+    `${JSON.stringify({ helpers: { scripts: [fileName], internal } }, null, 2)}\n`,
+  );
+  const helperPath = join(sourceRoot, "scripts", fileName);
+  writeFileSync(helperPath, content);
+  chmodSync(helperPath, 0o755);
+  return sourceRoot;
+}
+
+describe("run command", () => {
+  test("retired bounded verifier helper fails closed without running the command", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-retired-bounded-"));
+    try {
+      const marker = join(tmp, "ran");
+      const result = join(tmp, "result.json");
+      const res = spawnSync("bun", [
+        CLI, "run", "run-bounded-verifier-command",
+        "--deadline-ms", String(Date.now() + 30_000), "--log", join(tmp, "log"), "--result", result,
+        "--", "/bin/sh", "-c", `touch "${marker}"`,
+      ], { cwd: tmp, encoding: "utf-8", env: packageRuntimeEnv() });
+
+      expect(res.status).toBe(2);
+      expect(res.stderr).toContain('helper "run-bounded-verifier-command" is retired');
+      expect(res.stderr).toContain("rh verify plan execute");
+      expect(existsSync(marker)).toBe(false);
+      expect(existsSync(result)).toBe(false);
+      expect(resolveHelper("run-bounded-verifier-command")).toBeNull();
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("internal worktree helpers fail closed with their public command and run nothing", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-internal-"));
+    try {
+      expect(spawnSync("git", ["init", "-q", "-b", "main"], { cwd: tmp }).status).toBe(0);
+      const res = spawnSync("bun", [CLI, "run", "contract-worktree", "start", "--issue", "1"], {
+        cwd: tmp, encoding: "utf-8", env: packageRuntimeEnv(),
+      });
+      expect(res.status).toBe(2);
+      expect(res.stderr).toContain('rh run: helper "contract-worktree" is internal. Use `rh worktrees start|cleanup|notify-merged|sweep|status`.');
+      expect(res.stderr).not.toContain("known helpers:");
+      expect(spawnSync("git", ["worktree", "list", "--porcelain"], { cwd: tmp, encoding: "utf-8" }).stdout.match(/^worktree /gm)).toHaveLength(1);
+      expect(existsSync(join(tmp, ".ai"))).toBe(false);
+
+      const library = spawnSync("bun", [CLI, "run", "worktree-merge-lib"], { cwd: tmp, encoding: "utf-8", env: packageRuntimeEnv() });
+      expect(library.status).toBe(2);
+      expect(library.stderr).toContain('rh run: helper "worktree-merge-lib" is internal. It has no public command.');
+
+      expect(runHelper({ helper: "ship-worktrees.sh", args: ["--help"], cwd: tmp, stdio: "pipe" })).toMatchObject({ exitCode: 2, reason: "internal-helper" });
+      expect(runInternalHelper({ helper: "new-spec", cwd: tmp, stdio: "pipe" })).toMatchObject({ exitCode: 2, reason: "missing-helper" });
+      expect([...INTERNAL_HELPER_COMMANDS.keys()].sort()).toEqual(listInternalHelperIds(packageRuntimeEnv()));
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("worktrees runtime passes every argument, including --help, to the internal helper", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-worktrees-runtime-"));
+    const logFile = join(tmp, "args.json");
+    try {
+      const sourceRoot = writeSourceHelper(
+        tmp,
+        "contract-worktree-runtime.ts",
+        `require("fs").writeFileSync(${JSON.stringify(logFile)}, JSON.stringify(process.argv.slice(2)));\n`,
+        ["contract-worktree-runtime"],
+      );
+      const env = { ...process.env, REPO_HARNESS_SOURCE_ROOT: sourceRoot };
+
+      const refused = spawnSync("bun", [CLI, "run", "contract-worktree-runtime", "record"], { cwd: tmp, encoding: "utf-8", env });
+      expect(refused.status).toBe(2);
+      expect(refused.stderr).toContain("Use `rh worktrees runtime`.");
+      expect(existsSync(logFile)).toBe(false);
+
+      const res = spawnSync("bun", [CLI, "worktrees", "runtime", "record", "--repo", tmp, "--help", "-h"], { cwd: tmp, encoding: "utf-8", env });
+      expect(res.status, res.stderr).toBe(0);
+      expect(JSON.parse(readFileSync(logFile, "utf-8"))).toEqual(["record", "--repo", tmp, "--help", "-h"]);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("capability routes forward arguments and helper exits; internal ids run nothing", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-capability-routes-"));
+    try {
+      const marker = join(tmp, "ran");
+      for (const [route, helper, extension] of [
+        ["resolve", "capability-resolver", "ts"],
+        ["register", "capability-config", "ts"],
+        ["blocks", "select-agent-context-blocks", "sh"],
+      ]) {
+        const sourceRoot = writeSourceHelper(tmp, `${helper}.${extension}`, extension === "sh"
+          ? 'printf "%s\\n" "$@"; echo helper-error >&2; touch ran; exit 17\n'
+          : 'console.log(process.argv.slice(2).join("\\n")); console.error("helper-error"); require("fs").writeFileSync("ran", ""); process.exit(17);\n', [helper]);
+        const env = { ...process.env, REPO_HARNESS_SOURCE_ROOT: sourceRoot };
+        for (const id of [helper, `${helper}.${extension}`]) {
+          const refused = spawnSync("bun", [CLI, "run", id, "list"], { cwd: tmp, encoding: "utf-8", env });
+          expect(refused.status).toBe(2);
+          expect(refused.stderr).toContain(`Use \`rh capability ${route}\`.`);
+          expect(existsSync(marker)).toBe(false);
+        }
+        for (const args of [[], ["match", "--path", "a b.ts", "--help", "-h", "--", "literal"]]) {
+          const res = spawnSync("bun", [CLI, "capability", route, ...args], { cwd: tmp, encoding: "utf-8", env });
+          expect(res.status, res.stderr).toBe(17);
+          expect(res.stdout).toBe(`${args.join("\n")}\n`);
+          expect(res.stderr).toBe("helper-error\n");
+          rmSync(marker);
+        }
+        expect(listHelpers(packageRuntimeEnv()).map(item => item.id)).not.toContain(helper);
+      }
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("retired context helper is absent from the registry", () => {
+    expect(listHelpers().map((helper) => helper.id)).not.toContain("context-contract-sync");
+    expect(resolveHelper("context-contract-sync")).toBeNull();
+  });
+
+  test("removed plan and task helpers fail as unknown helpers", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-removed-helper-"));
+    try {
+      const res = spawnSync("bun", [CLI, "run", "new-plan", "--slug", "removed"], {
+        cwd: tmp,
+        encoding: "utf-8",
+        env: packageRuntimeEnv(),
+      });
+      expect(res.status).toBe(2);
+      expect(res.stderr).toContain('rh run: unknown helper "new-plan"');
+      expect(res.stderr).toContain("known helpers:");
+      expect(resolveHelper("new-plan")).toBeNull();
+      expect(resolveHelper("verify-contract")).toBeNull();
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("passes unknown options through to the selected helper", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-cli-"));
+    const logFile = join(tmp, "args.log");
+    try {
+      const sourceRoot = writeSourceHelper(
+        tmp,
+        "echo-args.sh",
+        `#!/bin/bash\nprintf '%s\\n' "$*" > "${logFile}"\n`,
+      );
+
+      const res = spawnSync("bun", [CLI, "run", "echo-args", "--strict", "--flag", "value"], {
+        cwd: tmp,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          REPO_HARNESS_SOURCE_ROOT: sourceRoot,
+        },
+      });
+
+      expect(res.status).toBe(0);
+      expect(readFileSync(logFile, "utf-8").trim()).toBe("--strict --flag value");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("resolves bundled helpers from the package by default", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-package-"));
+    try {
+      const resolved = resolveHelper("verify-sprint", tmp, packageRuntimeEnv());
+
+      expect(resolved?.source).toBe("package");
+      expect(resolved?.fileName).toBe("verify-sprint.sh");
+      expect(resolved?.path).toContain("scripts/verify-sprint.sh");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("source checkout override resolves only helpers declared by its contract", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-source-contract-"));
+    try {
+      const sourceRoot = writeSourceHelper(tmp, "known.sh", "#!/bin/bash\nexit 0\n");
+      writeFileSync(join(sourceRoot, "scripts", "unlisted.sh"), "#!/bin/bash\nexit 0\n");
+      chmodSync(join(sourceRoot, "scripts", "unlisted.sh"), 0o755);
+      const env = { REPO_HARNESS_SOURCE_ROOT: sourceRoot };
+
+      expect(resolveHelper("known", tmp, env)?.source).toBe("source");
+      expect(resolveHelper("known.sh", tmp, env)?.fileName).toBe("known.sh");
+      expect(resolveHelper("known.ts", tmp, env)).toBeNull();
+      expect(resolveHelper("unlisted", tmp, env)).toBeNull();
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("official run ignores source override and caller shell hooks for protected helpers", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-protected-"));
+    const marker = join(tmp, "bypass-marker");
+    try {
+      const sourceRoot = join(tmp, "source-root");
+      mkdirSync(join(sourceRoot, "assets"), { recursive: true });
+      mkdirSync(join(sourceRoot, "scripts"), { recursive: true });
+      const protectedFiles = ["contract-worktree.sh", "ship-worktrees.sh", "merge-gate.ts"];
+      writeFileSync(
+        join(sourceRoot, "assets", "workflow-contract.v1.json"),
+        `${JSON.stringify({ helpers: { scripts: protectedFiles } }, null, 2)}\n`,
+      );
+      for (const fileName of protectedFiles) {
+        const helperPath = join(sourceRoot, "scripts", fileName);
+        writeFileSync(helperPath, `#!/bin/bash\ntouch "${marker}"\n`);
+        chmodSync(helperPath, 0o755);
+        const resolved = resolveHelper(fileName, tmp, { REPO_HARNESS_SOURCE_ROOT: sourceRoot });
+        expect(resolved?.source).toBe("package");
+        expect(resolved?.path).toContain("scripts/");
+      }
+
+      const fakeBin = join(tmp, "fake-bin");
+      mkdirSync(fakeBin);
+      for (const binary of ["bash", "git", "bun"]) {
+        const fake = join(fakeBin, binary);
+        writeFileSync(fake, `#!/bin/sh\ntouch "${marker}"\nexit 99\n`);
+        chmodSync(fake, 0o755);
+      }
+
+      const bashEnv = join(tmp, "bash-env-injection.sh");
+      writeFileSync(bashEnv, `#!/bin/sh\ntouch "${marker}"\n`);
+      const direct = runInternalHelper({
+        helper: "ship-worktrees",
+        args: ["--help"],
+        cwd: tmp,
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          BASH_ENV: bashEnv,
+          REPO_HARNESS_SOURCE_ROOT: sourceRoot,
+        },
+        stdio: "pipe",
+      });
+      expect(direct.exitCode, direct.stderr).toBe(0);
+      expect(direct.stdout).toContain("Usage:");
+      expect(existsSync(marker)).toBe(false);
+
+      const res = spawnSync(process.execPath, [CLI, "worktrees", "ship", "--help"], {
+        cwd: tmp,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          BASH_ENV: join(fakeBin, "bash"),
+          GIT_EXEC_PATH: fakeBin,
+          GH_REPO: "attacker/redirect",
+          REPO_HARNESS_SOURCE_ROOT: sourceRoot,
+          REPO_HARNESS_BASH_BIN: join(fakeBin, "bash"),
+          REPO_HARNESS_GIT_BIN: join(fakeBin, "git"),
+          REPO_HARNESS_BUN_BIN: join(fakeBin, "bun"),
+        },
+      });
+      expect(res.status, res.stderr).toBe(0);
+      expect(res.stdout).toContain("Usage:");
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("protected helpers never probe caller PATH for a Node runtime", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-protected-node-"));
+    try {
+      const fakeBin = join(tmp, "node-bin");
+      const marker = join(tmp, "caller-node-executed");
+      mkdirSync(fakeBin);
+      const node = join(fakeBin, "node");
+      writeFileSync(node, `#!/bin/sh\ntouch "${marker}"\necho v24.18.0\n`);
+      chmodSync(node, 0o755);
+
+      const env = protectedChildEnv({ ...process.env, PATH: fakeBin,
+        REPO_HARNESS_NODE_BIN: "/attacker/node", REPO_HARNESS_GH_BIN: "/attacker/gh" });
+      expect(env.REPO_HARNESS_GH_BIN, "caller gh override must be discarded before the runner selects its host binary").toBeUndefined();
+      expect(env.REPO_HARNESS_NODE_BIN).not.toBe(realpathSync(node));
+      expect(existsSync(marker), "caller PATH Node must not execute during protected environment construction").toBe(false);
+      expect(env.PATH?.split(":"), "caller PATH must not become a general command authority").not.toContain(fakeBin);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("source checkout override fails closed for missing and malformed authority", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-source-invalid-"));
+    try {
+      const sourceRoot = join(tmp, "source-root");
+      mkdirSync(join(sourceRoot, "assets"), { recursive: true });
+      mkdirSync(join(sourceRoot, "scripts"), { recursive: true });
+      const env = { REPO_HARNESS_SOURCE_ROOT: sourceRoot };
+
+      expect(() => resolveHelper("known", tmp, env)).toThrow("helper contract not found");
+
+      writeFileSync(join(sourceRoot, "assets", "workflow-contract.v1.json"), "{broken\n");
+      expect(() => resolveHelper("known", tmp, env)).toThrow("malformed JSON");
+
+      writeFileSync(
+        join(sourceRoot, "assets", "workflow-contract.v1.json"),
+        `${JSON.stringify({ helpers: { scripts: ["known.sh"] } })}\n`,
+      );
+      expect(() => resolveHelper("known", tmp, env)).toThrow("contract helper is missing");
+      writeFileSync(
+        join(sourceRoot, "assets", "workflow-contract.v1.json"),
+        `${JSON.stringify({ helpers: { scripts: ["known.sh"], internal: ["ghost"] } })}\n`,
+      );
+      expect(() => resolveHelper("known", tmp, env)).toThrow('helpers.internal names helper id "ghost", which is not in helpers.scripts');
+      expect(() => resolveHelper("known", tmp, { REPO_HARNESS_SOURCE_ROOT: "relative/source" })).toThrow(
+        "must be an absolute path",
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("listHelpers fails closed for missing, malformed, and mismatched descriptions", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-descriptions-invalid-"));
+    try {
+      const sourceRoot = join(tmp, "source-root");
+      mkdirSync(join(sourceRoot, "assets"), { recursive: true });
+      const env = { REPO_HARNESS_SOURCE_ROOT: sourceRoot };
+      const contractPath = join(sourceRoot, "assets", "workflow-contract.v1.json");
+
+      writeFileSync(contractPath, `${JSON.stringify({ helpers: { scripts: ["known.sh"] } })}\n`);
+      expect(() => listHelpers(env)).toThrow("helpers.descriptions must be an object");
+
+      writeFileSync(
+        contractPath,
+        `${JSON.stringify({
+          helpers: { scripts: ["known.sh"], descriptions: { known: "Do the known thing", ghost: "Unknown helper" } },
+        })}\n`,
+      );
+      expect(() => listHelpers(env)).toThrow('helpers.descriptions has unknown helper id "ghost"');
+
+      writeFileSync(
+        contractPath,
+        `${JSON.stringify({ helpers: { scripts: ["known.sh"], descriptions: { known: "   " } } })}\n`,
+      );
+      expect(() => listHelpers(env)).toThrow("must be a non-empty string");
+
+      writeFileSync(
+        contractPath,
+        `${JSON.stringify({ helpers: { scripts: ["known.sh"], descriptions: {} } })}\n`,
+      );
+      expect(() => listHelpers(env)).toThrow('helpers.descriptions is missing entry for helper id "known"');
+
+      writeFileSync(
+        contractPath,
+        `${JSON.stringify({ helpers: { scripts: ["known.sh"], descriptions: { known: "Do the known thing" } } })}\n`,
+      );
+      expect(listHelpers(env)).toEqual([{ id: "known", description: "Do the known thing" }]);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("run --help enumerates bundled helpers with one-line descriptions from the contract", () => {
+    const res = spawnSync("bun", [CLI, "run", "--help"], {
+      cwd: ROOT,
+      encoding: "utf-8",
+      env: packageRuntimeEnv(),
+    });
+
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain("Helpers:");
+    expect(res.stdout).toMatch(/new-spec\s+Create docs\/spec.md from the product spec template/);
+    expect(res.stdout).toContain("Planning & execution:");
+    expect(res.stdout.match(/cutover-closure/g)).toHaveLength(1);
+    expect(res.stdout).toContain("Verification & maintenance:");
+    expect(res.stdout).not.toMatch(/contract-worktree|ship-worktrees|worktree-merge-lib|verify-sprint|verification-plan/);
+  }, 30_000);
+
+  test("run --help groups every real helper exactly once and stays within explicit budgets", () => {
+    const helpers = listHelpers(packageRuntimeEnv());
+    const realIds = helpers.map((helper) => helper.id).sort();
+    const groupedIds: string[] = RUN_HELP_GROUPS.flatMap((group) => group.helpers).sort();
+
+    expect(new Set(groupedIds).size).toBe(groupedIds.length);
+    expect(groupedIds).toEqual(realIds);
+    expect(helpers.length).toBeLessThanOrEqual(RUN_HELP_MAX_HELPERS);
+
+    const res = spawnSync("bun", [CLI, "run", "--help"], {
+      cwd: ROOT,
+      encoding: "utf-8",
+      env: packageRuntimeEnv(),
+    });
+    expect(res.status).toBe(0);
+    expect(res.stdout).toMatch(/Options:[\s\S]*\n\nHelpers:\n/);
+    expect(res.stdout.trimEnd().split("\n").length).toBeLessThanOrEqual(RUN_HELP_MAX_LINES);
+  }, 30_000);
+
+
+  test("removed session-recovery helpers fail as unknown helpers and write no handoff file", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-removed-handoff-"));
+    try {
+      expect(spawnSync("git", ["init"], { cwd: tmp }).status).toBe(0);
+      const res = spawnSync("bun", [CLI, "run", "prepare-handoff", "--reason", "removed"], {
+        cwd: tmp,
+        encoding: "utf-8",
+        env: packageRuntimeEnv(),
+      });
+      expect(res.status).toBe(2);
+      expect(res.stderr).toContain('rh run: unknown helper "prepare-handoff"');
+      expect(existsSync(join(tmp, ".ai/harness/handoff"))).toBe(false);
+      for (const id of ["prepare-handoff", "prepare-codex-handoff", "codex-handoff-resume", "recovery-view-cli"]) {
+        expect(resolveHelper(id)).toBeNull();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("ignores repo-local helper runtime when helper_source is repo pinned", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-repo-pin-"));
+    try {
+      mkdirSync(join(tmp, ".ai/harness/scripts"), { recursive: true });
+      writeFileSync(join(tmp, ".ai/harness/policy.json"), JSON.stringify({ harness: { helper_source: "repo" } }, null, 2));
+      writeFileSync(join(tmp, ".ai/harness/scripts/verify-sprint.sh"), "#!/bin/bash\necho repo\n");
+
+      const resolved = resolveHelper("verify-sprint", tmp, packageRuntimeEnv());
+
+      expect(resolved?.source).toBe("package");
+      expect(resolved?.path).toContain("scripts/verify-sprint.sh");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("runHelper pipe mode redacts common secrets from helper output", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-redact-"));
+    try {
+      const sourceRoot = writeSourceHelper(
+        tmp,
+        "leaky.sh",
+        "#!/bin/bash\necho 'api_key=super-secret'\necho 'Authorization: Bearer token-value' >&2\n",
+      );
+
+      const res = runHelper({
+        helper: "leaky",
+        cwd: tmp,
+        env: { REPO_HARNESS_SOURCE_ROOT: sourceRoot },
+        stdio: "pipe",
+      });
+
+      expect(res.exitCode).toBe(0);
+      expect(res.stdout).toContain("api_key=[redacted]");
+      expect(res.stderr).toContain("Authorization: [redacted]");
+      expect(`${res.stdout}\n${res.stderr}`).not.toContain("super-secret");
+      expect(`${res.stdout}\n${res.stderr}`).not.toContain("token-value");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("runHelper pipe mode caps helper output with a marker", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-cap-"));
+    try {
+      const sourceRoot = writeSourceHelper(tmp, "chatty.sh", "#!/bin/bash\nprintf '0123456789'\n");
+
+      const res = runHelper({
+        helper: "chatty",
+        cwd: tmp,
+        env: { REPO_HARNESS_SOURCE_ROOT: sourceRoot },
+        stdio: "pipe",
+        maxOutputBytes: 5,
+      });
+
+      expect(res.exitCode).toBe(0);
+      expect(res.stdout).toBe("01234\n[output truncated after 5 bytes]");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("runHelper reports timed out helpers distinctly", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "repo-harness-run-timeout-"));
+    try {
+      const sourceRoot = writeSourceHelper(tmp, "sleepy.sh", "#!/bin/bash\nsleep 1\n");
+
+      const res = runHelper({
+        helper: "sleepy",
+        cwd: tmp,
+        env: { REPO_HARNESS_SOURCE_ROOT: sourceRoot },
+        stdio: "pipe",
+        timeoutMs: 20,
+      });
+
+      expect(res.exitCode).toBe(1);
+      expect(res.reason).toBe("timeout");
+      expect(res.stderr).toContain("process timed out after 20ms");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("runHelper returns a structured spawn error when helper resolution fails", () => {
+    const res = runHelper({
+      helper: "verify-sprint",
+      env: { REPO_HARNESS_SOURCE_ROOT: "relative/source-root" },
+      stdio: "pipe",
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.reason).toBe("spawn-error");
+    expect(res.stderr).toContain("REPO_HARNESS_SOURCE_ROOT must be an absolute path");
+  });
+
+});
+
+describe('packaged state helpers', () => {
+  test('packaged state helpers work without a repo library and ignore legacy copies', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'workflow-state-package-helpers-'));
+    try {
+      expect(spawnSync('git', ['init'], { cwd: repo }).status).toBe(0);
+      for (const legacy of [false, true]) {
+        if (legacy) {
+          mkdirSync(join(repo, '.ai/hooks/lib'), { recursive: true });
+          writeFileSync(join(repo, '.ai/hooks/lib/workflow-state.sh'), 'exit 91\n');
+        }
+        for (const [helper, args] of [['summarize-failures', []]] as const) {
+          const result = runHelper({ helper, args, cwd: repo, env: packageRuntimeEnv(), stdio: 'pipe' });
+          expect(result.exitCode, `${helper}: ${result.stderr}`).toBe(0);
+          expect(result.stdout).toBeTruthy();
+        }
+      }
+    } finally { rmSync(repo, { recursive: true, force: true }); }
+  }, 30_000);
+});

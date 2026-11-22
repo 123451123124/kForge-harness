@@ -1,0 +1,103 @@
+import { HostConfigError, type FragmentEdit, type HostConfigStrategy, type TextRange } from './types';
+
+/** The marked blocks that rh writes, each with its one owner (#2841): the rules block in Markdown host files, and the runtime-state block in a repository's Git `info/exclude` (#3080). */
+export const MARKED_BLOCK_FRAGMENTS = {
+  'global-working-rules': 'core',
+  'runtime-state': 'core',
+} as const;
+export type MarkedBlockSelector = keyof typeof MARKED_BLOCK_FRAGMENTS;
+
+export function isMarkedBlockSelector(selector: string): selector is MarkedBlockSelector {
+  return Object.hasOwn(MARKED_BLOCK_FRAGMENTS, selector);
+}
+
+export function markedBlockMarkers(selector: string): { readonly begin: string; readonly end: string } {
+  // Git ignore text has `#` comments only.
+  if (selector === 'runtime-state') return { begin: `# BEGIN: repo-harness ${selector}`, end: `# END: repo-harness ${selector}` };
+  return { begin: `<!-- BEGIN: repo-harness ${selector} -->`, end: `<!-- END: repo-harness ${selector} -->` };
+}
+
+export type MarkedBlockLayout =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'unbalanced' }
+  /** `end` is the offset after the END marker. */
+  | { readonly kind: 'balanced'; readonly start: number; readonly end: number };
+
+function occurrences(haystack: string, needle: string): number[] {
+  const found: number[] = [];
+  for (let index = haystack.indexOf(needle); index !== -1; index = haystack.indexOf(needle, index + needle.length)) found.push(index);
+  return found;
+}
+
+/**
+ * Git ignore text is read by line, so each runtime-state marker must be a
+ * whole line: text before or after a marker on its line is the user's, and a
+ * removal of the block would join it to another rule (#3080).
+ */
+function isWholeLine(content: string, at: number, length: number): boolean {
+  const after = content.slice(at + length, at + length + 2);
+  return (at === 0 || content[at - 1] === '\n') && (after === '' || after.startsWith('\n') || after === '\r\n');
+}
+
+/** One BEGIN and one END marker, in that order, make a block; any other marker set is unbalanced. */
+export function markedBlockLayout(content: string, selector: string): MarkedBlockLayout {
+  const { begin, end } = markedBlockMarkers(selector);
+  const begins = occurrences(content, begin);
+  const ends = occurrences(content, end);
+  if (begins.length === 0 && ends.length === 0) return { kind: 'none' };
+  const [start, stop] = [begins[0] ?? -1, ends[0] ?? -1];
+  if (begins.length !== 1 || ends.length !== 1 || stop < start) return { kind: 'unbalanced' };
+  if (selector === 'runtime-state' && !(isWholeLine(content, start, begin.length) && isWholeLine(content, stop, end.length))) return { kind: 'unbalanced' };
+  return { kind: 'balanced', start, end: stop + end.length };
+}
+
+function eolOf(content: string): string {
+  return content.includes('\r\n') ? '\r\n' : '\n';
+}
+
+function locate(content: string, selector: string): TextRange | null {
+  const layout = markedBlockLayout(content, selector);
+  if (layout.kind === 'unbalanced') throw new HostConfigError('host_config_invalid_state', `unbalanced repo-harness ${selector} markers; preserving the file`);
+  return layout.kind === 'balanced' ? { start: layout.start, end: layout.end } : null;
+}
+
+/**
+ * The block goes right after the last byte that is not CR or LF, behind two
+ * line endings; a file with no such byte gets the block and one line ending at
+ * the start. The final-newline state does not change, and `removeMarkedBlock`
+ * takes out exactly these bytes. `block` has no final line ending.
+ */
+export function insertMarkedBlock(content: string, block: string): FragmentEdit {
+  const eol = eolOf(content);
+  const text = block.replace(/\r?\n/g, eol);
+  const at = content.replace(/[\r\n]+$/, '').length;
+  return { at, removed: '', inserted: at === 0 ? `${text}${eol}` : `${eol}${eol}${text}` };
+}
+
+/** The block, and up to two line endings directly before it; at the start of the file, the block and one line ending after it. */
+export function removeMarkedBlock(content: string, selector: string): FragmentEdit {
+  const range = locate(content, selector);
+  if (!range) return { at: 0, removed: '', inserted: '' };
+  const eol = eolOf(content);
+  if (range.start === 0) {
+    const end = content.startsWith(eol, range.end) ? range.end + eol.length : range.end;
+    return { at: 0, removed: content.slice(0, end), inserted: '' };
+  }
+  let start = range.start;
+  for (let count = 0; count < 2 && content.slice(start - eol.length, start) === eol; count += 1) start -= eol.length;
+  return { at: start, removed: content.slice(start, range.end), inserted: '' };
+}
+
+/** The edit that sets the block to `block`: in place when the file has one, else by `insertMarkedBlock`. */
+function apply(content: string, selector: string, block: string): FragmentEdit {
+  const range = locate(content, selector);
+  if (!range) return insertMarkedBlock(content, block);
+  return { at: range.start, removed: content.slice(range.start, range.end), inserted: block.replace(/\r?\n/g, eolOf(content)) };
+}
+
+export function markedBlockDocumentIsEmpty(content: string): boolean {
+  return content.trim() === '';
+}
+
+/** A marked block in a host file. The fragment is the text from BEGIN to the end of END. */
+export const markedBlock: HostConfigStrategy<string> = { locate, apply };

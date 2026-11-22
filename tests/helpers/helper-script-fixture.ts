@@ -1,0 +1,356 @@
+import { expect } from "bun:test";
+import { listHelperFiles } from "../../src/effects/runtime/helper-runner";
+import { buildReviewSubject } from "../../src/effects/review/diff-fingerprint";
+import {
+  chmodSync,
+  copyFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  symlinkSync,
+  writeFileSync
+} from "fs";
+import { join } from "path";
+
+import { commitAll, initGitRepo, run } from "./repo-fixture";
+
+export const ROOT = join(import.meta.dir, "../..");
+export const HELPER_DIR = join(ROOT, "scripts");
+export const TEMPLATE_DIR = join(ROOT, "assets/templates");
+
+// The repository resolver imports the canonical core. Its packaged projection
+// is intentionally standalone and is source-hash/drift checked separately.
+export const INTENTIONALLY_DIVERGENT: string[] = [];
+
+// Match the fixture's shell permission setup without starting a login shell.
+export function makeShellScriptsExecutable(directory: string): void {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) makeShellScriptsExecutable(path);
+    else if (entry.isFile() && entry.name.endsWith(".sh")) {
+      chmodSync(path, statSync(path).mode | (0o111 & ~process.umask()));
+    }
+  }
+}
+
+export function installSqlCheck(cwd: string): void {
+  mkdirSync(join(cwd, "scripts"), { recursive: true });
+  mkdirSync(join(cwd, ".ai/harness"), { recursive: true });
+  copyFileSync(join(HELPER_DIR, "check-deploy-sql-order.sh"), join(cwd, "scripts/check-deploy-sql-order.sh"));
+  makeShellScriptsExecutable(join(cwd, "scripts"));
+}
+
+export function copyHelpers(cwd: string, { linkDependencies = true } = {}) {
+  // Source CLI imports this package-owned template during readiness checks.
+  mkdirSync(join(cwd, "assets/templates"), { recursive: true });
+  copyFileSync(join(TEMPLATE_DIR, "runtime.gitignore"), join(cwd, "assets/templates/runtime.gitignore"));
+  if (linkDependencies && !existsSync(join(cwd, "node_modules"))) {
+    symlinkSync(join(ROOT, "node_modules"), join(cwd, "node_modules"), "dir");
+  }
+  const scriptsDir = join(cwd, "scripts");
+  const harnessScriptsDir = join(cwd, ".ai", "harness", "scripts");
+  mkdirSync(scriptsDir, { recursive: true });
+  mkdirSync(harnessScriptsDir, { recursive: true });
+  mkdirSync(join(cwd, ".ai", "harness"), { recursive: true });
+  mkdirSync(join(cwd, ".ai", "harness", "triage"), { recursive: true });
+  mkdirSync(join(cwd, "docs", "architecture"), { recursive: true });
+  mkdirSync(join(cwd, "src"), { recursive: true });
+  if (!existsSync(join(cwd, "src", "effects"))) {
+    symlinkSync(join(ROOT, "src", "effects"), join(cwd, "src", "effects"), "dir");
+  }
+  if (!existsSync(join(cwd, "src", "core"))) {
+    symlinkSync(join(ROOT, "src", "core"), join(cwd, "src", "core"), "dir");
+  }
+  // The resolver root reads the recorded install selection through src/cli/installer.
+  if (!existsSync(join(cwd, "src", "cli"))) {
+    symlinkSync(join(ROOT, "src", "cli"), join(cwd, "src", "cli"), "dir");
+  }
+
+  // The helpers start archctx and CodeGraph only through the shared gate in scripts/lib.
+  if (!existsSync(join(scriptsDir, "lib"))) symlinkSync(join(HELPER_DIR, "lib"), join(scriptsDir, "lib"), "dir");
+  for (const file of listHelperFiles({ REPO_HARNESS_SOURCE_ROOT: ROOT })) {
+    copyFileSync(join(HELPER_DIR, file), join(scriptsDir, file));
+    copyFileSync(join(HELPER_DIR, file), join(harnessScriptsDir, file));
+  }
+  copyFileSync(join(ROOT, "assets/workflow-contract.v1.json"), join(cwd, ".ai/harness/workflow-contract.json"));
+  writeFileSync(join(cwd, ".ai", "harness", "triage", ".gitkeep"), "");
+  if (!existsSync(join(cwd, "docs/architecture/index.md"))) {
+    writeFileSync(
+      join(cwd, "docs/architecture/index.md"),
+      [
+        "# Architecture Index",
+        "",
+        "## Pending Requests",
+        "",
+        "<!-- BEGIN ARCHITECTURE PENDING REQUESTS -->",
+        "- (none)",
+        "<!-- END ARCHITECTURE PENDING REQUESTS -->",
+        "",
+      ].join("\n")
+    );
+  }
+
+  makeShellScriptsExecutable(scriptsDir);
+  makeShellScriptsExecutable(harnessScriptsDir);
+}
+
+export function createTrustedMergeGateRuntime(path: string, authorityHome: string): string {
+  cpSync(HELPER_DIR, path, { recursive: true });
+  writeFileSync(
+    join(path, "merge-gate.ts"),
+    [
+      `import { runMergeGateCli } from ${JSON.stringify(join(ROOT, "scripts/merge-gate.ts"))};`,
+      `runMergeGateCli(process.argv.slice(2), ${JSON.stringify(authorityHome)});`,
+      "",
+    ].join("\n"),
+  );
+  return path;
+}
+
+export function writeValidSprintChecks(cwd: string) {
+  mkdirSync(join(cwd, ".ai/harness/checks"), { recursive: true });
+  writeFileSync(
+    join(cwd, ".ai/harness/checks/latest.json"),
+    JSON.stringify(
+      {
+        status: "pass",
+        source: "verify-sprint",
+        command: "rh verify",
+        exit_code: 0,
+        generated_at: "2026-03-04T14:10:00+0000",
+        contract: { file: "tasks/contracts/demo.contract.md", status: "pass", exit_code: 0 },
+        review: { file: "tasks/reviews/demo.review.md", status: "pass" },
+        benchmark_evidence: { status: "not_applicable", report_sha256: "", benchmark_subject_sha256: "" },
+      },
+      null,
+      2
+    ) + "\n"
+  );
+}
+
+// EPC-05: checks/latest.json is now materialized from the evidence ledger
+// (src/effects/evidence/checks-materializer.ts) rather than cp'd directly by
+// verify-sprint.sh. These deployed-helper fixtures never reach that ledger
+// (no git repo, no REPO_HARNESS_SOURCE_ROOT, and the ledger/materializer
+// tooling is source-repo-only -- never copied into
+// assets/templates/helpers/), so emission always cannot-binds (exit 3) and
+// checks/latest.json is genuinely absent after these runs. The exact same
+// rich content it used to receive via the deleted direct `cp` still lands,
+// byte-for-byte, in the run snapshot file (`.ai/harness/runs/*.json`,
+// unchanged by this package's cutover) -- these helpers read from there.
+export function latestRunSnapshot(cwd: string): { path: string; content: any } {
+  const runsDir = join(cwd, ".ai/harness/runs");
+  const names = readdirSync(runsDir).filter((name) => name.endsWith(".json"));
+  let best: { path: string; content: any; generatedAt: string } | null = null;
+  for (const name of names) {
+    const candidatePath = join(runsDir, name);
+    const parsed = JSON.parse(readFileSync(candidatePath, "utf-8"));
+    const generatedAt = String(parsed.generated_at ?? "");
+    if (!best || generatedAt > best.generatedAt) {
+      best = { path: candidatePath, content: parsed, generatedAt };
+    }
+  }
+  if (!best) throw new Error(`no run snapshot found in ${runsDir}`);
+  return { path: best.path, content: best.content };
+}
+
+export function runSnapshotById(cwd: string, runId: string, contractSlug: string): { path: string; content: any } {
+  const path = join(cwd, ".ai/harness/runs", `${runId}-${contractSlug}.json`);
+  return { path, content: JSON.parse(readFileSync(path, "utf-8")) };
+}
+
+export function expectChecksLatestAbsent(cwd: string): void {
+  expect(existsSync(join(cwd, ".ai/harness/checks/latest.json"))).toBe(false);
+}
+
+export function writeFixtureCapabilityRegistry(cwd: string): void {
+  mkdirSync(join(cwd, ".ai/context"), { recursive: true });
+  writeFileSync(join(cwd, ".ai/context/capabilities.json"), JSON.stringify({
+    version: 1,
+    capabilities: [
+      {
+        id: "fixture-package",
+        domain: "fixture",
+        name: "package",
+        prefixes: ["package.json"],
+        contract_files: { agents: "AGENTS.md", claude: "CLAUDE.md" },
+        architecture_module: "docs/architecture/modules/fixture/package.md",
+        lsp_profile: "typescript-lsp",
+        verification_hints: ["fixture checks"],
+      },
+    ],
+  }, null, 2) + "\n");
+}
+
+export function writeActivePlan(cwd: string, planPath: string) {
+  mkdirSync(join(cwd, ".ai/harness"), { recursive: true });
+  writeFileSync(join(cwd, ".ai/harness/active-plan"), planPath);
+  writeFileSync(join(cwd, ".ai/harness/active-worktree"), `${realpathSync(cwd)}\n`);
+}
+
+export function writeWorkflowRequiredSurface(cwd: string) {
+  for (const dir of [
+    ".ai/harness/triage",
+    "deploy",
+    "deploy/env",
+    "deploy/scripts",
+    "deploy/submissions",
+    "deploy/runbooks",
+    "deploy/release-checklists",
+    "deploy/sql",
+    "docs/reference-configs",
+  ]) {
+    mkdirSync(join(cwd, dir), { recursive: true });
+  }
+  writeFileSync(join(cwd, ".ai/context/capability-source-map.json"), "{}\n");
+  for (const file of [
+    "docs/reference-configs/harness-overview.md",
+    "docs/reference-configs/agentic-development-flow.md",
+    "docs/reference-configs/external-tooling.md",
+    "docs/reference-configs/sprint-contracts.md",
+    "docs/reference-configs/heartbeat-triage.md",
+    "docs/reference-configs/handoff-protocol.md",
+    "docs/reference-configs/document-generation.md",
+    "docs/reference-configs/global-working-rules.md",
+    "docs/reference-configs/change-assessment.md",
+    "deploy/README.md",
+  ]) {
+    writeFileSync(join(cwd, file), "# Fixture\n");
+  }
+}
+
+export function evidenceContract(): string {
+  return [
+    "## Evidence Contract",
+    "",
+    "- **State/progress path**: tasks/todos.md and tasks/notes/demo.notes.md",
+    "- **Verification evidence**: .ai/harness/checks/latest.json and bun test",
+    "- **Evaluator rubric**: Waza /check must recommend pass",
+    "- **Stop condition**: stop on failing contract verification",
+    "- **Rollback surface**: revert the plan branch and generated task files",
+  ].join("\n");
+}
+
+export function promotionGate(): string {
+  return [
+    "> **Artifact Level**: work-package",
+    "> **Promotion Reason**: worktree_boundary",
+    "> **Verification Boundary**: bun test and contract verification",
+    "> **Rollback Surface**: revert the demo branch and generated task files",
+    "",
+    "## Promotion Gate",
+    "",
+    "- **Merge/PR unit**: demo branch is the reviewed merge unit",
+    "- **Rollback surface**: revert the demo branch and generated task files",
+    "- **Verification boundary**: bun test and contract verification",
+    "- **Review/acceptance boundary**: task review must recommend pass",
+    "- **High-risk surface**: generated workflow artifacts and helper scripts",
+    "- **Why not checklist row**: fixture exercises contract projection",
+  ].join("\n");
+}
+
+export function currentReviewBinding(cwd: string): { subject: string; targetRevision: string } {
+  if (run("git", ["rev-parse", "--is-inside-work-tree"], cwd).status !== 0) {
+    initGitRepo(cwd);
+    commitAll(cwd, "fixture review baseline");
+  }
+  const parsed = buildReviewSubject(cwd, { targetRef: "main" });
+  expect(parsed.status).toBe("ok");
+  return { subject: parsed.review_subject_sha256, targetRevision: parsed.target_rev };
+}
+
+export function reviewSubjectMetadata(cwd: string): string {
+  const binding = currentReviewBinding(cwd);
+  return [
+    "> **Review Rubric Version**: 2",
+    `> **Reviewed Subject SHA256**: ${binding.subject}`,
+    "> **Reviewed Subject Scope**: normalized-final-content",
+    `> **Reviewed Target Revision**: ${binding.targetRevision}`,
+  ].join("\n");
+}
+
+export function externalAcceptanceAdvice(reviewer = "Codex", source = "generic-review", cwd?: string): string {
+  const binding = cwd ? currentReviewBinding(cwd) : null;
+  return [
+    "## External Acceptance Advice",
+    "",
+    "> **External Acceptance**: pass",
+    `> **External Reviewer**: ${reviewer}`,
+    `> **External Source**: ${source}`,
+    "> **External Started**: 2026-03-04T14:05:00+0800",
+    "> **External Completed**: 2026-03-04T14:06:00+0800",
+    ...(binding ? [
+      "> **Review Rubric Version**: 2",
+      `> **Reviewed Subject SHA256**: ${binding.subject}`,
+      "> **Reviewed Subject Scope**: normalized-final-content",
+      `> **Reviewed Target Revision**: ${binding.targetRevision}`,
+      "> **Benchmark Evidence SHA256**: not-applicable",
+    ] : []),
+    "",
+    "- P1 blockers: none",
+    "- P2 advisories: none",
+    "- Acceptance checklist: pass",
+  ].join("\n");
+}
+
+export function humanReviewCard(verdict = "pass", externalAcceptance = "pass"): string {
+  return [
+    "## Human Review Card",
+    "",
+    `- Verdict: ${verdict}`,
+    "- Change type: code-change",
+    "- Intended files changed: fixture",
+    "- Actual files changed: fixture",
+    "- Commands passed: fixture",
+    "- Residual risks: (none)",
+    "- Reviewer action required: approve fixture closeout",
+    "- Rollback: revert fixture branch",
+  ].join("\n");
+}
+
+export function verificationPlan(checks: unknown[]): string {
+  return [
+    "## Verification Plan",
+    "",
+    "```json",
+    JSON.stringify({ protocol: 1, checks }, null, 2),
+    "```",
+    "",
+  ].join("\n");
+}
+
+export function verificationCheck(
+  id: string,
+  command: string,
+  phase: "preflight" | "verification",
+  cost: "normal" | "expensive",
+): Record<string, unknown> {
+  return {
+    id,
+    kind: "command",
+    command,
+    cwd: ".",
+    phase,
+    cost,
+    evidence_policy: "current_exact",
+    necessity: `${id} is required by this fixture.`,
+    inputs: { env: [] },
+  };
+}
+
+export function replaceVerificationPlan(contract: string, checks: unknown[]): string {
+  return contract.replace(verificationPlan([]), verificationPlan(checks));
+}
+
+export function commitVerificationFixture(cwd: string): void {
+  initGitRepo(cwd);
+  writeFileSync(
+    join(cwd, ".git/info/exclude"),
+    ".ai/harness/checks/\n.ai/harness/runs/\n.ai/harness/evidence/\n",
+  );
+  commitAll(cwd, "verification fixture");
+}

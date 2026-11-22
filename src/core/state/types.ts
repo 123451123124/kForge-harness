@@ -1,0 +1,169 @@
+import type {
+  WorkflowOperationKind,
+  WorkflowProfile,
+  WorkflowProfileSignals,
+} from '../workflow/profile';
+import type { CapabilityOwnership } from '../capabilities/registry';
+
+export type SnapshotPlanState =
+  | 'none'
+  | 'stale_marker'
+  | 'foreign_worktree'
+  | 'draft'
+  | 'annotating'
+  | 'approved'
+  | 'executing'
+  | 'unknown';
+
+export type FreshnessState = 'fresh' | 'stale' | 'missing' | 'unavailable' | 'not_applicable';
+
+export interface StateSnapshot {
+  readonly protocol: 1;
+  readonly kind: 'repo-harness-state-snapshot';
+  readonly states: {
+    readonly spec: 'present' | 'missing';
+    readonly plan: SnapshotPlanState;
+    readonly pending: 'none' | 'fresh' | 'stale';
+    readonly worktree: 'current' | 'linked_target' | 'foreign_marker';
+    readonly evidence: 'unchecked' | 'complete' | 'incomplete';
+  };
+  readonly paths: {
+    readonly active_plan: string | null;
+  };
+  readonly marker: {
+    readonly problem: 'none' | 'deleted' | 'foreign_worktree';
+  };
+}
+
+export interface EffectiveStateSource {
+  readonly path: string | null;
+  readonly freshness: FreshnessState;
+  readonly detail?: string;
+}
+
+export interface EffectiveStateV2 {
+  readonly protocol: 2;
+  readonly kind: 'repo-harness-effective-state';
+  /** No local task identity remains; GitHub owns the task. */
+  readonly task_id: string | null;
+  readonly phase: string;
+  readonly state_version: number;
+  readonly state_revision: string;
+  /**
+   * Revisions separate authority, the observed Git subject and display
+   * projections. `state_revision` is the hash of all current inputs.
+   */
+  readonly authority_revision: string;
+  readonly subject_revision: string;
+  readonly projection_revision: string;
+  /**
+   * Pure content hash over exactly {subject_revision, the hard blocker set}.
+   * No projection, time, or PID input feeds it.
+   */
+  readonly progress_token: string;
+  readonly workflow_profile: WorkflowProfile | null;
+  readonly requested_workflow_profile: string | null;
+  readonly risk_floor: WorkflowProfile;
+  readonly profile_reasons: readonly string[];
+  readonly profile_signals: WorkflowProfileSignals | null;
+  /**
+   * Null when ownership was not computed: no implementation path, an absent
+   * registry, an ownership blocker, or capability ids the caller declared.
+   */
+  readonly capability_ownership: CapabilityOwnership | null;
+  readonly next_action: string | null;
+  readonly guidance: string | null;
+  readonly blockers: readonly string[];
+  readonly stale_sources: readonly string[];
+  readonly conflicting_sources: readonly string[];
+  readonly source_hashes: Readonly<Record<string, string>>;
+  readonly worktree: EffectiveStateSource & {
+    readonly current: string;
+    readonly owner: string | null;
+  };
+}
+
+export type EffectiveState = EffectiveStateV2;
+
+/**
+ * Decode one public Effective State payload. Protocol 1 is retired and fails
+ * closed; there is no compatibility branch.
+ */
+export function decodeEffectiveState(value: unknown): EffectiveStateV2 {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('effective_state_invalid');
+  }
+  const record = value as Record<string, unknown>;
+  if (record.protocol !== 2) throw new Error('effective_state_protocol_unsupported');
+  if (record.kind !== 'repo-harness-effective-state') {
+    throw new Error('effective_state_kind_unsupported');
+  }
+  return value as EffectiveStateV2;
+}
+
+/**
+ * The continuation routes. There is deliberately no `ask`/`wait` member:
+ * blocked and needs-user states collapse into `halt`, whose `reason` carries
+ * the blocker or the missing next action.
+ */
+export type ContinuationRoute =
+  | 'continue'
+  | 'halt'
+  | 'idle';
+
+/**
+ * One deterministic per-turn answer to "what is next", projected from the
+ * effective state. It is a read model, never an authority.
+ * `command` names the command that owns the action. One call yields one unit or
+ * one halt. Identical repo bytes yield byte-identical JSON -- no time, PID,
+ * locale, or absolute path enters this document.
+ */
+export interface ContinuationEnvelopeV2 {
+  readonly protocol: 2;
+  readonly kind: 'repo-harness-continuation-envelope';
+  readonly route: ContinuationRoute;
+  /** Content identity of the actionable unit; null for `halt` and `idle`. */
+  readonly unit_ref: string | null;
+  readonly authority_revision: string;
+  readonly progress_token: string;
+  /** Exact existing command for the `continue` route; null for `halt`/`idle`. */
+  readonly command: string | null;
+  readonly reason: string;
+}
+
+/**
+ * The three outcomes a continuation attempt may end in. `completed` and
+ * `halted` are what the loop host observed; `resumed` is the explicit user
+ * resume that clears a stall count.
+ */
+export type AttemptOutcome = 'completed' | 'halted' | 'resumed';
+
+/**
+ * One recorded continuation attempt, appended verbatim as a single JSONL line
+ * to the ignored runtime ledger. It is evidence, never authority: nothing in
+ * this document may enter `EffectiveState` resolution, `state_revision`, or the
+ * `progress_token` recipe. The only thing a sequence of receipts can do is flip
+ * an otherwise-actionable continuation envelope to `halt`.
+ *
+ * `before_progress_token`/`after_progress_token` are the envelope-scoped
+ * `progress_token` values the recorder was handed. They are null only for an
+ * explicit `resumed` receipt, which carries no token claim at all.
+ */
+export interface AttemptReceiptV1 {
+  readonly protocol: 1;
+  readonly kind: 'repo-harness-attempt-receipt';
+  readonly unit_ref: string;
+  readonly before_progress_token: string | null;
+  readonly after_progress_token: string | null;
+  readonly outcome: AttemptOutcome;
+  /** Ledger-only timestamp; never projected into envelope output. */
+  readonly recorded_at: string;
+}
+
+export interface EffectiveStateRiskInput {
+  readonly targetPaths?: readonly string[];
+  readonly capabilityIds?: readonly string[];
+  readonly capabilityCount?: number;
+  readonly operationKind?: WorkflowOperationKind;
+  readonly explicitOverride?: WorkflowProfile;
+}

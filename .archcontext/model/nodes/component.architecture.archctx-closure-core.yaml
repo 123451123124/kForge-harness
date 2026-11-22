@@ -1,0 +1,14 @@
+schemaVersion: archcontext.node/v2
+id: component.architecture.archctx-closure-core
+kind: component
+name: ArchContext Closure (core)
+status: active
+parent: capability.runtime-harness.architecture
+layer: core
+summary: The core-layer files of ArchContext Closure. Responsibilities stay with the parent node.
+responsibilities:
+  - Hold the core-layer source files of ArchContext Closure so layer direction is checked per directory.
+source:
+  include:
+    - src/core/architecture/projection.ts
+    - src/core/architecture/arch-verify.ts

@@ -1,0 +1,101 @@
+import { describe, expect, test } from "bun:test";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { join, relative } from "node:path";
+
+import {
+  ARCHITECTURE_DOCS_PROJECTION_MANIFEST_SCHEMA_VERSION,
+  ARCHITECTURE_DOCS_RENDERER_VERSION,
+  architectureDocsProjectionManifestIssues,
+  type ArchitectureDocsProjectionManifestV4,
+} from "archctx-contracts";
+import { devDependencies } from "../package.json";
+import { architectureModulePathFor } from '../src/core/capabilities/registry';
+
+const ROOT = join(import.meta.dir, "..");
+
+function filesUnder(root: string): string[] {
+  return readdirSync(root)
+    .map((name) => join(root, name))
+    .flatMap((path) => statSync(path).isDirectory() ? filesUnder(path) : [path])
+    .sort();
+}
+
+function yamlFiles(directory: string): Record<string, unknown>[] {
+  return filesUnder(directory)
+    .filter((path) => path.endsWith(".yaml") || path.endsWith(".yml"))
+    .map((path) => Bun.YAML.parse(readFileSync(path, "utf8")) as Record<string, unknown>);
+}
+
+describe("AXR7 repo-harness architecture consumer", () => {
+  test("has one reviewed component and at least one reviewed relation/required flow for every capability", () => {
+    const modelRoot = join(ROOT, ".archcontext", "model");
+    const nodes = yamlFiles(join(modelRoot, "nodes"));
+    const capabilities = nodes.filter((node) => node.kind === "capability");
+    const components = nodes.filter((node) => node.kind === "component");
+    const relations = yamlFiles(join(modelRoot, "relations"));
+    const flows = yamlFiles(join(modelRoot, "flows"));
+
+    expect(capabilities.length).toBeGreaterThan(0);
+    expect(new Set(capabilities.map(node => node.id)).size).toBe(capabilities.length);
+    expect(new Set(components.map(node => node.parent))).toEqual(new Set(capabilities.map(node => node.id)));
+    // Structure, not inventory: a model change needs no edit here.
+    for (const entries of [nodes, relations, flows]) {
+      expect(new Set(entries.map(entry => entry.id)).size).toBe(entries.length);
+    }
+    expect(relations.length).toBeGreaterThan(0);
+    expect(flows.every((flow) => flow.schemaVersion === "archcontext.flow/v1")).toBe(true);
+    expect(flows.every((flow) => flow.applicability === "required")).toBe(true);
+    expect(new Set(flows.map((flow) => flow.capabilityId))).toEqual(new Set(capabilities.map((node) => node.id)));
+  });
+
+  test("projects every model capability as a Mermaid-only document and one archimap HTML artifact", () => {
+    const architectureRoot = join(ROOT, "docs", "architecture");
+    const moduleDocs = filesUnder(join(architectureRoot, "modules")).filter((path) => path.endsWith(".md"));
+    const html = filesUnder(architectureRoot).filter((path) => path.endsWith(".html"));
+
+    const capabilities = yamlFiles(join(ROOT, ".archcontext", "model", "nodes")).filter(node => node.kind === "capability");
+    const expectedPaths = capabilities.map(node => {
+      const [, domain, name] = String(node.id).split('.');
+      return architectureModulePathFor(domain, name);
+    }).sort();
+    expect(moduleDocs.map(path => relative(ROOT, path)).sort()).toEqual(expectedPaths);
+    expect(html.map((path) => relative(ROOT, path))).toEqual(["docs/architecture/archimap.html"]);
+    for (const path of moduleDocs) {
+      const body = readFileSync(path, "utf8");
+      expect(body.match(/^```mermaid$/gm)?.length ?? 0).toBeGreaterThanOrEqual(2);
+      expect(body.match(/^flowchart (?:LR|TD)$/gm)).toHaveLength(1);
+      expect(body.match(/^sequenceDiagram$/gm)?.length ?? 0).toBeGreaterThanOrEqual(1);
+      expect(body).toContain('"actorTextColor":"#ffffff"');
+      expect(body).toContain('"signalTextColor":"#e5e7eb"');
+      expect(body).toContain("- Proof: `proven`");
+      expect(body).toContain("> **Proof**: `proven`");
+      expect(body).not.toContain("human-action-required");
+      expect(body).not.toMatch(/<(?:html|body|style|svg|div)\b/i);
+    }
+  });
+
+  test("binds the projection to exact renderer, layout, CodeGraph, and output digests", () => {
+    const manifestPath = join(ROOT, "docs", "architecture", ".projection-manifest.json");
+    expect(existsSync(manifestPath)).toBe(true);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as ArchitectureDocsProjectionManifestV4;
+    expect(architectureDocsProjectionManifestIssues(manifest)).toEqual([]);
+    expect(manifest.schemaVersion).toBe(ARCHITECTURE_DOCS_PROJECTION_MANIFEST_SCHEMA_VERSION);
+    expect(manifest.profile).toBe("repo-harness/v1");
+    expect(manifest.rendererVersion).toBe(ARCHITECTURE_DOCS_RENDERER_VERSION);
+    expect(manifest.layoutVersion).toBe("archcontext.docs-layout/v1");
+    // The manifest keeps only the reproducible CodeGraph identity, not the local index state.
+    expect(manifest.generatedFrom).toEqual({ codeGraphPackage: "@colbymchenry/codegraph", codeGraphVersion: devDependencies["@colbymchenry/codegraph"] });
+    expect(manifest.semanticBaseline.modelDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
+    const targets = Object.values(manifest.targets);
+    expect(targets.length).toBeGreaterThan(0);
+    for (const target of targets) expect(target.outputDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
+  });
+
+  test("authors no repository architecture policy or host projection preferences", () => {
+    const policy = JSON.parse(readFileSync(join(ROOT, ".ai", "harness", "policy.json"), "utf8"));
+    expect(policy.context.capability_source).toBe("archcontext");
+    // Projection preferences live in ~/.repo-harness/config.json. The generated
+    // repository architecture keys had no reader and adoption retires them.
+    expect(policy.architecture).toBeUndefined();
+  });
+});

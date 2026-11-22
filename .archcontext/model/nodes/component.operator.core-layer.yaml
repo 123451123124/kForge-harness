@@ -1,0 +1,49 @@
+schemaVersion: archcontext.node/v2
+id: component.operator.core-layer
+kind: component
+name: Operator Board (core)
+status: active
+parent: capability.runtime-harness.operator
+layer: core
+summary: The core-layer files of Operator Board. Responsibilities stay with the parent node.
+responsibilities:
+  - Hold the core-layer source files of Operator Board so layer direction is checked per directory.
+source:
+  include:
+    - src/core/operator/**
+    - src/core/setup/**
+    - src/core/dev-activity/**
+  exclude:
+    - src/core/dev-activity/architecture.ts
+    - src/core/dev-activity/brief.ts
+    - src/core/dev-activity/decode.ts
+    - src/core/dev-activity/projection.ts
+    - src/core/dev-activity/types.ts
+    - src/core/operator/agent-config.ts
+    - src/core/operator/architecture-map-model.ts
+    - src/core/operator/architecture-map.ts
+    - src/core/operator/architecture.ts
+    - src/core/operator/board-read.ts
+    - src/core/operator/bot-access.ts
+    - src/core/operator/docs-host-runtimes.ts
+    - src/core/operator/docs.ts
+    - src/core/operator/execution-state.ts
+    - src/core/operator/notify-status.ts
+    - src/core/operator/pull-request-files.ts
+    - src/core/operator/repositories.ts
+    - src/core/operator/runtime-capture-decoders.ts
+    - src/core/operator/runtime-capture.ts
+    - src/core/operator/runtime-status.ts
+    - src/core/operator/slack-review.ts
+    - src/core/operator/task-history.ts
+    - src/core/operator/task-messages.ts
+    - src/core/operator/tests.ts
+    - src/core/operator/rules.ts
+    - src/core/operator/worktree-cleanup-plan.ts
+    - src/core/operator/worktree-cleanup.ts
+    - src/core/setup/cli-inventory.ts
+    - src/core/setup/cli-seed.v1.json
+    - src/core/setup/decode.ts
+    - src/core/setup/hook-usage.ts
+    - src/core/setup/projection.ts
+    - src/core/setup/types.ts

@@ -1,0 +1,20 @@
+schemaVersion: archcontext.node/v2
+id: component.architecture.archctx-closure-cli
+kind: component
+name: ArchContext Closure (cli)
+status: active
+parent: capability.runtime-harness.architecture
+layer: cli
+summary: Routes rh arch commands to the pinned archctx and combines architecture check results.
+responsibilities:
+  - Check command dispositions before starting the package-local archctx, then preserve its arguments, stdio and exit code.
+  - Expose projection and debt under rh arch; the CLI root adds module, refactor and codegraph from their owning capabilities.
+  - Run the seven read-only architecture checks with a resolved base commit and return one verdict.
+source:
+  include:
+    - src/cli/commands/architecture-*.ts
+    - src/cli/commands/arch.ts
+    - src/cli/commands/arch-actions.ts
+    - src/cli/commands/arch-verify.ts
+  exclude:
+    - src/cli/commands/architecture-thread.ts

@@ -1,0 +1,6 @@
+schemaVersion: archcontext.relation/v1
+id: relation.task-fleet.publication
+kind: calls
+source: capability.organization.task-fleet
+target: capability.organization.publication
+intent: "Plugin → core: read explicit PR readiness and the publication digest helpers, and store provider feedback facts and delivery receipts through the Publication feedback store, for fleet commands, board cards and provider feedback"

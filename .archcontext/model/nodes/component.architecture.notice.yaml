@@ -1,0 +1,16 @@
+schemaVersion: archcontext.node/v2
+id: component.architecture.notice
+kind: component
+name: Architecture Notice
+status: active
+parent: capability.runtime-harness.architecture
+layer: cli
+summary: "Delivers architecture debt, map and task posture notices within the hook deadline and output limit."
+responsibilities:
+  - "Select debt and map notices for SessionStart, Claude Stop and Codex or Pi UserPromptSubmit."
+  - "At SessionStart, derive task text from the canonical issue-branch resolver and read prepare posture only when the existing daemon is ready."
+  - "Share one 3000 ms deadline across debt, prepare and process cleanup; failures omit posture and preserve measured debt."
+  - "Fit complete blocks within 800 output bytes and write a delivery marker only for each block that fits."
+source:
+  include:
+    - src/cli/hook/agent-notice.ts

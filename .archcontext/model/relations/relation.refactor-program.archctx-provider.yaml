@@ -1,0 +1,6 @@
+schemaVersion: archcontext.relation/v1
+id: relation.refactor-program.archctx-provider
+kind: calls
+source: capability.runtime-harness.refactor-program
+target: component.refactor-program.archctx-provider
+intent: Scan for structural observations and record user decisions through the pinned package-local ArchContext CLI

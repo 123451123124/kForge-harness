@@ -1,0 +1,59 @@
+{
+  "tasks": {
+    "research_dir": "docs/researches"
+  },
+  "external_sources": {
+    "version": 1,
+    "mode": "off"
+  },
+  "operations": {},
+  "context": {
+    "map_file": ".ai/context/context-map.json",
+    "capability_source": "archcontext"
+  },
+  "harness": {
+    "runs_dir": ".ai/harness/runs"
+  },
+  "documentation": {
+    "language": "en"
+  },
+  "worktree_strategy": {
+    "branch_prefix": "codex/",
+    "base_branch": "main",
+    "review_base": "origin/main",
+    "merge_back": {
+      "target": "main"
+    }
+  },
+  "publication": {
+    "acceptance_merge": "on"
+  },
+  "tooling": {
+    "codegraph": {
+      "enabled": true
+    }
+  },
+  "external_tooling": {
+    "agent_fleet": {
+      "managed_agents": [
+        "explorer",
+        "deep-reasoner",
+        "harness-evaluator"
+      ],
+      "install_mode": "auto-install-on-init"
+    }
+  },
+  "internal_pr_authors": [],
+  "review": {
+    "i3_paths": []
+  },
+  "rules": {
+    "TestBudget": {
+      "enabled": true,
+      "ratio_cap": 2,
+      "file_cap": 1,
+      "test_paths": ["tests"],
+      "product_paths": ["src", "scripts"]
+    }
+  }
+}

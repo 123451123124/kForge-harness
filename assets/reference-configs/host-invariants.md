@@ -1,0 +1,83 @@
+# Host Invariants
+
+The host chooses when to wake, which native agents to dispatch, and how to schedule them. repo-harness supplies the upstream admission and closeout contract: authorized scope, isolated ownership, durable workflow authority, and acceptance of the exact subject. Scheduling belongs to the host; repo-harness ships no scheduler as part of this contract. Follow [Long-Run Continuation](https://github.com/aimpact-inc/repo-harness/blob/main/docs/reference-configs/long-run-continuation.md) for the tick and recovery protocol. The package does not ship that file, so this link points to the source repository.
+
+These requirements apply to Claude Code, Codex and Pi. The tables distinguish what a host must do from what the current repository actually enforces. A host must not infer enforcement from a policy field, an injected sentence, a tool annotation, or a successful exit code.
+
+## Enforcement Levels
+
+| Level | Meaning |
+|---|---|
+| **E** | Mechanically enforced by the cited code or hook, within the stated path. It does not cover calls that bypass that path. |
+| **P** | Declared in policy/configuration, but no enforcing code was found for the complete requirement in the inspected path. |
+| **G** | Guidance only. The host or operator must uphold it; the inspected integration does not enforce it. |
+
+The grades describe repository boundaries. The delegation rows use evidence from 2026-10-16. The other rows retain their 2026-09-30 evidence. An **E** helper remains enforced when called from any host. That does not make all of that host's native operations enforced.
+
+## Invariants
+
+| Requirement | Level | Current boundary and evidence | Source of truth |
+|---|---|---|---|
+| Assign a single writer per directory; never give concurrent agents overlapping write ownership. | **G** | The root agent instructions give each task its own worktree at `/tmp/<repo>-wt-<slug>` and forbid one beside the main checkout (`CLAUDE.md#worktrees`, `AGENTS.md#worktrees`). No hook renders a single-writer rule, and no code acquires a directory-wide edit lease. | Root agent instructions; the active task's allowed paths and ownership brief. |
+| Run parallel writers only in separate worktrees from a clean source. Never silently drop isolation when worktree creation fails. | **G** | This is the upstream host requirement. The inspected start helper creates a Git worktree and rejects residual state with `--fresh`, but has no source-clean check in its start path (`scripts/contract-worktree.sh#start_worktree`). Do not describe the complete requirement as enforced. | Active contract's worktree boundary; `docs/researches/20260930-pi-harness-packages-extraction.md`, section 6.4. |
+| Refuse reuse when the caller requests a fresh contract worktree. | **E** | `--fresh` refuses an already-linked tree and existing metadata, path, worktree, or branch; it is an explicit option, not the default (`scripts/contract-worktree.sh#require_fresh`). | `rh worktrees start --fresh`. |
+| Child agents default to fresh task context and do not spawn further children. | **G** | The Codex install guidance asks for `fork_turns="none"` (`docs/reference-configs/install-profiles.md#fork_turns`). No hook or policy key sets spawn depth or validates the child's inherited transcript. `SubagentStart` records the native role observation and refuses no spawn (`src/cli/hook/subagent-context.ts#persistNativeRoleRoutingEvidence`). | Host-native spawn configuration. |
+| Accept the exact subject with its evidence, rather than treating exit code zero as acceptance. | **E** | Acceptance parsing refuses stale subject and contract evidence on its own: `validateAcceptanceReceiptAgainstPolicy` refuses a stale repository root, campaign, admission or goal, and `inspectAcceptanceCurrentBinding` refuses a stale semantic subject, verification evidence or observation (`src/effects/review/acceptance-receipt.ts#validateAcceptanceReceiptAgainstPolicy`, `src/effects/review/acceptance-receipt.ts#inspectAcceptanceCurrentBinding`). Scope: the receipt-backed completion gate. | Acceptance Policy in the active contract; the `repo-harness-issue-flow` skill (`references/acceptor.md`); AcceptanceReceipt and prepared verification evidence. |
+| After an interrupted managed push/PR/merge, recover explicitly with `recover reconcile`; never automatically replay the external effect. | **E** | Managed ship refuses unfinished closeout re-entry (`scripts/ship-worktrees.sh#closeout_journal_guard_reentry`). Reconcile requires an already-landed push and completes the missing phases without pushing again (`scripts/ship-worktrees.sh#recover_ship`). Normal first execution may perform the effect; before it lands, recovery uses `abort`. | `long-run-continuation.md`, Crash Recovery; the worktree-scoped closeout journal. |
+| Apply the same explicit-recovery discipline to external effects outside managed closeout. | **G** | The inspected closeout helpers do not intercept arbitrary host shell commands. A host must not replace the managed recovery protocol with its own retry loop. | `long-run-continuation.md`, Crash Recovery; the operation's authorization. |
+| Missing metadata means unknown; absence alone never authorizes destructive cleanup. | **G** | This is a host-wide rule, not a universal metadata gate (`docs/researches/20260930-pi-harness-packages-extraction.md`, section 6.4). Resolve authoritative Git/store state and ownership before cleanup. | Host guidance; the operation's cleanup/recovery authority. |
+| Refuse managed worktree cleanup when merge proof or readable, clean, unlocked worktree state is unavailable. | **E** | Cleanup requires merge proof and refuses unreadable status, a locked worktree, or dirty content. Runtime metadata absence does not replace these checks (`scripts/contract-worktree.sh#cleanup_worktree`). Scope: real cleanup, not a dry-run preview. | `rh worktrees cleanup`; Git topology, merge proof, and worktree status. |
+| Enforce MCP write authorization/admission independently of tool exposure. | **E** | MCP startup resolves one profile with its own read and write globs (`src/cli/mcp/policy.ts#getMcpPolicy`, `src/cli/mcp/server.ts#createMcpToolContext`). A repository mutation refuses a `read_only` registry entry (`src/cli/mcp/general-repo-access/authority.ts#assertRepoWriteEnabled`), and a fleet tool refuses a target outside the adopted registry (`src/cli/mcp/fleet-tools.ts#targetFromArgs`). Workflow-artifact writes separately use their policy path guard (`src/cli/mcp/tools.ts#writeMarkdownArtifact`). These are distinct write paths, not one universal grant. | MCP policy and registered-repository authorization; each owner handler. |
+| Keep MCP writes bounded, inspect each result, and retain operation evidence even when an enclosing script fails. | **G** | No inspected exposure setting or audit helper enforces this complete requirement. The audit is best-effort; the narrower write protections and durable-record example below are **E** only within their own paths. | MCP usage guidance below; each tool's structured result and canonical store. |
+
+## Host Landing
+
+| Host | Native execution and repo-harness landing | Enforcement boundary |
+|---|---|---|
+| Claude Code | Use the host's native subagent surface. The shared route registry attaches `PreToolUse` edit and subagent routes; the `Task`/`Agent` handler appends a return contract to the prompt (`src/cli/hook/route-registry.ts#ROUTES`, `src/cli/hook/return-channel.ts#runReturnChannel`). | **E** for installed typed-hook behavior and invoked CLI/MCP gates only. Appended instructions do not make writer ownership, fresh context, or spawn depth mechanically enforced. The Codex-only `SubagentStart.context` route does not run here. |
+| Codex | Use native `spawn_agent` with the installed role and a self-contained task packet. The registry selects the Codex-only `SubagentStart.context` route; the handler emits the child scope context (`src/cli/hook/route-registry.ts#ROUTES`, `src/cli/hook/subagent-context.ts#runSubagentContext`). | **E** for the installed route's handling. SubagentStart records the native role observation and refuses no spawn. Fresh-context and depth requirements remain **G**; scope text is guidance, not a filesystem lock. |
+| Pi | Load `src/pi/extension.ts` through the package's `pi.extensions` entry. Map native edit, write and bash calls, including codemode nested calls, to the typed guards. Pi has no built-in subagent route. | **E** within the extension's `tool_call` path. A failed capability probe blocks these tools in an opted-in repository. Other write paths remain outside this boundary. |
+
+Install and trust the user-level hook adapters before relying on their routes. Read the active contract for scope; use the receipt-backed gate for acceptance and the journal-backed helper for closeout. Native process/session state is an observation, not permission to change workflow authority.
+
+### Pi hook boundary
+
+`src/pi/compat.ts` owns `MIN_PI_VERSION` and the capability probe. There is no upper version bound. At `session_start`, an opted-in Git repository must pass the version check and load Pi's own `resolveToCwd` function from `getPackageDir()/dist/core/tools/path-utils.js`. The extension does not copy Pi's path grammar. A failed capability probe sets `unavailable` and blocks edit, write and bash with `PI_HOST_UNSUPPORTED_VERSION` or `PI_HOST_PATH_RESOLVER_UNAVAILABLE`. A successful Git repository probe without `.ai/harness/workflow-contract.json` stays `inactive` and calls no hooks. Git exit 128 with `not a git repository` or `detected dubious ownership` also means `inactive`. A timeout, missing Git binary, any other failed exit, or malformed root output sets `unknown`, blocks edit, write and bash with `PI_HOST_REPO_PROBE_FAILED`, and reports that code once per session as a hidden message. A new session or reload probes again.
+
+SessionStart runs once at `session_start`. The first `before_agent_start` delivers its context as a hidden custom message. Every `before_agent_start` also requests the inbox notice and creates a fresh run ID. `agent_settled` calls Stop with `aborted`; `agent_end` does not call Stop. Session IDs come from Pi's session manager. Tool results bind to `toolCallId`. Session replacement drops late results, and shutdown cancels only the extension's hook children.
+
+Both the opt-in probe and hook child remove inherited repository-selecting Git variables through `withoutRepositorySelectingGitEnv` in `src/effects/git/runner.ts`. Other Git configuration remains inherited.
+
+The bridge starts this package's `dist/hook-entry.js` with Bun. It removes inherited `HOOK_*`, `REPO_HARNESS_SOURCE_ROOT`, `REPO_HARNESS_HELPER_SOURCE_PATH` and `REPO_HARNESS_TARGET_REPO_ROOT`, then sets `HOOK_HOST=pi`. Other configuration variables, including `REPO_HARNESS_HOME`, pass through as they do for Claude and Codex. Every route has a 30-second deadline. Input is limited to 16 MiB and stdout to 1 MiB. The bridge accepts one protocol-1 object. A block, nonzero hook exit, malformed response, timeout or child failure blocks the mapped mutation. The bridge does not retry. Hook stdout stays inside the bridge; Pi stdout receives no hook log.
+
+Pi's `powershell` tool on Windows is out of scope and is not mapped to the Bash guard. The extension also does not cover `!`/`!!` user shell commands, writes from other extensions, or third-party MCP writes. Bash coverage is the safety hook's shell word reader; a script or a target built at run time can bypass it. This is not an OS sandbox. Later Pi extensions can mutate tool arguments; this integration does not establish a final gate after all extensions. If a hook returns `permission.updatedInput`, the extension blocks with `PI_HOST_UPDATED_INPUT_UNSUPPORTED`. Input mutation remains an open problem.
+
+The resolver is a private SDK file. An upstream public export is still needed. When Pi exports it, replace the private import and remove that path in one change. `tests/pi-extension.test.ts` uses the real SDK, real tools and a scripted provider fixture. It proves the covered boundary without making a real-provider acceptance claim.
+
+## MCP Write Safety
+
+Tool presentation and write admission serve different purposes. In Pi, `deferred`, `codemode`, `codemode-deferred`, and `direct` tools are all callable from codemode scripts. Only `hidden` blocks calls. Exposure neither limits nor orders writes. This distinction is recorded in `docs/researches/20260930-pi-harness-packages-extraction.md`, section 6.3 item 3 ("exposure is not a write constraint"); this document adds no universal MCP write gate.
+
+If using Pi MCP, keep ordinary discovery in `codemode` and set `hidden` only for tools the host must not use. A `deferred` override may change discovery, but is not a write-safety control. No special exposure configuration is required by this contract.
+
+Write safety has three parts:
+
+1. **Usage constraint (G).** Do not batch writes inside codemode scripts. Dispatch a bounded mutation, inspect its result and authoritative state, then decide the next action. A failed outer script does not undo completed effects. Inspect `isError` and `structuredContent.error` where provided: Pi resolves MCP error results rather than rejecting them (`docs/researches/20260930-pi-codemode-lazy-loading.md#isError`). Workflow-tool errors also require inspecting their error payload: `errorResult` does not set `isError` (`src/cli/mcp/tools.ts#errorResult`).
+2. **Server authorization and admission (E, path-specific).** Retain profile, repository/path authorization, revision preconditions, and owner fences. Do not derive authorization from discovery, exposure, or `readOnlyHint`. A hidden tool in one host is not a revoked server-side grant.
+3. **Audit and evidence (G for complete coverage).** Request and retain each operation's canonical evidence. MCP audit writes go to `.ai/harness/mcp/audit.log`, but `tryWriteMcpAuditEntry` returns `false` on storage failure and its callers ignore the result (`src/core/public-projections/mcp-audit-log.ts#MCP_AUDIT_LOG_RELATIVE_PATH`, `src/cli/mcp/audit.ts#tryWriteMcpAuditEntry`, `src/cli/mcp/tools.ts#audit`). A successful mutation can therefore lack an audit entry. Host nested-call records do not upgrade this server-side behavior.
+
+### Inspected Write Paths
+
+| Path | Level and actual protection | Evidence limit |
+|---|---|---|
+| Workflow artifacts: `writeMarkdownArtifact` → `guardedWriteFile` → audit → result | **E**: policy path guard, target-type/revision refusal, exclusive per-file lock, file fsync and rename (`src/cli/mcp/tools.ts#writeMarkdownArtifact`, `src/cli/mcp/guarded-write.ts#guardedWriteFileUnderLock`). | The returned hash describes the artifact; it is not a persisted audit receipt. Audit happens after the write and its failure does not block success (`src/cli/mcp/tools.ts#audit`). Directory fsync is best-effort. No fail-closed audit-evidence path was found here. |
+| General repository mutations: `write_file` and shared dispatch | **E**: read-write admission, path locks and revision/absence conditions in the inspected file-write path (`src/cli/mcp/general-repo-access.ts#writeFileTool`, `src/cli/mcp/general-repo-access.ts#withMutationLocks`, `src/cli/mcp/general-repo-access.ts#readExpectedExistingWriteTarget`, `src/cli/mcp/general-repo-access.ts#assertWriteTargetAbsent`). | Shared dispatch audits after the operation; audit and metric/trace appends swallow storage failure (`src/cli/mcp/general-repo-access.ts#audit`, `src/cli/mcp/general-repo-access.ts#tryAppendJsonLine`). No universal evidence-before-mutation gate was found. |
+| Fleet adapter | **E** for the inspected fleet authorization checks; no complete-audit grade. | The adapter calls the same best-effort audit helper (`src/cli/mcp/fleet-tools.ts#audit`). Domain records are separate from audit; their existence must be verified in their owner path. |
+
+The inspected paths do not establish equivalent semantics for every MCP write. Keep artifact persistence, operation evidence, diagnostic audit, and semantic acceptance distinct. If required evidence is unavailable, stop and report the gap rather than infer acceptance from a returned status.
+
+## Non-Goals
+
+- No `FleetRuntimeAdapter`, fleet scheduler, host timer, or replacement agent loop.
+- No changes to skill invocation flags, SessionStart provider budgets, authorization, audit durability, or existing runtime behavior.
+- No removal of existing fleet/engineer code based on this document. A later responsibility trace must distinguish scheduling from admission, evidence, and closeout before any removal is designed.

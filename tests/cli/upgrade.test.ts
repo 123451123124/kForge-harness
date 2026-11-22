@@ -1,0 +1,2435 @@
+import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'child_process';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { basename, dirname, join, relative } from 'path';
+import { formatUpgradeResult, installOwnershipReader, runUpgrade, runUpgradeDecide, UPGRADE_AUDIT_MAX_RECORDS } from '../../src/cli/commands/upgrade';
+import { runConfigRestore } from '../../src/cli/commands/config';
+import { runAdoptionApply } from '../../src/cli/commands/adoption-plan';
+import { LEGACY_WORKTREE_PROVIDER_DEFERRED, runLegacyWorktreeCleanup } from '../../src/effects/upgrade/legacy-worktree-cleanup';
+import { localMergeMode, planManagedWorktreeSweep, sweepManagedWorktrees, type WorktreeSweepPlan } from '../../src/effects/state/coordination-worktree-topology';
+import { taskWorkspaceKey } from '../../src/effects/git/repository-identity';
+import { legacyPathSnapshot, planLegacyLeftovers } from '../../src/effects/upgrade/legacy-inventory';
+import { migrateInstallState } from '../../src/cli/installer/install-state-migration';
+import { globalRuntimeScope, withRuntimeTransactionLock } from '../../src/effects/locking/runtime-transaction-lock';
+import { readInstallState, withHostConfigTransaction } from '../../src/cli/installer/install-profile';
+import { stageInstalledSkillCopy } from '../../src/cli/installer/skill-sync';
+import { openHostConfigGate } from '../../src/effects/host-config/gate';
+import { observeEntryIdentity } from '../../src/effects/host-config/whole-path';
+import { PLUGIN_IDS } from '../../src/core/skill-surface/plugin-manifest';
+import { hashManagedTree } from '../../src/effects/managed-tree';
+import { applyGlobalContextRefresh, preflightGlobalContextRefresh } from '../../src/cli/installer/global-context';
+import expectedReleaseInventory from './upgrade.expected.json';
+import workflowContract from '../../assets/workflow-contract.v1.json';
+import { copyUpgradeFixture, readUpgradeFixture, upgradeFixtureProvenance as provenance, UPGRADE_BLOBS, type UpgradeFixture } from '../helpers/upgrade-fixtures';
+import { formatRegisteredUpgradeResult, runRegisteredUpgrade, type RegisteredRepoResult } from '../../src/cli/commands/upgrade-registered';
+import { adoptedRepo, commitAll, git, registeredReposFixture, worktreeSnapshot, writeRegistry, type RegisteredReposFixture } from '../helpers/registered-repos';
+// The sweep's process inventory is a fixture input: Linux CI cannot prove that /proc lists every process.
+import '../helpers/controlled-worktree-processes';
+import { installStateFixturePath, recordLegacyInstallOwnership, RETIRED_CLI_LINES, seedPathRecords } from '../helpers/install-ownership';
+import type { PathRecord } from '../../src/core/host-config/types';
+import { ownedPath, pathRecordHost, pathRecordKey, readPathRecords } from '../../src/effects/host-config/path-records';
+
+const ROOT = join(import.meta.dir, '../..');
+const FIXTURES = join(ROOT, 'tests/fixtures');
+const CLI = join(ROOT, 'src/cli/index.ts');
+function seed(name: UpgradeFixture, target: string): void {
+  for (const entry of provenance(name)) {
+    if (entry.fixture_path.startsWith('release-source/')) continue;
+    const dest = join(target, entry.fixture_path);
+    copyUpgradeFixture(name, entry.fixture_path, dest);
+  }
+}
+/** Include all file bytes and links. Never follow a link into another tree. */
+function tree(root: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  function walk(dir: string): void {
+    for (const name of readdirSync(dir).sort()) {
+      const path = join(dir, name);
+      const stat = lstatSync(path);
+      const rel = relative(root, path);
+      if (stat.isSymbolicLink()) result[rel] = `link:${readlinkSync(path)}`;
+      else if (stat.isDirectory()) { result[rel] = 'directory'; walk(path); }
+      else result[rel] = readFileSync(path).toString('base64');
+    }
+  }
+  walk(root);
+  return result;
+}
+function sandbox(run: (opts: { cwd: string; home: string; packageRoot: string }) => void, fixtures = true): void {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'upgrade-real-release-')));
+  const cwd = join(root, 'repo');
+  const home = join(root, 'home');
+  mkdirSync(cwd); mkdirSync(home);
+  expect(spawnSync('git', ['init', '-q', cwd]).status).toBe(0);
+  if (fixtures) { seed('upgrade-v0.10-project', cwd); seed('upgrade-v0.10-home', home); }
+  try { run({ cwd, home, packageRoot: ROOT }); }
+  finally { rmSync(root, { recursive: true, force: true }); }
+}
+function put(path: string, content: string): void { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, content); }
+/**
+ * The v0.10 installer selects facades with `profile_facades | grep -Fxq` under pipefail. Bash writes one line per
+ * write(), so a grep that exits on an early match can make the next write raise SIGPIPE and drop the facade (#2374).
+ * This grep reads all of stdin before the real grep runs. It changes only the pipe timing, not the selection.
+ */
+function drainingGrepDir(home: string): string {
+  const realGrep = Bun.which('grep');
+  if (!realGrep) throw new Error('grep is required to run the v0.10 installer');
+  const dir = join(dirname(home), 'draining-grep-bin');
+  put(join(dir, 'grep'), `#!/bin/sh
+operands=0
+for arg in "$@"; do case "$arg" in -*) ;; *) operands=$((operands + 1)) ;; esac; done
+[ "$operands" -gt 1 ] && exec '${realGrep}' "$@"
+input=$(mktemp) || exit 2
+cat >"$input"
+'${realGrep}' "$@" <"$input"
+status=$?
+rm -f "$input"
+exit "$status"
+`);
+  chmodSync(join(dir, 'grep'), 0o755);
+  return dir;
+}
+const projectHook = '.ai/hooks/prompt-guard.sh';
+/** A released hook without a shim path, matcher Edit|Write and timeout 30, read from the manifest that the cleanup reads. */
+const RELEASED_HOOK = (JSON.parse(readFileSync(join(ROOT, 'assets/released-managed-values.v1.json'), 'utf8')) as {
+  hookRenderings: { entries: { event: string; block: Record<string, unknown>; hook: Record<string, unknown> }[] };
+}).hookRenderings.entries.find(({ block, hook }) => block.matcher === 'Edit|Write' && hook.timeout === 30 && !String(hook.command).includes('{{shim}}'))!;
+const CUSTOMIZED_HOOK = 'A repo-harness hook differs from every hook that a release wrote; preserve current bytes.';
+const ownership = (opts: { home: string }) => installOwnershipReader({ ...process.env, HOME: opts.home });
+/** A protocol 3 state written by an older package: every plugin record carries that older version. */
+function priorState(version: string) {
+  const plugins = PLUGIN_IDS.filter((id) => id !== 'pi');
+  return { protocol: 5, core: { version }, plugins: plugins.map((id) => ({ id, version })), selection: 'all',
+    transaction_id: 'prior-install', applied_at: '2026-09-30T00:00:00Z', previous: null };
+}
+
+/** One `created` path record under `home`, as an install leaves it. */
+function seedRecord(home: string, path: string, record: Pick<PathRecord, 'owner' | 'committed'>): PathRecord {
+  const env = { HOME: home };
+  const full: PathRecord = { ...record, host: pathRecordHost(env, path)!, kind: 'created', baseline: { state: 'unknown' } };
+  seedPathRecords(env, { ...readPathRecords(env), [pathRecordKey(env, path)]: full });
+  return full;
+}
+
+describe('upgrade with real release bytes', () => {
+  test('every fixture file has release provenance and its recorded Git blob identity', () => {
+    const listedBlobs = new Set<string>();
+    for (const name of ['upgrade-v0.10-project', 'upgrade-v0.10-home', 'upgrade-v0.19.5-home'] as const) {
+      const listed = new Set<string>();
+      for (const entry of provenance(name)) {
+        expect(entry.tag).toMatch(/^v0\./);
+        expect(entry.commit).toMatch(/^[a-f0-9]{40}$/);
+        expect(entry.path.length).toBeGreaterThan(0);
+        const file = join(UPGRADE_BLOBS, entry.blob_sha);
+        const result = spawnSync('git', ['hash-object', '--no-filters', file], { encoding: 'utf8' });
+        expect(result.status).toBe(0);
+        expect(result.stdout.trim()).toBe(entry.blob_sha);
+        listed.add(entry.fixture_path);
+        listedBlobs.add(entry.blob_sha);
+      }
+      expect(readdirSync(join(FIXTURES, name))).toEqual(['provenance.json']);
+      sandbox(({ home }) => {
+        copyUpgradeFixture(name, '', home);
+        for (const [path, bytes] of Object.entries(tree(home))) {
+          if (bytes !== 'directory') expect(listed.has(path)).toBe(true);
+        }
+        for (const entry of provenance(name)) {
+          expect(readFileSync(join(home, entry.fixture_path))).toEqual(readUpgradeFixture(name, entry.fixture_path));
+          expect(lstatSync(join(home, entry.fixture_path)).mode & 0o777).toBe(entry.mode);
+        }
+      }, false);
+    }
+    expect(readdirSync(UPGRADE_BLOBS).sort()).toEqual([...listedBlobs].sort());
+  });
+
+  test('CLI check returns structured ownership and writes no bytes or directories', () => sandbox((opts) => {
+    const beforeHome = tree(opts.home); const beforeRepo = tree(opts.cwd);
+    const result = spawnSync(process.execPath, [CLI, 'upgrade', '--json'], {
+      cwd: opts.cwd, env: { ...process.env, HOME: opts.home, BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' }, encoding: 'utf8', timeout: 60000,
+    });
+    expect(result.status).toBe(1);
+    const { items } = JSON.parse(result.stdout);
+    expect(items.length).toBeGreaterThan(0);
+    expect(items.map((item: Record<string, string>) => [item.location, item.surface,
+      relative(item.location === 'global' ? opts.home : opts.cwd, item.path!), item.retiredBy,
+      item.ownership, item.proof, item.action, item.hookEvent ?? null, item.hookCommand ?? null,
+    ])).toEqual(expectedReleaseInventory);
+    expect(items).toContainEqual(expect.objectContaining({
+      location: 'project', surface: 'file', path: join(opts.cwd, projectHook),
+      ownership: 'owned-clean', proof: 'historical-fingerprint', action: 'remove',
+    }));
+    expect(items).toContainEqual(expect.objectContaining({
+      location: 'global', path: join(opts.home, '.repo-harness/hook-shim.sh'),
+      ownership: 'owned-clean', proof: 'historical-fingerprint', action: 'remove',
+    }));
+    expect(tree(opts.home)).toEqual(beforeHome); expect(tree(opts.cwd)).toEqual(beforeRepo);
+  }));
+
+  test('check classifies a fixed release subset with a golden ownership report', () => sandbox((opts) => {
+    for (const path of [projectHook, 'scripts/capture-plan.sh']) {
+      put(join(opts.cwd, path), readUpgradeFixture('upgrade-v0.10-project', path).toString('utf8'));
+    }
+    seed('upgrade-v0.19.5-home', opts.home);
+    const items = planLegacyLeftovers({ ...opts, scope: 'all', installOwnership: ownership(opts) }).items;
+    const targets = [join(opts.cwd, projectHook), join(opts.cwd, 'scripts/capture-plan.sh'), join(opts.home, '.codex/skills/claude-plan'), join(opts.home, '.codex/skills/repo-harness-cross-review')];
+    expect(items.filter((item) => targets.includes(item.path)).map(({ path, ownership, proof, action }) => ({ path, ownership, proof, action })).sort((a, b) => a.path.localeCompare(b.path))).toEqual(targets.map((path) => ({ path, ownership: 'owned-clean' as const, proof: 'historical-fingerprint' as const, action: path.endsWith('/repo-harness-cross-review') ? 'refresh' as const : 'remove' as const })).sort((a, b) => a.path.localeCompare(b.path)));
+  }, false));
+
+  test('apply preserves modified surfaces, user files, docs and sibling hook keys', () => sandbox((opts) => {
+    seed('upgrade-v0.19.5-home', opts.home);
+    const modified = [join(opts.cwd, projectHook), join(opts.home, '.repo-harness/hook-shim.sh'), join(opts.home, '.codex/skills/claude-plan/SKILL.md')];
+    for (const path of modified) writeFileSync(path, `${readFileSync(path, 'utf8')}\nuser edit\n`);
+    const custom = join(opts.cwd, 'scripts/custom-owner-hook.sh'); put(custom, 'user script\n');
+    const doc = join(opts.cwd, 'AGENTS.md'); put(doc, 'Run .ai/hooks/prompt-guard.sh for old setup.\n');
+    const settingsPath = join(opts.home, '.claude/settings.json');
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
+    settings.hooks.Stop ??= [];
+    settings.hooks.Stop.push({ matcher: 'user', hooks: [{ type: 'command', command: 'echo user hook' }] });
+    const config = { first: 'preserve', ...settings, last: { enabled: true } };
+    writeFileSync(settingsPath, JSON.stringify(config, null, 2));
+    chmodSync(settingsPath, 0o600);
+    const result = runUpgrade({ ...opts, apply: true });
+    expect(result.exitCode).toBe(0); expect(result.removedPaths.length).toBeGreaterThan(0);
+    for (const path of modified) expect(readFileSync(path, 'utf8')).toContain('user edit');
+    expect(readFileSync(custom, 'utf8')).toBe('user script\n');
+    expect(readFileSync(doc, 'utf8')).toContain('prompt-guard.sh');
+    expect(result.items.find((item) => item.path === doc)?.action).toBe('report');
+    expect(lstatSync(settingsPath).mode & 0o777).toBe(0o600);
+    const next = JSON.parse(readFileSync(settingsPath, 'utf8'));
+    expect(Object.keys(next)).toEqual(Object.keys(config));
+    expect(next.hooks.Stop).toContainEqual({ matcher: 'user', hooks: [{ type: 'command', command: 'echo user hook' }] });
+    expect(next.first).toBe('preserve'); expect(next.last).toEqual({ enabled: true });
+    expect(existsSync(join(opts.home, '.codex/skills/repo-harness-cross-review/SKILL.md'))).toBe(true);
+    expect(readFileSync(join(opts.home, '.codex/skills/repo-harness-cross-review/SKILL.md'), 'utf8')).toBe(readUpgradeFixture('upgrade-v0.19.5-home', '.codex/skills/repo-harness-cross-review/SKILL.md').toString());
+    expect(existsSync(join(opts.home, '.codex/skills/repo-harness-cross-review/references/codex-plugin-mode.md'))).toBe(true);
+    expect(result.items.some((item) => item.ownership !== 'owned-clean' && item.action === 'report')).toBe(true);
+  }));
+
+  test('global cleanup keeps user commands that contain retired hook paths', () => sandbox((opts) => {
+    const shim = join(opts.home, '.repo-harness/hook-shim.sh');
+    const userCommands = [
+      'echo .ai/hooks/run-hook.sh',
+      'echo .claude/hooks/run-hook.sh',
+      `echo ${shim}`,
+      `${shim} --user-option`,
+      `bash "${shim}"`,
+      'repo-harness hook Stop --route user',
+    ];
+    // The user's own layout: a tab or four-space indent, and a member with its own spacing.
+    const layout = (indent: string, value: Record<string, unknown>) => `{\n${indent}"custom" :  [1,2],${JSON.stringify(value, null, indent).slice(1)}`;
+    const indents: Record<string, string> = { '.claude/settings.json': '\t', '.codex/hooks.json': '    ' };
+    const before: Record<string, string> = {};
+    for (const name of ['.claude/settings.json', '.codex/hooks.json']) {
+      const path = join(opts.home, name);
+      const settings = JSON.parse(readFileSync(path, 'utf8'));
+      const userHooks = userCommands.map((command) => ({ type: 'command', command }));
+      settings.hooks.Stop = [{ matcher: 'user', hooks: userHooks }, { hooks: [{ type: 'command', command: `bash ${shim} stop-orchestrator.sh`, timeout: 30 }] }];
+      before[name] = layout(indents[name]!, settings);
+      writeFileSync(path, before[name]);
+    }
+    const plan = planLegacyLeftovers({ ...opts, scope: 'global', installOwnership: ownership(opts) });
+    expect(plan.items.filter((item) => userCommands.includes(item.hookCommand!))).toEqual([]);
+    expect(plan.items.filter((item) => item.hookCommand === `bash ${shim} stop-orchestrator.sh`)).toHaveLength(2);
+    expect(plan.items.some((item) => item.hookEvent === 'SessionStart')).toBe(true);
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true });
+    expect(result.exitCode).toBe(0);
+    const sha = (text: string) => `sha256:${new Bun.CryptoHasher('sha256').update(text).digest('hex')}`;
+    const ledger = JSON.parse(readFileSync(join(opts.home, '.repo-harness/config/ledger.json'), 'utf8'));
+    for (const name of ['.claude/settings.json', '.codex/hooks.json']) {
+      const after = readFileSync(join(opts.home, name), 'utf8');
+      const settings = JSON.parse(after);
+      expect(settings.hooks.Stop).toEqual([{
+        matcher: 'user', hooks: userCommands.map((command) => ({ type: 'command', command })),
+      }]);
+      expect(settings.hooks.SessionStart).toBeUndefined();
+      // Text edits: only the legacy commands and the containers that they emptied go.
+      const { custom: _custom, ...rest } = settings;
+      expect(after).toBe(layout(indents[name]!, rest));
+      expect(ledger.files[join(opts.home, name)]).toEqual({ kind: 'text_block', baseline: { state: 'unknown' }, committed: { type: 'file', sha256: sha(after) },
+        backup: null, external_backup: sha(before[name]!), external_change: false });
+    }
+    expect(ledger.fragments).toEqual([]);
+
+    // A repository hook file gets the same text edits through the repository gate: its ledger keeps the file before, outside the worktree.
+    const project = join(opts.cwd, '.claude/settings.json');
+    const legacy = JSON.parse(readFileSync(project, 'utf8')).hooks.Stop[0].hooks[0];
+    const user = { type: 'command', command: 'echo project user' };
+    // Each copy of a released command is its own removal.
+    const projectBefore = layout('\t', { hooks: { Stop: [{ hooks: [legacy, user] }, { hooks: [legacy] }], Empty: [] } });
+    writeFileSync(project, projectBefore);
+    expect(runUpgrade({ ...opts, scope: 'project' }).items.filter((item) => item.hookCommand === legacy.command)).toHaveLength(2);
+    const applied = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(applied.exitCode).toBe(0);
+    expect(applied.removedPaths).toContain(project);
+    expect(readFileSync(project, 'utf8')).toBe(layout('\t', { hooks: { Stop: [{ hooks: [user] }], Empty: [] } }));
+    const backups = join(opts.cwd, '.ai/harness/backups');
+    const copies = existsSync(backups) ? readdirSync(backups, { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile()).map((entry) => readFileSync(join(entry.parentPath, entry.name), 'utf8')) : [];
+    expect(copies).not.toContain(projectBefore);
+    const repos = join(opts.home, '.repo-harness/config/repos');
+    expect(JSON.parse(readFileSync(join(repos, readdirSync(repos)[0]!, 'ledger.json'), 'utf8')).paths[project]).toMatchObject({ kind: 'replaced', host: 'claude', baseline: { sha256: sha(projectBefore) } });
+    expect(runConfigRestore({ HOME: opts.home }, project, { repo: opts.cwd }).exitCode).toBe(0);
+    expect(readFileSync(project, 'utf8')).toBe(projectBefore);
+  }));
+
+  test('the cleanup audit log keeps only the newest records', () => sandbox((opts) => {
+    const auditPath = join(opts.home, '.repo-harness/upgrade-cleanup.log.jsonl');
+    const prior = Array.from({ length: UPGRADE_AUDIT_MAX_RECORDS }, (_, index) => JSON.stringify({ transaction_id: `prior-${index}` }));
+    writeFileSync(auditPath, `${prior.join('\n')}\n`, { mode: 0o600 });
+
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true });
+
+    expect(result.exitCode).toBe(0);
+    const records = readFileSync(auditPath, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line));
+    expect(records).toHaveLength(UPGRADE_AUDIT_MAX_RECORDS);
+    expect(records[0].transaction_id).toBe('prior-1');
+    expect(records.at(-2).transaction_id).toBe(`prior-${UPGRADE_AUDIT_MAX_RECORDS - 1}`);
+    expect(records.at(-1).removed_paths).toEqual(result.removedPaths);
+  }));
+
+  test.each(['default', 'custom', 'custom-trailing-slash', 'custom-relative'])('global cleanup removes real installer shim commands from %s REPO_HARNESS_HOME', (kind) => sandbox((opts) => {
+    const base = join(opts.home, kind === 'default' ? '.repo-harness' : 'custom-runtime');
+    const harnessHome = kind === 'custom-trailing-slash' ? `${base}/` : kind === 'custom-relative' ? 'custom-runtime' : base;
+    const shim = `${harnessHome}/hook-shim.sh`;
+    const installer = join(opts.home, 'v0.10-installer/scripts/repo-harness.sh');
+    copyUpgradeFixture('upgrade-v0.10-home', 'release-source/scripts/repo-harness.sh', installer);
+    const generated = spawnSync('bash', ['-c', 'source "$1" help >/dev/null; build_hooks_json', 'release-installer', installer], {
+      env: { ...process.env, HOME: opts.home, REPO_HARNESS_HOME: harnessHome }, encoding: 'utf8',
+    });
+    expect(generated.status, generated.stderr).toBe(0);
+    const hooks: Record<string, { hooks: { type: string; command: string }[] }[]> = JSON.parse(generated.stdout);
+    const legacy = Object.values(hooks).flatMap((blocks) => blocks.flatMap((block) => block.hooks.map((hook) => hook.command)));
+    expect(legacy).toHaveLength(11);
+    expect(legacy).toContain(`bash ${shim} session-start-context.sh`);
+    const user = [
+      `echo ${legacy[0]}`,
+      `${legacy[0]} --user-option`,
+      `bash ${shim} user-owner.sh`,
+      ': repo-harness-managed-hook-v1; repo-harness-hook Stop --route default',
+    ].map((command) => ({ type: 'command', command }));
+    for (const name of ['.claude/settings.json', '.codex/hooks.json']) {
+      put(join(opts.home, name), JSON.stringify({ owner: 'user', hooks: {
+        ...hooks, Stop: [...hooks.Stop, { matcher: 'user', hooks: user }],
+      } }));
+    }
+    const env = { REPO_HARNESS_HOME: harnessHome };
+    const plan = runUpgrade({ ...opts, env, scope: 'global' });
+    expect(plan.items.filter((item) => legacy.includes(item.hookCommand!))).toHaveLength(22);
+    expect(plan.items.filter((item) => user.some((hook) => hook.command === item.hookCommand))).toEqual([]);
+    const result = runUpgrade({ ...opts, env, scope: 'global', apply: true });
+    expect(result.exitCode).toBe(0);
+    for (const name of ['.claude/settings.json', '.codex/hooks.json']) {
+      expect(JSON.parse(readFileSync(join(opts.home, name), 'utf8'))).toEqual({
+        owner: 'user', hooks: { Stop: [{ matcher: 'user', hooks: user }] },
+      });
+    }
+  }));
+
+  test('global cleanup removes four early installer shim hooks and keeps user mentions', () => sandbox((opts) => {
+    const release = spawnSync('git', ['show', 'v0.1.2:scripts/repo-harness.sh'], { cwd: ROOT, encoding: 'utf8' });
+    expect(release.status, release.stderr).toBe(0);
+    const installer = join(opts.home, 'release-source/scripts/repo-harness.sh');
+    put(installer, release.stdout);
+    const generated = spawnSync('bash', ['-c', 'source "$1" help >/dev/null; build_hooks_json', 'early-release-installer', installer], {
+      env: { ...process.env, HOME: opts.home }, encoding: 'utf8',
+    });
+    expect(generated.status, generated.stderr).toBe(0);
+    const hooks: Record<string, { hooks: { type: string; command: string }[] }[]> = JSON.parse(generated.stdout);
+    const names = ['trace-event.sh', 'context-pressure-hook.sh', 'autoresearch-advisory.sh', 'finalize-handoff.sh'];
+    const legacy = Object.values(hooks).flatMap((blocks) => blocks.flatMap((block) => block.hooks.map((hook) => hook.command)));
+    const early = legacy.filter((command) => names.some((name) => command.endsWith(` ${name}`)));
+    expect([...new Set(early)].sort()).toEqual(names.map((name) => `bash ${opts.home}/.repo-harness/hook-shim.sh ${name}`).sort());
+    const user = [...new Set(early)].flatMap((command) => [`echo ${command}`, `${command} --user-option`])
+      .map((command) => ({ type: 'command', command }));
+    for (const name of ['.claude/settings.json', '.codex/hooks.json']) {
+      put(join(opts.home, name), JSON.stringify({ owner: 'user', hooks: {
+        ...hooks, Stop: [...hooks.Stop, { matcher: 'user', hooks: user }],
+      } }));
+    }
+    const plan = runUpgrade({ ...opts, scope: 'global' });
+    expect(plan.items.filter((item) => early.includes(item.hookCommand!))).toHaveLength(early.length * 2);
+    expect(plan.items.filter((item) => user.some((hook) => hook.command === item.hookCommand))).toEqual([]);
+    expect(runUpgrade({ ...opts, scope: 'global', apply: true }).exitCode).toBe(0);
+    for (const name of ['.claude/settings.json', '.codex/hooks.json']) {
+      expect(JSON.parse(readFileSync(join(opts.home, name), 'utf8'))).toEqual({
+        owner: 'user', hooks: { Stop: [{ matcher: 'user', hooks: user }] },
+      });
+    }
+  }));
+
+  test('global cleanup reports legacy typed commands that no release wrote and keeps their file', () => sandbox((opts) => {
+    const legacy = [
+      'HOOK_HOST=codex repo-harness hook PreToolUse --route edit',
+      'HOOK_HOST=claude repo-harness hook SessionStart --route default',
+      'repo-harness hook Stop --route quality',
+    ];
+    const user = [
+      ...legacy.flatMap((command) => [`echo ${command}`, `${command}; echo user`, `${command}\n`]),
+      'repo-harness hook Stop --route user',
+      'HOOK_HOST=other repo-harness hook Stop --route quality',
+      'HOOK_HOST=codex repo-harness hook Unknown --route default',
+    ].map((command) => ({ type: 'command', command }));
+    const [claude, codex] = ['.claude/settings.json', '.codex/hooks.json'].map((name) => join(opts.home, name));
+    // No release tag rendered the bare typed form, so a file that holds it is reported; look-alike user commands are not rh's.
+    const typed = JSON.stringify({ hooks: { Stop: [{ hooks: [...legacy.map((command) => ({ type: 'command', command })), ...user] }] } });
+    const userOnly = JSON.stringify({ hooks: { Stop: [{ matcher: 'mixed', hooks: user }] } });
+    put(claude!, typed);
+    put(codex!, userOnly);
+    const plan = runUpgrade({ ...opts, scope: 'global' });
+    expect(plan.items.filter((item) => item.path === claude)).toEqual([expect.objectContaining({ action: 'report', reason: CUSTOMIZED_HOOK })]);
+    expect(plan.items.filter((item) => item.path === codex)).toEqual([]);
+    expect(runUpgrade({ ...opts, scope: 'global', apply: true }).exitCode).toBe(0);
+    expect([readFileSync(claude!, 'utf8'), readFileSync(codex!, 'utf8')]).toEqual([typed, userOnly]);
+  }, false));
+
+  test('a second apply removes nothing and changes no bytes', () => sandbox((opts) => {
+    expect(runUpgrade({ ...opts, apply: true }).exitCode).toBe(0);
+    const beforeHome = tree(opts.home); const beforeRepo = tree(opts.cwd);
+    const second = runUpgrade({ ...opts, apply: true });
+    expect(second.exitCode).toBe(0); expect(second.removedPaths).toEqual([]);
+    expect(tree(opts.home)).toEqual(beforeHome); expect(tree(opts.cwd)).toEqual(beforeRepo);
+  }));
+
+  test('global backups restore exact pre-apply target bytes, a completed run deletes its project copies, and repository hook files come back by restore --repo', () => sandbox((opts) => {
+    // Project files other than hook files hold proved rh bytes; a completed run keeps no copy of them (#2903).
+    const originals = new Map(planLegacyLeftovers({ ...opts, scope: 'all', installOwnership: ownership(opts) }).items
+      .filter((item) => item.action !== 'report' && (item.location === 'global' || item.surface === 'hook-entry'))
+      .map((item) => [item.path, lstatSync(item.path).isDirectory() ? tree(item.path) : readFileSync(item.path).toString('base64')]));
+    const result = runUpgrade({ ...opts, apply: true });
+    expect(result.exitCode).toBe(0); expect(result.backupPath).toBeDefined();
+    const copies = join(opts.cwd, '.ai/harness/backups/fs-transaction');
+    expect(existsSync(copies) ? readdirSync(copies).filter((name) => name.startsWith('upgrade-')) : []).toEqual([]);
+    // The project backup root ignores itself, with no exclude block and no user-level Git ignore (#3228).
+    const isolatedGit = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+    expect(spawnSync('git', ['add', '-A'], { cwd: opts.cwd, env: isolatedGit }).status).toBe(0);
+    expect(spawnSync('git', ['status', '--porcelain'], { cwd: opts.cwd, env: isolatedGit, encoding: 'utf8' }).stdout).not.toContain('.ai/harness/backups');
+    const manifestPath = join(result.backupPath!, 'manifest.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    for (const snapshot of manifest.snapshots) {
+      if (!snapshot.existed || !snapshot.backup_path) continue;
+      rmSync(snapshot.path, { recursive: true, force: true });
+      cpSync(snapshot.backup_path, snapshot.path, { recursive: true, verbatimSymlinks: true });
+    }
+    expect(runConfigRestore({ HOME: opts.home }, undefined, { repo: opts.cwd }).exitCode).toBe(0);
+    for (const [path, bytes] of originals) expect(typeof bytes === 'string' ? readFileSync(path).toString('base64') : tree(path)).toEqual(bytes);
+  }));
+
+  test('TOCTOU edit after backup stays and appears as a report', () => sandbox((opts) => {
+    const target = join(opts.cwd, projectHook);
+    const result = runUpgrade({ ...opts, scope: 'project', apply: true }, { beforeRemove(item) { if (item.path === target) writeFileSync(target, 'concurrent user edit\n'); } });
+    expect(result.exitCode).toBe(0); expect(readFileSync(target, 'utf8')).toBe('concurrent user edit\n');
+    expect(result.items.find((item) => item.path === target)?.action).toBe('report');
+    expect(result.removedPaths).not.toContain(target);
+  }));
+
+  test('a mid-apply write failure rolls back earlier targets and exits 1', () => sandbox((opts) => {
+    const before = tree(opts.cwd); let count = 0; let lockedDir: string | undefined;
+    try {
+      const result = runUpgrade({ ...opts, scope: 'project', apply: true }, { beforeRemove(item) {
+        if (++count === 2) {
+          lockedDir = dirname(item.path);
+          chmodSync(lockedDir, 0o555);
+          // Cause a real permission failure. Restore the parent so compensation
+          // can run without changing user permissions during rollback.
+          try { rmSync(item.path); } finally { chmodSync(lockedDir, 0o755); }
+        }
+      } });
+      expect(count).toBeGreaterThanOrEqual(2); expect(result.exitCode).toBe(1);
+      expect(result.error).toBeDefined();
+    } finally { if (lockedDir) chmodSync(lockedDir, 0o755); }
+    for (const [path, content] of Object.entries(before)) expect(tree(opts.cwd)[path]).toBe(content);
+  }));
+
+  test('a global hook rollback restores only the files that the gate wrote, and their ledger records', () => sandbox((opts) => {
+    const names = ['.claude/settings.json', '.codex/hooks.json'].map((name) => join(opts.home, name));
+    const original = JSON.stringify({ hooks: { [RELEASED_HOOK.event]: [{ ...RELEASED_HOOK.block, hooks: [RELEASED_HOOK.hook, { command: 'echo user' }] }] } });
+    for (const name of names) put(name, original);
+    const config = join(opts.home, '.repo-harness/config');
+    mkdirSync(join(config, 'vault'), { recursive: true });
+    const identity = () => names.map((name) => ({ ino: statSync(name).ino, bytes: readFileSync(name, 'utf8') }));
+    const before = identity();
+    const lastAudit = () => JSON.parse(readFileSync(join(opts.home, '.repo-harness/upgrade-cleanup.log.jsonl'), 'utf8').trim().split('\n').at(-1)!);
+
+    // The gate cannot publish its records, so it writes no hook file and the rollback touches none.
+    try {
+      const refused = runUpgrade({ ...opts, scope: 'global', apply: true }, { beforeRemove() { chmodSync(config, 0o500); } });
+      expect(refused.exitCode).toBe(1);
+    } finally { chmodSync(config, 0o700); }
+    expect(identity()).toEqual(before);
+    expect(lastAudit().attempted_paths).toEqual([]);
+
+    // A failure after the first gate write: that file and its ledger record go back; the second file was never written.
+    const failed = runUpgrade({ ...opts, scope: 'global', apply: true }, { beforeRemove(item) { if (item.path === names[1]) throw new Error('injected'); } });
+    expect(failed.exitCode).toBe(1);
+    expect(lastAudit().rolled_back_paths).toEqual([names[0]]);
+    expect(identity().map(({ bytes }) => bytes)).toEqual([original, original]);
+    expect(identity()[1]).toEqual(before[1]);
+    expect(existsSync(join(config, 'ledger.json'))).toBe(false);
+
+    // A file that changed after the gate wrote it keeps the new bytes, and the ledger keeps its cleanup record.
+    const sha = (text: string) => `sha256:${new Bun.CryptoHasher('sha256').update(text).digest('hex')}`;
+    const recorded = () => JSON.parse(readFileSync(join(config, 'ledger.json'), 'utf8')).files[names[0]!]?.committed.sha256;
+    let cleaned = '';
+    const changed = runUpgrade({ ...opts, scope: 'global', apply: true }, { beforeRemove(item) {
+      if (item.path !== names[1]) return;
+      cleaned = readFileSync(names[0]!, 'utf8');
+      writeFileSync(names[0]!, '{"user":"edit"}');
+      throw new Error('injected');
+    } });
+    expect({ exitCode: changed.exitCode, rolledBack: lastAudit().rolled_back_paths, file: readFileSync(names[0]!, 'utf8'), record: recorded() })
+      .toEqual({ exitCode: 1, rolledBack: [], file: '{"user":"edit"}', record: sha(cleaned) });
+    expect(changed.error).toContain(`${names[0]}: the target changed before the write: ${names[0]}; the ledger keeps the cleanup record, and the file before the cleanup is kept at`);
+
+    // The file goes back first; when the ledger rollback then fails, the error says so and the record stays ahead of the file.
+    rmSync(join(config, 'ledger.json'));
+    writeFileSync(names[0]!, original);
+    try {
+      const unresolved = runUpgrade({ ...opts, scope: 'global', apply: true }, { beforeRemove(item) {
+        if (item.path !== names[1]) return;
+        chmodSync(config, 0o500);
+        throw new Error('injected');
+      } });
+      expect(unresolved.error).toContain('host configuration rollback');
+    } finally { chmodSync(config, 0o700); }
+    expect({ file: readFileSync(names[0]!, 'utf8'), record: recorded() }).toEqual({ file: original, record: sha(cleaned) });
+  }, false));
+
+  const RETIRED_RC_FIXTURE = join(FIXTURES, 'retired-flow-reference-configs');
+  const RETIRED_RC_DOCS = [
+    'handoff-protocol.md', 'workflow-orchestration.md', 'development-protocol.md',
+    'sprint-contracts.md', 'contract-brief-example.md', 'contract-brief-example-bugfix.md',
+  ];
+  const retiredRcPaths = () => [
+    'CLAUDE.md', 'AGENTS.md',
+    ...RETIRED_RC_DOCS.map((name) => `docs/reference-configs/${name}`),
+    'docs/architecture/snapshots/.gitkeep', 'docs/architecture/domains/.gitkeep',
+  ];
+
+  test('retired flow reference configs migrate by exact fingerprint while user edits and populated directories stay', () => sandbox((opts) => {
+    cpSync(RETIRED_RC_FIXTURE, opts.cwd, { recursive: true });
+    const modified = join(opts.cwd, 'docs/reference-configs/sprint-contracts.md');
+    writeFileSync(modified, `${readFileSync(modified, 'utf8')}user edit\n`);
+    put(join(opts.cwd, 'docs/architecture/snapshots/user-note.md'), '# User snapshot\n');
+    const rootTemplate = readFileSync(join(ROOT, 'assets/templates/root-context.md'), 'utf8');
+    const rootHash = legacyPathSnapshot(join(ROOT, 'assets/templates/root-context.md'))?.contentHash;
+    const rootFingerprints = workflowContract.migrations.upgrade.actions.find((action) => action.id === 'retired-flow-root-context')?.fingerprints;
+    expect([rootFingerprints?.['CLAUDE.md'], rootFingerprints?.['AGENTS.md']]).toEqual([rootHash, rootHash]);
+
+    const check = runUpgrade({ ...opts, scope: 'project' });
+    for (const name of RETIRED_RC_DOCS.filter((name) => name !== 'sprint-contracts.md')) {
+      expect(check.items.find((item) => item.path === join(opts.cwd, 'docs/reference-configs', name))).toEqual(expect.objectContaining({
+        action: 'remove', ownership: 'owned-clean', proof: 'historical-fingerprint',
+      }));
+    }
+    expect(check.items.find((item) => item.path === modified)).toEqual(expect.objectContaining({
+      action: 'report', ownership: 'unowned', proof: null,
+    }));
+    expect(check.items.find((item) => item.path === join(opts.cwd, 'docs/architecture/snapshots/.gitkeep'))).toEqual(expect.objectContaining({
+      action: 'report', ownership: 'owned-clean', proof: 'historical-fingerprint',
+    }));
+    expect(check.items.find((item) => item.path === join(opts.cwd, 'docs/architecture/domains/.gitkeep'))).toEqual(expect.objectContaining({
+      action: 'remove', ownership: 'owned-clean', proof: 'historical-fingerprint',
+    }));
+    for (const name of ['CLAUDE.md', 'AGENTS.md']) {
+      expect(check.items.find((item) => item.path === join(opts.cwd, name))).toEqual(expect.objectContaining({
+        action: 'refresh', ownership: 'owned-clean', proof: 'historical-fingerprint',
+      }));
+    }
+
+    const result = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(result.exitCode, result.error).toBe(0);
+    for (const name of RETIRED_RC_DOCS.filter((name) => name !== 'sprint-contracts.md')) {
+      expect(existsSync(join(opts.cwd, 'docs/reference-configs', name))).toBe(false);
+      expect(result.removedPaths).toContain(join(opts.cwd, 'docs/reference-configs', name));
+    }
+    expect(readFileSync(modified, 'utf8')).toContain('user edit');
+    expect(result.removedPaths).not.toContain(modified);
+    expect(existsSync(join(opts.cwd, 'docs/architecture/snapshots/.gitkeep'))).toBe(true);
+    expect(existsSync(join(opts.cwd, 'docs/architecture/domains/.gitkeep'))).toBe(false);
+    expect(readFileSync(join(opts.cwd, 'docs/architecture/snapshots/user-note.md'), 'utf8')).toBe('# User snapshot\n');
+    for (const name of ['CLAUDE.md', 'AGENTS.md']) {
+      expect(readFileSync(join(opts.cwd, name), 'utf8')).toBe(rootTemplate);
+      expect(result.refreshedPaths).toContain(join(opts.cwd, name));
+    }
+
+    // The 0.34 root context capped the test volume; an unchanged copy refreshes.
+    const v034Template = rootTemplate.replace(
+      '- Report added test lines, added product lines and added test files in the PR as data; the report blocks no merge.',
+      '- Test budget per PR: added test lines divided by added product lines must not exceed 2:1, and the PR adds at most one test file.',
+    );
+    const cleanRoot = join(opts.cwd, 'CLAUDE.md');
+    put(cleanRoot, v034Template);
+    expect(legacyPathSnapshot(cleanRoot)?.contentHash).toBe('sha256:3d6741b137951bd51e3957edd93be78b59d0a1c8063acb2d72b97045ca17955e');
+    const v034Refreshed = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(v034Refreshed.exitCode, v034Refreshed.error).toBe(0);
+    expect(v034Refreshed.refreshedPaths).toContain(cleanRoot);
+    expect(readFileSync(cleanRoot, 'utf8')).toBe(rootTemplate);
+
+    const previousTemplate = v034Template.replace(
+      "- Write output text in a plain technical style: short sentences, one idea per sentence, active voice. For `en`, follow ASD-STE100 Simplified Technical English. For `zh-CN`, write plain Chinese (简明中文) with the same rules and keep technical terms in English. For `follow-user`, use the user's language with the same rules.",
+      '- Write output text in ASD-STE100 Simplified Technical English: short sentences, one idea per sentence, active voice.',
+    ).replace('`rh worktrees start', '`repo-harness run contract-worktree start');
+    const editedRoot = join(opts.cwd, 'AGENTS.md');
+    put(cleanRoot, previousTemplate);
+    expect(legacyPathSnapshot(cleanRoot)?.contentHash).toBe('sha256:58b9816cad7ffe1ba2380b15b3c5c41ab0ab862696763c618037bc904f93c026');
+    put(editedRoot, `${previousTemplate}user edit\n`);
+    const refreshed = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(refreshed.exitCode, refreshed.error).toBe(0);
+    expect(refreshed.refreshedPaths).toContain(cleanRoot);
+    expect(readFileSync(cleanRoot, 'utf8')).toBe(rootTemplate);
+    expect(refreshed.refreshedPaths).not.toContain(editedRoot);
+    expect(readFileSync(editedRoot, 'utf8')).toBe(`${previousTemplate}user edit\n`);
+
+    // The 0.33 root context named the helper id that is now internal.
+    const helperTemplate = v034Template.replace('`rh worktrees start', '`rh run contract-worktree start');
+    put(cleanRoot, helperTemplate);
+    expect(legacyPathSnapshot(cleanRoot)?.contentHash).toBe('sha256:5ec6c523a550df4dc3e36d1bbfa8470fa3dd48e494a1b8c5de52b9bd6276f5a1');
+    const helperRefreshed = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(helperRefreshed.exitCode, helperRefreshed.error).toBe(0);
+    expect(helperRefreshed.refreshedPaths).toContain(cleanRoot);
+    expect(readFileSync(cleanRoot, 'utf8')).toBe(rootTemplate);
+  }));
+
+  test('every byte-identical retired reference config is removed once and the migration is idempotent', () => sandbox((opts) => {
+    cpSync(RETIRED_RC_FIXTURE, opts.cwd, { recursive: true });
+    const result = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(result.exitCode, result.error).toBe(0);
+    for (const path of retiredRcPaths()) {
+      expect(result.removedPaths.includes(join(opts.cwd, path)) || result.refreshedPaths.includes(join(opts.cwd, path)), path).toBe(true);
+      if (path.endsWith('.md') && path.includes('reference-configs')) expect(existsSync(join(opts.cwd, path)), path).toBe(false);
+    }
+    for (const path of ['docs/architecture/snapshots/.gitkeep', 'docs/architecture/domains/.gitkeep']) {
+      expect(existsSync(join(opts.cwd, path))).toBe(false);
+    }
+    const before = tree(opts.cwd);
+    const second = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(second.exitCode).toBe(0);
+    expect(second.removedPaths).toEqual([]);
+    expect(second.refreshedPaths).toEqual([]);
+    expect(tree(opts.cwd)).toEqual(before);
+  }));
+
+  test('an injected migration failure restores every original byte and leaves a usable rollback manifest', () => sandbox((opts) => {
+    cpSync(RETIRED_RC_FIXTURE, opts.cwd, { recursive: true });
+    const before = tree(opts.cwd);
+    let calls = 0;
+    const result = runUpgrade({ ...opts, scope: 'project', apply: true }, { beforeRemove() {
+      calls += 1;
+      if (calls === 3) throw new Error('injected migration failure');
+    } });
+    expect(calls).toBe(3);
+    expect(result.exitCode).toBe(1);
+    expect(result.error).toContain('injected migration failure');
+    const afterFailure = tree(opts.cwd);
+    for (const path of retiredRcPaths()) expect(afterFailure[path], path).toBe(before[path]);
+  }));
+
+  test('minimal init creates no policy file when the repository has none', () => sandbox((opts) => {
+    expect(existsSync(join(opts.cwd, '.ai/harness/policy.json'))).toBe(false);
+    const result = runAdoptionApply({ repo: opts.cwd, mode: 'minimal', env: { HOME: opts.home } });
+    expect(result.exitCode, result.output).toBe(0);
+    expect(existsSync(join(opts.cwd, '.ai/harness/policy.json'))).toBe(false);
+  }));
+
+  test('minimal project mode cleans real retired bytes and the source checkout stays a no-op', () => sandbox((opts) => {
+    put(join(opts.cwd, '.ai/harness/policy.json'), '{"mode":"minimal"}\n');
+    const result = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(result.exitCode).toBe(0); expect(existsSync(join(opts.cwd, projectHook))).toBe(false);
+    expect(runUpgrade({ ...opts, cwd: ROOT, scope: 'project', apply: true }).items).toEqual([]);
+  }));
+
+  test('retired task artifact projections are removed only when their bytes are proven', () => sandbox((opts) => {
+    // Rendered bytes of the deferredGoalLedger adoption template that init shipped before this retirement.
+    const ledger = ['# Deferred Goal Ledger', '', '> **Status**: Backlog', '> **Updated**: (initial)',
+      '> **Scope**: Medium/long-term goals deferred from active plan execution', '',
+      "Current plan tasks live in the active plan's `## Task Breakdown`.",
+      'Do not duplicate that execution checklist here. Record only work intentionally deferred beyond this slice, with the tradeoff and revisit trigger.',
+      '', '## Deferred Goals', '', '| Goal | Why Deferred | Tradeoff | Revisit Trigger |', '|------|--------------|----------|-----------------|',
+      '| (none) | No deferred medium/long-term goal recorded yet. | Keep the first sprint bounded. | Add a row when a real follow-up is postponed. |', ''].join('\n');
+    const proven = ['tasks/notes/.gitkeep', 'tasks/todos.md'];
+    put(join(opts.cwd, 'tasks/notes/.gitkeep'), '');
+    put(join(opts.cwd, 'tasks/todos.md'), ledger);
+    put(join(opts.cwd, 'tasks/reviews/.gitkeep'), 'user note\n');
+    put(join(opts.cwd, '.claude/templates/review.template.md'), '# Team review\n');
+    const result = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(result.exitCode).toBe(0);
+    expect([...result.removedPaths].sort()).toEqual(proven.map((path) => join(opts.cwd, path)).sort());
+    for (const path of proven) expect(existsSync(join(opts.cwd, path))).toBe(false);
+    expect(readFileSync(join(opts.cwd, 'tasks/reviews/.gitkeep'), 'utf8')).toBe('user note\n');
+    expect(readFileSync(join(opts.cwd, '.claude/templates/review.template.md'), 'utf8')).toBe('# Team review\n');
+    for (const path of ['tasks/reviews/.gitkeep', '.claude/templates/review.template.md']) {
+      expect(result.items).toContainEqual(expect.objectContaining({ path: join(opts.cwd, path), ownership: 'unowned', action: 'report' }));
+    }
+  }, false));
+
+  test('old package dangling links need an exact manifest target', () => sandbox((opts) => {
+    const root = join(opts.home, '.codex/skills'); mkdirSync(root, { recursive: true });
+    const owned = join(root, 'repo-harness-old-owned'); const unowned = join(root, 'old-user');
+    const target = join(opts.home, 'old-package/missing-skill'); symlinkSync(target, owned); symlinkSync(target, unowned);
+    put(installStateFixturePath({ HOME: opts.home }), JSON.stringify(priorState('0.19.5')));
+    seedRecord(opts.home, owned, { owner: 'core', committed: { type: 'symlink', target } });
+    const preview = runUpgrade({ ...opts, scope: 'global' });
+    expect(preview.items.find(item => item.path === owned)?.action).toBe('remove');
+    expect(lstatSync(owned).isSymbolicLink()).toBe(true);
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true });
+    expect(result.exitCode).toBe(0); expect(() => lstatSync(owned)).toThrow(); expect(lstatSync(unowned).isSymbolicLink()).toBe(true);
+    expect(result.items.find((item) => item.path === unowned)?.ownership).toBe('unowned');
+  }, false));
+
+  test('symlinked parents never grant ownership for matching release bytes', () => sandbox((opts) => {
+    const external = join(opts.home, 'user-hooks'); mkdirSync(external);
+    put(join(external, 'prompt-guard.sh'), readUpgradeFixture('upgrade-v0.10-project', projectHook).toString('utf8'));
+    mkdirSync(join(opts.cwd, '.ai')); symlinkSync(external, join(opts.cwd, '.ai/hooks'));
+    const before = tree(external);
+    expect(runUpgrade({ ...opts, scope: 'project', apply: true }).removedPaths).toEqual([]);
+    expect(tree(external)).toEqual(before);
+  }, false));
+
+  test('current global typed adapters stay while a released legacy hook is removed', () => sandbox((opts) => {
+    const path = join(opts.home, '.codex/hooks.json');
+    const current = ': repo-harness-managed-hook-v1; repo-harness-hook SessionStart --route context';
+    const user = 'echo repo-harness';
+    const { event, block, hook } = RELEASED_HOOK;
+    put(path, JSON.stringify({ hooks: { [event]: [{ ...block, hooks: [{ command: current }, hook, { command: user }] }] } }));
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true });
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ hooks: { [event]: [{ ...block, hooks: [{ command: current }, { command: user }] }] } });
+
+    // Only an exact released hook goes. A customized matcher, timeout, command field or hook entry field keeps the file;
+    // so does a file that the text edits cannot place (a repeated event, command or timeout key, which JSON.parse reads
+    // as its last value) or read (a Latin-1 byte in a user string). Each file keeps its bytes and the ledger stays.
+    const entry = (fields: Record<string, unknown>, hooks: string) => `${JSON.stringify(fields).slice(0, -1)}${Object.keys(fields).length ? ',' : ''}"hooks":[${hooks}]}`;
+    const released = JSON.stringify(hook);
+    const file = (entries: string) => `{"hooks":{${JSON.stringify(event)}:[${entries}]}}`;
+    const kept: [Buffer, string][] = [
+      [Buffer.from(file(entry({ ...block, matcher: 'Edit|NotebookEdit' }, released))), CUSTOMIZED_HOOK],
+      [Buffer.from(file(entry(block, JSON.stringify({ ...hook, timeout: 120 })))), CUSTOMIZED_HOOK],
+      [Buffer.from(file(entry(block, JSON.stringify({ ...hook, statusMessage: 'mine' })))), CUSTOMIZED_HOOK],
+      [Buffer.from(file(entry({ ...block, note: 'mine' }, released))), CUSTOMIZED_HOOK],
+      [Buffer.from(`{"hooks":{${JSON.stringify(event)}:[],${file(entry(block, released)).slice(10)}`), 'Invalid hook settings; preserve current bytes.'],
+      [Buffer.from(file(entry(block, `{"command":"echo user",${released.slice(1)}`))), 'Invalid hook settings; preserve current bytes.'],
+      [Buffer.from(file(entry(block, `{"timeout":120,${released.slice(1)}`))), 'Invalid hook settings; preserve current bytes.'],
+      [Buffer.concat([Buffer.from('{"note":"caf'), Buffer.from([0xe9]), Buffer.from(`",${file(entry(block, released)).slice(1)}`)]), 'Invalid hook settings; preserve current bytes.'],
+    ];
+    const ledgerPath = join(opts.home, '.repo-harness/config/ledger.json');
+    for (const [scope, target] of [['global', path], ['project', join(opts.cwd, '.claude/settings.json')]] as const) {
+      for (const [bytes, reason] of kept) {
+        put(target, ''); writeFileSync(target, bytes);
+        const ledger = readFileSync(ledgerPath);
+        const reported = runUpgrade({ ...opts, scope, apply: true });
+        expect(reported.items.filter((item) => item.path === target)).toEqual([expect.objectContaining({ action: 'report', reason })]);
+        expect({ file: readFileSync(target).toString('base64'), ledger: readFileSync(ledgerPath).toString('base64') }).toEqual({ file: bytes.toString('base64'), ledger: ledger.toString('base64') });
+      }
+      // The exact released hook goes, with the containers that it empties.
+      writeFileSync(target, file(entry(block, released)));
+      expect(runUpgrade({ ...opts, scope, apply: true }).exitCode).toBe(0);
+      expect(readFileSync(target, 'utf8')).toBe('{}');
+    }
+    // A directory at the hook path, and a hook path below a directory that rh cannot search, are reported; the inventory goes on.
+    rmSync(path); mkdirSync(path);
+    const reportedPath = (reason: string) => expect(planLegacyLeftovers({ ...opts, scope: 'global', installOwnership: () => () => null }).items
+      .filter((item) => item.path === path)).toEqual([expect.objectContaining({ action: 'report', reason })]);
+    reportedPath('Invalid hook settings; preserve current bytes.');
+    chmodSync(dirname(path), 0o000);
+    try { reportedPath('Hook path has a protected symlink ancestor or an entry that rh cannot inspect.'); } finally { chmodSync(dirname(path), 0o755); }
+  }, false));
+
+  test('unrecorded historical copies are reported and both clean and edited bytes stay', () => sandbox((opts) => {
+    seed('upgrade-v0.19.5-home', opts.home);
+    const clean = join(opts.home, '.claude/skills/repo-harness-cross-review');
+    const edited = join(opts.home, '.codex/skills/repo-harness-cross-review');
+    writeFileSync(join(edited, 'SKILL.md'), `${readFileSync(join(edited, 'SKILL.md'), 'utf8')}\nuser edit\n`);
+    const cleanBefore = tree(clean);
+    const editedBefore = tree(edited);
+    const check = runUpgrade({ ...opts, scope: 'global' });
+    expect(check.items.find((item) => item.path === clean)?.action).toBe('report');
+    expect(check.items.find((item) => item.path === clean)?.reason).toContain('No ledger record');
+    expect(check.items.find((item) => item.path === edited)?.action).toBe('report');
+    expect(formatUpgradeResult(check)).toContain(clean);
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true });
+    expect(result.exitCode).toBe(0); expect(result.refreshedPaths).not.toContain(clean);
+    expect(result.status).toBe('partial');
+    expect(result.next).toContain('rh update');
+    expect(tree(clean)).toEqual(cleanBefore);
+    expect(tree(edited)).toEqual(editedBefore);
+    expect(runUpgrade({ ...opts, scope: 'global' }).items.some((item) => item.path === clean)).toBe(true);
+    const before = tree(opts.home);
+    expect(runUpgrade({ ...opts, scope: 'global', apply: true }).refreshedPaths).toEqual([]);
+    expect(tree(opts.home)).toEqual(before);
+  }, false));
+
+  test('real v0.10 installer markers are reported without granting a refresh', () => sandbox((opts) => {
+    const source = join(opts.home, 'release-source'); mkdirSync(join(source, 'assets/skill-commands'), { recursive: true });
+    copyUpgradeFixture('upgrade-v0.10-home', 'release-source/SKILL.md', join(source, 'SKILL.md'));
+    for (const name of ['repo-harness-plan', 'repo-harness-handoff', 'repo-harness-gptpro', 'repo-harness-check']) {
+      copyUpgradeFixture('upgrade-v0.10-home', `.codex/skills/${name}`, join(source, 'assets/skill-commands', name));
+    }
+    // The old installer must stay outside the source tree it copies and hashes.
+    const installerRoot = join(opts.home, 'release-installer');
+    copyUpgradeFixture('upgrade-v0.10-home', 'release-source', installerRoot);
+    const installerPath = join(installerRoot, 'scripts/sync-codex-installed-copies.sh');
+    const installer = spawnSync('bash', [installerPath], {
+      env: { ...process.env, PATH: `${drainingGrepDir(opts.home)}:${process.env.PATH}`, HOME: opts.home, AGENTIC_DEV_SOURCE_ROOT: source, CODEX_SKILLS_ROOT: join(opts.home, '.codex/skills'), CLAUDE_SKILLS_ROOT: '', REPO_HARNESS_INSTALL_PROFILE: 'strict', AGENTIC_DEV_LINK_INSTALLED_COPIES: '0', BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' }, encoding: 'utf8', timeout: 60000,
+    });
+    const installerOutput = JSON.stringify({
+      status: installer.status, signal: installer.signal, error: installer.error?.message ?? null, stdout: installer.stdout, stderr: installer.stderr,
+    });
+    expect(installer.status, installerOutput).toBe(0);
+    const installed = join(opts.home, '.codex/skills/repo-harness-check');
+    expect(existsSync(join(installed, '.repo-harness-owner.json')), installerOutput).toBe(true);
+    const item = runUpgrade({ ...opts, scope: 'global' }).items.find((item) => item.path === installed);
+    expect(item?.proof).toBe('owner-marker'); expect(item?.action).toBe('report');
+    const before = tree(installed);
+    const router = join(opts.home, '.codex/skills/repo-harness');
+    const routerBefore = tree(router);
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true });
+    expect(result.exitCode).toBe(0); expect(result.refreshedPaths).not.toContain(installed);
+    expect(result.refreshedPaths, JSON.stringify(result.items.find((item) => item.path === router))).not.toContain(router);
+    expect(tree(installed)).toEqual(before);
+    expect(tree(router)).toEqual(routerBefore);
+    expect(result.status).toBe('partial');
+    expect(ownedPath({ HOME: opts.home }, installed)).toBeNull();
+    expect(existsSync(join(router, '.git'))).toBe(false);
+    expect(existsSync(join(router, 'node_modules'))).toBe(false);
+  }, false));
+
+  test('retired plan and task scaffolds are removed only when their bytes are proven', () => sandbox((opts) => {
+    const helper = '.ai/hooks/lib/workflow-state.sh';
+    cpSync(join(FIXTURES, 'retired-plan-task-scaffolds'), opts.cwd, { recursive: true });
+    const modified = '.claude/templates/plan.template.md';
+    writeFileSync(join(opts.cwd, modified), `${readFileSync(join(opts.cwd, modified), 'utf8')}user edit\n`);
+    const proven = [
+      'tasks/current.md',
+      '.claude/templates/sprint.template.md',
+      '.claude/templates/contract.template.md',
+      'tasks/workstreams/.gitkeep',
+      '.ai/harness/active-plan',
+    ];
+    const check = runUpgrade({ ...opts, scope: 'project' });
+    for (const path of proven) {
+      expect(check.items.find((item) => item.path === join(opts.cwd, path)), path).toEqual(expect.objectContaining({
+        ownership: 'owned-clean', proof: 'historical-fingerprint', action: 'remove',
+      }));
+    }
+    expect(check.items.find((item) => item.path === join(opts.cwd, modified))).toEqual(expect.objectContaining({
+      ownership: 'unowned', proof: null, action: 'report',
+    }));
+    expect(check.items.find((item) => item.path === join(opts.cwd, helper))).toEqual(expect.objectContaining({ action: 'report', ownership: 'unowned', proof: null }));
+    const result = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(result.exitCode).toBe(0);
+    for (const path of proven) expect(result.removedPaths, path).toContain(join(opts.cwd, path));
+    expect(result.removedPaths).not.toContain(join(opts.cwd, modified));
+    for (const path of proven) expect(existsSync(join(opts.cwd, path))).toBe(false);
+    expect(readFileSync(join(opts.cwd, modified), 'utf8')).toContain('user edit');
+    expect(readFileSync(join(opts.cwd, helper), 'utf8')).toBe(readUpgradeFixture('upgrade-v0.10-project', helper).toString('utf8'));
+    const before = tree(opts.cwd);
+    const kept = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(kept.removedPaths).toEqual([]); expect(tree(opts.cwd)).toEqual(before);
+  }));
+
+  test('the 0.34.0 protocol 3 manifest moves to the gate before a shipped skill refresh', () => sandbox(opts => {
+    const env = { ...process.env, HOME: opts.home, BUN_INSTALL: join(opts.home, '.bun') };
+    const path = join(opts.home, '.codex/skills/repo-harness-cross-review');
+    copyUpgradeFixture('upgrade-v0.19.5-home', '.codex/skills/repo-harness-cross-review', path);
+    recordLegacyInstallOwnership([path], env);
+    const before = tree(opts.home);
+    const refused = runUpgrade({ ...opts, env, scope: 'global', apply: true });
+    expect(refused.exitCode).toBe(1);
+    expect(refused.error).toContain('rh update');
+    expect(tree(opts.home)).toEqual(before);
+    withRuntimeTransactionLock(globalRuntimeScope(env), () => migrateInstallState(env));
+    expect(readInstallState(env)?.protocol).toBe(5);
+    expect(ownedPath(env, path)?.committed.type).toBe('directory');
+    const refreshed = runUpgrade({ ...opts, env, scope: 'global', apply: true });
+    expect(refreshed.exitCode, refreshed.error).toBe(0);
+    expect(refreshed.refreshedPaths).toContain(path);
+    expect(ownedPath(env, path)?.committed).toEqual({ type: 'directory', sha256: hashManagedTree(path) });
+  }, false));
+
+  test('a gate refusal during legacy staging keeps a new marker directory', () => sandbox(opts => {
+    const path = join(opts.home, '.codex/skills/repo-harness-cross-review');
+    copyUpgradeFixture('upgrade-v0.19.5-home', '.codex/skills/repo-harness-cross-review', path);
+    seedRecord(opts.home, path, { owner: 'cross-review', committed: { type: 'directory', sha256: hashManagedTree(path) } });
+    let edited: ReturnType<typeof tree> | undefined;
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true }, { afterStage(item) {
+      if (item.path !== path) return;
+      const marker = join(path, '.repo-harness-owner.json');
+      rmSync(marker, { force: true }); mkdirSync(marker);
+      put(join(marker, 'keep.txt'), 'new user marker bytes\n');
+      edited = tree(path);
+    } });
+    expect(edited).toBeDefined();
+    expect(tree(path)).toEqual(edited!);
+    expect(result.refreshedPaths).not.toContain(path);
+    expect(result.items.find(item => item.path === path)?.action).toBe('report');
+  }, false));
+
+  test('legacy refresh rollback keeps a skill edited before a later cleanup fails', () => sandbox(opts => {
+    const path = join(opts.home, '.codex/skills/repo-harness-cross-review');
+    copyUpgradeFixture('upgrade-v0.19.5-home', '.codex/skills/repo-harness-cross-review', path);
+    seedRecord(opts.home, path, { owner: 'cross-review', committed: { type: 'directory', sha256: hashManagedTree(path) } });
+    const hook = join(opts.cwd, projectHook);
+    put(hook, readUpgradeFixture('upgrade-v0.10-project', projectHook).toString());
+    let edited: ReturnType<typeof tree> | undefined;
+    const result = runUpgrade({ ...opts, apply: true }, { beforeRemove(item) {
+      if (item.path !== hook) return;
+      expect(readFileSync(join(path, 'SKILL.md'))).toEqual(readFileSync(join(ROOT, 'assets/skills/repo-harness-cross-review/SKILL.md')));
+      put(join(path, 'user-note.txt'), 'user edit after the refresh\n');
+      edited = tree(path);
+      throw new Error('later cleanup failed');
+    } });
+    expect(edited).toBeDefined();
+    expect(result.exitCode).toBe(1);
+    expect(tree(path)).toEqual(edited!);
+    expect(result.error).toContain(path);
+    expect(ownedPath({ HOME: opts.home }, path)?.committed).toEqual({ type: 'directory', sha256: hashManagedTree(join(ROOT, 'assets/skills/repo-harness-cross-review')) });
+  }, false));
+
+  test.each(['drafts', '.repo-harness-owner.json'])('a changed skill entry is reported before a legacy backup: %s', entry => sandbox(opts => {
+    const path = join(opts.home, '.codex/skills/repo-harness-cross-review');
+    copyUpgradeFixture('upgrade-v0.19.5-home', '.codex/skills/repo-harness-cross-review', path);
+    seedRecord(opts.home, path, { owner: 'cross-review', committed: { type: 'directory', sha256: hashManagedTree(path) } });
+    rmSync(join(path, entry), { force: true }); mkdirSync(join(path, entry));
+    if (entry !== 'drafts') put(join(path, entry, 'keep.txt'), 'user marker bytes\n');
+    const before = tree(path);
+    for (const apply of [false, true]) {
+      const result = runUpgrade({ ...opts, scope: 'global', apply });
+      expect(result.items.find(item => item.path === path)).toMatchObject({ action: 'report', reason: expect.stringContaining('changed since rh recorded it') });
+      expect(result.backupPath).toBeUndefined();
+      expect(result.refreshedPaths).toEqual([]);
+      expect(tree(path)).toEqual(before);
+    }
+  }, false));
+
+  test('manifest-owned refresh updates its receipt and leaves only legacy cleanup backups', () => sandbox((opts) => {
+    seed('upgrade-v0.19.5-home', opts.home);
+    const path = join(opts.home, '.codex/skills/repo-harness-cross-review');
+    const statePath = installStateFixturePath({ HOME: opts.home });
+    const oldHash = hashManagedTree(path);
+    const state = priorState('0.19.5');
+    put(statePath, JSON.stringify(state));
+    seedRecord(opts.home, path, { owner: 'cross-review', committed: { type: 'directory', sha256: oldHash } });
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true });
+    expect(result.exitCode, result.error).toBe(0); expect(result.refreshedPaths).toContain(path);
+    const current = readInstallState({ ...process.env, HOME: opts.home });
+    expect(ownedPath({ HOME: opts.home }, path)?.committed).toEqual({ type: 'directory', sha256: hashManagedTree(path) });
+    expect(current?.core.version).toBe(JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version);
+    const snapshots = JSON.parse(readFileSync(join(result.backupPath!, 'manifest.json'), 'utf8')).snapshots as Array<{ path: string }>;
+    expect(snapshots.some(snapshot => [path, statePath, join(opts.home, '.repo-harness/config/ledger.json')].includes(snapshot.path))).toBe(false);
+    expect(readdirSync(join(opts.home, '.repo-harness/transactions')).sort()).toEqual(['.gitignore', basename(result.backupPath!)]);
+    expect(runUpgrade({ ...opts, scope: 'global' }).items.some((item) => item.path === path)).toBe(false);
+  }, false));
+
+  test('manifest-owned old-package link refresh retargets the link and keeps a symlink receipt', () => sandbox((opts) => {
+    const path = join(opts.home, '.codex/skills/repo-harness-cross-review');
+    const oldSource = join(opts.home, 'old-package/assets/skills/repo-harness-cross-review');
+    const currentSource = join(ROOT, 'assets/skills/repo-harness-cross-review');
+    const statePath = installStateFixturePath({ HOME: opts.home });
+    put(join(oldSource, 'SKILL.md'), '# old package\n');
+    mkdirSync(dirname(path), { recursive: true });
+    symlinkSync(oldSource, path);
+    const state = priorState('0.19.5');
+    put(statePath, JSON.stringify(state));
+    const receipt = seedRecord(opts.home, path, { owner: 'cross-review', committed: { type: 'symlink', target: oldSource } });
+    expect(runUpgrade({ ...opts, scope: 'global' }).items.find((item) => item.path === path)?.action).toBe('refresh');
+
+    const failed = runUpgrade({ ...opts, scope: 'global', apply: true }, { afterStage(item) {
+      if (item.path === path) put(statePath, JSON.stringify({ ...state, transaction_id: 'concurrent-writer' }));
+    } });
+    expect(failed.exitCode).toBe(1);
+    expect(readlinkSync(path)).toBe(oldSource);
+    // The rollback put the old link back as a new entry: the path counts as rolled back, not refreshed.
+    expect(failed.refreshedPaths).not.toContain(path);
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).transaction_id).toBe('concurrent-writer');
+    put(statePath, JSON.stringify(state));
+
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true });
+    expect(result.exitCode, result.error).toBe(0); expect(result.refreshedPaths).toContain(path);
+    expect(readlinkSync(path)).toBe(currentSource);
+    expect(ownedPath({ HOME: opts.home }, path)).toEqual({ ...receipt, committed: { type: 'symlink', target: currentSource }, identity: observeEntryIdentity(path)! });
+    const before = tree(opts.home);
+    expect(runUpgrade({ ...opts, scope: 'global', apply: true }).refreshedPaths).toEqual([]);
+    expect(tree(opts.home)).toEqual(before);
+  }, false));
+
+  test('state artifact removal needs apply, explicit flag, and an ownership proof', () => sandbox((opts) => {
+    const state = join(opts.home, '.repo-harness');
+    const gate = join(state, 'gates/project/merge-gate.latest.json');
+    const archive = join(state, 'packages/repo-harness-0.10.0-local.tgz');
+    const backup = join(state, 'backups/pre-0.19.5-skills-local');
+    const kept = [join(state, 'gates/linked/merge-gate.latest.json'), join(state, 'packages/repo-harness-0.10.0-linked.tgz'),
+      join(state, 'gates/directory/merge-gate.latest.json'), join(state, 'backups/pre-0.19.5-user')];
+    put(gate, '{"status":"complete"}\n');
+    mkdirSync(dirname(archive), { recursive: true });
+    const archiveSource = join(opts.cwd, 'archive-source');
+    copyUpgradeFixture('upgrade-v0.19.5-home', '.codex/skills/repo-harness-cross-review', join(archiveSource, 'repo-harness-cross-review'));
+    expect(spawnSync('tar', ['-czf', archive, '-C', archiveSource, 'repo-harness-cross-review']).status).toBe(0);
+    cpSync(join(archiveSource, 'repo-harness-cross-review'), backup, { recursive: true });
+    put(join(opts.cwd, 'link-target'), '{"status":"user"}\n');
+    for (const link of kept.slice(0, 2)) { mkdirSync(dirname(link), { recursive: true }); symlinkSync(join(opts.cwd, 'link-target'), link); }
+    put(join(kept[2]!, 'note'), 'user\n'); cpSync(backup, kept[3]!, { recursive: true });
+    // The retired gate and archive paths predate the manifest. A valid install state cannot hold a
+    // receipt for a state-root backup, so the backup has no ownership proof.
+    put(installStateFixturePath({ HOME: opts.home }), JSON.stringify(priorState('0.19.5')));
+    const before = tree(opts.home);
+    const check = runUpgrade({ ...opts, scope: 'global', includeStateArtifacts: true });
+    for (const path of [gate, archive]) expect(check.items.find((item) => item.path === path)).toMatchObject({ ownership: 'owned-clean',
+      proof: 'state-root-retired-path', action: 'report', reason: 'State artifact cleanup needs --include-state-artifacts.' });
+    expect(check.items.find((item) => item.path === backup)?.action).toBe('report');
+    expect(tree(opts.home)).toEqual(before);
+    expect(runUpgrade({ ...opts, scope: 'global', apply: true }).removedPaths).toEqual([]);
+    expect(tree(opts.home)).toEqual(before);
+    const applied = runUpgrade({ ...opts, scope: 'global', apply: true, includeStateArtifacts: true });
+    expect(applied.exitCode, applied.error).toBe(0);
+    expect([...applied.removedPaths].sort()).toEqual([archive, gate].sort());
+    for (const path of [gate, archive]) expect(existsSync(path)).toBe(false);
+    expect(applied.items.find((item) => item.path === backup)).toMatchObject({ ownership: 'unowned', action: 'report' });
+    expect(existsSync(backup)).toBe(true);
+    expect(Object.values(tree(applied.backupPath!))).toContain(Buffer.from('{"status":"complete"}\n').toString('base64'));
+    for (const path of kept) expect([existsSync(path), applied.items.find((item) => item.path === path)]).toMatchObject([true, { ownership: 'unowned', action: 'report' }]);
+  }, false));
+
+  test('a global rules refresh adds no upgrade leftover', () => sandbox((opts) => {
+    put(join(opts.home, '.codex/AGENTS.md'), '# Notes\n');
+    const refresh = applyGlobalContextRefresh(preflightGlobalContextRefresh(ROOT, opts.home, ['codex'], 'en'), opts.home);
+    expect(refresh.status).toBe('ok');
+    const check = runUpgrade({ ...opts, scope: 'global' });
+    expect(check.items).toEqual([]);
+    expect(check.exitCode).toBe(0);
+  }, false));
+
+  test('third-party Codex plugin and user rule lines always remain report-only', () => sandbox((opts) => {
+    const plugin = join(opts.home, '.claude/plugins/cache/openai-codex/codex/1.0.0');
+    put(join(plugin, 'plugin.json'), '{"name":"codex"}\n');
+    put(join(opts.home, '.claude/plugins/installed_plugins.json'), JSON.stringify({ plugins: { 'codex@openai-codex': [{ installPath: plugin }] } }));
+    put(join(opts.home, '.claude/settings.json'), JSON.stringify({ enabledPlugins: { 'codex@openai-codex': true } }));
+    const docs = [join(opts.home, '.claude/CLAUDE.md'), join(opts.home, '.codex/AGENTS.md')];
+    for (const path of docs) put(path, 'Use codex@openai-codex and scripts/capture-plan.sh.\n');
+    const before = tree(opts.home);
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true, includeStateArtifacts: true });
+    expect(result.exitCode).toBe(0); expect(result.removedPaths).toEqual([]); expect(result.refreshedPaths).toEqual([]);
+    for (const path of [plugin, ...docs]) expect(result.items.find((item) => item.path === path)?.action).toBe('report');
+    expect(tree(opts.home)).toEqual(before);
+  }, false));
+});
+
+test('upgrade has no worktree template migration option', () => {
+  const result = spawnSync(process.execPath, [CLI, 'upgrade', '--migrate-worktree-template'], { cwd: ROOT, encoding: 'utf8' });
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain("unknown option '--migrate-worktree-template'");
+});
+
+describe('legacy workflow-state upgrade report', () => {
+  for (const edited of [false, true]) {
+    test(`check and apply report and preserve ${edited ? 'edited' : 'historical'} library bytes`, () => sandbox((opts) => {
+      const path = join(opts.cwd, '.ai/hooks/lib/workflow-state.sh');
+      const bytes = readUpgradeFixture('upgrade-v0.10-project', '.ai/hooks/lib/workflow-state.sh').toString('utf8') + (edited ? '\n# Local operator changes\n' : '');
+      put(path, bytes); chmodSync(path, 0o755);
+      const beforeRepo = tree(opts.cwd); const beforeHome = tree(opts.home);
+      const check = runUpgrade({ ...opts, scope: 'project' });
+      expect(check.exitCode).toBe(1);
+      expect(check.items).toHaveLength(1);
+      expect(check.items[0]).toEqual(expect.objectContaining({ path, action: 'report', ownership: 'unowned', proof: null }));
+      expect(check.items[0]?.reason).toContain('rh run <helper>');
+      expect(check.items[0]?.reason).not.toContain('hook-lib');
+      expect(check.items[0]?.reason).toContain('back up');
+      expect(check.items[0]?.reason).toContain('review local edits');
+      const apply = runUpgrade({ ...opts, scope: 'project', apply: true });
+      expect(apply.exitCode).toBe(0);
+      expect(apply.keptPaths).toContain(path);
+      expect(apply.removedPaths).toEqual([]); expect(apply.refreshedPaths).toEqual([]);
+      expect(apply.transactionId).toBeUndefined();
+      expect(readFileSync(path, 'utf8')).toBe(bytes);
+      expect(lstatSync(path).mode & 0o777).toBe(0o755);
+      expect(tree(opts.cwd)).toEqual(beforeRepo); expect(tree(opts.home)).toEqual(beforeHome);
+      expect(runUpgrade({ ...opts, scope: 'global' }).items).toEqual([]);
+    }, false));
+  }
+
+  test('CLI text and JSON both give manual migration steps from a nested cwd', () => sandbox((opts) => {
+    const path = join(opts.cwd, '.ai/hooks/lib/workflow-state.sh');
+    const bytes = readUpgradeFixture('upgrade-v0.10-project', '.ai/hooks/lib/workflow-state.sh');
+    put(path, bytes.toString('utf8'));
+    const invoke = (args: string[]) => spawnSync(process.execPath, [CLI, 'upgrade', '--scope', 'project', ...args], {
+      cwd: dirname(path), env: { ...process.env, HOME: opts.home }, encoding: 'utf8', timeout: 60000,
+    });
+    const text = invoke([]); const json = invoke(['--json']);
+    expect(text.status, text.stderr).toBe(1); expect(json.status, json.stderr).toBe(1);
+    expect(text.stdout).toContain(path); expect(text.stdout).toContain('rh run <helper>');
+    const { items } = JSON.parse(json.stdout);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toEqual(expect.objectContaining({ path, action: 'report' }));
+    expect(items[0].reason).toContain('manual removal');
+    expect(readFileSync(path)).toEqual(bytes);
+  }, false));
+
+  test('package scripts that call a helper outside the public registry are report-only', () => sandbox((opts) => {
+    const path = join(opts.cwd, 'package.json');
+    const bytes = `${JSON.stringify({ name: 'fixture', scripts: {
+      'workflow:check': 'rh run check-task-workflow --strict',
+      'check:task-sync': 'rh run check-task-sync',
+      'plan:new': 'bunx repo-harness run new-plan',
+      'check:context-files': 'rh run check-context-files',
+      'spec:new': 'rh run new-spec.sh',
+      'worktree:old': 'rh run contract-worktree start --issue 42',
+      'worktree:file': 'rh run contract-worktree.sh start --issue 42',
+      'worktree:current': 'rh worktrees start --issue 42',
+      'brain:old': 'repo-harness brain check',
+      'board:env': 'env FOO=1 repo-harness board seats',
+      'board:inline': 'FOO=1 repo-harness board seats',
+      'cli:version': 'time -p repo-harness --version',
+      'check:deploy-sql': 'sudo repo-harness run check-deploy-sql-order --verbose',
+      'check:brain': 'repo-harness brain check',
+      'sync:brain': 'rh brain sync',
+      test: 'bun test',
+      ...Object.fromEntries(RETIRED_CLI_LINES.calls.map((line, index) => [`call:${index}`, line])),
+      ...Object.fromEntries(RETIRED_CLI_LINES.excluded.map((line, index) => [`excluded:${index}`, line])),
+    } }, null, '\t')}\n`;
+    put(path, bytes);
+    const check = runUpgrade({ ...opts, scope: 'project' });
+    expect(check.items).toEqual([expect.objectContaining({ path, surface: 'file', retiredBy: 'retired-script-reference', action: 'report', ownership: 'unowned' })]);
+    expect(check.items[0]?.reason).toContain('workflow:check: rh run check-task-workflow --strict; check:task-sync: rh run check-task-sync; plan:new: bunx repo-harness run new-plan');
+    expect(check.items[0]?.reason).toContain('brain:old: repo-harness brain check (the repo-harness command is now rh)');
+    expect(check.items[0]?.reason).toContain('board:env: env FOO=1 repo-harness board seats (the repo-harness command is now rh)');
+    expect(check.items[0]?.reason).toContain('board:inline: FOO=1 repo-harness board seats (the repo-harness command is now rh)');
+    expect(check.items[0]?.reason).toContain('cli:version: time -p repo-harness --version (the repo-harness command is now rh)');
+    // A script line is a command, so the finding stays pending.
+    expect(check.exitCode).toBe(1);
+    RETIRED_CLI_LINES.calls.forEach((line, index) => expect(check.items[0]?.reason).toContain(`call:${index}: ${line} (the repo-harness command is now rh)`));
+    RETIRED_CLI_LINES.excluded.forEach((_, index) => expect(check.items[0]?.reason).not.toContain(`excluded:${index}:`));
+    // init replaces a managed key only when its value is current or released, so the inventory reports an edited value.
+    for (const managed of ['check:brain:', 'sync:brain:']) expect(check.items[0]?.reason).not.toContain(managed);
+    expect(check.items[0]?.reason).toContain('check:deploy-sql: sudo repo-harness run check-deploy-sql-order --verbose (the repo-harness command is now rh)');
+    for (const key of ['worktree:old', 'worktree:file']) {
+      expect(check.items[0]?.reason).toContain(`${key}: rh run contract-worktree`);
+    }
+    expect(check.items[0]?.reason).toContain('rh worktrees start');
+    expect(check.items[0]?.reason).not.toContain('worktree:current:');
+    for (const live of ['check:context-files', 'spec:new', 'test:']) expect(check.items[0]?.reason).not.toContain(live);
+    expect(runUpgradeDecide({ ...opts, decision: 'remove', paths: ['package.json'] }).rejected.map((rejection) => rejection.path)).toEqual(['package.json']);
+    expect(runUpgrade({ ...opts, scope: 'project', apply: true }).keptPaths).toContain(path);
+    expect(readFileSync(path, 'utf8')).toBe(bytes);
+  }, false));
+
+  test('user-owned project text that names the retired command is advisory; init-owned script keys are not reported', () => sandbox((opts) => {
+    const policy = join(opts.cwd, '.ai/harness/policy.json');
+    const root = join(opts.cwd, 'CLAUDE.md');
+    put(policy, `${JSON.stringify({ information_lifecycle: { external_knowledge: { sync_script: 'repo-harness brain sync' } } }, null, 2)}\n`);
+    put(root, `${[...RETIRED_CLI_LINES.calls, RETIRED_CLI_LINES.prose, ...RETIRED_CLI_LINES.excluded].join('\n')}\n`);
+    put(join(opts.cwd, 'package.json'), `${JSON.stringify({ name: 'fixture', scripts: { 'check:brain': 'repo-harness brain check' } })}\n`);
+    const before = tree(opts.cwd);
+    const check = runUpgrade({ ...opts, scope: 'project' });
+    const named = Array.from({ length: RETIRED_CLI_LINES.calls.length + 1 }, (_, index) => index + 1).join(', ');
+    expect(check.items.filter((item) => item.retiredBy === 'retired-cli-command').map((item) => [item.path, item.action, item.advisory === true, item.reason])).toEqual([
+      [policy, 'report', true, 'Line 4 names repo-harness; change each line that calls it to rh. Upgrade does not edit this file.'],
+      [root, 'report', true, `Line ${named} names repo-harness; change each line that calls it to rh. Upgrade does not edit this file.`],
+    ].sort((left, right) => String(left[0]).localeCompare(String(right[0]))));
+    expect(check.items.some((item) => item.path === join(opts.cwd, 'package.json'))).toBe(false);
+    // Advisory items stay out of the preview exit code, so they do not make the repo pending.
+    expect(check.items.every((item) => item.advisory === true)).toBe(true);
+    expect(check.exitCode).toBe(0);
+    runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(tree(opts.cwd)).toEqual(before);
+  }, false));
+
+  test('a managed package script with a value that no release wrote gets an advisory notice and stays', () => sandbox((opts) => {
+    const path = join(opts.cwd, 'package.json');
+    const bytes = `${JSON.stringify({ name: 'fixture', scripts: {
+      'check:brain': 'repo-harness brain check',
+      'sync:brain': 'rh brain sync',
+      'check:deploy-sql': 'echo local-check',
+      'check:context-files': 42,
+      'check:brain-manifest': 'echo manifest',
+    } }, null, 2)}\n`;
+    put(path, bytes);
+    const check = runUpgrade({ ...opts, scope: 'project' });
+    expect(check.items).toEqual([expect.objectContaining({ path, retiredBy: 'customized-managed-value', action: 'report', advisory: true,
+      reason: 'Package scripts that init manages differ from every released value; init and upgrade keep them: '
+        + 'check:deploy-sql: "echo local-check"; check:context-files: 42; check:brain-manifest: "echo manifest"' })]);
+    expect(check.exitCode).toBe(0);
+    expect(runUpgradeDecide({ ...opts, decision: 'remove', paths: ['package.json'] }).rejected.map((rejection) => rejection.path)).toEqual(['package.json']);
+    runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(readFileSync(path, 'utf8')).toBe(bytes);
+  }, false));
+
+  test('package scripts that run a missing script key are report-only', () => sandbox((opts) => {
+    const path = join(opts.cwd, 'package.json');
+    put(join(opts.cwd, 'build.ts'), 'console.log("build");\n');
+    put(join(opts.cwd, 'node_modules/.bin/vite'), '#!/bin/sh\n');
+    const bytes = `${JSON.stringify({ name: 'fixture', workspaces: ['packages/*'], scripts: {
+      check: 'bun run check:task-workflow && bun run typecheck',
+      verify: 'npm run -s lint',
+      typecheck: 'tsc',
+      build: 'bun run build.ts && bun run vite',
+      'build:all': 'bun run --filter "*" build',
+      'lint:app': 'bun run --filter app lint',
+      'dev:a': 'npm run dev -w packages/a',
+      'test:ws': 'npm run -w packages/a test',
+    } }, null, 2)}\n`;
+    put(path, bytes);
+    const check = runUpgrade({ ...opts, scope: 'project' });
+    expect(check.items).toEqual([expect.objectContaining({ path, surface: 'file', retiredBy: 'retired-script-reference', action: 'report' })]);
+    expect(check.items[0]?.reason).toContain('check: bun run check:task-workflow && bun run typecheck (missing script "check:task-workflow"); verify: npm run -s lint (missing script "lint")');
+    for (const live of ['typecheck: tsc', 'build:', 'lint:app', 'dev:a', 'test:ws']) expect(check.items[0]?.reason).not.toContain(live);
+    expect(runUpgradeDecide({ ...opts, decision: 'remove', paths: ['package.json'] }).rejected.map((rejection) => rejection.path)).toEqual(['package.json']);
+    expect(runUpgrade({ ...opts, scope: 'project', apply: true }).keptPaths).toContain(path);
+    expect(readFileSync(path, 'utf8')).toBe(bytes);
+  }, false));
+
+  test('leaf links are report-only and a symlink parent is never followed', () => sandbox((opts) => {
+    const target = join(opts.home, 'operator-library.sh'); put(target, '# Outside operator file\n');
+    const libDir = join(opts.cwd, '.ai/hooks/lib'); mkdirSync(libDir, { recursive: true });
+    const path = join(libDir, 'workflow-state.sh'); symlinkSync(target, path);
+    const check = runUpgrade({ ...opts, scope: 'project' });
+    expect(check.items).toContainEqual(expect.objectContaining({ path, surface: 'symlink', action: 'report' }));
+    expect(runUpgrade({ ...opts, scope: 'project', apply: true }).keptPaths).toContain(path);
+    expect(readlinkSync(path)).toBe(target); expect(readFileSync(target, 'utf8')).toBe('# Outside operator file\n');
+    rmSync(libDir, { recursive: true }); symlinkSync(opts.home, libDir, 'dir');
+    put(join(opts.home, 'workflow-state.sh'), '# Library outside the repo\n');
+    expect(runUpgrade({ ...opts, scope: 'project', apply: true }).items.some((item) => item.path === path)).toBe(false);
+    expect(readFileSync(join(opts.home, 'workflow-state.sh'), 'utf8')).toBe('# Library outside the repo\n');
+  }, false));
+});
+
+describe('upgrade operator decisions', () => {
+  const decisionsFile = '.ai/harness/upgrade-decisions.json';
+  const library = '.ai/hooks/lib/workflow-state.sh';
+  const libraryBytes = () => readUpgradeFixture('upgrade-v0.10-project', library).toString('utf8');
+  const sha = (path: string) => `sha256:${new Bun.CryptoHasher('sha256').update(readFileSync(path)).digest('hex')}`;
+  const writeDecisions = (cwd: string, decisions: unknown) => put(join(cwd, decisionsFile), JSON.stringify({ version: 1, decisions }));
+  const readDecisions = (cwd: string) => JSON.parse(readFileSync(join(cwd, decisionsFile), 'utf8'));
+
+  test('keep removes the item from the pending list and exit code until the bytes change', () => sandbox((opts) => {
+    const path = join(opts.cwd, library);
+    put(path, libraryBytes());
+    writeDecisions(opts.cwd, [{ path: library, decision: 'keep', contentHash: sha(path) }]);
+    const check = runUpgrade({ ...opts, scope: 'project' });
+    expect(check.exitCode, check.error).toBe(0);
+    expect(check.items).toEqual([]);
+    expect(check.operatorKept).toEqual([expect.objectContaining({ path, action: 'report', operatorDecision: { decision: 'keep', status: 'applied' } })]);
+    const before = tree(opts.cwd);
+    const apply = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(apply.exitCode, apply.error).toBe(0);
+    expect(apply.removedPaths).toEqual([]);
+    expect(apply.operatorKept.map((item) => item.path)).toEqual([path]);
+    expect(tree(opts.cwd)).toEqual(before);
+
+    writeFileSync(path, `${libraryBytes()}\n# edited after the decision\n`);
+    const stale = runUpgrade({ ...opts, scope: 'project' });
+    expect(stale.exitCode).toBe(1);
+    expect(stale.operatorKept).toEqual([]);
+    expect(stale.items).toEqual([expect.objectContaining({ path, action: 'report', operatorDecision: { decision: 'keep', status: 'stale' } })]);
+    expect(stale.items[0]?.reason).toContain('decision is stale');
+  }, false));
+
+  test('remove deletes a regular file that the operator decided to remove', () => sandbox((opts) => {
+    const path = join(opts.cwd, library);
+    put(path, libraryBytes());
+    const decided = runUpgradeDecide({ ...opts, decision: 'remove', paths: [library] });
+    expect(decided.exitCode, decided.error).toBe(0);
+    expect(readDecisions(opts.cwd)).toEqual({ version: 1, decisions: [{ path: library, decision: 'remove', contentHash: sha(path) }] });
+    const check = runUpgrade({ ...opts, scope: 'project' });
+    expect(check.exitCode).toBe(1);
+    expect(check.items).toEqual([expect.objectContaining({ path, action: 'remove', ownership: 'unowned', operatorDecision: { decision: 'remove', status: 'applied' } })]);
+    expect(existsSync(path)).toBe(true);
+
+    const result = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(result.exitCode, result.error).toBe(0);
+    expect(result.removedPaths).toEqual([path]);
+    expect(existsSync(path)).toBe(false);
+  }, false));
+
+  test('remove is rejected for a directory and for a document that refers to a retired path', () => sandbox((opts) => {
+    const directory = join(opts.cwd, library);
+    put(join(directory, 'nested.sh'), '# operator directory\n');
+    const doc = join(opts.cwd, 'CLAUDE.md');
+    put(doc, `Run ${projectHook} for the old setup.\n`);
+    const items = runUpgrade({ ...opts, scope: 'project' }).items;
+    expect(items.find((item) => item.path === directory)).toEqual(expect.objectContaining({ surface: 'directory', action: 'report' }));
+    expect(items.find((item) => item.path === doc)).toEqual(expect.objectContaining({ retiredBy: 'retired-script-reference', action: 'report' }));
+
+    const decided = runUpgradeDecide({ ...opts, decision: 'remove', paths: [library, 'CLAUDE.md'] });
+    expect(decided.exitCode).toBe(1);
+    expect(decided.rejected.map((rejection) => rejection.path)).toEqual([library, 'CLAUDE.md']);
+    expect(decided.rejected[0]?.reason).toContain('regular file');
+    expect(decided.rejected[1]?.reason).toContain('retired path');
+    expect(existsSync(join(opts.cwd, decisionsFile))).toBe(false);
+
+    writeDecisions(opts.cwd, [
+      { path: library, decision: 'remove', contentHash: hashManagedTree(directory) },
+      { path: 'CLAUDE.md', decision: 'remove', contentHash: sha(doc) },
+    ]);
+    const before = tree(opts.cwd);
+    const apply = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(apply.exitCode, apply.error).toBe(0);
+    expect(apply.removedPaths).toEqual([]);
+    for (const path of [directory, doc]) {
+      expect(apply.items.find((item) => item.path === path)).toEqual(expect.objectContaining({
+        action: 'report', operatorDecision: { decision: 'remove', status: 'rejected' },
+      }));
+    }
+    expect(tree(opts.cwd)).toEqual(before);
+    expect(runUpgrade({ ...opts, scope: 'project' }).exitCode).toBe(1);
+
+    expect(runUpgradeDecide({ ...opts, decision: 'keep', paths: [library, 'CLAUDE.md'] }).exitCode).toBe(0);
+    const kept = runUpgrade({ ...opts, scope: 'project' });
+    expect(kept.exitCode, kept.error).toBe(0);
+    expect(kept.operatorKept.map((item) => item.path).sort()).toEqual([directory, doc].sort());
+  }, false));
+
+  test('a retired generated handoff packet accepts remove, and an edit after the decision keeps it', () => sandbox((opts) => {
+    const packet = '.ai/harness/handoff/resume.md';
+    const path = join(opts.cwd, packet);
+    const bytes = `# Codex Resume Packet\n<!-- generated-by: repo-harness codex-handoff-resume v1 -->\n\nRead ${projectHook} first.\n`;
+    put(path, bytes);
+    put(join(opts.cwd, 'CLAUDE.md'), `Run ${projectHook} for the old setup.\n`);
+    // The marker classifies the file only; without a decision upgrade never removes it.
+    expect(runUpgrade({ ...opts, scope: 'project' }).items.find((item) => item.path === path)).toEqual(expect.objectContaining({
+      retiredBy: 'retired-generated-artifact', ownership: 'unowned', proof: null, action: 'report',
+    }));
+
+    const decided = runUpgradeDecide({ ...opts, decision: 'remove', paths: [packet, 'CLAUDE.md'] });
+    expect(decided.exitCode).toBe(1);
+    expect(decided.recorded).toEqual([{ path: packet, decision: 'remove', contentHash: sha(path) }]);
+    expect(decided.rejected).toEqual([{ path: 'CLAUDE.md', reason: expect.stringContaining('retired path') }]);
+
+    writeFileSync(path, `${bytes}\nOperator note: keep this.\n`);
+    const stale = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(stale.removedPaths).toEqual([]);
+    expect(stale.items.find((item) => item.path === path)?.operatorDecision).toEqual({ decision: 'remove', status: 'stale' });
+    expect(readFileSync(path, 'utf8')).toContain('Operator note');
+
+    expect(runUpgradeDecide({ ...opts, decision: 'remove', paths: [packet] }).exitCode).toBe(0);
+    const removed = runUpgrade({ ...opts, scope: 'project', apply: true });
+    expect(removed.exitCode, removed.error).toBe(0);
+    expect(removed.removedPaths).toEqual([path]);
+  }, false));
+
+  test('retired runtime state below a symlinked .claude is outside the repository and is not listed', () => sandbox((opts) => {
+    const outside = join(dirname(opts.cwd), 'outside-claude');
+    put(join(outside, '.session-id'), 'session\n');
+    symlinkSync(outside, join(opts.cwd, '.claude'));
+    expect(runUpgrade({ ...opts, scope: 'project' }).items.map((item) => item.path)).not.toContain(join(opts.cwd, '.claude/.session-id'));
+  }, false));
+
+  const invalidFiles: readonly [string, (cwd: string, hash: string) => void][] = [
+    ['not JSON', (cwd) => put(join(cwd, decisionsFile), '{"version":1,')],
+    ['an unknown version', (cwd, contentHash) => put(join(cwd, decisionsFile), JSON.stringify({ version: 2, decisions: [{ path: library, decision: 'keep', contentHash }] }))],
+    ['an extra top-level key', (cwd) => put(join(cwd, decisionsFile), JSON.stringify({ version: 1, decisions: [], note: 'x' }))],
+    ['an unknown decision', (cwd, contentHash) => writeDecisions(cwd, [{ path: library, decision: 'ignore', contentHash }])],
+    ['a malformed hash', (cwd) => writeDecisions(cwd, [{ path: library, decision: 'keep', contentHash: 'sha256:abc' }])],
+    ['a path outside the repository', (cwd, contentHash) => writeDecisions(cwd, [{ path: '../outside', decision: 'keep', contentHash }])],
+    ['a duplicate path', (cwd, contentHash) => writeDecisions(cwd, [{ path: library, decision: 'keep', contentHash }, { path: library, decision: 'remove', contentHash }])],
+    ['a directory at the decision path', (cwd) => mkdirSync(join(cwd, decisionsFile), { recursive: true })],
+  ];
+  for (const [name, write] of invalidFiles) {
+    test(`a decision file with ${name} fails closed`, () => sandbox((opts) => {
+      const path = join(opts.cwd, library);
+      put(path, libraryBytes());
+      write(opts.cwd, sha(path));
+      const before = tree(opts.cwd);
+      for (const apply of [false, true]) {
+        const result = runUpgrade({ ...opts, scope: 'project', apply });
+        expect(result.exitCode).toBe(1);
+        expect(result.error).toContain('invalid upgrade decision file');
+        expect(result.items).toEqual([]);
+      }
+      const decided = runUpgradeDecide({ ...opts, decision: 'keep', paths: [library] });
+      expect(decided.exitCode).toBe(1);
+      expect(decided.error).toContain('invalid upgrade decision file');
+      expect(tree(opts.cwd)).toEqual(before);
+    }, false));
+  }
+
+  test('decide rejects paths that are not report items and rewrites an existing entry in path order', () => sandbox((opts) => {
+    const path = join(opts.cwd, library);
+    put(path, libraryBytes());
+    put(join(opts.cwd, 'CLAUDE.md'), `Run ${projectHook} for the old setup.\n`);
+    put(join(opts.cwd, 'README.md'), '# User readme\n');
+
+    const rejected = runUpgradeDecide({ ...opts, decision: 'keep', paths: ['README.md', library, '../outside.md'] });
+    expect(rejected.exitCode).toBe(1);
+    expect(rejected.rejected).toEqual([
+      { path: 'README.md', reason: 'Path is not a current project upgrade report item.' },
+      { path: '../outside.md', reason: 'Path is outside the repository.' },
+    ]);
+    // Each path is judged alone, so the valid path in the batch is written.
+    expect(rejected.recorded).toEqual([{ path: library, decision: 'keep', contentHash: sha(path) }]);
+    expect(readDecisions(opts.cwd).decisions).toEqual(rejected.recorded);
+
+    expect(runUpgradeDecide({ ...opts, decision: 'keep', paths: ['CLAUDE.md'] }).exitCode).toBe(0);
+    expect(runUpgradeDecide({ ...opts, decision: 'keep', paths: [library] }).exitCode).toBe(0);
+    const firstHash = sha(path);
+    expect(readDecisions(opts.cwd).decisions).toEqual([
+      { path: library, decision: 'keep', contentHash: firstHash },
+      { path: 'CLAUDE.md', decision: 'keep', contentHash: sha(join(opts.cwd, 'CLAUDE.md')) },
+    ]);
+
+    writeFileSync(path, `${libraryBytes()}\n# edited\n`);
+    expect(runUpgrade({ ...opts, scope: 'project' }).items[0]?.operatorDecision?.status).toBe('stale');
+    const rewritten = runUpgradeDecide({ ...opts, decision: 'remove', paths: [library] });
+    expect(rewritten.exitCode, rewritten.error).toBe(0);
+    const decisions = readDecisions(opts.cwd).decisions;
+    expect(decisions.map((entry: { path: string }) => entry.path)).toEqual([library, 'CLAUDE.md']);
+    expect(decisions[0]).toEqual({ path: library, decision: 'remove', contentHash: sha(path) });
+    expect(decisions[0].contentHash).not.toBe(firstHash);
+    expect(existsSync(path)).toBe(true);
+  }, false));
+
+  test('CLI decide from a nested cwd records keep and the project check exits 0', () => sandbox((opts) => {
+    const path = join(opts.cwd, library);
+    put(path, libraryBytes());
+    const invoke = (args: string[]) => spawnSync(process.execPath, [CLI, 'upgrade', ...args], {
+      cwd: dirname(path), env: { ...process.env, HOME: opts.home }, encoding: 'utf8', timeout: 60000,
+    });
+    const decided = invoke(['decide', '--keep', 'workflow-state.sh', '--json']);
+    expect(decided.status, decided.stderr).toBe(0);
+    expect(JSON.parse(decided.stdout).recorded).toEqual([{ path: library, decision: 'keep', contentHash: sha(path) }]);
+    expect(invoke(['decide', 'workflow-state.sh']).status).toBe(2);
+    const check = invoke(['--scope', 'project', '--json']);
+    expect(check.status, check.stderr).toBe(0);
+    const checked = JSON.parse(check.stdout);
+    expect(checked.items).toEqual([]);
+    expect(checked.operatorKept.map((item: { path: string }) => item.path)).toEqual([expect.stringMatching(/\.ai\/hooks\/lib\/workflow-state\.sh$/)]);
+    const text = invoke(['--scope', 'project']);
+    expect(text.status).toBe(0);
+    expect(text.stdout).toContain(`Operator kept (${decisionsFile}):`);
+    expect(text.stdout).toContain(path);
+  }, false));
+});
+
+interface LegacyWorktreeFixture {
+  readonly main: string;
+  readonly projects: string;
+  readonly managed: string;
+  readonly home: string;
+  readonly ghBin: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly git: (cwd: string, ...args: string[]) => string;
+  /** Add a real linked worktree with one own commit, optionally merged into the target. */
+  readonly worktree: (path: string, branch: string, merge: boolean) => string;
+}
+
+// Real `git worktree add` checkouts beside a primary checkout, with an
+// isolated HOME and managed root. The provider stub knows no merged PR.
+function legacyWorktreeSandbox(run: (f: LegacyWorktreeFixture) => void): void {
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'upgrade-legacy-worktrees-')));
+  const projects = join(parent, 'projects');
+  const main = join(projects, 'repo');
+  const managed = join(parent, 'managed');
+  const home = join(parent, 'home');
+  for (const directory of [main, managed, home]) mkdirSync(directory, { recursive: true });
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, REPO_HARNESS_WORKTREE_ROOT: managed };
+  const git = (cwd: string, ...args: string[]) => {
+    const result = spawnSync('git', args, { cwd, env, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  git(main, 'init', '-q', '-b', 'main');
+  git(main, 'config', 'user.name', 'Test');
+  git(main, 'config', 'user.email', 'test@example.test');
+  writeFileSync(join(main, '.gitignore'), '.ai/\n.claude/\n');
+  writeFileSync(join(main, 'README.md'), '# repo\n');
+  git(main, 'add', '.');
+  git(main, 'commit', '-qm', 'base');
+  git(main, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+  const ghBin = join(parent, 'gh');
+  writeFileSync(ghBin, '#!/bin/sh\necho "[]"\n');
+  chmodSync(ghBin, 0o755);
+  const worktree = (path: string, branch: string, merge: boolean) => {
+    mkdirSync(dirname(path), { recursive: true });
+    git(main, 'worktree', 'add', '-q', '-b', branch, path);
+    writeFileSync(join(path, `${branch.replaceAll('/', '-')}.txt`), `${branch}\n`);
+    git(path, 'add', '.');
+    git(path, 'commit', '-qm', branch);
+    if (merge) {
+      git(main, 'merge', '-q', '--no-ff', '-m', `merge ${branch}`, branch);
+      git(main, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    }
+    return path;
+  };
+  try { run({ main, projects, managed, home, ghBin, env, git, worktree }); }
+  finally { rmSync(parent, { recursive: true, force: true }); }
+}
+
+describe('legacy sibling worktree cleanup', () => {
+  test('apply removes only the merged, clean, unlocked and unowned sibling and its branch', () => legacyWorktreeSandbox((f) => {
+    const merged = f.worktree(join(f.projects, 'merged'), 'feat/merged', true);
+    const dirty = f.worktree(join(f.projects, 'dirty'), 'feat/dirty', true);
+    writeFileSync(join(dirty, 'scratch.txt'), 'uncommitted\n');
+    const unmerged = f.worktree(join(f.projects, 'unmerged'), 'feat/unmerged', false);
+    const locked = f.worktree(join(f.projects, 'locked'), 'feat/locked', true);
+    f.git(f.main, 'worktree', 'lock', locked);
+    const owned = f.worktree(join(f.projects, 'owned'), 'feat/owned', true);
+    put(join(f.main, '.ai/harness/active-worktree'), `${owned}\n`);
+    const detached = join(f.projects, 'detached');
+    f.git(f.main, 'worktree', 'add', '-q', '--detach', detached, 'HEAD');
+    const nested = f.worktree(join(f.main, '.claude/worktrees/nested'), 'feat/nested', true);
+    const managed = f.worktree(join(f.managed, 'repo-wt-managed'), 'feat/managed', true);
+    const mergedHead = f.git(f.main, 'rev-parse', 'refs/heads/feat/merged');
+
+    const preview = runLegacyWorktreeCleanup(f.main, f.main, f.env, false, { ghBin: f.ghBin });
+    expect(preview.error).toBeUndefined();
+    const byPath = new Map(preview.candidates.map((item) => [item.path, item]));
+    expect([...byPath.keys()].sort()).toEqual([detached, dirty, locked, merged, owned, unmerged].sort());
+    expect(byPath.has(nested)).toBe(false);
+    expect(byPath.has(managed)).toBe(false);
+    expect(byPath.get(merged)).toEqual({
+      path: merged, branch: 'feat/merged', head: mergedHead, verdict: 'remove',
+      reason: 'merged into refs/remotes/origin/main', rebuild: `git worktree add -b feat/merged ${merged} ${mergedHead}`,
+    });
+    expect(byPath.get(dirty)).toEqual(expect.objectContaining({ verdict: 'keep', reason: 'dirty worktree', rebuild: null }));
+    expect(byPath.get(unmerged)).toEqual(expect.objectContaining({ verdict: 'deferred', reason: LEGACY_WORKTREE_PROVIDER_DEFERRED }));
+    expect(byPath.get(locked)).toEqual(expect.objectContaining({ verdict: 'keep', reason: 'locked' }));
+    expect(byPath.get(owned)).toEqual(expect.objectContaining({ verdict: 'keep', reason: 'cleanup has an active-worktree marker reference' }));
+    expect(byPath.get(detached)).toEqual(expect.objectContaining({ branch: null, verdict: 'keep', reason: 'no local branch' }));
+    for (const path of [merged, dirty, unmerged, locked, owned, detached, nested, managed]) expect(existsSync(path)).toBe(true);
+
+    const announced: string[] = [];
+    const applied = runLegacyWorktreeCleanup(f.main, f.main, f.env, true, { ghBin: f.ghBin, beforeRemove: (item) => announced.push(item.path) });
+    expect(applied.error).toBeUndefined();
+    expect(announced).toEqual([merged]);
+    expect(applied.candidates.find((item) => item.path === merged)).toEqual(expect.objectContaining({ verdict: 'removed', head: mergedHead }));
+    expect(applied.candidates.filter((item) => item.verdict === 'removed')).toHaveLength(1);
+    expect(existsSync(merged)).toBe(false);
+    expect(f.git(f.main, 'branch', '--list', 'feat/merged')).toBe('');
+    for (const path of [dirty, unmerged, locked, owned, detached, nested, managed]) expect(existsSync(path)).toBe(true);
+    for (const branch of ['feat/dirty', 'feat/unmerged', 'feat/locked', 'feat/owned', 'feat/nested', 'feat/managed']) {
+      expect(f.git(f.main, 'branch', '--list', branch)).not.toBe('');
+    }
+    expect(readFileSync(join(dirty, 'scratch.txt'), 'utf8')).toBe('uncommitted\n');
+  }));
+
+  test('the local merge proof throws on unknown merge-library output instead of reading it as unmerged', () => legacyWorktreeSandbox((f) => {
+    const merged = f.worktree(join(f.projects, 'merged'), 'feat/merged', true);
+    const target = f.git(f.main, 'rev-parse', 'refs/remotes/origin/main');
+    expect(localMergeMode(f.main, f.git(merged, 'rev-parse', 'HEAD'), target, {})).toBe('ancestor');
+    // The library skips an empty branch argument, so its output names no mode.
+    expect(() => localMergeMode(f.main, '', target, {})).toThrow('cleanup merge is unproven');
+  }));
+
+  test('a sibling inside the managed root is left to the sweep', () => legacyWorktreeSandbox((f) => {
+    f.worktree(join(f.projects, 'merged'), 'feat/merged', true);
+    const outcome = runLegacyWorktreeCleanup(f.main, f.main, { ...f.env, REPO_HARNESS_WORKTREE_ROOT: f.projects }, false, { ghBin: f.ghBin });
+    expect(outcome).toEqual({ candidates: [] });
+  }));
+
+  test('a sibling that changes after preview is kept by the locked recheck', () => legacyWorktreeSandbox((f) => {
+    const merged = f.worktree(join(f.projects, 'merged'), 'feat/merged', true);
+    const applied = runLegacyWorktreeCleanup(f.main, f.main, f.env, true, {
+      ghBin: f.ghBin, beforeRemove: () => writeFileSync(join(merged, 'late.txt'), 'late edit\n'),
+    });
+    expect(applied.error).toBeUndefined();
+    expect(applied.candidates).toEqual([expect.objectContaining({ path: merged, verdict: 'keep', reason: 'changed before removal: cleanup_blocked_dirty_worktree' })]);
+    expect(readFileSync(join(merged, 'late.txt'), 'utf8')).toBe('late edit\n');
+    expect(f.git(f.main, 'branch', '--list', 'feat/merged')).not.toBe('');
+  }));
+
+  test('a sibling on the cloned integration branch is kept while the primary checkout is on another branch', () => legacyWorktreeSandbox((f) => {
+    const clone = join(f.projects, 'clone');
+    f.git(f.projects, 'clone', '-q', f.main, clone);
+    f.git(clone, 'checkout', '-q', '-b', 'develop');
+    const sibling = join(f.projects, 'clone-main');
+    f.git(clone, 'worktree', 'add', '-q', sibling, 'main');
+    const head = f.git(clone, 'rev-parse', 'refs/heads/main');
+    for (const apply of [false, true]) {
+      const outcome = runLegacyWorktreeCleanup(clone, clone, f.env, apply, { ghBin: f.ghBin });
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.candidates).toEqual([{ path: sibling, branch: 'main', head, verdict: 'keep', reason: 'branch has no commits of its own', rebuild: null }]);
+    }
+    expect(existsSync(sibling)).toBe(true);
+    expect(f.git(clone, 'rev-parse', 'refs/heads/main')).toBe(head);
+  }));
+
+  test('a sibling on the local integration branch is kept even with a direct commit in its reflog', () => legacyWorktreeSandbox((f) => {
+    f.git(f.main, 'checkout', '-q', '-b', 'develop');
+    const sibling = join(f.projects, 'main-checkout');
+    f.git(f.main, 'worktree', 'add', '-q', sibling, 'main');
+    writeFileSync(join(sibling, 'direct.txt'), 'direct\n');
+    f.git(sibling, 'add', '.');
+    f.git(sibling, 'commit', '-qm', 'direct commit on main');
+    f.git(f.main, 'update-ref', 'refs/remotes/origin/main', 'refs/heads/main');
+    const head = f.git(f.main, 'rev-parse', 'refs/heads/main');
+    for (const apply of [false, true]) {
+      const outcome = runLegacyWorktreeCleanup(f.main, f.main, f.env, apply, { ghBin: f.ghBin });
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.candidates).toEqual([{ path: sibling, branch: 'main', head, verdict: 'keep', reason: 'integration branch', rebuild: null }]);
+    }
+    expect(existsSync(sibling)).toBe(true);
+    expect(f.git(f.main, 'rev-parse', 'refs/heads/main')).toBe(head);
+  }));
+
+  test('a sibling on a branch named by a slash-named remote target is kept', () => legacyWorktreeSandbox((f) => {
+    put(join(f.main, '.ai/harness/policy.json'), JSON.stringify({ worktree_strategy: { merge_back: { target: 'my/fork/main' } } }));
+    f.git(f.main, 'update-ref', 'refs/remotes/my/fork/main', 'HEAD');
+    f.git(f.main, 'checkout', '-q', '-b', 'develop');
+    const sibling = join(f.projects, 'main-checkout');
+    f.git(f.main, 'worktree', 'add', '-q', sibling, 'main');
+    writeFileSync(join(sibling, 'direct.txt'), 'direct\n');
+    f.git(sibling, 'add', '.');
+    f.git(sibling, 'commit', '-qm', 'direct commit on main');
+    const head = f.git(f.main, 'rev-parse', 'refs/heads/main');
+    for (const apply of [false, true]) {
+      const outcome = runLegacyWorktreeCleanup(f.main, f.main, f.env, apply, { ghBin: f.ghBin });
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.candidates).toEqual([{ path: sibling, branch: 'main', head, verdict: 'keep', reason: 'integration branch', rebuild: null }]);
+    }
+    expect(existsSync(sibling)).toBe(true);
+    expect(f.git(f.main, 'rev-parse', 'refs/heads/main')).toBe(head);
+  }));
+
+  test('a target that is not a branch keeps every sibling', () => legacyWorktreeSandbox((f) => {
+    f.git(f.main, 'tag', 'v1');
+    put(join(f.main, '.ai/harness/policy.json'), JSON.stringify({ worktree_strategy: { merge_back: { target: 'refs/tags/v1' } } }));
+    const merged = f.worktree(join(f.projects, 'merged'), 'feat/merged', true);
+    const head = f.git(f.main, 'rev-parse', 'refs/heads/feat/merged');
+    for (const apply of [false, true]) {
+      const outcome = runLegacyWorktreeCleanup(f.main, f.main, f.env, apply, { ghBin: f.ghBin });
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.candidates).toEqual([{ path: merged, branch: 'feat/merged', head, verdict: 'keep', reason: 'integration target is not a branch', rebuild: null }]);
+    }
+    expect(existsSync(merged)).toBe(true);
+    expect(f.git(f.main, 'branch', '--list', 'feat/merged')).not.toBe('');
+  }));
+
+  test('a never-committed branch at the target tip is kept', () => legacyWorktreeSandbox((f) => {
+    const fresh = join(f.projects, 'fresh');
+    f.git(f.main, 'worktree', 'add', '-q', '-b', 'fresh', fresh, 'refs/remotes/origin/main');
+    for (const apply of [false, true]) {
+      const outcome = runLegacyWorktreeCleanup(f.main, f.main, f.env, apply, { ghBin: f.ghBin });
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.candidates).toEqual([expect.objectContaining({ path: fresh, branch: 'fresh', verdict: 'keep', reason: 'branch has no commits of its own' })]);
+    }
+    expect(existsSync(fresh)).toBe(true);
+    expect(f.git(f.main, 'branch', '--list', 'fresh')).not.toBe('');
+  }));
+
+  test('a sibling with an open task runtime is kept', () => legacyWorktreeSandbox((f) => {
+    const merged = f.worktree(join(f.projects, 'merged'), 'feat/merged', true);
+    mkdirSync(join(f.main, '.ai/harness/runs/task-workspaces', taskWorkspaceKey(join(f.main, '.git'), merged)), { recursive: true });
+    for (const apply of [false, true]) {
+      const outcome = runLegacyWorktreeCleanup(f.main, f.main, f.env, apply, { ghBin: f.ghBin });
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.candidates).toEqual([expect.objectContaining({ path: merged, verdict: 'keep', reason: 'runtime is open' })]);
+    }
+    expect(existsSync(merged)).toBe(true);
+    expect(f.git(f.main, 'branch', '--list', 'feat/merged')).not.toBe('');
+  }));
+
+  test('a sibling with submodules is kept before removal', () => legacyWorktreeSandbox((f) => {
+    const sibling = f.worktree(join(f.projects, 'submodules'), 'feat/submodules', false);
+    writeFileSync(join(sibling, '.gitmodules'), '');
+    f.git(sibling, 'add', '.gitmodules');
+    f.git(sibling, 'commit', '-qm', 'gitmodules');
+    f.git(f.main, 'merge', '-q', '--no-ff', '-m', 'merge feat/submodules', 'feat/submodules');
+    f.git(f.main, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    for (const apply of [false, true]) {
+      const outcome = runLegacyWorktreeCleanup(f.main, f.main, f.env, apply, { ghBin: f.ghBin });
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.candidates).toEqual([expect.objectContaining({ path: sibling, verdict: 'keep', reason: 'submodules present' })]);
+    }
+    expect(existsSync(sibling)).toBe(true);
+  }));
+
+  test('project upgrade keeps the sibling that holds the caller cwd while cwd selects the repository', () => legacyWorktreeSandbox((f) => {
+    const merged = f.worktree(join(f.projects, 'merged'), 'feat/merged', true);
+    const callerCwd = join(merged, 'sub');
+    mkdirSync(callerCwd);
+    const opts = { cwd: f.main, callerCwd, home: f.home, packageRoot: ROOT, scope: 'project' as const, env: { REPO_HARNESS_WORKTREE_ROOT: f.managed } };
+    for (const apply of [false, true]) {
+      const result = runUpgrade({ ...opts, apply });
+      expect(result.exitCode, result.error).toBe(0);
+      expect(result.legacyWorktrees?.candidates).toEqual([expect.objectContaining({ path: merged, verdict: 'keep', reason: 'current checkout' })]);
+    }
+    expect(existsSync(merged)).toBe(true);
+    expect(f.git(f.main, 'branch', '--list', 'feat/merged')).not.toBe('');
+  }));
+
+  test('project upgrade previews path, branch and HEAD with a pending exit, then apply removes the sibling', () => legacyWorktreeSandbox((f) => {
+    const merged = f.worktree(join(f.projects, 'merged'), 'feat/merged', true);
+    const head = f.git(f.main, 'rev-parse', 'refs/heads/feat/merged');
+    const opts = { cwd: f.main, home: f.home, packageRoot: ROOT, scope: 'project' as const, env: { REPO_HARNESS_WORKTREE_ROOT: f.managed } };
+    const preview = runUpgrade(opts);
+    expect(preview.items).toEqual([]);
+    expect(preview.exitCode, preview.error).toBe(1);
+    const text = formatUpgradeResult(preview);
+    expect(text).toContain('project legacy-worktree:');
+    expect(text).toContain(`  ${merged}: branch=feat/merged; head=${head}; remove; merged into refs/remotes/origin/main`);
+    expect(text).toContain(`    rebuild: git worktree add -b feat/merged ${merged} ${head}`);
+    expect(text).toContain('  note: removal also deletes ignored files in the checkout (for example .env); commit or copy anything you need first.');
+    const json = JSON.parse(formatUpgradeResult(preview, true));
+    expect(json.legacyWorktrees.candidates).toEqual([expect.objectContaining({ path: merged, branch: 'feat/merged', head, verdict: 'remove' })]);
+    expect(existsSync(merged)).toBe(true);
+
+    const announced: string[] = [];
+    const applied = runUpgrade({ ...opts, apply: true }, { beforeLegacyWorktreeRemove: (item) => announced.push(item.rebuild!) });
+    expect(applied.exitCode, applied.error).toBe(0);
+    expect(announced).toEqual([`git worktree add -b feat/merged ${merged} ${head}`]);
+    expect(applied.legacyWorktrees?.candidates).toEqual([expect.objectContaining({ path: merged, verdict: 'removed' })]);
+    expect(existsSync(merged)).toBe(false);
+    expect(f.git(f.main, 'branch', '--list', 'feat/merged')).toBe('');
+    const after = runUpgrade(opts);
+    expect(after.legacyWorktrees).toBeUndefined();
+    expect(after.exitCode, after.error).toBe(0);
+  }));
+
+  test('preview defers a squash-merged sibling as pending without querying the provider; apply proves it there and removes it', () => legacyWorktreeSandbox((f) => {
+    const squashed = f.worktree(join(f.projects, 'squashed'), 'feat/squashed', false);
+    const head = f.git(f.main, 'rev-parse', 'refs/heads/feat/squashed');
+    f.git(f.main, 'merge', '-q', '--squash', 'feat/squashed');
+    f.git(f.main, 'commit', '-qm', 'squash feat/squashed');
+    const squash = f.git(f.main, 'rev-parse', 'HEAD');
+    // A later edit of the same file defeats the local merge-tree proof, so only the provider can prove the merge.
+    writeFileSync(join(f.main, 'feat-squashed.txt'), 'later\n');
+    f.git(f.main, 'commit', '-qam', 'later conflicting edit');
+    f.git(f.main, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    const log = join(dirname(f.ghBin), 'gh-merged.log');
+    const gh = join(dirname(f.ghBin), 'gh-merged');
+    const pulls = [{ number: 7, state: 'closed', merged_at: '2026-10-01T00:00:00Z', base: { ref: 'main' }, merge_commit_sha: squash }];
+    writeFileSync(gh, `#!/bin/sh\necho "$*" >> '${log}'\necho '${JSON.stringify(pulls)}'\n`);
+    chmodSync(gh, 0o755);
+
+    const preview = runLegacyWorktreeCleanup(f.main, f.main, f.env, false, { ghBin: gh });
+    const rebuild = `git worktree add -b feat/squashed ${squashed} ${head}`;
+    expect(preview).toEqual({ candidates: [{ path: squashed, branch: 'feat/squashed', head, verdict: 'deferred', reason: LEGACY_WORKTREE_PROVIDER_DEFERRED, rebuild }] });
+    expect(existsSync(log)).toBe(false);
+    const upgradePreview = runUpgrade({ cwd: f.main, home: f.home, packageRoot: ROOT, scope: 'project', env: { REPO_HARNESS_WORKTREE_ROOT: f.managed } });
+    expect(upgradePreview.exitCode, upgradePreview.error).toBe(1);
+    expect(upgradePreview.legacyWorktrees?.candidates).toEqual([expect.objectContaining({ path: squashed, verdict: 'deferred', reason: LEGACY_WORKTREE_PROVIDER_DEFERRED })]);
+    const text = formatUpgradeResult(upgradePreview);
+    expect(text).toContain(`  ${squashed}: branch=feat/squashed; head=${head}; deferred; ${LEGACY_WORKTREE_PROVIDER_DEFERRED}`);
+    expect(text).toContain(`    rebuild: ${rebuild}`);
+    expect(text).toContain('  note: removal also deletes ignored files in the checkout (for example .env); commit or copy anything you need first.');
+    expect(existsSync(log)).toBe(false);
+    expect(existsSync(squashed)).toBe(true);
+
+    const applied = runLegacyWorktreeCleanup(f.main, f.main, f.env, true, { ghBin: gh });
+    expect(applied.error).toBeUndefined();
+    expect(applied.candidates).toEqual([expect.objectContaining({ path: squashed, verdict: 'removed', reason: 'provider-proven merge into refs/remotes/origin/main' })]);
+    expect(readFileSync(log, 'utf8')).toContain(`commits/${head}/pulls`);
+    expect(existsSync(squashed)).toBe(false);
+    expect(f.git(f.main, 'branch', '--list', 'feat/squashed')).toBe('');
+  }));
+});
+
+// The real v0.10 writer supplies the old payload. A current ledger record models
+// gate ownership before these source-projection checks.
+function projectionSandbox(run: (opts: { cwd: string; home: string; packageRoot: string }, router: string) => void): void {
+  sandbox((opts) => {
+    const oldSource = join(opts.home, 'old-source');
+    copyUpgradeFixture('upgrade-v0.10-home', 'release-source/SKILL.md', join(oldSource, 'SKILL.md'));
+    const oldInstaller = join(opts.home, 'old-installer');
+    copyUpgradeFixture('upgrade-v0.10-home', 'release-source', oldInstaller);
+    const installed = spawnSync('bash', [join(oldInstaller, 'scripts/sync-codex-installed-copies.sh')], {
+      env: { ...process.env, HOME: opts.home, AGENTIC_DEV_SOURCE_ROOT: oldSource,
+        CODEX_SKILLS_ROOT: join(opts.home, '.codex/skills'), CLAUDE_SKILLS_ROOT: '',
+        REPO_HARNESS_INSTALL_PROFILE: 'strict', AGENTIC_DEV_LINK_INSTALLED_COPIES: '0' }, encoding: 'utf8',
+    });
+    expect(installed.status, installed.stderr).toBe(0);
+    const router = join(opts.home, '.codex/skills/repo-harness');
+    seedRecord(opts.home, router, { owner: 'core', committed: { type: 'directory', sha256: hashManagedTree(router) } });
+    const packageRoot = join(opts.home, 'active-source');
+    mkdirSync(packageRoot);
+    for (const path of ['src', 'scripts', 'assets', 'references', 'SKILL.md', 'package.json']) {
+      cpSync(join(ROOT, path), join(packageRoot, path), { recursive: true, verbatimSymlinks: true });
+    }
+    put(join(packageRoot, '.ai/harness/state/effective.json'), '{"revision":1}\n');
+    put(join(packageRoot, 'dist/oar-review-host.js'), 'shipped runtime bundle\n');
+    put(join(packageRoot, 'dist/unshipped-build.js'), 'build residue\n');
+    put(join(packageRoot, 'plans/untracked.md'), 'untracked plan\n');
+    run({ ...opts, packageRoot }, join(opts.home, '.codex/skills/repo-harness'));
+  }, false);
+}
+
+describe('upgrade copy projection fences', () => {
+  test('runtime writes and new untracked plans during staging do not abort a real router refresh', () => projectionSandbox((opts, router) => {
+    let staged = false;
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true }, {
+      afterStage(item) {
+        if (item.path !== router) return;
+        staged = true;
+        put(join(opts.packageRoot, '.ai/harness/state/effective.json'), '{"revision":2}\n');
+        put(join(opts.packageRoot, 'plans/new-untracked.md'), 'new concurrent plan\n');
+        put(join(opts.packageRoot, 'dist/unshipped-build.js'), 'new build residue\n');
+      },
+    });
+    expect(staged).toBe(true);
+    expect(result.exitCode, result.error).toBe(0);
+    expect(result.refreshedPaths, JSON.stringify(result.items)).toContain(router);
+    expect(readFileSync(join(router, 'SKILL.md'))).toEqual(readFileSync(join(opts.packageRoot, 'SKILL.md')));
+    for (const path of ['.ai/harness/state/effective.json', 'plans/untracked.md', 'plans/new-untracked.md', 'dist/unshipped-build.js']) {
+      expect(existsSync(join(router, path))).toBe(false);
+    }
+    expect(runUpgrade({ ...opts, scope: 'global' }).items.some(item => item.path === router)).toBe(false);
+  }));
+
+  for (const projected of ['SKILL.md', 'dist/oar-review-host.js']) test(`a projected ${projected} edit during staging aborts and preserves the installed bytes`, () => projectionSandbox((opts, router) => {
+    const before = tree(router);
+    let staged = false;
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true }, {
+      afterStage(item) {
+        if (item.path !== router) return;
+        staged = true;
+        put(join(opts.packageRoot, projected), 'concurrent projected file edit\n');
+      },
+    });
+    expect(staged).toBe(true);
+    expect(result.exitCode, result.error).toBe(0);
+    expect(result.refreshedPaths).not.toContain(router);
+    expect(result.items.find(item => item.path === router)).toEqual(expect.objectContaining({
+      action: 'report', reason: 'Source or target changed during staging.',
+    }));
+    expect(tree(router)).toEqual(before);
+  }));
+});
+
+test('a non-root provider uses its declared surface for hashing and real staging', async () => {
+  const { hashUpgradeSource } = await import('../../src/effects/upgrade/legacy-inventory');
+  projectionSandbox((opts) => {
+    seed('upgrade-v0.19.5-home', opts.home);
+    const provider = join(opts.home, '.codex/skills/repo-harness-cross-review');
+    seedRecord(opts.home, provider, { owner: 'cross-review', committed: { type: 'directory', sha256: hashManagedTree(provider) } });
+    const source = join(opts.packageRoot, 'assets/skills/repo-harness-cross-review');
+    put(join(source, 'examples/outside-projection.md'), 'source example outside canonical includes\n');
+    const planned = runUpgrade({ ...opts, scope: 'global' }).items.find(item => item.path === provider);
+    expect(planned?.action).toBe('refresh');
+    expect(planned?.sourcePath).toBe(source);
+    expect(planned?.sourceSurface).toBe('command-facade');
+    expect(hashUpgradeSource(source, opts.packageRoot, 'canonical-skill'))
+      .not.toBe(hashUpgradeSource(source, opts.packageRoot, 'command-facade'));
+    let staged = false;
+    const result = runUpgrade({ ...opts, scope: 'global', apply: true }, {
+      afterStage(item, staging) {
+        if (item.path !== provider) return;
+        staged = true;
+        expect(item.sourceSurface).toBe(planned?.sourceSurface);
+        expect(hashUpgradeSource(source, opts.packageRoot, item.sourceSurface)).toBe(hashManagedTree(staging));
+        expect(planned?.expectedSourceHash).toBe(hashManagedTree(staging));
+        put(join(source, '.DS_Store'), 'concurrent excluded metadata edit\n');
+      },
+    });
+    expect(staged).toBe(true);
+    expect(result.exitCode, result.error).toBe(0);
+    expect(result.refreshedPaths, JSON.stringify(result.items)).toContain(provider);
+    expect(existsSync(join(provider, 'examples/outside-projection.md'))).toBe(true);
+    expect(readFileSync(join(provider, 'SKILL.md'))).toEqual(readFileSync(join(source, 'SKILL.md')));
+    expect(runUpgrade({ ...opts, scope: 'global' }).items.some(item => item.path === provider)).toBe(false);
+  });
+});
+
+test('directory source hashing rejects missing and invalid surfaces while file hashing needs no surface', async () => {
+  const { hashUpgradeSource, legacyPathSnapshot } = await import('../../src/effects/upgrade/legacy-inventory');
+  expect(() => hashUpgradeSource(ROOT, ROOT, undefined)).toThrow('source surface is missing or invalid');
+  expect(() => Reflect.apply(hashUpgradeSource, undefined, [ROOT, ROOT, 'unknown-surface']))
+    .toThrow('source surface is missing or invalid');
+  const file = join(ROOT, 'SKILL.md');
+  expect(hashUpgradeSource(file, ROOT, undefined)).toBe(legacyPathSnapshot(file)?.contentHash ?? null);
+});
+
+function nonRouterSkillSandbox(
+  name: 'repo-harness-cross-review',
+  run: (opts: { cwd: string; home: string; packageRoot: string }, source: string, installed: string) => void,
+): void {
+  projectionSandbox((opts) => {
+    const source = join(opts.packageRoot, 'assets/skills', name);
+    const installed = join(opts.home, '.codex/skills', name);
+    const env = { HOME: opts.home, BUN_INSTALL: join(opts.home, '.bun') };
+    withHostConfigTransaction(env, undefined, transaction => {
+      const copy = stageInstalledSkillCopy(source, 'command-facade', transaction, workflowContract);
+      openHostConfigGate({ env }).writePaths([{ path: installed, owner: 'cross-review', entry: { type: 'directory', source: copy } }], { transaction });
+    });
+    put(join(source, 'examples/new-resource.md'), 'new non-router resource\n');
+    put(join(source, '.DS_Store'), 'excluded metadata\n');
+    run(opts, source, installed);
+  });
+}
+
+for (const name of ['repo-harness-cross-review'] as const) {
+  test(`${name} refresh keeps top-level examples and matches a whole-folder copy with plain excludes`, async () => {
+    const { installedCopyTreeOptions, managedTreeEntries } = await import('../../src/effects/managed-tree');
+    nonRouterSkillSandbox(name, (opts, source, installed) => {
+      const planned = runUpgrade({ ...opts, scope: 'global' }).items.find(item => item.path === installed);
+      expect(planned?.action).toBe('refresh');
+      expect(planned?.sourceSurface).toBe('command-facade');
+      // Use the installer's real filesystem primitive as the independent copy.
+      const wholeFolder = join(opts.home, `whole-folder-${name}`);
+      cpSync(source, wholeFolder, { recursive: true });
+      const contract = JSON.parse(readFileSync(join(opts.packageRoot, 'assets/workflow-contract.v1.json'), 'utf8'));
+      const expectedFiles = managedTreeEntries(wholeFolder, installedCopyTreeOptions('command-facade', contract));
+      let staged = false;
+      const result = runUpgrade({ ...opts, scope: 'global', apply: true }, {
+        afterStage(item, staging) {
+          if (item.path !== installed) return;
+          staged = true;
+          expect(item.sourceSurface).toBe(planned?.sourceSurface);
+          expect(managedTreeEntries(staging)).toEqual(expectedFiles);
+          expect(planned?.expectedSourceHash).toBe(hashManagedTree(staging));
+        },
+      });
+      expect(staged).toBe(true);
+      expect(result.exitCode, result.error).toBe(0);
+      expect(result.refreshedPaths, JSON.stringify(result.items)).toContain(installed);
+      expect(managedTreeEntries(installed)).toEqual(expectedFiles);
+      for (const entry of expectedFiles) {
+        if (entry.type === 'symlink') expect(readlinkSync(join(installed, entry.path))).toBe(readlinkSync(join(wholeFolder, entry.path)));
+        else expect(readFileSync(join(installed, entry.path))).toEqual(readFileSync(join(wholeFolder, entry.path)));
+      }
+      expect(readFileSync(join(installed, 'examples/new-resource.md'), 'utf8')).toBe('new non-router resource\n');
+      expect(existsSync(join(installed, '.DS_Store'))).toBe(false);
+    });
+  });
+
+  test(`${name} projected example edit during staging aborts and keeps installed bytes`, () => {
+    nonRouterSkillSandbox(name, (opts, source, installed) => {
+      const before = tree(installed);
+      let staged = false;
+      const result = runUpgrade({ ...opts, scope: 'global', apply: true }, {
+        afterStage(item) {
+          if (item.path !== installed) return;
+          staged = true;
+          put(join(source, 'examples/new-resource.md'), 'concurrent projected resource edit\n');
+        },
+      });
+      expect(staged).toBe(true);
+      expect(result.exitCode, result.error).toBe(0);
+      expect(result.refreshedPaths).not.toContain(installed);
+      expect(result.items.find(item => item.path === installed)).toEqual(expect.objectContaining({
+        action: 'report', reason: 'Source or target changed during staging.',
+      }));
+      expect(tree(installed)).toEqual(before);
+    });
+  });
+}
+
+test('router keeps canonical includes while non-projected top-level examples change', () => projectionSandbox((opts, router) => {
+  put(join(opts.packageRoot, 'examples/router-residue.md'), 'router worktree residue\n');
+  const planned = runUpgrade({ ...opts, scope: 'global' }).items.find(item => item.path === router);
+  expect(planned?.sourceSurface).toBe('canonical-skill');
+  let staged = false;
+  const result = runUpgrade({ ...opts, scope: 'global', apply: true }, {
+    afterStage(item) {
+      if (item.path !== router) return;
+      staged = true;
+      expect(item.sourceSurface).toBe('canonical-skill');
+      put(join(opts.packageRoot, 'examples/router-residue.md'), 'concurrent router residue edit\n');
+    },
+  });
+  expect(staged).toBe(true);
+  expect(result.exitCode, result.error).toBe(0);
+  expect(result.refreshedPaths).toContain(router);
+  for (const path of ['examples/router-residue.md', 'plans/untracked.md', '.ai/harness/state/effective.json', 'dist/unshipped-build.js']) {
+    expect(existsSync(join(router, path))).toBe(false);
+  }
+}));
+
+describe('upgrade --registered', () => {
+  const policyPath = (repo: string) => join(repo, '.ai/harness/policy.json');
+  function registeredSandbox(run: (f: RegisteredReposFixture) => void): void {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'upgrade-registered-')));
+    try { run(registeredReposFixture(root)); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  }
+  function editPolicy(f: RegisteredReposFixture, repo: string, edit: (policy: { worktree_strategy: Record<string, unknown> }) => void): void {
+    const policy = JSON.parse(readFileSync(policyPath(repo), 'utf8'));
+    edit(policy);
+    writeFileSync(policyPath(repo), `${JSON.stringify(policy, null, 2)}\n`);
+    commitAll(f, repo, 'edit policy');
+  }
+  /** Adopted and committed, then one managed file is deleted and the deletion committed. */
+  function staleRepo(f: RegisteredReposFixture, name: string): string {
+    const repo = adoptedRepo(f, name);
+    rmSync(join(repo, 'deploy/README.md'));
+    commitAll(f, repo, 'drop managed file');
+    return repo;
+  }
+  const byPath = (repos: readonly RegisteredRepoResult[], path: string) => {
+    const repo = repos.find((entry) => entry.path === path);
+    if (!repo) throw new Error(`no result for ${path}`);
+    return repo;
+  };
+  const cli = (f: RegisteredReposFixture, ...args: string[]) => spawnSync(process.execPath, [CLI, 'upgrade', ...args], {
+    cwd: f.root, env: { ...f.env, BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' }, encoding: 'utf8', timeout: 120000,
+  });
+
+  test('preview classifies every row from one registry snapshot and writes nothing', () => registeredSandbox((f) => {
+    const fresh = adoptedRepo(f, 'fresh');
+    const stale = staleRepo(f, 'stale');
+    const missing = join(f.root, 'missing');
+    const linked = join(f.root, 'linked');
+    git(f, fresh, 'worktree', 'add', '-q', '-b', 'feature', linked);
+    const plain = join(f.root, 'plain');
+    mkdirSync(plain);
+    git(f, plain, 'init', '-q', '-b', 'main');
+    const noBase = adoptedRepo(f, 'no-base');
+    editPolicy(f, noBase, (policy) => { delete policy.worktree_strategy.base_branch; });
+    const topic = adoptedRepo(f, 'topic');
+    git(f, topic, 'checkout', '-q', '-b', 'topic');
+    const dirty = adoptedRepo(f, 'dirty');
+    writeFileSync(join(dirty, 'untracked.txt'), 'operator work\n');
+    const broken = join(f.root, 'broken');
+    mkdirSync(join(broken, '.ai/harness'), { recursive: true });
+    writeFileSync(join(broken, '.ai/harness/policy.json'), '{}\n');
+    writeFileSync(join(broken, '.git'), `gitdir: ${join(f.root, 'no-such-git-dir')}\n`);
+    // An unregistered adopted repo is never a target: nothing scans directories.
+    const unregistered = staleRepo(f, 'unregistered');
+    const targets = [fresh, stale, missing, linked, plain, noBase, topic, dirty, broken];
+    writeRegistry(f, targets);
+    const registryBefore = readFileSync(f.registry, 'utf8');
+    const before = Object.fromEntries([...targets.filter(existsSync), unregistered].map((path) => [path, worktreeSnapshot(path)]));
+
+    const result = runRegisteredUpgrade({ env: f.env, callerCwd: f.root });
+    expect(result.error).toBeUndefined();
+    expect(result.apply).toBe(false);
+    expect(result.revision).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(result.repos.map((repo) => repo.path).sort()).toEqual([...targets].sort());
+    expect(byPath(result.repos, fresh)).toMatchObject({ status: 'ready', pending: false, init: { planned: 0, operations: [] }, sweep: { ran: false } });
+    const staleResult = byPath(result.repos, stale);
+    expect(staleResult).toMatchObject({ status: 'ready', pending: true });
+    expect((staleResult.init as { planned: number }).planned).toBeGreaterThan(0);
+    expect((staleResult.init as { operations: readonly unknown[] }).operations).toContainEqual(expect.objectContaining({ path: 'deploy/README.md' }));
+    expect(staleResult.upgrade).toMatchObject({ apply: false, operatorKept: [] });
+    const reasons = Object.fromEntries(result.repos.filter((repo) => repo.status === 'skipped').map((repo) => [repo.path, repo.reason]));
+    expect(reasons).toEqual({
+      [missing]: 'path_missing',
+      [linked]: 'not_primary_checkout',
+      [plain]: 'not_adopted',
+      [noBase]: 'default_branch_unknown',
+      [topic]: 'not_default_branch',
+      [dirty]: 'dirty_worktree',
+      [broken]: 'git_probe_failed',
+    });
+    for (const repo of result.repos.filter((entry) => entry.status === 'skipped')) {
+      expect(repo.detail?.length).toBeGreaterThan(0);
+      expect(repo.init ?? repo.upgrade ?? repo.sweep).toBeUndefined();
+    }
+    expect(result.exitCode).toBe(1);
+    const text = formatRegisteredUpgradeResult(result);
+    expect(text).toContain(`Plan revision: ${result.revision}`);
+    expect(text).toContain(`${dirty}: skipped (dirty_worktree)`);
+    expect(text).toContain('  sweep: no managed worktrees');
+    expect(text).toContain(`--apply --expected-revision ${result.revision}`);
+
+    const json = cli(f, '--registered', '--json');
+    expect(json.status, json.stderr).toBe(1);
+    const payload = JSON.parse(json.stdout);
+    expect(Object.keys(payload).sort()).toEqual(['apply', 'exitCode', 'repos', 'revision']);
+    expect(payload.revision).toBe(result.revision);
+    expect(payload.repos.map((repo: RegisteredRepoResult) => [repo.path, repo.status, repo.reason ?? null]).sort())
+      .toEqual(result.repos.map((repo) => [repo.path, repo.status, repo.reason ?? null]).sort());
+
+    expect(readFileSync(f.registry, 'utf8')).toBe(registryBefore);
+    for (const [path, snapshot] of Object.entries(before)) expect(worktreeSnapshot(path)).toEqual(snapshot);
+    expect(git(f, dirty, 'status', '--porcelain')).toBe('?? untracked.txt');
+  }), 120_000);
+
+  test('apply refuses a missing or changed registry revision before any repo write', () => registeredSandbox((f) => {
+    const stale = staleRepo(f, 'stale');
+    writeRegistry(f, [stale]);
+    const before = worktreeSnapshot(stale);
+    const preview = runRegisteredUpgrade({ env: f.env, callerCwd: f.root });
+    expect(byPath(preview.repos, stale).pending).toBe(true);
+
+    const unfenced = runRegisteredUpgrade({ apply: true, env: f.env, callerCwd: f.root });
+    expect(unfenced).toMatchObject({ exitCode: 2, repos: [], error: '--apply requires --expected-revision from the preview' });
+
+    writeRegistry(f, [stale], 2);
+    const changed = runRegisteredUpgrade({ apply: true, expectedRevision: preview.revision!, env: f.env, callerCwd: f.root });
+    expect(changed).toMatchObject({ exitCode: 2, repos: [], error: 'registry or worktree sweep plan changed; preview again before applying' });
+    expect(changed.revision).not.toBe(preview.revision);
+    expect(worktreeSnapshot(stale)).toEqual(before);
+
+    const mismatch = cli(f, '--registered', '--apply', '--expected-revision', preview.revision!, '--json');
+    expect(mismatch.status).toBe(2);
+    expect(JSON.parse(mismatch.stdout)).toMatchObject({ apply: true, repos: [], error: 'registry or worktree sweep plan changed; preview again before applying' });
+    expect(cli(f, '--expected-revision', preview.revision!).status).toBe(2);
+    expect(cli(f, '--registered', '--scope', 'global').status).toBe(2);
+    expect(worktreeSnapshot(stale)).toEqual(before);
+  }), 120_000);
+
+  test('apply re-checks each repo, isolates a failing repo and never commits', () => registeredSandbox((f) => {
+    const stale = staleRepo(f, 'stale');
+    const template = adoptedRepo(f, 'template');
+    editPolicy(f, template, (policy) => { policy.worktree_strategy.worktree_dir_template = '../{{repo}}-wt-{{slug}}'; });
+    const failing = adoptedRepo(f, 'failing');
+    // A symlinked ownership target makes the init plan fail closed before it writes.
+    mkdirSync(join(failing, '.ai/context'), { recursive: true });
+    writeFileSync(join(f.root, 'outside-capabilities.json'), '{}\n');
+    rmSync(join(failing, '.ai/context/capabilities.json'), { force: true });
+    symlinkSync(join(f.root, 'outside-capabilities.json'), join(failing, '.ai/context/capabilities.json'));
+    commitAll(f, failing, 'symlinked capability authority');
+    const dirtyLater = staleRepo(f, 'dirty-later');
+    const branchLater = staleRepo(f, 'branch-later');
+    writeRegistry(f, [stale, template, failing, dirtyLater, branchLater]);
+    const heads = Object.fromEntries([stale, template].map((repo) => [repo, git(f, repo, 'rev-parse', 'HEAD')]));
+
+    const preview = runRegisteredUpgrade({ env: f.env, callerCwd: f.root });
+    expect(byPath(preview.repos, dirtyLater).status).toBe('ready');
+    expect(byPath(preview.repos, branchLater).status).toBe('ready');
+    expect(byPath(preview.repos, template)).toMatchObject({ status: 'ready', pending: true });
+    expect(byPath(preview.repos, failing)).toMatchObject({ status: 'failed' });
+    expect(byPath(preview.repos, failing).error).toContain('symlink is not allowed in adoption path');
+
+    // Both repos were ready at preview time; apply must see the change.
+    writeFileSync(join(dirtyLater, 'late-edit.txt'), 'operator work\n');
+    git(f, branchLater, 'checkout', '-q', '-b', 'topic');
+    const dirtyBefore = worktreeSnapshot(dirtyLater);
+    const branchBefore = worktreeSnapshot(branchLater);
+
+    const result = runRegisteredUpgrade({ apply: true, expectedRevision: preview.revision!, env: f.env, callerCwd: f.root });
+    expect(result.error).toBeUndefined();
+    expect(result.exitCode).toBe(1);
+    expect(byPath(result.repos, dirtyLater)).toMatchObject({ status: 'skipped', reason: 'dirty_worktree' });
+    expect(byPath(result.repos, branchLater)).toMatchObject({ status: 'skipped', reason: 'not_default_branch' });
+    expect(worktreeSnapshot(dirtyLater)).toEqual(dirtyBefore);
+    expect(worktreeSnapshot(branchLater)).toEqual(branchBefore);
+    const failed = byPath(result.repos, failing);
+    expect(failed.status).toBe('failed');
+    expect(failed.error).toContain('symlink is not allowed in adoption path');
+    expect(failed.upgrade).toBeUndefined();
+
+    const staleResult = byPath(result.repos, stale);
+    expect(staleResult).toMatchObject({ status: 'applied', init: { ok: true, failed: 0 }, upgrade: { apply: true }, sweep: { ran: true } });
+    expect((staleResult.init as { applied: number }).applied).toBeGreaterThan(0);
+    expect(existsSync(join(stale, 'deploy/README.md'))).toBe(true);
+    const templateResult = byPath(result.repos, template);
+    expect(templateResult).toMatchObject({ status: 'applied', init: { ok: true }, sweep: { ran: true } });
+    expect(JSON.parse(readFileSync(policyPath(template), 'utf8')).worktree_strategy ?? {}).not.toHaveProperty('worktree_dir_template');
+    expect(formatRegisteredUpgradeResult(result)).toContain('Nothing was committed.');
+    for (const [repo, head] of Object.entries(heads)) expect(git(f, repo, 'rev-parse', 'HEAD')).toBe(head);
+
+    // The operator commits; a new preview then plans nothing for the refreshed repos.
+    commitAll(f, stale, 'refresh');
+    commitAll(f, template, 'refresh');
+    const again = runRegisteredUpgrade({ env: f.env, callerCwd: f.root });
+    expect(again.error).toBeUndefined();
+    for (const repo of [stale, template]) {
+      expect(byPath(again.repos, repo)).toMatchObject({ status: 'ready', init: { planned: 0, operations: [] } });
+    }
+  }), 120_000);
+
+  test('an untracked file counts as dirty even when git config hides untracked files', () => registeredSandbox((f) => {
+    const repo = staleRepo(f, 'hidden-untracked');
+    git(f, repo, 'config', 'status.showUntrackedFiles', 'no');
+    writeRegistry(f, [repo]);
+    const preview = runRegisteredUpgrade({ env: f.env, callerCwd: f.root });
+    expect(byPath(preview.repos, repo).status).toBe('ready');
+
+    // The init refresh would write this path; the file is the operator's.
+    const target = join(repo, 'deploy/README.md');
+    writeFileSync(target, 'operator notes\n');
+    expect(git(f, repo, 'status', '--porcelain')).toBe('');
+    const dirty = runRegisteredUpgrade({ env: f.env, callerCwd: f.root });
+    expect(byPath(dirty.repos, repo)).toMatchObject({ status: 'skipped', reason: 'dirty_worktree' });
+
+    const result = runRegisteredUpgrade({ apply: true, expectedRevision: preview.revision!, env: f.env, callerCwd: f.root });
+    expect(byPath(result.repos, repo)).toMatchObject({ status: 'skipped', reason: 'dirty_worktree' });
+    expect(readFileSync(target, 'utf8')).toBe('operator notes\n');
+  }), 120_000);
+
+  /**
+   * `--pr` inputs: an operator identity, a caller GH_REPO and GH_HOST that must not reach gh, and a recording gh stub.
+   * origin is `git@github.com:fixture/<repo>.git`; a fake ssh command serves it from the local bare repository `<repo>.git`.
+   */
+  function prFixture(f: RegisteredReposFixture) {
+    const ssh = join(f.root, 'ssh');
+    writeFileSync(ssh, ['#!/bin/sh', 'for cmd; do :; done', 'eval "set -- $cmd"', 'exec git "${1#git-}" "$FIXTURE_REMOTES/${2#fixture/}"', ''].join('\n'));
+    chmodSync(ssh, 0o755);
+    Object.assign(f.env, { GIT_SSH_COMMAND: ssh, FIXTURE_REMOTES: f.root });
+    const env = { ...f.env, GIT_AUTHOR_NAME: 'operator', GIT_AUTHOR_EMAIL: 'operator@example.invalid',
+      GIT_COMMITTER_NAME: 'operator', GIT_COMMITTER_EMAIL: 'operator@example.invalid',
+      REPO_HARNESS_GH_BIN: join(f.root, 'gh'), GH_LOG: join(f.root, 'gh.log'), GH_PR: join(f.root, 'gh.pr'),
+      GH_REPO: 'fixture/elsewhere', GH_HOST: 'github.invalid' };
+    // Logs each call with its last argument, the --repo value, and each edit in full. `pr list` prints the PRs
+    // stored for that repository; `pr create` stores one. A caller GH_REPO or GH_HOST, or any other command, fails.
+    writeFileSync(env.REPO_HARNESS_GH_BIN, ['#!/bin/sh',
+      'for repo; do :; done',
+      'echo "$1 $2 $repo" >> "$GH_LOG"',
+      '[ "$2" != edit ] || echo "$*" >> "$GH_LOG.edit"',
+      '[ -z "$GH_REPO$GH_HOST" ] || exit 3',
+      'state="$GH_PR-${repo##*/}"',
+      'case "$1 $2" in',
+      '  "pr list") if [ -f "$state" ]; then cat "$state"; else echo "[]"; fi ;;',
+      '  "pr create") printf \'[{"url":"https://%s/pull/1","headRepositoryOwner":{"login":"fixture"},"headRepository":{"name":"%s"}}]\' "$repo" "${repo##*/}" > "$state"; echo "https://$repo/pull/1" ;;',
+      '  "pr edit") ;;',
+      '  *) exit 1 ;;',
+      'esac', ''].join('\n'));
+    chmodSync(env.REPO_HARNESS_GH_BIN, 0o755);
+    const withOrigin = (repo: string): string => {
+      const bare = `${repo}.git`;
+      git(f, f.root, 'init', '-q', '--bare', '-b', 'main', bare);
+      git(f, repo, 'remote', 'add', 'origin', `git@github.com:fixture/${basename(repo)}.git`);
+      git(f, repo, 'push', '-q', 'origin', 'main');
+      return bare;
+    };
+    const openPrs = (repo: string, prs: readonly { readonly owner: string; readonly number: number }[]) => writeFileSync(`${env.GH_PR}-${basename(repo)}`,
+      JSON.stringify(prs.map(({ owner, number }) => ({ url: `https://github.com/${owner}/${basename(repo)}/pull/${number}`,
+        headRepositoryOwner: { login: owner }, headRepository: { name: basename(repo) } }))));
+    return { env, withOrigin, openPrs };
+  }
+
+  test('--pr refreshes in a temporary worktree, pushes one commit, opens one PR and leaves the checkout alone', () => registeredSandbox((f) => {
+    const { env, withOrigin } = prFixture(f);
+    const dirty = staleRepo(f, 'dirty');
+    // A legacy repo-local hook beside a user hook: the refresh commit strips it, and the commit is its only record (#2854 D7).
+    const legacyHook = 'repo=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; HOOK_REPO_ROOT="$repo" bash "$repo/.ai/hooks/run-hook.sh" prompt-guard.sh';
+    put(join(dirty, '.claude/settings.json'), `${JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: legacyHook }] }] }, permissions: { allow: ['Bash(git status:*)'] } }, null, 2)}\n`);
+    commitAll(f, dirty, 'legacy hook');
+    const dirtyRemote = withOrigin(dirty);
+    git(f, dirty, 'checkout', '-q', '-b', 'topic');
+    writeFileSync(join(dirty, 'untracked.txt'), 'operator work\n');
+    writeFileSync(join(dirty, 'AGENTS.md'), 'operator edit\n');
+    const fresh = adoptedRepo(f, 'fresh');
+    const freshRemote = withOrigin(fresh);
+    const noOrigin = staleRepo(f, 'no-origin');
+    const foreign = staleRepo(f, 'foreign');
+    const foreignRemote = withOrigin(foreign);
+    git(f, foreign, 'checkout', '-q', '-b', 'repo-harness/refresh');
+    commitAll(f, foreign, 'chore(harness): refresh repo-harness files for 0.0.0');
+    git(f, foreign, 'push', '-q', 'origin', 'repo-harness/refresh');
+    git(f, foreign, 'checkout', '-q', 'main');
+    git(f, foreign, 'branch', '-q', '-D', 'repo-harness/refresh');
+    const foreignTip = git(f, foreignRemote, 'rev-parse', 'repo-harness/refresh');
+    writeRegistry(f, [dirty, fresh, noOrigin, foreign]);
+    const status = (repo: string) => spawnSync('git', ['status', '--porcelain'], { cwd: repo, env, encoding: 'utf8' }).stdout;
+    const before = { status: status(dirty), files: worktreeSnapshot(dirty), head: git(f, dirty, 'rev-parse', 'HEAD'), branches: git(f, dirty, 'branch', '--list') };
+
+    const preview = runRegisteredUpgrade({ env, callerCwd: f.root });
+    expect(byPath(preview.repos, dirty)).toMatchObject({ status: 'skipped', reason: 'not_default_branch', prRefresh: { ready: true } });
+    expect(byPath(preview.repos, noOrigin)).toMatchObject({ status: 'ready', prRefresh: { ready: false, reason: 'no_origin_remote' } });
+    expect(formatRegisteredUpgradeResult(preview)).toContain(`--apply --pr --expected-revision ${preview.revision}`);
+    expect(cli(f, '--registered', '--pr').status).toBe(2);
+
+    const result = runRegisteredUpgrade({ apply: true, pr: true, expectedRevision: preview.revision!, env, callerCwd: f.root });
+    expect(result.error).toBeUndefined();
+    const refreshed = byPath(result.repos, dirty);
+    expect(refreshed.status, refreshed.error).toBe('applied');
+    expect(refreshed.refresh).toMatchObject({ outcome: 'pushed', branch: 'repo-harness/refresh', pr: 'https://github.com/fixture/dirty/pull/1', prAction: 'created' });
+    expect(git(f, dirtyRemote, 'log', '--format=%s', 'main..repo-harness/refresh')).toMatch(/^chore\(harness\): refresh repo-harness files for \S+$/);
+    const committed = git(f, dirtyRemote, 'diff', '--name-only', 'main', 'repo-harness/refresh').split('\n');
+    expect(committed).toContain('deploy/README.md');
+    expect(committed.filter((path) => path.startsWith('.ai/harness/backups/'))).toEqual([]);
+    const refreshedHooks = git(f, dirtyRemote, 'show', 'repo-harness/refresh:.claude/settings.json');
+    expect([refreshedHooks.includes('run-hook.sh'), refreshedHooks.includes('permissions'), existsSync(join(f.env.HOME!, '.repo-harness/config/repos'))]).toEqual([false, true, false]);
+    expect({ status: status(dirty), files: worktreeSnapshot(dirty), head: git(f, dirty, 'rev-parse', 'HEAD'), branches: git(f, dirty, 'branch', '--list') }).toEqual(before);
+    const worktree = join(f.env.REPO_HARNESS_WORKTREE_ROOT!, 'harness-refresh.dirty');
+    expect(existsSync(worktree)).toBe(false);
+    expect(byPath(result.repos, fresh)).toMatchObject({ status: 'applied', refresh: { outcome: 'up_to_date' } });
+    expect(git(f, freshRemote, 'branch', '--list', 'repo-harness/refresh')).toBe('');
+    expect(byPath(result.repos, noOrigin)).toMatchObject({ status: 'skipped', reason: 'no_origin_remote' });
+    expect(byPath(result.repos, foreign)).toMatchObject({ status: 'skipped', reason: 'refresh_branch_foreign' });
+    expect(git(f, foreignRemote, 'rev-parse', 'repo-harness/refresh')).toBe(foreignTip);
+    expect(formatRegisteredUpgradeResult(result)).not.toContain('Nothing was committed.');
+
+    // The same package version again: the remote branch already holds the refresh, so nothing is pushed.
+    const tip = git(f, dirtyRemote, 'rev-parse', 'repo-harness/refresh');
+    const again = runRegisteredUpgrade({ env, callerCwd: f.root });
+    const second = runRegisteredUpgrade({ apply: true, pr: true, expectedRevision: again.revision!, env, callerCwd: f.root });
+    expect(byPath(second.repos, dirty).refresh).toMatchObject({ outcome: 'unchanged', commit: tip, prAction: 'open' });
+    expect(git(f, dirtyRemote, 'rev-parse', 'repo-harness/refresh')).toBe(tip);
+
+    // main gains the same refresh without the PR: the run reports the open PR and leaves it alone.
+    git(f, dirtyRemote, 'update-ref', 'refs/heads/main', tip);
+    const third = runRegisteredUpgrade({ apply: true, pr: true, expectedRevision: runRegisteredUpgrade({ env, callerCwd: f.root }).revision!, env, callerCwd: f.root });
+    expect(byPath(third.repos, dirty).refresh).toEqual({ outcome: 'up_to_date', stalePr: 'https://github.com/fixture/dirty/pull/1' });
+    expect(readFileSync(env.GH_LOG, 'utf8').trim().split('\n')).toEqual(['pr list', 'pr create', 'pr list', 'pr list']
+      .map((call) => `${call} github.com/fixture/dirty`));
+
+    // An occupied worktree path fails the repo and leaves no local refresh branch behind.
+    git(f, dirtyRemote, 'update-ref', '-d', 'refs/heads/repo-harness/refresh');
+    git(f, dirtyRemote, 'update-ref', 'refs/heads/main', git(f, dirtyRemote, 'rev-parse', 'main~1'));
+    mkdirSync(join(worktree, 'leftover'), { recursive: true });
+    const blocked = runRegisteredUpgrade({ apply: true, pr: true, expectedRevision: runRegisteredUpgrade({ env, callerCwd: f.root }).revision!, env, callerCwd: f.root });
+    expect(byPath(blocked.repos, dirty)).toMatchObject({ status: 'failed', error: expect.stringContaining(`git worktree add ${worktree} exited with status`) });
+    expect(existsSync(join(worktree, 'leftover'))).toBe(true);
+    expect(git(f, dirty, 'branch', '--list', 'repo-harness/refresh')).toBe('');
+    expect(git(f, dirtyRemote, 'branch', '--list', 'repo-harness/refresh')).toBe('');
+  }), 240_000);
+
+  test('--pr commits the refresh without the transaction backups when the backup root is gitignored', () => registeredSandbox((f) => {
+    const { env, withOrigin } = prFixture(f);
+    const repo = staleRepo(f, 'ignored-backups');
+    writeFileSync(join(repo, '.gitignore'), `${readFileSync(join(repo, '.gitignore'), 'utf8')}.ai/harness/backups/\n`);
+    commitAll(f, repo, 'ignore backups');
+    const remote = withOrigin(repo);
+    writeRegistry(f, [repo]);
+
+    const preview = runRegisteredUpgrade({ env, callerCwd: f.root });
+    const result = runRegisteredUpgrade({ apply: true, pr: true, expectedRevision: preview.revision!, env, callerCwd: f.root });
+    const refreshed = byPath(result.repos, repo);
+    expect(refreshed.status, refreshed.error).toBe('applied');
+    expect(refreshed.refresh).toMatchObject({ outcome: 'pushed', prAction: 'created' });
+    const committed = git(f, remote, 'diff', '--name-only', 'main', 'repo-harness/refresh').split('\n');
+    expect(committed).toContain('deploy/README.md');
+    expect(committed.filter((path) => path.startsWith('.ai/harness/backups/'))).toEqual([]);
+  }), 120_000);
+
+  test('--pr publishes only to the one repository that git fetches from and pushes to, and deletes only its own branch', () => registeredSandbox((f) => {
+    const { env, withOrigin, openPrs } = prFixture(f);
+    const hooks = join(f.root, 'concurrent-hooks');
+    mkdirSync(hooks);
+    // Fails `worktree add` after another writer has moved the new branch to a commit of its own.
+    writeFileSync(join(hooks, 'post-checkout'), '#!/bin/sh\ngit -c user.name=other -c user.email=other@example.invalid commit -q --allow-empty -m concurrent\nexit 1\n');
+    chmodSync(join(hooks, 'post-checkout'), 0o755);
+    const cases: readonly { readonly name: string; readonly setup: (repo: string) => void; readonly expected: Partial<RegisteredRepoResult> }[] = [
+      { name: 'fetch-rewrite', setup: (repo) => {
+        git(f, repo, 'config', 'url.git@github.com:fixture/mirror.git.insteadOf', 'git@github.com:fixture/fetch-rewrite.git');
+        git(f, repo, 'config', 'url.git@github.com:fixture/fetch-rewrite.git.pushInsteadOf', 'git@github.com:fixture/fetch-rewrite.git');
+      }, expected: { status: 'skipped', reason: 'remote_target_mismatch' } },
+      { name: 'pushurl', setup: (repo) => git(f, repo, 'config', 'remote.origin.pushurl', 'git@github.com:someone/pushurl.git'),
+        expected: { status: 'skipped', reason: 'remote_target_mismatch' } },
+      { name: 'two-push-urls', setup: (repo) => {
+        git(f, repo, 'remote', 'set-url', '--add', '--push', 'origin', 'git@github.com:fixture/two-push-urls.git');
+        git(f, repo, 'remote', 'set-url', '--add', '--push', 'origin', 'git@github.com:someone/two-push-urls.git');
+      }, expected: { status: 'skipped', reason: 'remote_target_mismatch' } },
+      // Resolved URLs with a token: the detail names only owner/name.
+      { name: 'credentials', setup: (repo) => {
+        git(f, repo, 'remote', 'set-url', '--add', '--push', 'origin', 'https://x-access-token:ghs_SECRET@github.com/someone/credentials.git');
+        git(f, repo, 'remote', 'set-url', '--add', '--push', 'origin', 'https://x-access-token:ghs_SECRET@gitlab.example/x.git');
+      }, expected: { status: 'skipped', reason: 'remote_target_mismatch',
+        detail: 'origin fetches from fixture/credentials and pushes to someone/credentials, a non-github.com URL; every URL must name the same github.com repository' } },
+      { name: 'fork-pr', setup: (repo) => openPrs(repo, [{ owner: 'someone', number: 7 }, { owner: 'fixture', number: 1 }]),
+        expected: { status: 'applied', refresh: expect.objectContaining({ outcome: 'pushed', pr: 'https://github.com/fixture/fork-pr/pull/1', prAction: 'updated' }) } },
+      { name: 'two-prs', setup: (repo) => openPrs(repo, [{ owner: 'fixture', number: 1 }, { owner: 'Fixture', number: 2 }]),
+        expected: { status: 'skipped', reason: 'refresh_pr_ambiguous' } },
+      { name: 'concurrent-branch', setup: (repo) => git(f, repo, 'config', 'core.hooksPath', hooks),
+        expected: { status: 'failed', error: expect.stringContaining('the branch is left') } },
+      // Another run created the branch at the same base commit: this run must neither take it over nor delete it.
+      { name: 'concurrent-create', setup: (repo) => git(f, repo, 'branch', 'repo-harness/refresh', 'main'),
+        expected: { status: 'skipped', reason: 'refresh_branch_exists' } },
+    ];
+    const repos = cases.map(({ name, setup }) => {
+      const repo = staleRepo(f, name);
+      const remote = withOrigin(repo);
+      setup(repo);
+      return { repo, remote };
+    });
+    writeRegistry(f, repos.map(({ repo }) => repo));
+
+    const preview = runRegisteredUpgrade({ env, callerCwd: f.root });
+    expect(byPath(preview.repos, repos[2]!.repo).prRefresh).toMatchObject({ ready: false, reason: 'remote_target_mismatch' });
+    const result = runRegisteredUpgrade({ apply: true, pr: true, expectedRevision: preview.revision!, env, callerCwd: f.root });
+    cases.forEach(({ name, expected }, index) => expect([name, byPath(result.repos, repos[index]!.repo)]).toEqual([name, expect.objectContaining(expected)]));
+    const row = (name: string) => repos[cases.findIndex((entry) => entry.name === name)]!;
+    for (const name of ['fetch-rewrite', 'pushurl', 'two-push-urls', 'credentials', 'concurrent-create']) {
+      expect([name, git(f, row(name).remote, 'branch', '--list', 'repo-harness/refresh')]).toEqual([name, '']);
+    }
+    expect(readFileSync(env.GH_LOG, 'utf8')).not.toMatch(/fetch-rewrite|mirror|pushurl|push-urls|credentials|concurrent-create/);
+    // The update sets only the title of the origin PR; the fork PR and the operator's body stay.
+    expect(readFileSync(`${env.GH_LOG}.edit`, 'utf8').trim().split('\n'))
+      .toEqual([expect.stringMatching(/^pr edit https:\/\/github\.com\/fixture\/fork-pr\/pull\/1 --title chore\(harness\): refresh repo-harness files for \S+ --repo github\.com\/fixture\/fork-pr$/)]);
+    expect(git(f, row('concurrent-branch').repo, 'log', '-1', '--format=%s', 'repo-harness/refresh')).toBe('concurrent');
+    expect(git(f, row('concurrent-branch').repo, 'worktree', 'list', '--porcelain')).not.toContain('harness-refresh.');
+    expect(JSON.stringify(result) + formatRegisteredUpgradeResult(result)).not.toContain('ghs_SECRET');
+    expect(git(f, row('concurrent-create').repo, 'rev-parse', 'repo-harness/refresh')).toBe(git(f, row('concurrent-create').repo, 'rev-parse', 'main'));
+  }), 240_000);
+
+  test('preview counts a removable legacy sibling worktree as pending and shows it', () => registeredSandbox((f) => {
+    const repo = adoptedRepo(f, 'legacy');
+    const sibling = join(f.root, 'legacy-old');
+    git(f, repo, 'worktree', 'add', '-q', '-b', 'feat/old', sibling);
+    writeFileSync(join(sibling, 'old.txt'), 'old work\n');
+    commitAll(f, sibling, 'old work');
+    git(f, repo, 'merge', '-q', '--no-ff', '-m', 'merge feat/old', 'feat/old');
+    git(f, repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    const head = git(f, repo, 'rev-parse', 'refs/heads/feat/old');
+    writeRegistry(f, [repo]);
+
+    const result = runRegisteredUpgrade({ env: f.env, callerCwd: f.root });
+    const row = byPath(result.repos, repo);
+    expect(row).toMatchObject({ status: 'ready', pending: true, init: { planned: 0 }, upgrade: { items: [] } });
+    expect(row.upgrade?.legacyWorktrees?.candidates).toEqual([expect.objectContaining({ path: sibling, branch: 'feat/old', head, verdict: 'remove' })]);
+    expect(result.exitCode).toBe(1);
+    const text = formatRegisteredUpgradeResult(result);
+    expect(text).toContain(`${repo}: ready; pending`);
+    expect(text).toContain('    project legacy-worktree:');
+    expect(text).toContain(`      ${sibling}: branch=feat/old; head=${head}; remove; merged into `);
+    expect(existsSync(sibling)).toBe(true);
+  }), 120_000);
+
+  test('apply passes the caller cwd to the sweep, which keeps a managed worktree that holds it', () => registeredSandbox((f) => {
+    const repo = adoptedRepo(f, 'swept');
+    writeRegistry(f, [repo]);
+    const managed = join(f.env.REPO_HARNESS_WORKTREE_ROOT!, 'swept-wt-held');
+    git(f, repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+    git(f, repo, 'worktree', 'add', '-q', '-b', 'held', managed);
+    const preview = runRegisteredUpgrade({ env: f.env, callerCwd: managed });
+    const result = runRegisteredUpgrade({ apply: true, expectedRevision: preview.revision!, env: f.env, callerCwd: managed });
+    const swept = byPath(result.repos, repo);
+    expect(swept.status, swept.error).toBe('applied');
+    expect(swept.sweep).toMatchObject({ ran: true });
+    expect((swept.sweep as { report: string | null }).report).toContain(`${managed}: kept; session cwd`);
+    expect(existsSync(managed)).toBe(true);
+  }), 120_000);
+
+  /** A branch with a commit of its own, merged into main and pushed; its scratch checkout is gone. */
+  function mergedBranch(f: RegisteredReposFixture, repo: string, branch: string): void {
+    const scratch = join(f.root, `scratch-${branch}`);
+    git(f, repo, 'worktree', 'add', '-q', '-b', branch, scratch);
+    commitAll(f, scratch, branch);
+    git(f, repo, 'worktree', 'remove', scratch);
+    git(f, repo, 'merge', '-q', '--no-ff', '-m', `merge ${branch}`, branch);
+    git(f, repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+  }
+  const managedCheckout = (f: RegisteredReposFixture, repo: string, branch: string, slug = branch) => {
+    const path = join(f.env.REPO_HARNESS_WORKTREE_ROOT!, `${basename(repo)}-wt-${slug}`);
+    git(f, repo, 'worktree', 'add', '-q', path, branch);
+    return path;
+  };
+
+  test('preview lists the sweep steps and apply refuses a plan that changed after the preview', () => registeredSandbox((f) => {
+    const repo = adoptedRepo(f, 'swept');
+    writeRegistry(f, [repo]);
+    for (const branch of ['done', 'late']) mergedBranch(f, repo, branch);
+    const done = managedCheckout(f, repo, 'done');
+    const preview = runRegisteredUpgrade({ env: f.env, callerCwd: f.root });
+    const row = byPath(preview.repos, repo);
+    expect(row).toMatchObject({ status: 'ready', pending: true, sweep: { ran: false } });
+    expect((row.sweep as { plan: WorktreeSweepPlan }).plan.items.map((item) => [item.action, item.path, item.branch])).toEqual([['remove', done, 'done']]);
+    expect(formatRegisteredUpgradeResult(preview)).toContain(`    remove ${done} (done)`);
+    expect(existsSync(done)).toBe(true);
+
+    const late = managedCheckout(f, repo, 'late');
+    const refused = runRegisteredUpgrade({ apply: true, expectedRevision: preview.revision!, env: f.env, callerCwd: f.root });
+    expect(refused).toMatchObject({ exitCode: 2, repos: [], error: 'registry or worktree sweep plan changed; preview again before applying' });
+    expect([existsSync(done), existsSync(late)]).toEqual([true, true]);
+
+    const again = runRegisteredUpgrade({ env: f.env, callerCwd: f.root });
+    const result = runRegisteredUpgrade({ apply: true, expectedRevision: again.revision!, env: f.env, callerCwd: f.root });
+    expect((byPath(result.repos, repo).sweep as { report: string }).report).toContain('removed=2');
+    expect([existsSync(done), existsSync(late)]).toEqual([false, false]);
+  }), 120_000);
+
+  test('an approved sweep acts only on the identities and prune scope of its plan', () => registeredSandbox((f) => {
+    const repo = adoptedRepo(f, 'bound');
+    for (const branch of ['kept', 'rebuilt', 'other', 'fresh']) mergedBranch(f, repo, branch);
+    const kept = managedCheckout(f, repo, 'kept');
+    const rebuilt = managedCheckout(f, repo, 'rebuilt');
+    // A stat-stale index: a plain `git status` would refresh and rewrite it.
+    const index = join(git(f, kept, 'rev-parse', '--absolute-git-dir'), 'index');
+    utimesSync(policyPath(kept), new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
+    utimesSync(index, new Date(Date.now() - 7_200_000), new Date(Date.now() - 7_200_000));
+    const indexMtime = statSync(index).mtimeMs;
+    const plan = planManagedWorktreeSweep(repo, f.root, f.env, { deadlineMs: 30_000 })!;
+    expect(plan.items.map((item) => [item.action, item.path])).toEqual([['remove', kept], ['remove', rebuilt]]);
+    expect(statSync(index).mtimeMs).toBe(indexMtime);
+
+    // The same path now holds another clean, merged branch, and a new candidate appears.
+    git(f, repo, 'worktree', 'remove', rebuilt);
+    managedCheckout(f, repo, 'other', 'rebuilt');
+    const fresh = managedCheckout(f, repo, 'fresh');
+    const report = sweepManagedWorktrees(repo, f.root, f.env, { deadlineMs: 30_000, approved: plan })!;
+    expect(report).toContain(`${kept}: removed`);
+    expect(report).toContain(`${rebuilt}: kept; not in the preview`);
+    expect(report).toContain(`${fresh}: kept; not in the preview`);
+    expect([existsSync(kept), existsSync(rebuilt), existsSync(fresh)]).toEqual([false, true, true]);
+
+    // A checkout lost after the plan: Git's whole prune would drop its registration, so nothing runs.
+    const next = planManagedWorktreeSweep(repo, f.root, f.env, { deadlineMs: 30_000 })!;
+    rmSync(fresh, { recursive: true });
+    const blocked = sweepManagedWorktrees(repo, f.root, f.env, { deadlineMs: 30_000, approved: next })!;
+    expect(blocked).toContain(`prune: kept; not in the preview`);
+    expect(blocked).toContain(`${rebuilt}: kept; not in the preview`);
+    expect(existsSync(rebuilt)).toBe(true);
+    expect(git(f, repo, 'worktree', 'list', '--porcelain')).toContain(`worktree ${fresh}`);
+  }), 120_000);
+});

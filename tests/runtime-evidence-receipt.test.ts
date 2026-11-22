@@ -1,0 +1,140 @@
+import { afterEach, describe, expect, test } from 'bun:test';
+import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { dirname, join } from 'path';
+import { createHash } from 'crypto';
+import { spawnSync } from 'child_process';
+
+import { collectRuntimeEvidence, trustedRuntimePath } from '../src/effects/release/runtime-evidence';
+import { runProcess } from '../src/effects/process-runner';
+
+const tempDirs: string[] = [];
+const SOURCE_ROOT = join(import.meta.dir, '..');
+afterEach(() => { for (const path of tempDirs.splice(0)) rmSync(path, { recursive: true, force: true }); });
+
+function sha1(path: string): string { return createHash('sha1').update(readFileSync(path)).digest('hex'); }
+function integrity(path: string): string { return `sha512-${createHash('sha512').update(readFileSync(path)).digest('base64')}`; }
+
+function fixture(): { root: string; registry: string; tarball: string; installedPackage: string; cli: string; hook: string; hookRepo: string } {
+  const root = mkdtempSync(join(tmpdir(), 'repo-harness-runtime-evidence-'));
+  tempDirs.push(root);
+  const packageDir = join(root, 'package');
+  const installedPackage = join(root, 'node_modules', 'repo-harness');
+  const hookRepo = join(root, 'hook-repo');
+  mkdirSync(packageDir, { recursive: true });
+  mkdirSync(join(packageDir, 'bin'), { recursive: true });
+  mkdirSync(hookRepo, { recursive: true });
+  writeFileSync(join(root, 'package.json'), '{"name":"repo-harness","version":"1.2.3"}\n');
+  writeFileSync(join(packageDir, 'package.json'), '{"name":"repo-harness","version":"1.2.3","bin":{"rh":"bin/rh","repo-harness-hook":"bin/repo-harness-hook"}}\n');
+  writeFileSync(join(packageDir, 'bin', 'rh'), '#!/usr/bin/env bun\nconsole.log("1.2.3");\n');
+  writeFileSync(join(packageDir, 'bin', 'repo-harness-hook'), '#!/usr/bin/env bun\nconsole.log(JSON.stringify({ protocol: 1, kind: "repo-harness-state-snapshot", state_version: 1 }));\n');
+  chmodSync(join(packageDir, 'bin', 'rh'), 0o755);
+  chmodSync(join(packageDir, 'bin', 'repo-harness-hook'), 0o755);
+  const tarball = join(root, 'repo-harness-1.2.3.tgz');
+  const packed = spawnSync('tar', ['-czf', tarball, '-C', root, 'package'], { encoding: 'utf-8' });
+  expect(packed.status, packed.stderr).toBe(0);
+  const registry = join(root, 'registry.json');
+  writeFileSync(registry, JSON.stringify({
+    version: '1.2.3', 'dist.integrity': integrity(tarball), 'dist.shasum': sha1(tarball), 'dist.tarball': 'https://registry.example/repo-harness-1.2.3.tgz',
+  }));
+  cpSync(packageDir, installedPackage, { recursive: true });
+  mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true });
+  const cli = join(root, 'node_modules', '.bin', 'rh');
+  const hook = join(root, 'node_modules', '.bin', 'repo-harness-hook');
+  symlinkSync('../repo-harness/bin/rh', cli);
+  symlinkSync('../repo-harness/bin/repo-harness-hook', hook);
+  return { root, registry, tarball, installedPackage, cli, hook, hookRepo };
+}
+
+describe('release runtime evidence', () => {
+  test('uses the trusted Bun runtime directory for real env-shebang readback', () => {
+    const value = fixture();
+    const priorMinimalPath = runProcess(value.cli, ['--version'], {
+      inheritEnv: false,
+      env: { PATH: '/usr/bin:/bin' },
+      timeoutMs: 15_000,
+    });
+    expect(priorMinimalPath.ok).toBe(false);
+    expect(trustedRuntimePath()).toBe(`${dirname(process.execPath)}:/usr/bin:/bin`);
+    expect(collectRuntimeEvidence({
+      packageName: 'repo-harness', packageVersion: '1.2.3', registryReadbackPath: value.registry, tarballPath: value.tarball, installedPackagePath: value.installedPackage,
+      installedCliPath: value.cli, installedHookPath: value.hook, hookRepo: value.hookRepo,
+    })).toHaveLength(3);
+  });
+
+  test('passes published tarball, clean install, and installed hook readback without merge authority', () => {
+    const value = fixture();
+    const observations = collectRuntimeEvidence({
+      packageName: 'repo-harness', packageVersion: '1.2.3', registryReadbackPath: value.registry, tarballPath: value.tarball, installedPackagePath: value.installedPackage,
+      installedCliPath: value.cli, installedHookPath: value.hook, hookRepo: value.hookRepo,
+    });
+    expect(observations.map((entry) => entry.invariant)).toEqual(['published_tarball', 'clean_install', 'installed_hook_readback']);
+    expect(observations.every((entry) => entry.status === 'pass' && !('subject_sha256' in entry))).toBe(true);
+  });
+
+  test('rejects external CLI or hook stand-ins even when their output matches', () => {
+    const value = fixture();
+    const externalCli = join(value.root, 'external-cli');
+    const externalHook = join(value.root, 'external-hook');
+    writeFileSync(externalCli, '#!/usr/bin/env bun\nconsole.log("1.2.3");\n');
+    writeFileSync(externalHook, '#!/usr/bin/env bun\nconsole.log(JSON.stringify({ protocol: 1, kind: "repo-harness-state-snapshot", state_version: 1 }));\n');
+    chmodSync(externalCli, 0o755);
+    chmodSync(externalHook, 0o755);
+    expect(() => collectRuntimeEvidence({
+      packageName: 'repo-harness', packageVersion: '1.2.3', registryReadbackPath: value.registry, tarballPath: value.tarball, installedPackagePath: value.installedPackage,
+      installedCliPath: externalCli, installedHookPath: value.hook, hookRepo: value.hookRepo,
+    })).toThrow('canonical bin');
+    expect(() => collectRuntimeEvidence({
+      packageName: 'repo-harness', packageVersion: '1.2.3', registryReadbackPath: value.registry, tarballPath: value.tarball, installedPackagePath: value.installedPackage,
+      installedCliPath: value.cli, installedHookPath: externalHook, hookRepo: value.hookRepo,
+    })).toThrow('canonical bin');
+  });
+
+  test('rejects a same-version installed package whose canonical bin differs from the published tarball', () => {
+    const value = fixture();
+    writeFileSync(join(value.installedPackage, 'bin', 'rh'), '#!/usr/bin/env bun\nconsole.log("1.2.3");\n// altered\n');
+    expect(() => collectRuntimeEvidence({
+      packageName: 'repo-harness', packageVersion: '1.2.3', registryReadbackPath: value.registry, tarballPath: value.tarball, installedPackagePath: value.installedPackage,
+      installedCliPath: value.cli, installedHookPath: value.hook, hookRepo: value.hookRepo,
+    })).toThrow('does not match published tarball member');
+  });
+
+  test('fails closed when registry metadata does not bind the packed tarball', () => {
+    const value = fixture();
+    writeFileSync(value.registry, JSON.stringify({
+      version: '1.2.3', 'dist.integrity': integrity(value.tarball), 'dist.shasum': '0'.repeat(40), 'dist.tarball': 'https://registry.example/repo-harness-1.2.3.tgz',
+    }));
+    expect(() => collectRuntimeEvidence({
+      packageName: 'repo-harness', packageVersion: '1.2.3', registryReadbackPath: value.registry, tarballPath: value.tarball, installedPackagePath: value.installedPackage,
+      installedCliPath: value.cli, installedHookPath: value.hook, hookRepo: value.hookRepo,
+    })).toThrow('does not match registry');
+  });
+
+  test('CLI verifies all three runtime invariants, writes no receipt and rejects the retired output flag', () => {
+    const value = fixture();
+    expect(spawnSync('git', ['init', '-q'], { cwd: value.root, encoding: 'utf-8' }).status).toBe(0);
+    const verify = (...extra: string[]) => spawnSync('bun', [join(SOURCE_ROOT, 'scripts', 'runtime-evidence-receipt.ts'), 'verify',
+      '--registry', value.registry,
+      '--tarball', value.tarball,
+      '--installed-package', value.installedPackage,
+      '--installed-cli', value.cli,
+      '--installed-hook', value.hook,
+      '--hook-repo', value.hookRepo,
+      ...extra,
+    ], { cwd: value.root, encoding: 'utf-8' });
+    const result = verify();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('runtime-evidence-receipt: valid published_tarball, clean_install, installed_hook_readback\n');
+    expect(existsSync(join(value.root, '.ai'))).toBe(false);
+    const retired = verify('--output', '.ai/harness/checks/runtime-evidence.fixture.json');
+    expect(retired.status).toBe(2);
+    expect(retired.stderr).toContain('--output is not a verify option');
+    expect(existsSync(join(value.root, '.ai'))).toBe(false);
+    // A registry readback that does not parse is named by its path; its text never reaches stderr (I1).
+    writeFileSync(value.registry, '{"version": sk_FAKE_REGISTRY_12345}');
+    const broken = verify();
+    expect(broken.status).not.toBe(0);
+    expect(broken.stderr).toContain(`${value.registry}: the file is not valid JSON`);
+    expect(`${broken.stdout}${broken.stderr}`).not.toContain('sk_FAKE');
+  });
+});

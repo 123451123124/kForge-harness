@@ -1,0 +1,44 @@
+schemaVersion: "archcontext.node/v2"
+id: "capability.runtime-harness.operator"
+kind: "capability"
+name: "Operator Board"
+status: "active"
+layer: "web"
+summary: "Provides bounded read-only HTTP views of the registered repositories and provider issues."
+responsibilities:
+  - "Serve public observations through GET and HEAD routes."
+  - "Read architecture facts through the shared model reader in a bounded worker."
+  - "Collect setup, development activity, CLI inventory, Bot access, notify status, docs and daily test results in bounded background collectors; GET reads only their cache, except that a docs file GET asks the resident cat-file worker of the docs collector for one object."
+  - "Keep commands in the Bot and CLI channel."
+  - "List the registered repositories from the registry as the one repository source of the console; per-repository health and counts stay with Dev Activity."
+source:
+  include:
+    - docs/kanban-runtime-status.md
+    - src/effects/operator/**
+    - src/operator-web/**
+    - packages/operator-web/**
+    - src/effects/setup/**
+    - src/effects/dev-activity/**
+    - vite.operator.config.ts
+  entrypoints:
+    - id: "entrypoint.operator.primary"
+      path: "src/effects/operator/architecture.ts"
+      symbols:
+        - name: "readArchitecture"
+          sinks:
+            - id: "sink.operator.primary"
+              path: "src/core/operator/architecture.ts"
+              symbol: "decodeArchitectureModuleIndex"
+            - id: "sink.operator.model-reader-list"
+              path: "src/effects/architecture/model-reader.ts"
+              symbol: "list"
+extensions:
+  harnessTier: "plugin"
+  harnessContract: "Surface"
+  contractFiles:
+    agents: "AGENTS.md"
+    claude: "CLAUDE.md"
+  lspProfile: "typescript-lsp"
+  verification:
+    - "bun run check:type"
+    - "bun run test:files tests/cli/operator-serve.test.ts tests/effects/operator-write-boundary.test.ts --timeout 60000 --max-concurrency 1"

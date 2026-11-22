@@ -1,0 +1,19 @@
+schemaVersion: "archcontext.node/v2"
+id: "component.operator.view-projections"
+kind: "component"
+name: "Operator View Projections"
+status: "active"
+parent: "capability.runtime-harness.operator"
+layer: "core"
+summary: "Pure projections, route parsers and strict decoders for every operator observation schema."
+responsibilities:
+  - "Project the repository list, planning, organization, decision and task reads into public snapshot shapes."
+  - "Decode each public schema with exact field sets so the server and the web console share one contract."
+  - "Parse closed request shapes for session and architecture routes before any process starts."
+  - "Own the list of runtimes with verified docs isolation: the agent settings read only this list."
+  - "Validate bounded organization V2 payloads with exact field sets, repository and admitted-session identities, component consistency, SHA syntax and overlay-to-attention digest linkage. Snapshot builders compute content hashes; the decoder does not recompute them."
+source:
+  include:
+    - "src/core/operator/**"
+  exclude:
+    - "src/core/operator/worktree-cleanup-observation.ts"

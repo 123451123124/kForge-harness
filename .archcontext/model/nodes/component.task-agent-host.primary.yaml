@@ -1,0 +1,18 @@
+schemaVersion: archcontext.node/v2
+id: component.task-agent-host.primary
+kind: component
+name: Herdr Task Session Host
+status: active
+parent: capability.runtime-harness.task-agent-host
+layer: effects
+summary: "Owns task launch, request delivery and result collection in hc terminals, and the notify relay with its install record. Uses core runtime closeout for session cleanup."
+source:
+  include:
+    - src/effects/terminal/task-*.ts
+    - src/effects/terminal/herdr-notify-install.ts
+    - src/effects/terminal/notify-relay.ts
+  exclude:
+    - src/effects/terminal/task-session-io.ts
+    - src/effects/terminal/task-role-profiles.ts
+    - src/effects/terminal/task-session-record.ts
+    - src/effects/terminal/task-session-admission.ts

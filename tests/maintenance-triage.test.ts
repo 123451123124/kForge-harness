@@ -1,0 +1,180 @@
+import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { spawnSync } from "child_process";
+
+const ROOT = join(import.meta.dir, "..");
+const SCRIPT = join(ROOT, "scripts", "maintenance-triage.sh");
+
+function git(repo: string, args: string[]): string {
+  const res = spawnSync("git", args, { cwd: repo, encoding: "utf-8" });
+  if (res.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${res.stderr}`);
+  }
+  return res.stdout;
+}
+
+type EntryOptions = { seen?: string; enforcedBy?: string; promoted?: string; name?: string };
+
+function entry(
+  theme: string,
+  trigger: string,
+  { seen = "1×", enforcedBy = "judgment", promoted, name }: EntryOptions = {},
+): string {
+  return [
+    "- Date: 2026-10-01",
+    ...(name ? [`- Name: ${name}`] : []),
+    `- Mistake pattern: ${theme}`,
+    "- Prevention rule: Keep the failure evidence.",
+    `- Enforced by: ${enforcedBy}`,
+    `- Triggered by correction: ${trigger}`,
+    `- Seen: ${seen}`,
+    ...(promoted ? [`- Promoted: ${promoted}`] : []),
+    "",
+  ].join("\n");
+}
+
+function ledgerRepo(seed: string): string {
+  const repo = mkdtempSync(join(tmpdir(), "maintenance-triage-"));
+  mkdirSync(join(repo, "tasks"), { recursive: true });
+  git(repo, ["init", "-q"]);
+  git(repo, ["config", "user.email", "triage@example.com"]);
+  git(repo, ["config", "user.name", "triage"]);
+  writeFileSync(join(repo, "tasks", "lessons.md"), `# Lessons\n\n${seed}`);
+  git(repo, ["add", "tasks/lessons.md"]);
+  git(repo, ["commit", "-qm", "docs(lessons): record three failures (#10)"]);
+  return repo;
+}
+
+function ledgerLines(repo: string): number[] {
+  return readFileSync(join(repo, "tasks", "lessons.md"), "utf-8")
+    .split("\n")
+    .flatMap((line, index) => (line.startsWith("- Date:") ? [index + 1] : []));
+}
+
+function consolidate(repo: string, body: string): void {
+  writeFileSync(join(repo, "tasks", "lessons.md"), `# Lessons\n\n${body}`);
+  git(repo, ["add", "tasks/lessons.md"]);
+  git(repo, ["commit", "-qm", "refactor(lessons): consolidate the ledger (#20)"]);
+}
+
+function triage(repo: string, args: string[] = []) {
+  return spawnSync("bash", [SCRIPT, ...args], { cwd: repo, encoding: "utf-8" });
+}
+
+describe("maintenance triage lesson evidence", () => {
+  test("fails an entry whose only Triggered by correction is the consolidation PR", () => {
+    const repo = ledgerRepo([
+      entry("theme-a", "#10"),
+      entry("theme-b", "#11"),
+      entry("theme-c", "#12"),
+    ].join("\n"));
+    try {
+      consolidate(repo, [entry("theme-a", "#20"), entry("theme-b", "#20")].join("\n"));
+      const res = triage(repo, ["--json"]);
+      expect(res.status).toBe(1);
+      const report = JSON.parse(res.stdout) as { evidence_errors: { theme: string }[] };
+      expect(report.evidence_errors.map((item) => item.theme).sort()).toEqual(["theme-a", "theme-b"]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("passes when the consolidating entry keeps the earlier references", () => {
+    const repo = ledgerRepo([
+      entry("theme-a", "#10"),
+      entry("theme-b", "#11"),
+      entry("theme-c", "#12"),
+    ].join("\n"));
+    try {
+      consolidate(repo, [entry("theme-a", "#10, #20"), entry("theme-b", "#11, #20")].join("\n"));
+      const res = triage(repo, ["--json"]);
+      expect(res.status).toBe(0);
+      expect((JSON.parse(res.stdout) as { evidence_errors: unknown[] }).evidence_errors).toEqual([]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("text mode names the failing entry and exits non-zero", () => {
+    const repo = ledgerRepo([
+      entry("theme-a", "#10"),
+      entry("theme-b", "#11"),
+    ].join("\n"));
+    try {
+      consolidate(repo, entry("theme-a", "#20"));
+      const res = triage(repo);
+      expect(res.status).toBe(1);
+      expect(res.stdout).toContain("consolidation commit");
+      expect(res.stdout).toContain("theme-a: #20");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+describe("maintenance triage judgment themes", () => {
+  test("lists the themes whose latest cumulative Seen is 3 or more and that judgment enforces", () => {
+    const repo = ledgerRepo([
+      entry("counted-by-seen", "#10", { seen: "4×", promoted: "#30" }),
+      entry("below-three", "#11", { seen: "1×", name: "Below three" }),
+      entry("below-three", "#12", { seen: "2×", name: "Below three" }),
+      entry("migrated-to-check", "#13", { seen: "3×" }),
+      entry("migrated-to-check", "#13, #14", { seen: "3×", enforcedBy: "tests/maintenance-triage.test.ts" }),
+      entry("repeat-after-promotion", "#15", { seen: "3×", promoted: "#31" }),
+      entry("repeat-after-promotion", "#16", { seen: "4×" }),
+    ].join("\n"));
+    try {
+      const res = triage(repo, ["--json"]);
+      expect(res.status).toBe(0);
+      const report = JSON.parse(res.stdout) as { judgment: { theme: string; seen: number; promoted: string | null }[] };
+      const lines = ledgerLines(repo);
+      const themes = [
+        ["below-three", "Below three", 2, "judgment", null, [lines[1], lines[2]], ["#11", "#12"]],
+        ["counted-by-seen", null, 4, "judgment", "#30", [lines[0]], ["#10"]],
+        ["migrated-to-check", null, 3, "tests/maintenance-triage.test.ts", null, [lines[3], lines[4]], ["#13", "#14"]],
+        ["repeat-after-promotion", null, 4, "judgment", "#31", [lines[5], lines[6]], ["#15", "#16"]],
+      ].map(([key, name, seen, enforced_by, promoted, owned, correction_sources]) => ({
+        key, theme: key, name, seen, enforced_by, promoted, lines: owned,
+        prevention_rule: "Keep the failure evidence.", why: "", correction_sources,
+      }));
+      expect((report as unknown as { themes: unknown }).themes).toEqual(themes);
+      expect(report.judgment.map(({ theme, seen, promoted }) => ({ theme, seen, promoted }))).toEqual([
+        { theme: "counted-by-seen", seen: 4, promoted: "#30" },
+        { theme: "repeat-after-promotion", seen: 4, promoted: "#31" },
+      ]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("fails closed on a malformed Seen and does not compute the judgment themes", () => {
+    const repo = ledgerRepo(entry("theme-a", "#10", { seen: "three" }));
+    try {
+      const res = triage(repo, ["--json"]);
+      expect(res.status).toBe(1);
+      const report = JSON.parse(res.stdout) as { judgment: unknown; field_errors: { field: string; value: string }[] };
+      expect(report.judgment).toBeNull();
+      expect((report as unknown as { themes: unknown }).themes).toBeNull();
+      expect(report.field_errors.map(({ field, value }) => ({ field, value }))).toEqual([{ field: "Seen", value: "three" }]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("reports no themes without a ledger or without Enforced by", () => {
+    const empty = mkdtempSync(join(tmpdir(), "maintenance-triage-"));
+    const badEntry = ledgerRepo(["- Date: 2026-10-01", "- Mistake pattern: theme-a", "- Seen: 1×", ""].join("\n"));
+    try {
+      const res = triage(badEntry, ["--json"]);
+      const report = JSON.parse(res.stdout) as { judgment: unknown; themes: unknown; field_errors: { field: string }[] };
+      expect(JSON.parse(triage(empty, ["--json"]).stdout).themes).toEqual([]);
+      expect([res.status, report.judgment, report.themes]).toEqual([1, null, null]);
+      expect(report.field_errors.map(({ field }) => field)).toEqual(["Enforced by"]);
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+      rmSync(badEntry, { recursive: true, force: true });
+    }
+  }, 30_000);
+});

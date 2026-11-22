@@ -1,0 +1,6 @@
+schemaVersion: archcontext.relation/v1
+id: relation.operator.console-collectors.git
+kind: reads
+source: component.operator.console-collectors
+target: external.git
+intent: "Read remote URLs from local config, docs blobs through a resident cat-file worker on local refs only, line counts of a commit for the architecture map, and worktree topology and status. Worktree merge proof uses the shared sweep authority."

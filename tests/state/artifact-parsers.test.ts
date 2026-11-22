@@ -1,0 +1,102 @@
+import { describe, expect, test } from 'bun:test';
+import {
+  artifactStemFromPlan,
+  evidenceContractComplete,
+  firstOpenTask,
+  markdownBullet,
+  markdownHeader,
+  markdownSection,
+  markdownSectionHeader,
+  parseAllowedPaths,
+  parseIsoOrLocalTimestamp,
+  planSlugFromPath,
+  planStatusFromText,
+  stripWrappingQuotes,
+  stripYamlInlineComment,
+} from '../../src/core/state/artifact-parsers';
+
+describe('Effective State artifact parsers', () => {
+  const contract = [
+    '# Contract',
+    '> **Status**: Active',
+    '> **Plan**: plans/plan-fixture.md',
+    '',
+    '## Allowed Paths',
+    '',
+    '```yaml',
+    'allowed_paths:',
+    '  - src/',
+    '  - tests/state/',
+    '```',
+    '',
+    '## Task Breakdown',
+    '- [x] finished',
+    '- [ ] next slice',
+  ].join('\n');
+
+  test('reads headers, bullets, section headers, and the first open task', () => {
+    expect(markdownHeader(contract, 'Status')).toBe('Active');
+    expect(markdownSection(contract, 'Task Breakdown')).toContain('- [ ] next slice');
+    expect(markdownSectionHeader('## Metadata\n> **Status**: Active\n', 'Metadata', 'Status')).toBe('Active');
+    expect(firstOpenTask(contract)).toBe('next slice');
+    expect(markdownBullet('- Exact Next Step: run checks\n', 'Exact Next Step')).toBe('run checks');
+  });
+
+  test('parses only explicit allowed paths and strips wrapping quotes', () => {
+    expect(parseAllowedPaths(contract)).toEqual(['src/', 'tests/state/']);
+    expect(stripWrappingQuotes('"plans/plan-fixture.md"')).toBe('plans/plan-fixture.md');
+  });
+
+  test('drops YAML inline comments from allowed path items but keeps quoted and embedded hashes', () => {
+    const commented = [
+      '## Allowed Paths',
+      '',
+      '```yaml',
+      'allowed_paths:',
+      '  - AGENTS.md  # generated marker block only',
+      '  - "docs/a #b.md" # quoted hash stays',
+      '  - path#frag',
+      '  - # comment-only item',
+      '```',
+      '',
+    ].join('\n');
+    expect(parseAllowedPaths(commented)).toEqual(['AGENTS.md', 'docs/a #b.md', 'path#frag']);
+    expect(stripYamlInlineComment("'tasks/' # note")).toBe("'tasks/'");
+  });
+
+  test('parses valid timestamps and rejects missing or invalid values', () => {
+    expect(parseIsoOrLocalTimestamp('2026-07-15T12:00:00Z')).toBe(Date.parse('2026-07-15T12:00:00Z'));
+    expect(parseIsoOrLocalTimestamp('not-a-date')).toBeNull();
+    expect(parseIsoOrLocalTimestamp(null)).toBeNull();
+  });
+
+  test('preserves plan status and artifact-stem derivation semantics', () => {
+    expect(planStatusFromText('prefix **Status**: Draft\n')).toBe('draft');
+    expect(planStatusFromText('> **Status**: Annotating\n')).toBe('annotating');
+    expect(planStatusFromText('> **Status**: Approved\n')).toBe('approved');
+    expect(planStatusFromText('> **Status**: Executing\n')).toBe('executing');
+    expect(planStatusFromText('> **Status**: Complete\n')).toBe('unknown');
+    expect(planStatusFromText(null)).toBe('unknown');
+
+    const normal = 'plans/plan-20260715-1200-effective-state.md';
+    expect(planSlugFromPath(normal)).toBe('effective-state');
+    expect(artifactStemFromPlan(normal, '# Plan: Effective State')).toBe('20260715-1200-effective-state');
+    expect(artifactStemFromPlan(
+      'plans/plan-20260715-1200-think-plan-123.md',
+      '# Plan: Canonical State Cutover',
+    )).toBe('20260715-1200-canonical-state-cutover');
+  });
+
+  test('projects evidence completeness', () => {
+    const evidence = [
+      '## Evidence Contract',
+      '- **State/progress path**: plan',
+      '- **Verification evidence**: tests',
+      '- **Evaluator rubric**: review',
+      '- **Stop condition**: pass',
+      '- **Rollback surface**: revert',
+    ].join('\n');
+    expect(evidenceContractComplete(evidence)).toBe(true);
+    expect(evidenceContractComplete(evidence.replace('tests', 'todo'))).toBe(false);
+  });
+});

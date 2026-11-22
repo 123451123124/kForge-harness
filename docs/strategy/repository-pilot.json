@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "owner": "Aimpact",
+  "goal": {
+    "text": "Assess whether strategic reflection preserves file-backed continuity and authorized execution under human intent ownership.",
+    "kind": "assumption",
+    "evidence": [
+      "README.md",
+      "docs/strategy/optional-strategy-memory.md"
+    ]
+  },
+  "intendedResults": [
+    {
+      "text": "Export traceable context without agent launch, dispatch or automatic goal changes.",
+      "kind": "assumption",
+      "evidence": [
+        "README.md",
+        "docs/strategy/optional-strategy-memory.md"
+      ]
+    },
+    {
+      "text": "Keep source facts, assumptions and unknown outcomes distinct.",
+      "kind": "assumption",
+      "evidence": [
+        "README.md",
+        "docs/strategy/optional-strategy-memory.md"
+      ]
+    }
+  ],
+  "realityConstraints": [
+    {
+      "key": "execution",
+      "value": "export-only",
+      "evidence": [
+        "docs/strategy/optional-strategy-memory.md"
+      ]
+    }
+  ],
+  "observedOutcomes": [
+    {
+      "text": "A business-success verdict has not been established.",
+      "kind": "unknown",
+      "evidence": []
+    }
+  ],
+  "gaps": [
+    {
+      "text": "Live host read-only and resume capability is unverified.",
+      "kind": "unknown",
+      "evidence": []
+    }
+  ],
+  "architecture": [
+    {
+      "text": "The repository describes a file-backed workflow and an authorized program runtime.",
+      "kind": "fact",
+      "evidence": [
+        "README.md"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "path": "README.md",
+      "revision": "f7ffaef7b35a8d92941c90ab6b8c7235fb6681fa",
+      "sha256": "15ff93f7a0caa5cdff6e6d541ae01d639e1f1de95490187e2b62b2f38c6455f1"
+    },
+    {
+      "path": "docs/strategy/optional-strategy-memory.md",
+      "revision": "f18a6948d496824bc6e4e8b5b7063368293ef41b",
+      "sha256": "df15c55f0bac2e23ab3827c83d8e99fa6b81fe46ad29b9cd214b28ddca0866d3"
+    }
+  ],
+  "memory": [
+    {
+      "id": "strategy-boundaries",
+      "summary": "The approved first scope keeps human intent authority, bounded source reads and proposal-only strategic output.",
+      "kind": "long_term",
+      "lifecycle": "active",
+      "body": {
+        "path": "docs/strategy/optional-strategy-memory.md",
+        "revision": "f18a6948d496824bc6e4e8b5b7063368293ef41b",
+        "sha256": "df15c55f0bac2e23ab3827c83d8e99fa6b81fe46ad29b9cd214b28ddca0866d3"
+      },
+      "provenance": [
+        "docs/strategy/optional-strategy-memory.md"
+      ],
+      "applicability": [
+        "strategy-pilot"
+      ],
+      "expiresAt": null,
+      "reviewOnRevision": null,
+      "reviewConditions": [
+        "Review when the approved strategy scope changes."
+      ],
+      "supersededBy": null
+    }
+  ]
+}

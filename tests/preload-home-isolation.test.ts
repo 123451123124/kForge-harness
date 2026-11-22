@@ -1,0 +1,494 @@
+import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+
+const ROOT = resolve(import.meta.dir, "..");
+const TMP_ROOT = realpathSync(resolve("/tmp"));
+const PRELOAD = join(import.meta.dir, "preload-home-isolation.ts");
+
+function isTemporary(path: string): boolean {
+  const suffix = relative(TMP_ROOT, realpathSync(path));
+  return suffix === "" || (!isAbsolute(suffix) && suffix !== ".." && !suffix.startsWith(".." + sep));
+}
+
+function fixture() {
+  const home = mkdtempSync(join(TMP_ROOT, "home-iso-fixture-"));
+  const temp = mkdtempSync(join(TMP_ROOT, "tmp-iso-fixture-"));
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home, TMPDIR: temp, TEMP: temp, TMP: temp };
+  // Name an unavailable path outside system tmp. Do not allocate it.
+  return {
+    home, temp, env,
+    unsafe: () => join(dirname(TMP_ROOT), "repo-harness-outside-" + basename(home)),
+    close: () => {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(temp, { recursive: true, force: true });
+    },
+  };
+}
+
+const inspection = '({home:process.env.HOME,osHome:require("node:os").homedir(),tmp:require("node:os").tmpdir()})';
+
+// Independent cases cover each ambient authority that can bypass HOME.
+const toolFamilies = [
+  ["Bun", ["BUN_INSTALL", "BUN_INSTALL_CACHE_DIR"]],
+  ["Codex", ["CODEX_HOME", "CODEX_SKILLS_ROOT"]],
+  ["Claude", ["CLAUDE_CONFIG_DIR", "CLAUDE_SKILLS_ROOT"]],
+  ["XDG", ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_DIRS", "XDG_DATA_DIRS"]],
+  ["Git command settings", ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]],
+  ["Git", ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG", "GIT_TEMPLATE_DIR", "GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY"]],
+  ["Windows and temp aliases", ["USERPROFILE", "TEMP", "TMP", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH"]],
+  ["package tools", ["NPM_CONFIG_USERCONFIG", "npm_config_userconfig", "NPM_CONFIG_GLOBALCONFIG", "npm_config_globalconfig", "NPM_CONFIG_CACHE", "npm_config_cache", "NPM_CONFIG_PREFIX", "npm_config_prefix", "PNPM_HOME", "YARN_CACHE_FOLDER", "CARGO_HOME", "RUSTUP_HOME"]],
+  ["credentials", ["GNUPGHOME", "DOCKER_CONFIG", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "AZURE_CONFIG_DIR", "KUBECONFIG"]],
+  ["shell config", ["BASH_ENV", "ENV", "ZDOTDIR"]],
+  ["other tool state", ["ORACLE_HOME_DIR", "HERDR_CONFIG_PATH", "REPO_HARNESS_MCP_WORKTREE_ROOT"]],
+  ["registry", ["REPO_HARNESS_HOME"]],
+  ["mixed-case roots", ["Bun_Install", "Codex_Home", "Xdg_Config_Home", "Git_Config_Global", "repo_harness_home"]],
+] as const;
+
+describe("test HOME and TMPDIR isolation", () => {
+  test("keeps process and native HOME/TMPDIR under /tmp, away from the account home", () => {
+    const account = spawnSync("node", ["-e", 'console.log(require("node:os").userInfo().homedir)'], {
+      env: { ...process.env }, encoding: "utf8",
+    });
+    expect(account.status).toBe(0);
+    const realHome = account.stdout.trim();
+    expect(isTemporary(process.env.HOME!)).toBe(true);
+    expect(isTemporary(homedir())).toBe(true);
+    expect(isTemporary(tmpdir())).toBe(true);
+    expect(realpathSync(process.env.HOME!)).not.toBe(realHome);
+    expect(realpathSync(homedir())).not.toBe(realHome);
+  });
+
+  test("bare Bun and Node children inherit temporary startup directories", () => {
+    const bun = Bun.spawnSync([process.execPath, "-e", "console.log(JSON.stringify(" + inspection + "))"], { stdout: "pipe", stderr: "pipe" });
+    const node = spawnSync("node", ["-e", "console.log(JSON.stringify(" + inspection + "))"], { encoding: "utf8" });
+    expect(bun.exitCode).toBe(0);
+    expect(node.status).toBe(0);
+    for (const output of [bun.stdout.toString(), node.stdout]) {
+      const value = JSON.parse(output) as { home: string; osHome: string; tmp: string };
+      expect(isTemporary(value.home)).toBe(true);
+      expect(isTemporary(value.osHome)).toBe(true);
+      expect(isTemporary(value.tmp)).toBe(true);
+    }
+  });
+
+  test("preserves an existing temporary HOME, Git config, and explicit registry home", () => {
+    const f = fixture();
+    try {
+      const config = "[user]\n\tname = Provided Identity\n\temail = provided@example.invalid\n";
+      writeFileSync(join(f.home, ".gitconfig"), config);
+      const registry = join(f.temp, "explicit-registry");
+      const code = "await import(" + JSON.stringify(PRELOAD) + "); console.log(JSON.stringify({home:process.env.HOME,registry:process.env.REPO_HARNESS_HOME}));";
+      const result = Bun.spawnSync([process.execPath, "-e", code], { env: { ...f.env, REPO_HARNESS_HOME: registry }, stdout: "pipe", stderr: "pipe" });
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout.toString())).toEqual({ home: realpathSync(f.home), registry });
+      expect(readFileSync(join(f.home, ".gitconfig"), "utf8")).toBe(config);
+    } finally { f.close(); }
+  });
+
+  test("replaces a changed HOME symlink without following its outside target", () => {
+    const f = fixture();
+    let replacement: string | undefined;
+    try {
+      const link = join(f.home, "outside-link");
+      symlinkSync(dirname(TMP_ROOT), link, process.platform === "win32" ? "junction" : "dir");
+      const code = 'require("node:os").homedir(); process.env.HOME=' + JSON.stringify(link) + "; await import(" + JSON.stringify(PRELOAD) + "); console.log(process.env.HOME);";
+      const result = Bun.spawnSync([process.execPath, "-e", code], { env: f.env, stdout: "pipe", stderr: "pipe" });
+      expect(result.exitCode).toBe(0);
+      replacement = result.stdout.toString().trim();
+      expect(isTemporary(replacement)).toBe(true);
+      expect(replacement).not.toBe(link);
+      expect(replacement).not.toBe(realpathSync(f.home));
+    } finally {
+      if (replacement && isTemporary(replacement)) rmSync(replacement, { recursive: true, force: true });
+      f.close();
+    }
+  });
+
+  test("rejects raw parent segments that could hide a symlink", () => {
+    const f = fixture();
+    let replacement: string | undefined;
+    try {
+      const collapsed = join(f.home, "dir");
+      const target = join(f.temp, "target");
+      mkdirSync(collapsed);
+      mkdirSync(target);
+      const link = join(f.home, "link");
+      symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+      const raw = link + sep + ".." + sep + "dir";
+      const code = 'require("node:os").homedir(); process.env.HOME=' + JSON.stringify(raw) + "; await import(" + JSON.stringify(PRELOAD) + "); console.log(process.env.HOME);";
+      const result = Bun.spawnSync([process.execPath, "-e", code], { env: f.env, stdout: "pipe", stderr: "pipe" });
+      expect(result.exitCode).toBe(0);
+      replacement = result.stdout.toString().trim();
+      expect(isTemporary(replacement)).toBe(true);
+      expect(replacement).not.toBe(realpathSync(collapsed));
+    } finally {
+      if (replacement && isTemporary(replacement)) rmSync(replacement, { recursive: true, force: true });
+      f.close();
+    }
+  });
+
+  test("fails before test code when the startup temp directory is outside /tmp", () => {
+    const f = fixture();
+    try {
+      const code = "await import(" + JSON.stringify(PRELOAD) + "); console.log('TEST_BODY_RAN');";
+      const result = Bun.spawnSync([process.execPath, "-e", code], {
+        env: { ...f.env, TMPDIR: f.unsafe(), TEMP: f.unsafe(), TMP: f.unsafe() },
+        stdout: "pipe", stderr: "pipe",
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr.toString()).toContain("Unsafe Bun test startup environment");
+      expect(result.stdout.toString()).not.toContain("TEST_BODY_RAN");
+    } finally { f.close(); }
+  });
+
+  test.each(["ci-file", "coverage"])("starts %s with safe HOME before Bun loads", (entrypoint) => {
+    const f = fixture();
+    try {
+      const marker = join(f.temp, "observed.json");
+      const probe = join(f.temp, "startup.test.ts");
+      writeFileSync(probe, 'import {test,expect} from "bun:test"; test("safe startup", async () => { const value=' + inspection + "; await Bun.write(" + JSON.stringify(marker) + ",JSON.stringify(value)); expect(value.home).toBe(value.osHome); });\n");
+      const result = entrypoint === "ci-file"
+        ? spawnSync("bash", ["-c", 'source "$1"; run_bun_test_file "$2"', "test-home", join(ROOT, "scripts/lib/ci-run-tests.sh"), probe], { cwd: ROOT, env: f.env, encoding: "utf8" })
+        : spawnSync(process.execPath, ["run", "test:coverage", probe], { cwd: ROOT, env: f.env, encoding: "utf8" });
+      expect(result.status, "stdout:\n" + result.stdout + "\nstderr:\n" + result.stderr).toBe(0);
+      const value = JSON.parse(readFileSync(marker, "utf8")) as { home: string; osHome: string; tmp: string };
+      // The entrypoint has already removed these directories after Bun exits.
+      for (const path of [value.home, value.osHome, value.tmp]) {
+        const suffix = relative(TMP_ROOT, path);
+        expect(suffix.length).toBeGreaterThan(0);
+        expect(suffix.startsWith(".." + sep) || suffix === ".." || isAbsolute(suffix)).toBe(false);
+      }
+      expect(value.home).not.toBe(f.home);
+    } finally { f.close(); }
+  });
+
+  test.each(toolFamilies)("refuses unsafe %s roots before test code", (_family, names) => {
+    const f = fixture();
+    try {
+      for (const name of names) {
+        const outside = f.unsafe();
+        const value = name.endsWith("_DIRS") || name === "KUBECONFIG"
+          ? f.temp + delimiter + outside : outside;
+        const env = { ...f.env };
+        // Windows consumes only one case-insensitive entry. Inject one authority.
+        for (const key of Object.keys(env)) {
+          if (key.toUpperCase() === name.toUpperCase()) delete env[key];
+        }
+        env[name] = value;
+        const code = "await import(" + JSON.stringify(PRELOAD) + "); console.log('TEST_BODY_RAN');";
+        const result = Bun.spawnSync([process.execPath, "-e", code], {
+          env, stdout: "pipe", stderr: "pipe",
+        });
+        expect(result.exitCode, name).not.toBe(0);
+        expect(result.stderr.toString(), name).toContain("Unsafe Bun test startup environment");
+        expect(result.stdout.toString(), name).not.toContain("TEST_BODY_RAN");
+      }
+    } finally { f.close(); }
+  });
+
+  test.each(toolFamilies)("clears inherited %s roots before Bun and bare children start", (_family, names) => {
+    const f = fixture();
+    try {
+      const marker = join(f.temp, "roots.json");
+      const probe = join(f.temp, "roots.test.ts");
+      const selected = JSON.stringify(names);
+      writeFileSync(probe, 'import {test,expect} from "bun:test"; test("safe roots", async () => {'
+        + 'const child=Bun.spawnSync([process.execPath,"-e","console.log(JSON.stringify(process.env))"],{stdout:"pipe",stderr:"pipe"});'
+        + 'expect(child.exitCode).toBe(0); await Bun.write(' + JSON.stringify(marker)
+        + ',JSON.stringify({parent:process.env,child:JSON.parse(child.stdout.toString())}));});\n');
+      const env: NodeJS.ProcessEnv = { ...f.env };
+      for (const name of names) {
+        for (const key of Object.keys(env)) {
+          if (key.toUpperCase() === name.toUpperCase()) delete env[key];
+        }
+        env[name] = f.unsafe();
+      }
+      // The shell config fixture names a missing path. It never writes there.
+      const result = spawnSync("bash", ["--noprofile", "--norc", "-c", 'source "$1"; run_bun_test_file "$2"', "test-home", join(ROOT, "scripts/lib/ci-run-tests.sh"), probe], {
+        cwd: ROOT, env, encoding: "utf8",
+      });
+      expect(result.status, result.stdout + result.stderr + selected).toBe(0);
+      const observed = JSON.parse(readFileSync(marker, "utf8")) as { parent: Record<string, string>; child: Record<string, string> };
+      for (const name of names) {
+        for (const environment of [observed.parent, observed.child]) {
+          if (["USERPROFILE", "TEMP", "TMP"].includes(name)) {
+            const suffix = relative(TMP_ROOT, environment[name]!);
+            expect(isAbsolute(suffix) || suffix === ".." || suffix.startsWith(".." + sep), name).toBe(false);
+          } else if (process.platform === "win32" && ["APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH"].includes(name)) {
+            const path = name === "HOMEDRIVE" || name === "HOMEPATH"
+              ? environment.HOMEDRIVE! + environment.HOMEPATH! : environment[name]!;
+            const suffix = relative(TMP_ROOT, path);
+            expect(isAbsolute(suffix) || suffix === ".." || suffix.startsWith(".." + sep), name).toBe(false);
+            expect(environment[name], name).not.toBe(env[name]);
+          } else if (name === "REPO_HARNESS_HOME" && environment === observed.parent) {
+            // The repo preload creates its default only after the runner removed the unsafe input.
+            expect(environment[name]!.startsWith(environment.TMPDIR! + sep)).toBe(true);
+            expect(environment[name]).not.toBe(env[name]);
+          } else {
+            expect(environment[name], name).toBeUndefined();
+          }
+        }
+      }
+    } finally { f.close(); }
+  });
+
+  // Two pooled files overlap: "owner" creates a -wt- path, "bystander" ends while it exists.
+  function runWorktreeOverlap(remove: boolean) {
+    const f = fixture();
+    const tree = join(TMP_ROOT, `rh-guard-${process.pid}-${remove ? "gone" : "leak"}-wt-overlap`);
+    try {
+      const seen = join(f.temp, "seen");
+      const wait = (path: string) => `while(!require("node:fs").existsSync(${JSON.stringify(path)}))await Bun.sleep(20);`;
+      const head = 'import {test} from "bun:test";test("t",async()=>{';
+      writeFileSync(join(f.temp, "owner.test.ts"), head + `require("node:fs").mkdirSync(${JSON.stringify(tree)});${wait(seen)}`
+        + (remove ? `require("node:fs").rmSync(${JSON.stringify(tree)},{recursive:true});` : "") + "});\n");
+      writeFileSync(join(f.temp, "bystander.test.ts"), head + `${wait(tree)}require("node:fs").writeFileSync(${JSON.stringify(seen)},"1");});\n`);
+      const result = spawnSync("bash", ["--noprofile", "--norc", "-c",
+        'source "$1"; failed_list=""; _ci_run_bun_test_pool 2 "$2" "$3"; printf "FAILED:%s" "$failed_list"',
+        "pool", join(ROOT, "scripts/lib/ci-run-tests.sh"), join(f.temp, "owner.test.ts"), join(f.temp, "bystander.test.ts")], {
+        // This pool is the top-level run: an inherited report sink would make it record without judging.
+        cwd: ROOT, env: { ...f.env, CI_WORKTREE_SUSPECT_DIR: "", CI_WORKTREE_SUSPECT_OWNER: "" }, encoding: "utf8",
+      });
+      return result.stdout.split("FAILED:")[1] ?? result.stdout + result.stderr;
+    } finally { rmSync(tree, { recursive: true, force: true }); f.close(); }
+  }
+
+  test("blames no pooled file for a worktree that a concurrent file created and removed", () => {
+    expect(runWorktreeOverlap(true)).toBe("");
+  });
+
+  test("still fails the pooled file that leaked a worktree", () => {
+    expect(runWorktreeOverlap(false)).toContain("owner.test.ts (exit 1)");
+  });
+
+  test("drops a sentinel PI_CODING_AGENT_DIR before test code starts", () => {
+    const f = fixture();
+    try {
+      const marker = join(f.temp, "pi-agent-dir.json");
+      const probe = join(f.temp, "pi-agent-dir.test.ts");
+      writeFileSync(probe, 'import {test} from "bun:test";test("dropped",async()=>{await Bun.write(' + JSON.stringify(marker) + ',JSON.stringify(process.env.PI_CODING_AGENT_DIR??null));});\n');
+      // A path under the fixture temp root passes the refusal check, so only the removal can keep it off.
+      const sentinel = join(f.temp, "sentinel-pi-agent-dir");
+      const result = spawnSync("bash", ["--noprofile", "--norc", "-c", 'source "$1"; run_bun_test_file "$2"', "test-home", join(ROOT, "scripts/lib/ci-run-tests.sh"), probe], {
+        cwd: ROOT, env: { ...f.env, PI_CODING_AGENT_DIR: sentinel }, encoding: "utf8",
+      });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(readFileSync(marker, "utf8")).toBe("null");
+    } finally { f.close(); }
+  });
+
+  test("preserves safe tool file paths and registry state without reading their contents", () => {
+    const f = fixture();
+    try {
+      const config = join(f.home, "not-yet-created", "gitconfig");
+      const registry = join(f.temp, "explicit-registry");
+      const code = "await import(" + JSON.stringify(PRELOAD) + "); console.log(JSON.stringify({config:process.env.GIT_CONFIG_GLOBAL,registry:process.env.REPO_HARNESS_HOME}));";
+      const result = Bun.spawnSync([process.execPath, "-e", code], {
+        env: { ...f.env, GIT_CONFIG_GLOBAL: config, REPO_HARNESS_HOME: registry }, stdout: "pipe", stderr: "pipe",
+      });
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout.toString())).toEqual({ config, registry });
+    } finally { f.close(); }
+  });
+
+  test("accepts TMPDIR=/tmp without a private temp directory for each process", () => {
+    const f = fixture();
+    try {
+      const env: NodeJS.ProcessEnv = { ...f.env, TMPDIR: TMP_ROOT, TEMP: TMP_ROOT, TMP: TMP_ROOT };
+      delete env.REPO_HARNESS_HOME;
+      const code = "await import(" + JSON.stringify(PRELOAD) + "); console.log(JSON.stringify({tmp:process.env.TMPDIR,registry:process.env.REPO_HARNESS_HOME}));";
+      const result = Bun.spawnSync([process.execPath, "-e", code], { env, stdout: "pipe", stderr: "pipe" });
+      expect(result.exitCode).toBe(0);
+      const value = JSON.parse(result.stdout.toString()) as { tmp: string; registry: string };
+      expect(value.tmp).toBe(TMP_ROOT);
+      expect(dirname(value.registry)).toBe(TMP_ROOT);
+      rmSync(value.registry, { recursive: true, force: true });
+    } finally { f.close(); }
+  });
+
+  test("runs the named package test instead of the default core selection", () => {
+    const f = fixture();
+    try {
+      const marker = join(f.temp, "selected.json");
+      const probe = join(f.temp, "selected.test.ts");
+      writeFileSync(probe, 'import {test} from "bun:test"; test("selected",async()=>{await Bun.write(' + JSON.stringify(marker) + ',JSON.stringify(' + inspection + '));});\n');
+      const result = spawnSync(process.execPath, ["run", "test", "--", probe], { cwd: ROOT, env: f.env, encoding: "utf8" });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      const value = JSON.parse(readFileSync(marker, "utf8")) as { home: string; osHome: string };
+      expect(value.home).toBe(value.osHome);
+      expect(value.home).not.toBe(f.home);
+    } finally { f.close(); }
+  });
+
+  test("preserves a temporary registry home through the runner and bare child", () => {
+    const f = fixture();
+    try {
+      const registry = join(f.temp, "provided-registry");
+      const marker = join(f.temp, "registry.json");
+      const probe = join(f.temp, "registry.test.ts");
+      writeFileSync(probe, 'import {test,expect} from "bun:test"; test("registry",async()=>{'
+        + 'const child=Bun.spawnSync([process.execPath,"-e","console.log(process.env.REPO_HARNESS_HOME)"],{stdout:"pipe",stderr:"pipe"});'
+        + 'expect(child.exitCode).toBe(0);await Bun.write(' + JSON.stringify(marker)
+        + ',JSON.stringify({parent:process.env.REPO_HARNESS_HOME,child:child.stdout.toString().trim()}));});\n');
+      const result = spawnSync("bash", ["-c", 'source "$1"; run_bun_test_file "$2"', "test-home", join(ROOT, "scripts/lib/ci-run-tests.sh"), probe], {
+        cwd: ROOT, env: { ...f.env, REPO_HARNESS_HOME: registry }, encoding: "utf8",
+      });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(JSON.parse(readFileSync(marker, "utf8"))).toEqual({ parent: registry, child: registry });
+    } finally { f.close(); }
+  });
+
+  test("writes the JUnit report for an absolute test path under its sanitized name", () => {
+    const f = fixture();
+    try {
+      const junit = join(f.temp, "junit-out");
+      mkdirSync(junit);
+      const probe = join(f.temp, "report.test.ts");
+      writeFileSync(probe, 'import {test} from "bun:test"; test("report",()=>{});\n');
+      const result = spawnSync("bash", ["-c", 'source "$1"; run_bun_test_file "$2"', "test-home", join(ROOT, "scripts/lib/ci-run-tests.sh"), probe], {
+        cwd: ROOT, env: { ...f.env, BUN_TEST_JUNIT_DIR: junit }, encoding: "utf8",
+      });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(existsSync(join(junit, probe.replace(/[\\/:]/g, "__") + ".xml"))).toBe(true);
+    } finally { f.close(); }
+  });
+
+  test("refuses a registry home under the caller's real HOME before any test runs", () => {
+    const f = fixture();
+    try {
+      const registry = join(f.home, ".repo-harness");
+      const marker = join(f.temp, "registry-under-home.json");
+      const probe = join(f.temp, "registry-under-home.test.ts");
+      writeFileSync(probe, 'import {test} from "bun:test"; test("registry",async()=>{await Bun.write(' + JSON.stringify(marker) + ',"ran");});\n');
+      const result = spawnSync("bash", ["-c", 'source "$1"; run_bun_test_file "$2"', "test-home", join(ROOT, "scripts/lib/ci-run-tests.sh"), probe], {
+        cwd: ROOT, env: { ...f.env, REPO_HARNESS_HOME: registry }, encoding: "utf8",
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("REPO_HARNESS_HOME resolves under the real user HOME");
+      expect(existsSync(marker)).toBe(false);
+    } finally { f.close(); }
+  });
+
+  test("keeps a package without a preload safe through the tarball runner path", () => {
+    const f = fixture();
+    try {
+      const marker = join(f.temp, "unpacked.json");
+      const probe = join(f.temp, "unpacked.test.ts");
+      writeFileSync(probe, 'import {test,expect} from "bun:test";test("unpacked",async()=>{'
+        + 'const child=Bun.spawnSync([process.execPath,"-e","console.log(JSON.stringify(process.env))"],{stdout:"pipe",stderr:"pipe"});'
+        + 'expect(child.exitCode).toBe(0);await Bun.write(' + JSON.stringify(marker)
+        + ',JSON.stringify({paths:' + inspection + ',roots:JSON.parse(child.stdout.toString())}));});\n');
+      const result = spawnSync("bash", ["-c", 'source "$1"; BUN_TEST_ISOLATE_FILES=0 run_bun_tests "$2"', "test-home", join(ROOT, "scripts/lib/ci-run-tests.sh"), probe], {
+        cwd: f.temp, env: { ...f.env, BUN_INSTALL: f.unsafe(), CODEX_HOME: f.unsafe() }, encoding: "utf8",
+      });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      const value = JSON.parse(readFileSync(marker, "utf8")) as { paths: { home: string; osHome: string; tmp: string }; roots: Record<string, string> };
+      expect(value.paths.home).toBe(value.paths.osHome);
+      expect(value.paths.home).not.toBe(f.home);
+      for (const path of [value.paths.home, value.paths.tmp]) {
+        const suffix = relative(TMP_ROOT, path);
+        expect(isAbsolute(suffix) || suffix === ".." || suffix.startsWith(".." + sep)).toBe(false);
+      }
+      expect(value.roots.BUN_INSTALL).toBeUndefined();
+      expect(value.roots.CODEX_HOME).toBeUndefined();
+    } finally { f.close(); }
+  });
+
+  test("refuses a Git config symlink before Git can follow it", () => {
+    const f = fixture();
+    try {
+      symlinkSync(f.unsafe(), join(f.home, ".gitconfig"), "file");
+      const result = Bun.spawnSync([process.execPath, "-e", "await import(" + JSON.stringify(PRELOAD) + "); console.log('TEST_BODY_RAN');"], {
+        env: f.env, stdout: "pipe", stderr: "pipe",
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr.toString()).toContain("Unsafe Bun test startup environment: .gitconfig");
+      expect(result.stdout.toString()).not.toContain("TEST_BODY_RAN");
+    } finally { f.close(); }
+  });
+
+  test("runs the shared library from an installed package path", () => {
+    const f = fixture();
+    try {
+      const library = join(f.temp, "node_modules", "repo-harness", "scripts", "lib");
+      mkdirSync(library, { recursive: true });
+      cpSync(join(ROOT, "scripts/lib"), library, { recursive: true });
+      const marker = join(f.temp, "installed.json");
+      const probe = join(f.temp, "installed.test.ts");
+      writeFileSync(probe, 'import {test} from "bun:test";test("installed",async()=>{await Bun.write('
+        + JSON.stringify(marker) + ',JSON.stringify(' + inspection + '));});\n');
+      const result = spawnSync("bash", ["-c", 'source "$1"; run_bun_test_file "$2"', "test-home", join(library, "ci-run-tests.sh"), probe], {
+        cwd: f.temp, env: f.env, encoding: "utf8",
+      });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      const value = JSON.parse(readFileSync(marker, "utf8")) as { home: string; osHome: string };
+      expect(value.home).toBe(value.osHome);
+      expect(value.home).not.toBe(f.home);
+    } finally { f.close(); }
+  });
+
+  test("tarball smoke setup permits a nested installed test runner with its explicit registry", () => {
+    const f = fixture();
+    try {
+      const scripts = join(f.temp, "scripts");
+      mkdirSync(scripts);
+      writeFileSync(join(f.temp, "package.json"), JSON.stringify({ name: "smoke-probe", version: "0.0.0" }));
+      const marker = join(f.temp, "nested-result.json");
+      const probe = join(f.temp, "nested.test.ts");
+      writeFileSync(probe, `import {test,expect} from "bun:test";
+import {mkdirSync,writeFileSync,realpathSync} from "node:fs";
+test("nested registry",()=>{
+  expect(process.env.HOME).not.toBe(process.env.SMOKE_PARENT_HOME);
+  expect(process.env.REPO_HARNESS_HOME).toBe(process.env.SMOKE_PARENT_REGISTRY);
+  mkdirSync(process.env.REPO_HARNESS_HOME!,{recursive:true});
+  writeFileSync(process.env.REPO_HARNESS_HOME+"/probe","isolated");
+  writeFileSync(${JSON.stringify(marker)},JSON.stringify({home:process.env.HOME,registry:realpathSync(process.env.REPO_HARNESS_HOME!)}));
+});`);
+      // Execute the smoke's real setup and cleanup, stopping before npm pack.
+      // The nested runner is real; no package install, server or full suite runs.
+      const smoke = readFileSync(join(ROOT, "scripts/check-tarball-install-smoke.sh"), "utf8");
+      const boundary = smoke.indexOf('PACK_JSON="$TMP_DIR/pack.json"');
+      expect(boundary).toBeGreaterThan(0);
+      const script = join(scripts, "smoke-setup.sh");
+      writeFileSync(script, smoke.slice(0, boundary) + `
+export SMOKE_PARENT_HOME="$HOME" SMOKE_PARENT_REGISTRY="$REPO_HARNESS_HOME"
+source "$1"
+run_bun_test_file "$2"
+`);
+      const result = spawnSync("bash", [script, join(ROOT, "scripts/lib/ci-run-tests.sh"), probe], {
+        cwd: f.temp, env: f.env, encoding: "utf8",
+      });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      const value = JSON.parse(readFileSync(marker, "utf8")) as { home: string; registry: string };
+      expect(value.registry.startsWith(TMP_ROOT + sep)).toBe(true);
+      expect(value.registry).not.toBe(join(value.home, ".repo-harness"));
+    } finally { f.close(); }
+  });
+
+  test.each(["HOME", "TMPDIR"])("refuses startup %s outside /tmp despite safe native aliases", (name) => {
+    const f = fixture();
+    try {
+      const result = Bun.spawnSync([process.execPath, "--no-env-file", "-e", "await import(" + JSON.stringify(PRELOAD) + "); console.log('TEST_BODY_RAN');"], {
+        env: { ...f.env, [name]: f.unsafe() }, stdout: "pipe", stderr: "pipe",
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr.toString()).toContain("Unsafe Bun test startup environment");
+      expect(result.stdout.toString()).not.toContain("TEST_BODY_RAN");
+    } finally { f.close(); }
+  });
+
+  test("refuses a cached unsafe tool root even when process.env removes it before preload", () => {
+    const f = fixture();
+    try {
+      const result = Bun.spawnSync([process.execPath, "--no-env-file", "-e", "delete process.env.BUN_INSTALL; await import(" + JSON.stringify(PRELOAD) + "); console.log('TEST_BODY_RAN');"], {
+        env: { ...f.env, BUN_INSTALL: f.unsafe() }, stdout: "pipe", stderr: "pipe",
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr.toString()).toContain("unsafe BUN_INSTALL");
+      expect(result.stdout.toString()).not.toContain("TEST_BODY_RAN");
+    } finally { f.close(); }
+  });
+});

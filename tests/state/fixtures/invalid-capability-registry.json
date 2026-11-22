@@ -1,0 +1,77 @@
+{
+  "baseline": "82550779cdccf0575d674ae53bbc95ba63e44743",
+  "scenario": "invalid-capability-registry",
+  "cli_exit": 1,
+  "cli_stderr": "",
+  "field": {
+    "exit": 1,
+    "stdout": "",
+    "stderr": ""
+  },
+  "state": {
+    "protocol": 2,
+    "kind": "repo-harness-effective-state",
+    "task_id": null,
+    "phase": "blocked",
+    "state_version": 1,
+    "state_revision": "sha256:<dynamic:state_revision>",
+    "authority_revision": "sha256:<dynamic:authority_revision>",
+    "subject_revision": "sha256:d31dbdd5e2dfc9ab92d46761ca33650470390c98cf3fac9e20515cb68a937787",
+    "projection_revision": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "progress_token": "sha256:<dynamic:progress_token>",
+    "workflow_profile": "routine",
+    "requested_workflow_profile": null,
+    "risk_floor": "routine",
+    "profile_reasons": [
+      "risk-floor:routine:local-change",
+      "capability:registry:invalid",
+      "capability:diagnostic:INVALID_JSON"
+    ],
+    "profile_signals": {
+      "targetPathCount": 1,
+      "capabilityCount": 0,
+      "operationKind": "edit",
+      "strictCategories": [],
+      "mediumScope": false,
+      "crossCapability": false
+    },
+    "capability_ownership": null,
+    "next_action": "resolve blockers: capability_registry:invalid INVALID_JSON: invalid JSON: the file is not valid JSON; fix: rh capability resolve validate",
+    "guidance": "Implement the authorized scope; verify typecheck and affected tests once; record goal/change/verification/risk/rollback in the PR. This is a state snapshot, not a session-wide restriction; re-resolve for the proposed edit and current diff when scope changes. Current edit-time requirements supersede earlier snapshot guidance.",
+    "blockers": [
+      "capability_registry:invalid"
+    ],
+    "stale_sources": [],
+    "conflicting_sources": [],
+    "source_hashes": {
+      ".ai/context/capabilities.json": "sha256:92072df399cb74703f8e86f450d552bc0bb01eeeb98a90985a1b7772c8fd0016",
+      ".ai/harness/active-worktree": "sha256:<dynamic:.ai/harness/active-worktree>",
+      ".ai/harness/policy.json": "sha256:001e056f4ac35ace2e89e20bef71f492ac9a0ac7373cacaeaf1e0fa36ea130b8",
+      "review_subject": "sha256:8a48a87d4183098e73ae4f89c74fed8f1767410bd1f5272e245d4ec977b74183",
+      "authority_revision": "sha256:<dynamic:authority_revision>"
+    },
+    "worktree": {
+      "path": ".ai/harness/active-worktree",
+      "freshness": "fresh",
+      "current": "<repo>",
+      "owner": "<repo>"
+    }
+  },
+  "hook": {
+    "protocol": 1,
+    "kind": "repo-harness-state-snapshot",
+    "states": {
+      "spec": "present",
+      "plan": "none",
+      "pending": "none",
+      "worktree": "current",
+      "evidence": "unchecked"
+    },
+    "paths": {
+      "active_plan": null
+    },
+    "marker": {
+      "problem": "none"
+    }
+  }
+}

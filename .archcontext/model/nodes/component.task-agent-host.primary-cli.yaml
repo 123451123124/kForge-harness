@@ -1,0 +1,13 @@
+schemaVersion: archcontext.node/v2
+id: component.task-agent-host.primary-cli
+kind: component
+name: Herdr Task Session Host (cli)
+status: active
+parent: capability.runtime-harness.task-agent-host
+layer: cli
+summary: The notify action bodies loaded after the core CLI checks the peer-runtime selection.
+responsibilities:
+  - Hold the cli-layer source files of Herdr Task Session Host so layer direction is checked per directory.
+source:
+  include:
+    - src/cli/commands/herdr-actions.ts

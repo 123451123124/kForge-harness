@@ -1,0 +1,70 @@
+{
+  "baseline": "82550779cdccf0575d674ae53bbc95ba63e44743",
+  "scenario": "profile-below-strict-floor",
+  "cli_exit": 1,
+  "cli_stderr": "",
+  "field": {
+    "exit": 1,
+    "stdout": "",
+    "stderr": ""
+  },
+  "state": {
+    "protocol": 2,
+    "kind": "repo-harness-effective-state",
+    "task_id": null,
+    "phase": "blocked",
+    "state_version": 1,
+    "state_revision": "sha256:<dynamic:state_revision>",
+    "authority_revision": "sha256:<dynamic:authority_revision>",
+    "subject_revision": "sha256:b120c4bb8e858486b6f5c8893bf3e9da6b9c4efaf8640276457e5891afe91c30",
+    "projection_revision": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "progress_token": "sha256:<dynamic:progress_token>",
+    "workflow_profile": null,
+    "requested_workflow_profile": "routine",
+    "risk_floor": "high",
+    "profile_reasons": [
+      "risk-floor:high:auth",
+      "risk-floor:high:security",
+      "capability:registry:absent"
+    ],
+    "profile_signals": null,
+    "capability_ownership": null,
+    "next_action": "resolve blockers",
+    "guidance": null,
+    "blockers": [
+      "workflow_profile:profile_below_risk_floor"
+    ],
+    "stale_sources": [],
+    "conflicting_sources": [],
+    "source_hashes": {
+      ".ai/context/capabilities.json": "sha256:becde17b6600ee6ea2f65fe3320f11bc1efbb103d81bb7dda3788623ca293441",
+      ".ai/harness/active-worktree": "sha256:<dynamic:.ai/harness/active-worktree>",
+      ".ai/harness/policy.json": "sha256:001e056f4ac35ace2e89e20bef71f492ac9a0ac7373cacaeaf1e0fa36ea130b8",
+      "review_subject": "sha256:b6728423245c1f39a952e3d5e3f39227ce00a658be92d51253eadf167eced6fc",
+      "authority_revision": "sha256:<dynamic:authority_revision>"
+    },
+    "worktree": {
+      "path": ".ai/harness/active-worktree",
+      "freshness": "fresh",
+      "current": "<repo>",
+      "owner": "<repo>"
+    }
+  },
+  "hook": {
+    "protocol": 1,
+    "kind": "repo-harness-state-snapshot",
+    "states": {
+      "spec": "present",
+      "plan": "none",
+      "pending": "none",
+      "worktree": "current",
+      "evidence": "unchecked"
+    },
+    "paths": {
+      "active_plan": null
+    },
+    "marker": {
+      "problem": "none"
+    }
+  }
+}

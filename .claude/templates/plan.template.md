@@ -1,0 +1,84 @@
+# Plan: {{TITLE}}
+Optional document: use this template only when the task calls for it. Ordinary work records Goal / Scope / Changes / Verification / Risk / Rollback in the PR description. This document is not a merge permit.
+
+> **Status**: Draft
+> **Created**: {{TIMESTAMP}}
+> **Slug**: {{SLUG}}
+> **Artifact Level**: work-package
+> **Promotion Reason**:
+> **Verification Boundary**:
+> **Rollback Surface**:
+> **Spec**: `docs/spec.md`
+> **Research**: See `docs/researches/`
+> **Task Contract**: `tasks/contracts/{{ARTIFACT_STEM}}.contract.md`
+
+## Agentic Routing
+- Selected route:
+- Routing reason:
+- Due diligence:
+  - P1 map:
+  - P2 trace:
+  - P3 decision rationale:
+
+## Workflow Inventory
+Record only artifacts selected for this task. Omit unused optional contract entries; this inventory does not block ordinary implementation.
+
+- Optional plan: `{{PLAN_FILE}}`
+- Sprint contract: `tasks/contracts/{{ARTIFACT_STEM}}.contract.md`
+- Verification: declare and execute a non-empty Verification Plan. Select its native report explicitly.
+- Run snapshots: `.ai/harness/runs/`
+- Scope authority: the active approved admission and its `allowed_paths`; this plan and contract only propose scope.
+- Concurrency rule: use the current admitted task/session and immutable claim. Preserve the owning Git worktree and do not infer execution ownership from planning files.
+- Execution isolation: use a worktree for actual concurrency or dirty-work conflicts. Worktree creation does not replace task/session admission.
+
+## Approach
+### Strategy
+### Trade-offs
+| Option | Pros | Cons | Decision |
+|--------|------|------|----------|
+
+## Detailed Design
+### File Changes
+| File | Action | Description |
+|------|--------|-------------|
+
+### Code Snippets
+### Data Flow
+
+## Risk Assessment
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+
+## Task Contracts
+- Contract file: `tasks/contracts/{{ARTIFACT_STEM}}.contract.md`
+- Template: `.claude/templates/contract.template.md`
+- Verification command: `rh verify --test <affected-test-file>` (repeat `--test` for each selected existing test; omit it for a typecheck-only task).
+- Planning selection is metadata only. Do not infer active execution from an active-plan marker or the latest non-archived plan.
+
+## Handoff
+
+- Verification: declare and execute a non-empty Verification Plan. Select its native report explicitly.
+- Session handoff: the issue, the PR and the claim status comments
+
+## Promotion Gate
+
+- **Merge/PR unit**:
+- **Rollback surface**:
+- **Verification boundary**:
+- **Review/acceptance boundary**:
+- **High-risk surface**:
+- **Why not checklist row**:
+
+## Evidence Contract
+
+- **State/progress path**:
+- **Verification evidence**:
+- **Evaluator rubric**:
+- **Stop condition**:
+- **Rollback surface**:
+
+## Annotations
+<!-- [NOTE]: prefixed inline. Claude processes all and revises. -->
+
+## Task Breakdown
+- [ ] ...

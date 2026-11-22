@@ -1,0 +1,20 @@
+schemaVersion: archcontext.node/v2
+id: component.hook-adapters.host-installer-effects
+kind: component
+name: Host Adapter Installer (effects)
+status: active
+parent: capability.runtime-harness.hook-adapters
+layer: effects
+summary: The effects-layer files of Host Adapter Installer. Responsibilities stay with the parent node.
+responsibilities:
+  - Hold the effects-layer source files of Host Adapter Installer so layer direction is checked per directory.
+source:
+  include:
+    - src/effects/managed-tree.ts
+    - src/effects/pi-executable.ts
+    - src/effects/pi-agent-dir.ts
+    - src/effects/path-identity.ts
+    - src/effects/pi-host-probe.ts
+    - src/effects/pi-capability-child.ts
+    - src/effects/pi-model-child.ts
+    - src/pi/compat.ts

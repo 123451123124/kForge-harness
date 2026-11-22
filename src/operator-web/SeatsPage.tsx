@@ -1,0 +1,595 @@
+import { useState, type ReactNode } from 'react';
+import { Banner, Button, Empty, Loader, Switch, cn } from '@cloudflare/kumo';
+import { effectiveSeatConfig, seatAccountQuotas, seatOnCredits } from '../core/board/seat-routing';
+import { EXHAUSTED_AT_OR_ABOVE_USED_RANGE } from '../core/board/quota';
+import { agySeatLimits, buildSeatLaunch, type SeatLimitLevel } from '../core/board/seat-launch';
+import { CODEX_CREDIT_MODES, MODEL_FAMILY_LABELS, PI_SUB_AGENT_DEFAULTS, SEAT_IDS, SEAT_SCAFFOLD_SUB_AGENTS, SEAT_TOOLS, decodeSeatsSettingsRequest, isAgyAllowedSeat, isClaudeOrNeonSeat, isCouncilSeat, isOptionalSeat, isReviewSeat, isSeatScaffoldSubAgent, isWorkerSeat, piSubAgentModel, seatHostId, type OptionalSeatId, type RoutingClass, type SeatId, type SeatRuntime, type SeatsConfigV1, type SeatsSettingsV1 } from '../core/board/seats-settings';
+import type { SetupSnapshotV2 } from '../core/setup/types';
+import type { OperatorTranslate } from './i18n';
+import type { QuotaSection } from './quota';
+import {
+  GATEKEEPER_FALLBACK_STARTER, councilStarter, seatChanges, setExplorer, setOptionalSeat, setPiSubAgentModel, setRoute, setSeatAdvisorModel, setSeatEffort, setSeatModel, setSeatRole, setSeatRuntime, setRoutingValue, setSeatTool, type SeatsSettingsForm,
+} from './seats';
+import { EnableSwitch, formLocked, runtimeRowOf, SaveResult } from './SettingsPage';
+import type { AgentsSettingsForm } from './settings';
+import { CommandLine, SectionTitle } from './ui';
+
+const LEVEL_TONE: Readonly<Record<SeatLimitLevel, string>> = {
+  enforced: 'bg-kumo-success-tint text-kumo-success',
+  named_types_only: 'bg-kumo-warning-tint text-kumo-warning',
+  common_commands: 'bg-kumo-warning-tint text-kumo-warning',
+  instructions_only: 'bg-kumo-warning-tint text-kumo-warning',
+};
+
+// The plain command prints the argv alone, so `--argv "$(...)"` takes it as is. `seats argv` also names the pane and
+// the tab (#1544), so no command types a name.
+type FormSeatId = 'orchestrator' | 'advisor' | 'worker';
+export const ARGV: Readonly<Record<FormSeatId, string>> = {
+  orchestrator: 'rh seats argv orchestrator --repository-id <repository-id>',
+  advisor: 'rh seats argv advisor --repository-id <repository-id>',
+  worker: 'rh seats argv worker --repository-id <repository-id> --parent <n> --issue <n>',
+};
+function launchOf(seat: SeatId): string {
+  if (seat === 'orchestrator') return `herdr-app do tab.new --name "$(${ARGV.orchestrator} --json | jq -r .tab)" --space <id> --folder <repo> --argv "$(${ARGV.orchestrator})"`;
+  if (seat === 'advisor') return `herdr-app do pane.split --direction right --pane <orchestrator-pane> --argv "$(${ARGV.advisor})"`;
+  if (isCouncilSeat(seat)) return 'rh seats council --issue <n> --members fable,carbon';
+  // The fallback launches as the effective gatekeeper, so its card shows the gatekeeper command.
+  const argv = isReviewSeat(seat)
+    ? `rh seats argv ${seat === 'gatekeeper-fallback' ? 'gatekeeper' : seat} --repository-id <repository-id> --pr <n>`
+    : ARGV.worker.replace('argv worker', `argv ${seat}`);
+  return `herdr-app do tab.new --name "$(${argv} --json | jq -r .tab)" --space <id> --folder <worktree> --argv "$(${argv})" --task <packet>`;
+}
+
+/** The pane layout rule: Tab 1 holds the orchestrator, the advisor and one worker; later tabs hold workers only. */
+const LAYOUT: readonly (readonly FormSeatId[])[] = [['orchestrator', 'advisor', 'worker'], ['worker', 'worker', 'worker']];
+
+function Badge({ className, children }: { readonly className: string; readonly children: ReactNode }) {
+  return <span className={cn('inline-flex h-5 shrink-0 items-center rounded-full px-2 text-xs font-medium whitespace-nowrap', className)}>{children}</span>;
+}
+
+function LimitBadge({ level, t }: { readonly level: SeatLimitLevel; readonly t: OperatorTranslate }) {
+  return <span data-limit={level}><Badge className={LEVEL_TONE[level]}>{t(`seats.limit.${level}`)}</Badge></span>;
+}
+
+function Segmented<T extends string | null>({ label, options, value, onPick, disabled }: {
+  readonly label: string; readonly options: readonly { readonly value: T; readonly label: string; readonly off?: boolean; readonly why?: string }[];
+  readonly value: T; readonly onPick: (value: T) => void; readonly disabled: boolean;
+}) {
+  return (
+    <div role="group" aria-label={label} className="inline-flex flex-wrap gap-0.5 rounded-lg bg-kumo-recessed p-0.5">
+      {options.map(option => (
+        <button key={option.value ?? ''} type="button" aria-pressed={option.value === value} disabled={disabled || option.off} title={option.why}
+          onClick={() => onPick(option.value)}
+          className={cn('h-7 rounded-md px-2.5 font-mono text-xs',
+            option.value === value ? 'bg-kumo-base text-kumo-strong shadow-xs' : 'text-kumo-subtle',
+            option.off ? 'cursor-not-allowed line-through opacity-60' : 'cursor-pointer')}>
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Field({ label, children }: { readonly label: string; readonly children: ReactNode }) {
+  return (
+    <div className="grid grid-cols-1 items-center gap-2 border-t border-kumo-hairline px-4 py-3 first:border-t-0 sm:grid-cols-[120px_1fr] sm:px-5">
+      <span className="text-sm text-kumo-subtle">{label}</span>
+      <div className="flex min-w-0 flex-wrap items-center gap-2.5">{children}</div>
+    </div>
+  );
+}
+
+/**
+ * A bounded integer percent field whose draft is local text (#2909). Typing 100 over 95 passes through `1` and `10`,
+ * and clearing the field is a keystroke, so the stored value cannot be the input's only source: the intermediate draft
+ * stays here and is committed at blur or Enter. A committed value outside min-max is refused, and the field shows the
+ * stored value again. The section decoder refuses the same value at the save.
+ */
+function PercentInput({ field, label, value, min, max, disabled, commit }: {
+  readonly field: string; readonly label: string; readonly value: number; readonly min: number; readonly max: number;
+  readonly disabled: boolean; readonly commit: (value: number) => void;
+}) {
+  // Null means the field shows the stored value: it is not being edited.
+  const [draft, setDraft] = useState<string | null>(null);
+  const accept = (text: string) => {
+    setDraft(null);
+    const parsed = Number(text);
+    if (text.trim() !== '' && Number.isInteger(parsed) && parsed >= min && parsed <= max) commit(parsed);
+  };
+  return (
+    <input type="number" min={min} max={max} step={1} value={draft ?? String(value)} disabled={disabled} aria-label={label}
+      className={NUMBER_INPUT} data-threshold={field}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={(event) => accept(event.target.value)}
+      onKeyDown={(event) => { if (event.key === 'Enter') accept(event.currentTarget.value); }} />
+  );
+}
+
+/** A typed model id outside the recommended list (#3250). The server checks its shape on save; the agent checks the id at launch. */
+function ModelInput({ label, disabled, commit }: { readonly label: string; readonly disabled: boolean; readonly commit: (model: string) => void }) {
+  const [draft, setDraft] = useState('');
+  const accept = (text: string) => {
+    setDraft('');
+    if (text.trim() !== '') commit(text.trim());
+  };
+  return (
+    <input type="text" value={draft} disabled={disabled} aria-label={label} placeholder={label} spellCheck={false}
+      className={MODEL_INPUT} data-model-input
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={(event) => accept(event.target.value)}
+      onKeyDown={(event) => { if (event.key === 'Enter') accept(event.currentTarget.value); }} />
+  );
+}
+
+function ToggleRow({ name, mono, badge, detail, why, on, locked, aria, onToggle }: {
+  readonly name: string; readonly mono: boolean; readonly badge: ReactNode; readonly detail: string; readonly why: string | null;
+  readonly on: boolean; readonly locked: boolean; readonly aria: string; readonly onToggle: (on: boolean) => void;
+}) {
+  return (
+    <li className={cn('flex flex-wrap items-center gap-3 border-t border-kumo-hairline px-4 py-2.5 sm:px-5', locked && 'opacity-70')}>
+      <span className={cn('w-36 shrink-0 text-sm text-kumo-strong', mono && 'font-mono')}>{name}</span>
+      {badge}
+      <span className="min-w-0 flex-[1_1_220px] truncate text-xs text-kumo-subtle" title={detail}>{detail}</span>
+      {why !== null && <span className="text-xs text-kumo-subtle">{why}</span>}
+      <Switch checked={on} disabled={locked} aria-label={aria} onCheckedChange={onToggle} />
+    </li>
+  );
+}
+
+function fleetDetail(setup: SetupSnapshotV2 | null, role: string): string {
+  const entry = setup?.fleet.find(item => item.name === role);
+  if (!entry) return '';
+  const model = [entry.model, entry.effort].filter(Boolean).join(' ');
+  return [model, entry.description].filter(Boolean).join(' · ');
+}
+
+/** The Hosts switch of a runtime that the last seats read does not report enabled, on the same agents draft. */
+function InPlaceEnable({ runtime, agents, t }: { readonly runtime: SeatRuntime; readonly agents: AgentsSettingsForm; readonly t: OperatorTranslate }) {
+  const row = runtimeRowOf(agents, seatHostId(runtime));
+  if (row === null) return null;
+  return (
+    <span className="inline-flex h-7 items-center gap-1.5 rounded-lg border border-dashed border-kumo-line px-2" data-runtime-enable={runtime}>
+      <span className="font-mono text-xs text-kumo-subtle">{t(`seats.runtime.${runtime}`)}</span>
+      <EnableSwitch row={row} draft={agents.draft!} locked={formLocked(agents)} onEdit={agents.edit} t={t} />
+    </span>
+  );
+}
+
+function SeatHeader({ seat, runtime, t }: { readonly seat: SeatId; readonly runtime: SeatRuntime | null; readonly t: OperatorTranslate }) {
+  return (
+    <div className="flex flex-wrap items-center gap-3 border-b border-kumo-hairline px-4 py-4 sm:px-5">
+      <span className={cn('flex size-10 shrink-0 items-center justify-center rounded-lg font-semibold',
+        runtime === 'claude' ? 'bg-(--rh-agent-claude-tint) text-(--rh-agent-claude)' : runtime === 'codex' ? 'bg-(--rh-agent-codex-tint) text-(--rh-agent-codex)' : 'bg-kumo-fill text-kumo-strong')}>
+        {seat[0]!.toUpperCase()}
+      </span>
+      <div className="flex min-w-0 flex-1 flex-col">
+        <h2 id={`seat-${seat}-title`} className="text-base font-semibold text-kumo-strong">{t(`seats.${seat}.title`)}</h2>
+        <span className="text-xs text-kumo-subtle">{t(`seats.${seat}.duty`)}</span>
+      </div>
+      <Badge className="bg-kumo-fill text-kumo-subtle">{t(`seats.${seat}.count`)}</Badge>
+    </div>
+  );
+}
+
+/** The Claude families: the closed range of `advisor_model`, and the Claude choices of the low-quota explorer. */
+const CLAUDE_FAMILIES = Object.keys(MODEL_FAMILY_LABELS);
+
+/** The switch of a seat that may be null. Turning it on uses the starter configuration. */
+function OptionalSeatSwitch({ seat, form, settings, locked, t }: {
+  readonly seat: OptionalSeatId; readonly form: SeatsSettingsForm; readonly settings: SeatsSettingsV1; readonly locked: boolean; readonly t: OperatorTranslate;
+}) {
+  const on = form.draft![seat] !== null;
+  const recommended = seat === 'worker-light' ? settings.defaults['worker-light']
+    : seat === 'council' ? councilStarter(settings.ranges) : GATEKEEPER_FALLBACK_STARTER;
+  return (
+    <Field label={t('seats.field.configured')}>
+      <Switch checked={on} disabled={locked || (!on && recommended === null)} aria-label={t('seats.field.configured')}
+        onCheckedChange={next => form.edit(current => setOptionalSeat(current, seat, next ? recommended : null))} />
+    </Field>
+  );
+}
+
+function SeatCard({ seat, form, agents, settings, setup, quota, locked, t }: {
+  readonly seat: SeatId; readonly form: SeatsSettingsForm; readonly agents: AgentsSettingsForm; readonly settings: SeatsSettingsV1; readonly setup: SetupSnapshotV2 | null;
+  readonly quota: QuotaSection; readonly locked: boolean; readonly t: OperatorTranslate;
+}) {
+  const configured = form.draft![seat];
+  if (configured === null) {
+    return (
+      <section aria-labelledby={`seat-${seat}-title`} data-seat-card={seat} className="flex flex-col overflow-hidden rounded-xl border border-kumo-line bg-kumo-base">
+        <SeatHeader seat={seat} runtime={null} t={t} />
+        {isOptionalSeat(seat) && <OptionalSeatSwitch seat={seat} form={form} settings={settings} locked={locked} t={t} />}
+      </section>
+    );
+  }
+  const draft = configured;
+  const saved = (form.save.kind === 'saved' ? form.base : null) ?? settings.config;
+  const advisorLaunch = seat === 'advisor' ? effectiveSeatConfig(seat, saved, seatAccountQuotas(
+    quota.view.kind === 'ready' ? quota.view.report.accounts : [], saved.routing,
+  )) : null;
+  const { ranges, defaults } = settings;
+  const runtime = ranges.runtimes.find(entry => entry.id === draft.runtime)!;
+  const runtimeChoices = ranges.runtimes.filter(entry => entry.id !== 'agy' || isAgyAllowedSeat(seat));
+  const agy = draft.runtime === 'agy';
+  const range = ranges.seats[seat];
+  const recommended = seat !== 'worker' && defaults[seat]?.runtime === draft.runtime ? defaults[seat] : null;
+  const review = isReviewSeat(seat);
+  const council = isCouncilSeat(seat);
+  const check = (on: boolean) => (on ? ' ✓' : '');
+  const suggested = range.models.filter(entry => entry.runtime === draft.runtime).map(entry => entry.model);
+  const models = [
+    ...(agy || council ? [] : [{ value: null, label: t('seats.model.hostDefault') }]),
+    ...suggested.map(model => ({ value: model as string | null, label: model })),
+    // A typed or stored model outside the seat's recommended list stays visible as a choice.
+    ...(draft.model !== null && !suggested.includes(draft.model) ? [{ value: draft.model as string | null, label: draft.model }] : []),
+  ];
+  const efforts = [{ value: null, label: t('seats.effort.default') }, ...ranges.efforts.map(effort => ({ value: effort as string | null, label: effort, off: !runtime.effort }))];
+  // The host agent types change only the argv; the limit levels do not depend on them, so the page passes none.
+  const launchSeat = seat === 'gatekeeper-fallback' ? 'gatekeeper' : seat;
+  const limits = agy ? agySeatLimits(launchSeat, draft) : buildSeatLaunch(launchSeat, draft, 'seats', []).limits;
+  const levelOf = (subject: string) => limits.find(limit => limit.subject === subject)?.level ?? null;
+  const fleetLevel = levelOf('fleet');
+  // A stored role the server no longer lists stays visible, as a stored model does, so it can be switched off.
+  const roles: readonly { readonly name: string; readonly writable: boolean | null }[] = [
+    ...ranges.roles,
+    ...draft.fleet.filter(name => !ranges.roles.some(role => role.name === name)).map(name => ({ name, writable: null })),
+  ];
+  return (
+    <section aria-labelledby={`seat-${seat}-title`} data-seat-card={seat} className="flex flex-col overflow-hidden rounded-xl border border-kumo-line bg-kumo-base">
+      <SeatHeader seat={seat} runtime={draft.runtime} t={t} />
+      {isOptionalSeat(seat) && <OptionalSeatSwitch seat={seat} form={form} settings={settings} locked={locked} t={t} />}
+
+      <Field label={t('seats.field.runtime')}>
+        {/* Choices use the saved Hosts settings. A stored seat can still use a disabled runtime. */}
+        {runtimeChoices.some(entry => entry.enabled) && (
+          <Segmented label={t('seats.field.runtime')} disabled={locked} value={draft.runtime as SeatRuntime}
+            options={runtimeChoices.filter(entry => entry.enabled).map(entry => ({ value: entry.id, label: t(`seats.runtime.${entry.id}`) }))}
+            onPick={value => form.edit(current => setSeatRuntime(current, seat, value, ranges))} />
+        )}
+        {runtimeChoices.filter(entry => !entry.enabled).map(entry => <InPlaceEnable key={entry.id} runtime={entry.id} agents={agents} t={t} />)}
+        {runtime.enabled && seat === 'orchestrator' && !isClaudeOrNeonSeat(draft) && (
+          <span className="text-xs text-kumo-subtle" data-runtime-note>{t('seats.runtime.orchestratorMode')}</span>
+        )}
+      </Field>
+
+      <Field label={t('seats.field.model')}>
+        <Segmented label={t('seats.field.model')} disabled={locked} value={draft.model} options={models}
+          onPick={value => form.edit(current => setSeatModel(current, seat, value))} />
+        {!council && <ModelInput label={t('seats.model.custom')} disabled={locked} commit={value => form.edit(current => setSeatModel(current, seat, value))} />}
+        <span className="text-xs text-kumo-brand">
+          {council ? t('seats.rec.council') : seat === 'worker' ? t('seats.rec.worker')
+            : recommended?.model ? t('seats.rec.model', { model: recommended.model }) + check(draft.model === recommended.model) : ''}
+        </span>
+      </Field>
+
+      {advisorLaunch !== null && (
+        <Field label={t('seats.field.launchModel')}>
+          <span className="font-mono text-xs text-kumo-strong [overflow-wrap:anywhere]" data-seat-launch-model>
+            {advisorLaunch.model ?? t('seats.model.hostDefault')}
+          </span>
+        </Field>
+      )}
+
+      {draft.runtime === 'claude' && (
+        <Field label={t('seats.field.advisor')}>
+          <Segmented label={t('seats.field.advisor')} disabled={locked} value={draft.advisor_model}
+            options={[{ value: null, label: t('seats.advisor.off') }, ...CLAUDE_FAMILIES.map(model => ({ value: model as string | null, label: model }))]}
+            onPick={value => form.edit(current => setSeatAdvisorModel(current, seat, value))} />
+        </Field>
+      )}
+
+      <Field label={t('seats.field.effort')}>
+        <Segmented label={t('seats.field.effort')} disabled={locked} value={draft.effort} options={efforts}
+          onPick={value => form.edit(current => setSeatEffort(current, seat, value))} />
+        {recommended?.effort && <span className="text-xs text-kumo-brand">{t('seats.rec.effort', { effort: recommended.effort }) + check(draft.effort === recommended.effort)}</span>}
+      </Field>
+
+      <ul aria-label={t('seats.tools.title')} data-seat-tools>
+        <li className="flex flex-wrap items-center gap-3 bg-kumo-recessed px-4 py-2.5 sm:px-5">
+          <span className="flex-1 text-sm font-medium text-kumo-strong">{t('seats.tools.title')}</span>
+        </li>
+        {/* The section limits the tool range for review seats and the council. */}
+        {SEAT_TOOLS.filter(tool => !(review || council) || range.tools.includes(tool)).map((tool) => {
+          const on = draft.tools.includes(tool);
+          const ruled = !range.tools.includes(tool);
+          const agyLockedTool = agy && !(isWorkerSeat(seat) && ((tool === 'gh' && (draft.tools.includes('edit') || on)) || (tool === 'edit' && !on)));
+          // Codex always runs commands, so its Shell can be turned on but not off.
+          const hostWhy = agyLockedTool ? t('seats.tools.why.agy') : draft.runtime === 'pi' ? t('seats.tools.why.pi')
+            : tool === 'read' ? t('seats.tools.why.read')
+              : draft.runtime === 'codex' && tool === 'shell' && on ? t('seats.tools.why.codexShell')
+                : draft.runtime === 'codex' && (tool === 'tasks' || tool === 'schedule') ? t('seats.tools.why.codexTasks') : null;
+          const why = ruled ? t(tool === 'edit' || tool === 'gh' ? `seats.tools.rule.${tool}` : 'seats.tools.rule.other') : hostWhy;
+          // A group that is on has no limit; an off group shows how the host applies the limit.
+          const level = levelOf(tool);
+          return (
+            <ToggleRow key={tool} name={t(`seats.tool.${tool}`)} mono={false} detail={level === null ? '' : t(`seats.limit.${level}.detail`)}
+              badge={level === null ? null : <LimitBadge level={level} t={t} />}
+              // An out-of-range group that the draft holds can only be switched off; the server refuses the section while it stays.
+              why={why} locked={locked || (why !== null && !(ruled && on))} on={on}
+              aria={t('seats.tools.allow', { tool: t(`seats.tool.${tool}`) })}
+              onToggle={on => form.edit(current => setSeatTool(current, seat, tool, on))} />
+          );
+        })}
+      </ul>
+
+      {!review && <ul aria-label={t('seats.fleet.title')} data-seat-fleet>
+        <li className="flex flex-wrap items-center gap-3 bg-kumo-recessed px-4 py-2.5 sm:px-5">
+          <span className="flex-1 text-sm font-medium text-kumo-strong">{t('seats.fleet.title')}</span>
+          {fleetLevel !== null && <LimitBadge level={fleetLevel} t={t} />}
+        </li>
+        {roles.map((role) => {
+          const on = draft.fleet.includes(role.name);
+          const why = role.writable === null ? t('seats.fleet.why.unknown') : !runtime.fleet ? t('seats.fleet.why.runtime')
+            : !range.fleet.includes(role.name) ? t('seats.fleet.why.writable') : null;
+          const detail = draft.runtime === 'pi' && isSeatScaffoldSubAgent(role.name)
+            ? piSubAgentModel(role.name, form.draft!.pi_sub_agent_models)
+            : fleetDetail(setup, role.name);
+          return (
+            <ToggleRow key={role.name} name={role.name} mono detail={detail}
+              badge={role.writable === null ? null
+                : <Badge className={role.writable ? 'bg-kumo-warning-tint text-kumo-warning' : 'bg-kumo-fill text-kumo-subtle'}>{t(role.writable ? 'seats.fleet.writable' : 'seats.fleet.readOnly')}</Badge>}
+              why={why} locked={locked || (why !== null && !on)} on={on}
+              aria={t('seats.fleet.allow', { role: role.name })}
+              onToggle={next => form.edit(current => setSeatRole(current, seat, role.name, next))} />
+          );
+        })}
+      </ul>}
+
+      <div className="flex flex-col gap-2 border-t border-kumo-hairline px-4 py-4 sm:px-5" data-seat-launch>
+        <span className="text-sm font-medium text-kumo-strong">{t('seats.launch.title')}</span>
+        <CommandLine command={launchOf(seat)} t={t} />
+        <pre aria-label={t('seats.launch.config')} className="m-0 rounded-md bg-kumo-recessed px-3 py-2 font-mono text-xs whitespace-pre-wrap [overflow-wrap:anywhere]">{JSON.stringify(draft)}</pre>
+      </div>
+    </section>
+  );
+}
+
+const MODEL_INPUT = 'h-7 w-48 rounded-md border border-kumo-line bg-kumo-base px-2 font-mono text-xs text-kumo-default focus-visible:ring-2 focus-visible:ring-kumo-brand focus-visible:outline-none';
+const NUMBER_INPUT = 'h-7 w-16 rounded-md border border-kumo-line bg-kumo-base px-2 font-mono text-xs text-kumo-default focus-visible:ring-2 focus-visible:ring-kumo-brand focus-visible:outline-none';
+const ICON_BUTTON = 'size-6 cursor-pointer rounded-md text-xs text-kumo-subtle hover:bg-kumo-fill disabled:cursor-not-allowed disabled:opacity-40';
+
+function RouteRow({ task, draft, settings, locked, edit, t }: {
+  readonly task: RoutingClass; readonly draft: SeatsConfigV1; readonly settings: SeatsSettingsV1; readonly locked: boolean;
+  readonly edit: (route: readonly SeatId[]) => void; readonly t: OperatorTranslate;
+}) {
+  const route = draft.routing[task];
+  const { routing } = settings.ranges;
+  const candidates = (task === 'frontend' ? routing.frontend_seats : routing.worker_seats).filter(id => {
+    const seat = draft[id];
+    return seat !== null && !route.includes(id) && (task !== 'frontend' || isClaudeOrNeonSeat(seat));
+  });
+  const moved = (from: number, to: number) => route.map((id, index) => (index === from ? route[to]! : index === to ? route[from]! : id));
+  return (
+    <Field label={t(`seats.routing.${task}`)}>
+      <ol className="flex flex-wrap items-center gap-1.5" data-route={task}>
+        {route.map((id, index) => (
+          <li key={id} data-route-seat={id} className="inline-flex h-7 items-center gap-0.5 rounded-lg border border-kumo-line bg-kumo-recessed pl-2">
+            <span className="pr-1 font-mono text-xs text-kumo-strong">{index + 1}. {id}</span>
+            <button type="button" className={ICON_BUTTON} disabled={locked || index === 0} aria-label={t('seats.routing.up', { seat: id })} onClick={() => edit(moved(index, index - 1))}>↑</button>
+            <button type="button" className={ICON_BUTTON} disabled={locked || index === route.length - 1} aria-label={t('seats.routing.down', { seat: id })} onClick={() => edit(moved(index, index + 1))}>↓</button>
+            {/* The section refuses an empty route, so the last seat stays. */}
+            <button type="button" className={ICON_BUTTON} disabled={locked || route.length === 1} aria-label={t('seats.routing.remove', { seat: id })} onClick={() => edit(route.filter(seat => seat !== id))}>✕</button>
+          </li>
+        ))}
+      </ol>
+      {candidates.map(id => (
+        <button key={id} type="button" disabled={locked} aria-label={t('seats.routing.add', { seat: id })} onClick={() => edit([...route, id])}
+          className="h-7 cursor-pointer rounded-lg border border-dashed border-kumo-line px-2 font-mono text-xs text-kumo-subtle disabled:cursor-not-allowed">+ {id}</button>
+      ))}
+    </Field>
+  );
+}
+
+/** The modes come from seatAccountQuotas on the draft thresholds and the page quota read; no read or no report shows unknown. */
+function RoutingEditor({ form, settings, quota, locked, t }: {
+  readonly form: SeatsSettingsForm; readonly settings: SeatsSettingsV1; readonly quota: QuotaSection; readonly locked: boolean; readonly t: OperatorTranslate;
+}) {
+  const draft = form.draft!;
+  const accounts = seatAccountQuotas(quota.view.kind === 'ready' ? quota.view.report.accounts : [], draft.routing);
+  const explorer = draft.routing.low_quota_explorer;
+  const onCredits = SEAT_IDS.filter(id => draft[id] !== null && seatOnCredits(id, draft[id]!, accounts));
+  const thresholds = [
+    { field: 'claude_saving_below_remaining', account: 'claude', quota: accounts.claude },
+    { field: 'claude_hyper_at_or_above_remaining', account: 'claude', quota: accounts.claude },
+    { field: 'agy_saving_below_remaining', account: 'agy_gemini', quota: accounts.agy_gemini },
+  ] as const;
+  return (
+    <section aria-labelledby="seats-routing-heading" className="flex flex-col overflow-hidden rounded-xl border border-kumo-line bg-kumo-base" data-seats-routing>
+      <h2 id="seats-routing-heading" className="border-b border-kumo-hairline px-4 py-3 text-base font-semibold text-kumo-strong sm:px-5">{t('seats.routing.title')}</h2>
+      {settings.ranges.routing.classes.map(task => (
+        <RouteRow key={task} task={task} draft={draft} settings={settings} locked={locked} t={t}
+          edit={route => form.edit(current => setRoute(current, task, route as typeof current.routing[typeof task]))} />
+      ))}
+      <Field label={t('seats.routing.explorer')}>
+        <Segmented label={t('seats.field.model')} disabled={locked} value={explorer.model ?? ''}
+          options={[...CLAUDE_FAMILIES, ...(explorer.model !== null && !CLAUDE_FAMILIES.includes(explorer.model) ? [explorer.model] : [])].map(model => ({ value: model, label: model }))}
+          onPick={model => form.edit(current => setExplorer(current, { model }))} />
+        <ModelInput label={t('seats.model.custom')} disabled={locked} commit={model => form.edit(current => setExplorer(current, { model }))} />
+        <Segmented label={t('seats.field.effort')} disabled={locked} value={explorer.effort}
+          options={[{ value: null, label: t('seats.effort.default') }, ...settings.ranges.efforts.map(effort => ({ value: effort as string | null, label: effort }))]}
+          onPick={effort => form.edit(current => setExplorer(current, { effort }))} />
+      </Field>
+      {thresholds.map(({ field, account, quota: current }) => (
+        <Field key={field} label={t(`seats.threshold.${field}`)}>
+          <PercentInput field={field} label={t(`seats.threshold.${field}`)} value={draft.routing[field]} min={0} max={100} disabled={locked}
+            commit={value => form.edit(next => setRoutingValue(next, field, value))} />
+          <span className="font-mono text-xs text-kumo-subtle">%</span>
+          <span data-account-mode={account} data-mode={current.mode} className="text-xs text-kumo-subtle">
+            {t(`seats.quota.${account}`)} · <b className="font-medium text-kumo-strong">{t(`seats.quota.mode.${current.mode}`)}</b>
+            {current.remaining !== null && ` · ${t('seats.quota.left', { n: current.remaining })}`}
+          </span>
+        </Field>
+      ))}
+      {/* The account states above are the ones the server read at the saved line; this field moves the line itself. */}
+      <Field label={t('seats.threshold.exhausted_at_or_above_used')}>
+        <PercentInput field="exhausted_at_or_above_used" label={t('seats.threshold.exhausted_at_or_above_used')}
+          value={draft.routing.exhausted_at_or_above_used} min={EXHAUSTED_AT_OR_ABOVE_USED_RANGE.min} max={EXHAUSTED_AT_OR_ABOVE_USED_RANGE.max}
+          disabled={locked} commit={value => form.edit(next => setRoutingValue(next, 'exhausted_at_or_above_used', value))} />
+        <span className="font-mono text-xs text-kumo-subtle">%</span>
+      </Field>
+      <Field label={t('seats.credits.mode')}>
+        <Segmented label={t('seats.credits.mode')} disabled={locked} value={draft.routing.codex_credit_mode}
+          options={CODEX_CREDIT_MODES.map(mode => ({ value: mode, label: t(`seats.credits.${mode}`) }))}
+          onPick={mode => form.edit(current => setRoutingValue(current, 'codex_credit_mode', mode))} />
+        {onCredits.length > 0 && <span data-credit-seats={onCredits.join(' ')} className="text-xs text-kumo-subtle">{t('seats.credits.acting', { seats: onCredits.join(', ') })}</span>}
+      </Field>
+      <Field label={t('seats.credits.floor')}>
+        <input type="number" min={0} step="any" value={draft.routing.codex_credit_floor} disabled={locked} aria-label={t('seats.credits.floor')} className={NUMBER_INPUT}
+          data-credit-floor
+          onChange={(event) => {
+            const value = Number(event.target.value);
+            if (event.target.value !== '' && Number.isFinite(value) && value >= 0) form.edit(next => setRoutingValue(next, 'codex_credit_floor', value));
+          }} />
+      </Field>
+    </section>
+  );
+}
+
+/** The server's request decoder is the one authority for section validity; its refusal code keeps Save off. */
+function sectionRefusal(revision: string, seats: SeatsConfigV1): string | null {
+  try {
+    decodeSeatsSettingsRequest({ expected_revision: revision, seats });
+    return null;
+  } catch (error) {
+    return (error as Error).message;
+  }
+}
+
+/** The seats section of the Agents page. `agents` is the Hosts form, whose switch shows in place for a runtime that is not enabled. */
+export function SeatsSection({ form, agents, setup, quota, t }: {
+  readonly form: SeatsSettingsForm; readonly agents: AgentsSettingsForm; readonly setup: SetupSnapshotV2 | null; readonly quota: QuotaSection; readonly t: OperatorTranslate;
+}) {
+  return (
+    <section aria-labelledby="agents-seats-heading" className="flex min-w-0 flex-col gap-4" data-agents-section="seats">
+      <SectionTitle id="agents-seats-heading">{t('seats.title')}</SectionTitle>
+      <SeatsBody form={form} agents={agents} setup={setup} quota={quota} t={t} />
+    </section>
+  );
+}
+
+function SeatModelPool({ cache, seat, t }: {
+  readonly cache: SeatsSettingsV1['model_pool']; readonly seat: SeatId; readonly t: OperatorTranslate;
+}) {
+  const row = cache?.report.seats.find(entry => entry.seat === seat);
+  return (
+    <section aria-labelledby="seats-pool-heading" className="rounded-xl border border-kumo-line bg-kumo-base px-4 py-3 sm:px-5" data-seat-pool={cache?.status ?? 'unavailable'}>
+      <h2 id="seats-pool-heading" className="text-base font-semibold text-kumo-strong">{t('seats.pool.title')}</h2>
+      <p className="mt-1 text-xs text-kumo-subtle">{t('seats.pool.refresh', { command: 'rh seats pool' })}</p>
+      {cache !== undefined && row !== undefined && <>
+        <p className={cn('mt-2 text-xs', cache.status === 'stale' ? 'text-kumo-warning' : 'text-kumo-subtle')}>
+          {t(`seats.pool.${cache.status}`, { time: cache.report.collected_at })}
+        </p>
+        <p className="mt-2 text-sm text-kumo-subtle"><code className="break-all">{row.configured.field}</code> · {t(`seats.pool.reason.${row.configured.reason}`)}</p>
+        {row.pool.length === 0 && <p className="mt-2 text-sm text-kumo-strong">{t('seats.pool.empty')}</p>}
+        <ul className="mt-2 divide-y divide-kumo-hairline">
+          {[...row.pool, ...row.excluded].map(entry => (
+            <li key={entry.runtime + '/' + entry.model} className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 py-2 text-sm">
+              <span className="min-w-0 break-all font-mono text-kumo-strong">{entry.runtime} {entry.model}</span>
+              <span className="text-xs text-kumo-subtle">
+                {t(`seats.pool.reason.${entry.status}`)}{entry.account === null ? '' : ` · ${entry.account}`}
+                {entry.status === 'not_installed' && <> · {t('seats.pool.install', { runtime: t(`seats.runtime.${entry.runtime}`) })}</>}
+                {entry.status === 'signed_out' && <> · {t('seats.pool.login', { command: entry.runtime === 'claude' ? 'claude auth login' : 'codex login' })}</>}
+              </span>
+            </li>
+          ))}
+        </ul>
+        <p className="mt-1 text-xs text-kumo-subtle">{t('seats.pool.quota', { command: 'rh quota' })}</p>
+      </>}
+    </section>
+  );
+}
+
+function SeatsBody({ form, agents, setup, quota, t }: {
+  readonly form: SeatsSettingsForm; readonly agents: AgentsSettingsForm; readonly setup: SetupSnapshotV2 | null; readonly quota: QuotaSection; readonly t: OperatorTranslate;
+}) {
+  const [seat, setSeat] = useState<SeatId>('advisor');
+  const { view, draft, base } = form;
+  if (view.kind === 'loading') return <Empty size="sm" icon={<Loader />} title={t('settings.pending.title')} />;
+  if (view.kind === 'unavailable') {
+    return <Banner variant="error" data-settings-unavailable={view.reason} title={t('settings.failed.title')} description={t(`settings.reason.${view.reason}`)} />;
+  }
+  const { settings } = view;
+  const locked = formLocked(form);
+  const changedElsewhere = base !== null && form.request !== null && form.save.kind !== 'saving' && settings.config.revision !== base.revision;
+  const changes = base !== null && draft !== null ? seatChanges(base, draft) : 0;
+  const notEnabled = draft === null ? [] : SEAT_IDS.flatMap((id) => {
+    const seat = draft[id];
+    return seat !== null && !settings.ranges.runtimes.find(entry => entry.id === seat.runtime)!.enabled ? [{ id, runtime: seat.runtime }] : [];
+  });
+  const refused = draft === null ? null : sectionRefusal(settings.config.revision, draft);
+  return (
+    <div className="flex flex-col gap-5" data-seats-page>
+      <p className="text-sm text-kumo-subtle">{t('seats.lead')}</p>
+      <section aria-labelledby="seats-layout-heading" className="flex flex-col gap-2.5">
+        <div className="flex flex-wrap items-baseline gap-2.5">
+          <SectionTitle id="seats-layout-heading">{t('seats.layout.title')}</SectionTitle>
+          <span className="text-xs text-kumo-subtle">{t('seats.layout.hint')}</span>
+        </div>
+        <div className="flex flex-wrap gap-3">
+          {LAYOUT.map((panes, tab) => (
+            <div key={tab} className="flex min-w-0 flex-[1_1_300px] flex-col gap-2 rounded-xl border border-kumo-line bg-kumo-base p-2.5">
+              <span className="font-mono text-xs text-kumo-subtle">{t('seats.layout.tab', { n: tab + 1 })}</span>
+              <div className="flex gap-1.5">
+                {panes.map((id, index) => (
+                  <button key={index} type="button" aria-pressed={id === seat} onClick={() => setSeat(id)} data-pane={id}
+                    className={cn('flex min-w-0 flex-1 cursor-pointer flex-col items-start gap-0.5 rounded-lg border px-2.5 py-2 text-left',
+                      id === seat ? 'border-(--rh-accent) bg-(--rh-accent-tint)' : 'border-kumo-line bg-kumo-recessed hover:border-kumo-subtle')}>
+                    <b className="text-sm font-semibold text-kumo-strong">{t(`seats.${id}.short`)}</b>
+                    {draft && <span className="w-full truncate text-xs text-kumo-subtle">{[draft[id].runtime, draft[id].model ?? t('seats.model.hostDefault')].join(' · ')}</span>}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+        <p className="flex flex-wrap items-center gap-2 text-xs text-kumo-subtle"><Badge className="bg-kumo-fill text-kumo-subtle">{t('seats.layout.ruleBadge')}</Badge>{t('seats.layout.rule')}</p>
+      </section>
+
+      {draft !== null && <>
+        <Segmented label={t('seats.pick')} disabled={false} value={seat} options={SEAT_IDS.map(id => ({ value: id, label: t(`seats.${id}.short`) }))} onPick={setSeat} />
+        <SeatCard seat={seat} form={form} agents={agents} settings={settings} setup={setup} quota={quota} locked={locked} t={t} />
+        <SeatModelPool seat={seat} cache={settings.model_pool} t={t} />
+        <section aria-labelledby="seats-pi-models-heading" className="overflow-hidden rounded-xl border border-kumo-line bg-kumo-base">
+          <h2 id="seats-pi-models-heading" className="border-b border-kumo-hairline px-4 py-3 text-base font-semibold text-kumo-strong sm:px-5">{t('seats.piModels.title')}</h2>
+          {SEAT_SCAFFOLD_SUB_AGENTS.map(role => (
+            <Field key={role} label={role}>
+              <input type="text" aria-label={t('seats.piModels.model', { role })} disabled={locked} spellCheck={false}
+                className={cn(MODEL_INPUT, 'w-full max-w-sm')} placeholder={PI_SUB_AGENT_DEFAULTS[role].model}
+                value={draft.pi_sub_agent_models?.[role] ?? ''}
+                onChange={event => {
+                  const model = event.target.value;
+                  form.edit(current => setPiSubAgentModel(current, role, model));
+                }} />
+            </Field>
+          ))}
+        </section>
+        <RoutingEditor form={form} settings={settings} quota={quota} locked={locked} t={t} />
+      </>}
+
+      <SaveResult save={form.save} reload={form.reload} changedElsewhere={changedElsewhere} t={t} />
+      {form.save.kind === 'saved' && <Banner variant="default" data-seats-saved description={t('seats.saved')} />}
+      <div className="flex flex-wrap items-center gap-3 rounded-xl border border-kumo-line bg-kumo-base px-4 py-3" data-seats-savebar>
+        <span className="text-xs text-kumo-subtle">{t('seats.savebar.target')} · <span className="font-mono">{settings.config.revision === 'absent' ? 'absent' : `${settings.config.revision.slice(0, 13)}…`}</span></span>
+        <span className="flex-1" />
+        <span className="text-xs text-kumo-subtle">{changes === 0 ? t('seats.savebar.clean') : t('seats.savebar.dirty', { count: changes })}</span>
+        <Button variant="ghost" onClick={form.discard} disabled={form.request === null || locked}>{t('settings.discard')}</Button>
+        {notEnabled.map(({ id, runtime }) => (
+          <span key={id} className="inline-flex flex-wrap items-center gap-2 text-xs text-kumo-warning" data-save-blocked={id}>
+            {t('seats.savebar.notEnabled', { seat: id, runtime: t(`seats.runtime.${runtime}`) })}
+            <InPlaceEnable runtime={runtime} agents={agents} t={t} />
+            {id === 'worker-light' && (
+              <Button variant="secondary" size="sm" disabled={locked} onClick={() => form.edit(current => setOptionalSeat(current, 'worker-light', null))} data-worker-light-off>
+                {t('seats.savebar.workerLightOff')}
+              </Button>
+            )}
+          </span>
+        ))}
+        {refused !== null && <span className="text-xs text-kumo-warning" data-save-refused={refused}>{t('seats.savebar.refused', { code: refused })}</span>}
+        <Button variant="primary" onClick={form.submit} disabled={form.request === null || locked || notEnabled.length > 0 || refused !== null} data-save="seats">
+          {form.save.kind === 'saving' ? t('settings.saving') : t('settings.save')}
+        </Button>
+      </div>
+      <p className="text-xs text-kumo-subtle">{t('seats.footnote')}</p>
+    </div>
+  );
+}

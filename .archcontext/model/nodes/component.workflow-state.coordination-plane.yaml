@@ -1,0 +1,18 @@
+schemaVersion: "archcontext.node/v2"
+id: "component.workflow-state.coordination-plane"
+kind: "component"
+name: "Task Session Admission and Historical Worktree Safety"
+status: "active"
+parent: "capability.workflow-engine.workflow-state"
+layer: "effects"
+summary: "Observes the admission of task sessions, retains historical canonical task parsers and guards exact worktree cleanup."
+responsibilities:
+  - "Observe the live review admission of a persisted task session and recheck it for each caller with the caller's own refusal, so no refusal is translated."
+  - "Retain historical canonical task parsing, worktree topology, sweep and exact deletion guards. Historical leases and claim tokens are not current authority."
+source:
+  include:
+    - src/effects/state/coordination-*.ts
+    - src/effects/state/pruned-worktree-intents.ts
+    - src/effects/state/worktree-trash.ts
+    - src/effects/state/canonical-target.ts
+    - src/effects/terminal/task-session-admission.ts

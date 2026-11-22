@@ -1,0 +1,153 @@
+#!/bin/bash
+# Create standard project directory structure
+# Usage: bash scripts/create-project-dirs.sh
+#
+# Creates the three-layer project structure:
+#   IMMUTABLE LAYER (资产层): specs, contracts, tests
+#   MUTABLE LAYER (厕纸层): src
+#   SUPPORTING (支撑层): docs, deploy, _ops, artifacts, tasks, plans
+#
+# The init-managed parts (package scripts, the .gitignore managed block and the
+# reference-config stubs) come only from `rh init --repo .`, which runs next.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PI_LIB_DIR="$SCRIPT_DIR/lib"
+if [[ -f "$PI_LIB_DIR/project-init-lib.sh" ]]; then
+  # shellcheck source=/dev/null
+  . "$PI_LIB_DIR/project-init-lib.sh"
+fi
+ASSETS_TEMPLATES_DIR="$SCRIPT_DIR/../assets/templates"
+ASSETS_FACTOR_FACTORY_DIR="$ASSETS_TEMPLATES_DIR/factor-factory"
+ASSETS_WORKFLOW_CONTRACT="$SCRIPT_DIR/../assets/workflow-contract.v1.json"
+
+write_templates() {
+  pi_install_templates "$PWD" "$ASSETS_TEMPLATES_DIR" "apply"
+}
+
+install_workflow_helpers() {
+  local helper_names
+  helper_names="$(pi_workflow_contract_query_lines "$ASSETS_WORKFLOW_CONTRACT" "helpers.scripts" | xargs)"
+  pi_install_helpers "$PWD" "$ASSETS_TEMPLATES_DIR/helpers" "apply" "$helper_names"
+}
+
+create_contract_directories() {
+  while IFS= read -r rel_dir; do
+    [[ -z "$rel_dir" ]] && continue
+    mkdir -p "$rel_dir"
+  done < <(pi_workflow_contract_query_lines "$ASSETS_WORKFLOW_CONTRACT" "artifacts.requiredDirectories")
+}
+
+install_hook_assets() {
+  pi_install_hook_assets "$PWD" "apply"
+}
+
+# ===== IMMUTABLE LAYER (资产层) =====
+mkdir -p interfaces/modules
+mkdir -p tests/unit
+mkdir -p tests/integration
+mkdir -p tests/e2e
+
+# ===== MUTABLE LAYER (厕纸层) =====
+mkdir -p src/modules
+
+# ===== SUPPORTING (支撑层) =====
+mkdir -p docs/reference-configs
+if pi_should_generate_full_docs; then
+  mkdir -p docs/architecture
+  mkdir -p docs/api
+  mkdir -p docs/guides
+  mkdir -p docs/archives
+fi
+mkdir -p .ai/hooks
+mkdir -p .ai/context
+mkdir -p .ai/harness/checks
+mkdir -p .ai/harness/failures
+mkdir -p .ai/harness/security
+mkdir -p .ai/harness/runs
+mkdir -p deploy/env
+mkdir -p deploy/scripts
+mkdir -p deploy/submissions
+mkdir -p deploy/runbooks
+mkdir -p deploy/release-checklists
+mkdir -p deploy/sql
+mkdir -p _ops/env
+mkdir -p _ops/secrets
+mkdir -p _ops/artifacts
+mkdir -p _ops/logs
+mkdir -p _ops/state
+mkdir -p _ops/scratch
+mkdir -p artifacts
+create_contract_directories
+
+# ===== Initial Files =====
+touch docs/CHANGELOG.md
+if pi_should_generate_full_docs; then
+  touch docs/brief.md
+  touch docs/tech-stack.md
+  touch docs/decisions.md
+fi
+
+# Adoption writes the same contract template, so every new ledger uses one record format.
+pi_workflow_contract_query_lines "$ASSETS_WORKFLOW_CONTRACT" "adoptionTemplates.files.lessonsLog.lines" > tasks/lessons.md
+
+write_templates
+install_workflow_helpers
+install_hook_assets
+if pi_should_enable_factor_factory "$(pi_plan_type)"; then
+  pi_install_factor_factory "$PWD" "$ASSETS_FACTOR_FACTORY_DIR" "$SCRIPT_DIR" "apply"
+fi
+
+pi_print_codex_hook_trust_notice
+
+# Canonical harness state surface:
+# - .ai/harness/events.jsonl
+# - .ai/harness/failures/latest.jsonl
+# - .ai/harness/security/.gitkeep
+# - .ai/harness/worktrees/.gitkeep
+# - .ai/harness/runs/.gitkeep
+pi_ensure_harness_state_surface "$PWD" "apply"
+
+cat > interfaces/types.ts << 'INTERFACES_TYPES_EOF'
+/**
+ * Shared Runtime Interface Definitions
+ *
+ * IMMUTABLE: Changes here require downstream rewrites
+ */
+
+// Add shared API schemas, event schemas, DTOs, or boundary types here
+export {}
+INTERFACES_TYPES_EOF
+
+cat > tests/README.md << 'TESTS_README_EOF'
+# Test Directory Structure
+
+> **Test is the new Spec. 测试是唯一的真理。**
+
+## Asset Hierarchy
+
+Tests are IMMUTABLE ASSETS. Implementation is DISPOSABLE.
+
+## Rules
+
+- Test code quantity ≥ Implementation code quantity
+- Test failure = Delete module and rewrite
+- Never modify tests to make buggy code pass
+
+## Running Tests
+
+```bash
+bun test              # Run all tests
+bun test --coverage   # With coverage
+bun test --watch      # Watch mode
+```
+TESTS_README_EOF
+
+touch deploy/env/.gitkeep
+touch deploy/scripts/.gitkeep
+touch deploy/submissions/.gitkeep
+touch deploy/runbooks/.gitkeep
+touch deploy/release-checklists/.gitkeep
+touch deploy/sql/.gitkeep
+echo "Project directory structure created successfully. Next: rh init --repo ."

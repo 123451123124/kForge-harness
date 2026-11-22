@@ -1,0 +1,252 @@
+import { afterEach, expect, test } from 'bun:test';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { RefactorProviderError, type RefactorScanResultV1, type RefactorScopeV1 } from '../../src/core/refactor/provider-contract';
+import { observeRefactorRecommendations, refactorCandidates } from '../../src/effects/refactor/recommendations';
+import { buildRefactorCommand, formatRefactorRecommendations } from '../../src/cli/commands/refactor';
+
+const roots: string[] = [];
+afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), 'refactor-recommendation-')); roots.push(root);
+  const home = join(root, 'home'); mkdirSync(join(home, '.repo-harness'), { recursive: true });
+  const repo = join(root, 'repo'); mkdirSync(join(repo, '.archcontext'), { recursive: true });
+  writeFileSync(join(repo, '.archcontext/manifest.yaml'), 'fixture: true\n');
+  return { root, repo, env: { ...process.env, HOME: home } };
+}
+
+// The archctx-contracts package ships these 0.7.2 fixtures: a real scan result and one recorded open suggestion.
+const shipped = (name: string) => JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.resolve('archctx-contracts'))), '../fixtures/valid', name), 'utf8'));
+const shippedScan = () => shipped('runtime-refactor-scan.json');
+const shippedRecord = () => shipped('recommendation-v3.json');
+
+/** The shipped scan has unknown code facts; the tests that need suggestions start from a complete read of it. */
+function discovery(options: { codeFacts?: Record<string, unknown>; multiplyOwned?: number; scan?: Record<string, unknown>; open?: unknown[] } = {}): RefactorScanResultV1 {
+  const scan = shippedScan();
+  scan.snapshot.codeFacts = { ...scan.snapshot.codeFacts, coverage: 'complete', truncated: false, reasonCodes: [], ...options.codeFacts };
+  scan.snapshot.repositorySummary.multiplyOwnedFileCount = options.multiplyOwned ?? 0;
+  return { ...scan, ...options.scan, openRecommendations: options.open ?? [] };
+}
+
+test('each suggestion carries the metrics and bounded evidence of its own observation and no state is written', () => {
+  const f = fixture();
+  const value = observeRefactorRecommendations(f.repo, { env: f.env, discover: () => discovery() });
+  expect(value.status).toBe('recommended');
+  expect(value.snapshotDigest).toBe(shippedScan().snapshotDigest);
+  expect(value.candidates.map((entry) => entry.kind)).toEqual(['undeclared-footprint', 'evidence-gap']);
+  expect(value.candidates[1]).toMatchObject({
+    subject: 'repository:repo.537182127c5f2134',
+    metrics: { unresolvedImportCount: 0, edgeLimit: 5000 },
+    evidence: { kind: 'evidence-gap', coverage: 'unknown', totalCount: 0, truncated: false },
+  });
+  expect(value.candidates[0]).toMatchObject({
+    metrics: {},
+    evidence: { kind: 'undeclared-footprint', paths: [], totalCount: 0, truncated: false },
+    snapshot: 'current',
+    modules: [{ nodeId: 'capability.architecture.context', files: null, directionViolations: null, unresolvedImports: 0 }],
+  });
+  // archctx 0.7.2 never measures these, so they are not part of the module evidence.
+  expect(Object.keys(value.candidates[0]!.modules[0]!)).not.toContain('instability');
+  expect(Object.keys(value.candidates[0]!.modules[0]!)).not.toContain('testFiles');
+  const text = formatRefactorRecommendations(value);
+  expect(text).toContain('metrics: unresolvedImportCount=0, edgeLimit=5000');
+  expect(text).toContain('evidence: evidence-gap, 0 total');
+  expect(existsSync(join(f.repo, '.ai/harness/runs'))).toBe(false);
+});
+
+test('the text view lists the first items of a truncated evidence sample', () => {
+  const record = shippedRecord();
+  record.payload = {
+    ...record.payload, kind: 'cycle', affectedNodeIds: [], metrics: { memberCount: 64, cycleEdgeCount: 444 },
+    evidence: {
+      kind: 'cycle', memberNodeIds: ['module.a', 'module.b'], totalCount: 444, truncated: true,
+      edges: Array.from({ length: 8 }, (_, index) => ({ fromPath: `src/a${index}.ts`, fromLine: index + 1, toPath: 'src/b.ts', specifier: './b', fromNodeId: 'module.a', toNodeId: 'module.b' })),
+    },
+  };
+  const [candidate] = refactorCandidates(discovery({ scan: { proposedRecommendations: [] }, open: [record] }));
+  expect(candidate).toMatchObject({ kind: 'cycle', metrics: { memberCount: 64, cycleEdgeCount: 444 } });
+  const text = formatRefactorRecommendations({ schemaVersion: 'repo-harness.refactor-recommendations/v2', status: 'recommended', candidates: [candidate!] });
+  expect(text).toContain('metrics: memberCount=64, cycleEdgeCount=444');
+  expect(text).toContain('evidence: cycle, 444 total (sample is truncated)');
+  expect(text).toContain('- src/a0.ts:1 -> src/b.ts');
+  expect(text).toContain('- src/a4.ts:5 -> src/b.ts');
+  expect(text).not.toContain('src/a5.ts');
+});
+
+test('the text view lists the sampled edges of a residual cycle', () => {
+  const record = shippedRecord();
+  record.payload = {
+    ...record.payload, kind: 'residual-cycle', affectedNodeIds: ['module.a', 'module.b', 'module.c'], metrics: { memberCount: 3 },
+    evidence: {
+      kind: 'residual-cycle', memberNodeIds: ['module.a', 'module.b', 'module.c'], totalCount: 3, truncated: false,
+      edges: [
+        { fromPath: 'src/a.ts', fromLine: 2, toPath: 'src/b.ts', specifier: './b', fromNodeId: 'module.a', toNodeId: 'module.b' },
+        { fromPath: 'src/b.ts', fromLine: null, toPath: 'src/c.ts', specifier: './c', fromNodeId: 'module.b', toNodeId: 'module.c' },
+        { fromPath: 'src/c.ts', fromLine: 7, toPath: 'src/a.ts', specifier: './a', fromNodeId: 'module.c', toNodeId: 'module.a' },
+      ],
+    },
+  };
+  const [candidate] = refactorCandidates(discovery({ scan: { proposedRecommendations: [] }, open: [record] }));
+  expect(candidate).toMatchObject({ kind: 'residual-cycle', evidence: { kind: 'residual-cycle', totalCount: 3, truncated: false } });
+  const text = formatRefactorRecommendations({ schemaVersion: 'repo-harness.refactor-recommendations/v2', status: 'recommended', candidates: [candidate!] });
+  expect(text).toContain('evidence: residual-cycle, 3 total\n');
+  expect(text).toContain('- src/a.ts:2 -> src/b.ts');
+  expect(text).toContain('- src/b.ts:? -> src/c.ts');
+  expect(text).toContain('- src/c.ts:7 -> src/a.ts');
+});
+
+test('a recorded open suggestion that the scan suppresses is still listed, once, next to new scan candidates', () => {
+  const f = fixture();
+  const record = shippedRecord();
+  // archctx suppresses a scan candidate whose fingerprint is already recorded, so the scan no longer proposes it.
+  const scanned = shippedScan().proposedRecommendations;
+  const onlyRecorded = observeRefactorRecommendations(f.repo, { env: f.env, discover: () => discovery({ scan: { proposedRecommendations: [], suppressed: [{ reasonCode: 'duplicate-active-fingerprint' }] }, open: [record] }) });
+  expect(onlyRecorded.status).toBe('recommended');
+  expect(onlyRecorded.candidates.map((entry) => entry.recommendationId)).toEqual([record.recommendationId]);
+  // The shipped record is also a scan candidate, so a second recorded suggestion needs its own id.
+  const second = { ...record, recommendationId: 'recommendation.recorded-elsewhere' };
+  const mixed = observeRefactorRecommendations(f.repo, { env: f.env, discover: () => discovery({ open: [second] }) });
+  expect(mixed.candidates.map((entry) => entry.recommendationId)).toEqual([second.recommendationId, ...scanned.map((entry: { recommendationId: string }) => entry.recommendationId)]);
+  const listedTwice = observeRefactorRecommendations(f.repo, { env: f.env, discover: () => discovery({ open: [scanned[0]] }) });
+  expect(listedTwice.candidates.map((entry) => entry.recommendationId)).toEqual(scanned.map((entry: { recommendationId: string }) => entry.recommendationId));
+});
+
+test('a recorded suggestion from an earlier snapshot keeps its own metrics and gets no current module statistics', () => {
+  const stale = { ...shippedRecord(), payload: { ...shippedRecord().payload, baselineSnapshotDigest: `sha256:${'0'.repeat(64)}`, metrics: { unownedFileCount: 218 } } };
+  const scan = { proposedRecommendations: [] };
+  const [earlier] = refactorCandidates(discovery({ scan, open: [stale] }));
+  expect(earlier).toMatchObject({ snapshot: 'earlier', baselineSnapshotDigest: stale.payload.baselineSnapshotDigest, metrics: { unownedFileCount: 218 }, modules: [] });
+  const [current] = refactorCandidates(discovery({ scan, open: [shippedRecord()] }));
+  expect(current).toMatchObject({ snapshot: 'current', modules: [{ nodeId: 'capability.architecture.context' }] });
+  const text = formatRefactorRecommendations({ schemaVersion: 'repo-harness.refactor-recommendations/v2', status: 'recommended', candidates: [earlier!] });
+  expect(text).toContain(`recorded on an earlier snapshot (${stale.payload.baselineSnapshotDigest})`);
+  expect(text).not.toContain('modules:');
+});
+
+test('no open record and no scan candidate means no action', () => {
+  const f = fixture();
+  expect(observeRefactorRecommendations(f.repo, { env: f.env, discover: () => discovery({ scan: { proposedRecommendations: [] } }) }).status).toBe('no_action');
+});
+
+test('incomplete code facts withhold suggestions while ambiguous ownership surfaces candidates with metadata', () => {
+  const f = fixture();
+  const partial = observeRefactorRecommendations(f.repo, { env: f.env, discover: () => discovery({ codeFacts: { coverage: 'partial', reasonCodes: ['code-facts-missing'] } }) });
+  expect(partial).toMatchObject({ status: 'proof_required', candidates: [] });
+  expect(partial.message).toContain('codegraph init');
+  const ambiguous = observeRefactorRecommendations(f.repo, { env: f.env, discover: () => discovery({ multiplyOwned: 75 }) });
+  expect(ambiguous.status).toBe('recommended');
+  expect(ambiguous.multiplyOwnedFileCount).toBe(75);
+  expect(ambiguous.candidates).toHaveLength(2);
+  expect(ambiguous.message).toContain('75 files have more than one owning capability');
+  expect(formatRefactorRecommendations(ambiguous)).toContain('note: 75 files have more than one owning capability');
+});
+
+test('includes refactor_proposal records alongside structural observations and exposes full CLI subcommands', () => {
+  const proposal = {
+    ...shippedRecord(),
+    recommendationId: 'recommendation.abcdef0123456789',
+    category: 'refactor_proposal' as const,
+    subject: 'proposal:split-board',
+    explanation: ['Split monolithic board handler into focused modules'],
+    payload: {
+      assessmentDigest: `sha256:${'1'.repeat(64)}`,
+      proposalDigest: `sha256:${'a'.repeat(64)}`,
+      scale: 'module' as const,
+      affectedNodeIds: ['capability.architecture.context'],
+      majorChangeReasons: [],
+      baselineSnapshotDigest: shippedScan().snapshot.snapshotDigest,
+      targetOutcomes: [{ outcomeId: 'outcome.0123456789abcdef', metric: 'module.footprint.lineCount', subjectSelectorId: 'capability.architecture.context', nodeId: 'capability.architecture.context', operator: 'less_than' as const, value: 400, required: true }],
+      killList: [{ kind: 'path' as const, selectorId: 'src/cli/commands/legacy-board.ts', required: true }],
+    },
+  };
+  const candidates = refactorCandidates(discovery({ open: [proposal] }));
+  expect(candidates[0]).toMatchObject({
+    recommendationId: 'recommendation.abcdef0123456789',
+    category: 'refactor_proposal',
+    kind: 'refactor-proposal',
+    proposal: { scale: 'module' },
+  });
+  const text = formatRefactorRecommendations({ schemaVersion: 'repo-harness.refactor-recommendations/v2', status: 'recommended', snapshotDigest: shippedScan().snapshotDigest, candidates });
+  expect(text).toContain('proposal: scale=module (1 target outcome(s), 1 kill entry/entries)');
+  expect(text).toContain('- kill path: src/cli/commands/legacy-board.ts');
+
+  const command = buildRefactorCommand();
+  expect(command.commands.map((c) => c.name())).toEqual(['recommendations', 'decide', 'verify', 'resolve', 'record', 'list', 'show']);
+});
+
+test('the import node limit reaches the scan and its remedy is a larger limit, not a new index', () => {
+  const f = fixture();
+  const limits: Array<number | undefined> = [];
+  const limited = observeRefactorRecommendations(f.repo, {
+    env: f.env, importNodeLimit: 100,
+    discover: (_root, _provider, limit) => { limits.push(limit); return discovery({ codeFacts: { coverage: 'partial', reasonCodes: ['code-facts-import-limit'], edgeLimit: 100, importNodeCount: 6145 } }); },
+  });
+  expect(limits).toEqual([100]);
+  expect(limited).toMatchObject({ status: 'proof_required', candidates: [] });
+  expect(limited.message).toContain('6145 import nodes');
+  expect(limited.message).toContain('limit of 100');
+  expect(limited.message).toContain('`rh arch refactor recommendations --import-node-limit <n>`');
+  expect(limited.message).toContain('`rh arch refactor decide`');
+  expect(limited.message).not.toContain('codegraph init');
+  observeRefactorRecommendations(f.repo, { env: f.env, discover: (_root, _provider, limit) => { limits.push(limit); return discovery(); } });
+  expect(limits).toEqual([100, undefined]);
+});
+
+test('a provider error keeps its code, reasonCode, action and full message', () => {
+  const f = fixture();
+  const message = `repository state is stale: ${'x'.repeat(1500)}`;
+  const failed = observeRefactorRecommendations(f.repo, { env: f.env, discover: () => { throw new RefactorProviderError('AC_REFACTOR_STALE', message, 'rerun-refactor-scan', 'refactor-measurement-changed'); } });
+  expect(failed).toMatchObject({ status: 'unavailable', candidates: [], code: 'AC_REFACTOR_STALE', reasonCode: 'refactor-measurement-changed', action: 'rerun-refactor-scan', message });
+  expect(formatRefactorRecommendations(failed)).toBe(`[RefactorRecommendations] unavailable: AC_REFACTOR_STALE: ${message} (reasonCode: refactor-measurement-changed) (action: rerun-refactor-scan)\n`);
+});
+
+test('a refactor scan timeout stays unavailable with its code and action', () => {
+  const f = fixture();
+  const message = 'archctx refactor scan timed out after 120000 ms. Retry with --timeout-ms <larger value> (max 600000).';
+  const failed = observeRefactorRecommendations(f.repo, { env: f.env, discover: () => { throw new RefactorProviderError('refactor_provider_timeout', message, 'raise-timeout-and-retry'); } });
+  expect(failed).toMatchObject({ status: 'unavailable', candidates: [], code: 'refactor_provider_timeout', action: 'raise-timeout-and-retry', message });
+  expect(formatRefactorRecommendations(failed)).toBe(`[RefactorRecommendations] unavailable: refactor_provider_timeout: ${message} (action: raise-timeout-and-retry)\n`);
+  const times: Array<number | undefined> = [];
+  observeRefactorRecommendations(f.repo, { env: f.env, timeoutMs: 300_000, discover: (_root, _provider, _limit, timeoutMs) => { times.push(timeoutMs); return discovery(); } });
+  expect(times).toEqual([300_000]);
+});
+
+test('an unavailable provider or a missing model reports unavailable without a scan', () => {
+  const f = fixture();
+  const failed = observeRefactorRecommendations(f.repo, { env: f.env, discover: () => { throw new Error('archctx missing'); } });
+  expect(failed).toMatchObject({ status: 'unavailable', message: 'archctx missing' });
+  expect(failed.code).toBeUndefined();
+  rmSync(join(f.repo, '.archcontext'), { recursive: true });
+  expect(observeRefactorRecommendations(f.repo, { env: f.env, discover: () => { throw new Error('must not scan'); } }).status).toBe('unavailable');
+});
+
+test('forwards node and sorted-unique paths scopes and refuses conflicting or invalid scopes', () => {
+  const f = fixture();
+  const scopes: Array<RefactorScopeV1 | undefined> = [];
+  observeRefactorRecommendations(f.repo, {
+    env: f.env,
+    scope: { kind: 'node', nodeId: 'capability.runtime-harness.architecture' },
+    discover: (_root, _provider, _limit, _timeout, scope) => { scopes.push(scope); return discovery(); },
+  });
+  observeRefactorRecommendations(f.repo, {
+    env: f.env,
+    scope: { kind: 'paths', paths: ['src/b.ts', 'src/a.ts', 'src/b.ts'] },
+    discover: (_root, _provider, _limit, _timeout, scope) => { scopes.push(scope); return discovery(); },
+  });
+  expect(scopes).toEqual([
+    { kind: 'node', nodeId: 'capability.runtime-harness.architecture' },
+    { kind: 'paths', paths: ['src/a.ts', 'src/b.ts'] },
+  ]);
+  const badPath = observeRefactorRecommendations(f.repo, { env: f.env, scope: { kind: 'paths', paths: ['../escape.ts'] } });
+  expect(badPath).toMatchObject({ status: 'unavailable', code: 'refactor_invalid_scope' });
+
+  const command = buildRefactorCommand();
+  const recommendations = command.commands.find((entry) => entry.name() === 'recommendations')!;
+  recommendations.exitOverride();
+  recommendations.configureOutput({ writeOut: () => {}, writeErr: () => {} });
+  expect(() => recommendations.parse(['--node', 'capability.a', '--path', 'src/a.ts'], { from: 'user' })).toThrow();
+  expect(recommendations.options.map((option) => option.long)).toContain('--node');
+  expect(recommendations.options.map((option) => option.long)).toContain('--path');
+});

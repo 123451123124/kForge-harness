@@ -1,0 +1,14 @@
+schemaVersion: "archcontext.node/v2"
+id: "component.task-fleet.primary"
+kind: "component"
+name: "Fleet Commands"
+status: "active"
+parent: "capability.organization.task-fleet"
+layer: "cli"
+summary: "Owns the fleet command group: task messages, inbox, provider feedback and repository registration."
+responsibilities:
+  - "Parse the admitted inbox and feedback context of each fleet command and refuse unknown fields before any store read."
+  - "Register and prune repository registry rows only through the registry effects; no command scans directories."
+source:
+  include:
+    - src/cli/commands/fleet.ts

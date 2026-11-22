@@ -1,0 +1,163 @@
+// Strict, browser-safe decoder for GET /api/v1/dev-activity. Exact keys, closed
+// vocabularies, and no absolute-path-looking text outside `url`.
+
+import { decodeReaders } from '../evidence/decode-readers';
+import { isPublicDevActivityText, isPublicRepoPath } from '../public-projections/public-text';
+import { PULL_REQUEST_FILES_REASONS } from '../operator/pull-request-files';
+import {
+  DEV_ACTIVITY_ATTENTION_KINDS,
+  DEV_ACTIVITY_COLUMNS,
+  DEV_ACTIVITY_PROJECTION,
+  type DevActivitySnapshotV2,
+} from './types';
+
+const SOURCE_KINDS = ['git', 'github', 'runtime'];
+const SOURCE_STATUSES = ['ok', 'unavailable', 'stale', 'not_configured'];
+const HIDDEN_REASONS = ['closed_unmerged'];
+const CI_STATES = ['success', 'failure', 'pending', 'none'];
+const REVIEW_STATES = ['approved', 'changes_requested', 'review_required', 'none'];
+const PR_STATES = ['open', 'merged', 'closed'];
+const SNAPSHOT_STATUSES = ['ready', 'partial', 'unavailable'];
+
+export function unavailableDevActivitySnapshot(): DevActivitySnapshotV2 {
+  return {
+    projection_version: DEV_ACTIVITY_PROJECTION, status: 'unavailable', collected_at: null,
+    repositories: [], unreadable_registrations: 0, items: [], attention: [],
+  };
+}
+
+export function decodeDevActivitySnapshot(value: unknown): DevActivitySnapshotV2 {
+  const fail = (what: string): never => { throw new Error(`dev activity projection invalid: ${what}`); };
+  const { obj, nullable, bool, count, array } = decodeReaders(fail);
+  const text = (v: unknown, what: string): string => {
+    if (typeof v !== 'string' || !isPublicDevActivityText(v)) return fail(what);
+    return v;
+  };
+  // PR titles are public GitHub data and are shown verbatim, so they skip the path guard.
+  const verbatimNonEmpty = (v: unknown, what: string): string =>
+    (typeof v === 'string' && v.length > 0 ? v : fail(what));
+  const nonEmpty = (v: unknown, what: string): string => {
+    const s = text(v, what);
+    return s.length > 0 ? s : fail(what);
+  };
+  const time = (v: unknown, what: string): string => {
+    const s = text(v, what);
+    return Number.isFinite(Date.parse(s)) ? s : fail(what);
+  };
+  const oneOf = (v: unknown, values: readonly string[], what: string): string =>
+    (typeof v === 'string' && values.includes(v) ? v : fail(what));
+  const githubUrl = (v: unknown, what: string): string =>
+    (typeof v === 'string' && /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[^\s]*$/u.test(v) ? v : fail(what));
+  const repositoryId = (v: unknown): string =>
+    (typeof v === 'string' && /^repo_[0-9a-f]{16}$/u.test(v) ? v : fail('repository_id'));
+
+  const v = obj(value, ['projection_version', 'status', 'collected_at', 'repositories', 'unreadable_registrations', 'items', 'attention'], 'snapshot');
+  if (v.projection_version !== DEV_ACTIVITY_PROJECTION) fail('projection_version');
+  const status = oneOf(v.status, SNAPSHOT_STATUSES, 'status');
+  nullable(v.collected_at, x => time(x, 'collected_at'));
+  count(v.unreadable_registrations, 'unreadable_registrations');
+
+  const repositoryIds = new Set<string>();
+  for (const raw of array(v.repositories, 'repositories')) {
+    const r = obj(raw, ['repository_id', 'display_name', 'github', 'default_branch', 'sources'], 'repository');
+    const id = repositoryId(r.repository_id);
+    if (repositoryIds.has(id)) fail('duplicate repository');
+    repositoryIds.add(id);
+    nonEmpty(r.display_name, 'display_name');
+    nullable(r.github, x => (typeof x === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(x) ? x : fail('github')));
+    nullable(r.default_branch, x => nonEmpty(x, 'default_branch'));
+    const kinds = new Set<string>();
+    for (const rawSource of array(r.sources, 'sources')) {
+      const s = obj(rawSource, ['kind', 'status', 'reason', 'observed_at'], 'source');
+      const kind = oneOf(s.kind, SOURCE_KINDS, 'source kind');
+      if (kinds.has(kind)) fail('duplicate source');
+      kinds.add(kind);
+      oneOf(s.status, SOURCE_STATUSES, 'source status');
+      nullable(s.reason, x => (typeof x === 'string' && /^[a-z][a-z0-9_]{0,63}$/u.test(x) ? x : fail('source reason')));
+      nullable(s.observed_at, x => time(x, 'source observed_at'));
+    }
+  }
+
+  const itemIds = new Set<string>();
+  const itemHasPullRequest = new Map<string, boolean>();
+  for (const raw of array(v.items, 'items')) {
+    const i = obj(raw, ['id', 'repository_id', 'branch', 'title', 'column', 'hidden', 'column_since', 'worktrees',
+      'pull_request'], 'item');
+    const repo = repositoryId(i.repository_id);
+    if (!repositoryIds.has(repo)) fail('item repository');
+    const id = nonEmpty(i.id, 'item id');
+    if (!id.startsWith(`${repo}:`) || itemIds.has(id)) fail('item id');
+    itemIds.add(id);
+    const hasPullRequest = i.pull_request !== null;
+    itemHasPullRequest.set(id, hasPullRequest);
+    nonEmpty(i.branch, 'branch');
+    if (hasPullRequest) verbatimNonEmpty(i.title, 'title');
+    else nonEmpty(i.title, 'title');
+    oneOf(i.column, DEV_ACTIVITY_COLUMNS, 'column');
+    nullable(i.hidden, x => oneOf(x, HIDDEN_REASONS, 'hidden'));
+    nullable(i.column_since, x => time(x, 'column_since'));
+    for (const rawWorktree of array(i.worktrees, 'worktrees')) {
+      const w = obj(rawWorktree, ['directory', 'head_sha', 'dirty', 'ahead', 'behind'], 'worktree');
+      const directory = nonEmpty(w.directory, 'worktree directory');
+      if (directory.includes('/') || directory.includes('\\') || directory === '.' || directory === '..') fail('worktree directory');
+      if (typeof w.head_sha !== 'string' || !/^[0-9a-f]{40,64}$/u.test(w.head_sha)) fail('head_sha');
+      bool(w.dirty, 'dirty');
+      nullable(w.ahead, x => count(x, 'ahead'));
+      nullable(w.behind, x => count(x, 'behind'));
+    }
+    nullable(i.pull_request, x => {
+      const p = obj(x, ['number', 'title', 'url', 'state', 'is_draft', 'base_branch', 'merge_state', 'ci', 'review',
+        'updated_at', 'merged_at', 'closed_at', 'head_sha', 'changed_files'], 'pull_request');
+      if (count(p.number, 'pr number') < 1) fail('pr number');
+      if (typeof p.title !== 'string') fail('pr title');
+      githubUrl(p.url, 'pr url');
+      oneOf(p.state, PR_STATES, 'pr state');
+      bool(p.is_draft, 'is_draft');
+      nonEmpty(p.base_branch, 'base_branch');
+      if (typeof p.merge_state !== 'string' || !/^[A-Z_]{1,32}$/u.test(p.merge_state)) fail('merge_state');
+      nullable(p.ci, y => oneOf(y, CI_STATES, 'ci'));
+      if ((p.state === 'open') !== (p.ci !== null)) fail('ci');
+      oneOf(p.review, REVIEW_STATES, 'review');
+      time(p.updated_at, 'updated_at');
+      nullable(p.merged_at, y => time(y, 'merged_at'));
+      nullable(p.closed_at, y => time(y, 'closed_at'));
+      if ((p.state === 'merged') !== (p.merged_at !== null)) fail('merged_at');
+      // Only the open query asks gh for the head and the files; an open PR always says whether its list is complete.
+      nullable(p.head_sha, y => (typeof y === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(y) ? y : fail('pr head_sha')));
+      nullable(p.changed_files, y => {
+        const files = typeof y === 'object' && y !== null && (y as Record<string, unknown>).state === 'ok'
+          ? obj(y, ['state', 'paths'], 'changed_files') : obj(y, ['state', 'reason'], 'changed_files');
+        if (files.state === 'ok') {
+          const paths = array(files.paths, 'changed_files paths');
+          if (paths.some(path => typeof path !== 'string' || !isPublicRepoPath(path)) || new Set(paths).size !== paths.length) fail('changed_files paths');
+        } else if (files.state !== 'unavailable') fail('changed_files state');
+        else oneOf(files.reason, PULL_REQUEST_FILES_REASONS, 'changed_files reason');
+        return files;
+      });
+      if ((p.state === 'open') !== (p.changed_files !== null) || (p.state !== 'open' && p.head_sha !== null)) fail('pr head');
+      return p;
+    });
+  }
+
+  let previous = Number.NEGATIVE_INFINITY;
+  for (const raw of array(v.attention, 'attention')) {
+    const a = obj(raw, ['kind', 'subject_id', 'repository_id', 'summary', 'waiting_since', 'url', 'command'], 'attention');
+    oneOf(a.kind, DEV_ACTIVITY_ATTENTION_KINDS, 'attention kind');
+    const repo = repositoryId(a.repository_id);
+    if (!repositoryIds.has(repo)) fail('attention repository');
+    const subject = nonEmpty(a.subject_id, 'subject_id');
+    if (!itemIds.has(subject)) fail('attention subject');
+    // A PR-backed item's attention summary is the PR title, shown verbatim.
+    if (itemHasPullRequest.get(subject) === true) verbatimNonEmpty(a.summary, 'summary');
+    else text(a.summary, 'summary');
+    const at = Date.parse(time(a.waiting_since, 'waiting_since'));
+    if (at < previous) fail('attention order');
+    previous = at;
+    nullable(a.url, x => githubUrl(x, 'attention url'));
+    nullable(a.command, x => nonEmpty(x, 'command'));
+  }
+  if (status === 'unavailable' && ((v.repositories as unknown[]).length || (v.items as unknown[]).length || (v.attention as unknown[]).length)) {
+    fail('unavailable snapshot carries data');
+  }
+  return v as unknown as DevActivitySnapshotV2;
+}

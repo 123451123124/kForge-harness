@@ -1,0 +1,203 @@
+import { decodeRuntimeIdentity, decodeRuntimeObservation, projectRuntimeOverlay, runtimeIdentityKey, runtimeBindingKeys, runtimeInteger,
+  unavailableRuntimeOverlay, nativeRuntimeFreshness, RUNTIME_LIMIT, NATIVE_RUNTIME_SOURCE_LIMIT, type NativeRuntimeSourceSummary, type RuntimeIdentity, type RuntimeObservation, type RuntimeOverlay, type RuntimeUnavailableReason } from '../../core/operator/runtime-status';
+import { HcVersionMismatchError } from '../../core/terminal/herdr-pin';
+import { decodeRuntimeCaptureSnapshot, type NativeRuntimeProvider, type RuntimeCaptureSnapshot } from '../../core/operator/runtime-capture';
+import { hcStatusClass } from '../../core/board/desk';
+
+/**
+ * Select only the hc status word of the bound terminal. No title, cwd or text inference. A terminal without a
+ * status report, or with a word outside these, is unknown: never idle.
+ */
+export function observeHcTerminal(value: unknown, binding: RuntimeIdentity): RuntimeObservation | null {
+  const identity = decodeRuntimeIdentity(binding);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const terminal = value as Record<string, unknown>;
+  if (terminal.terminal_id !== identity.terminal_id) return null;
+  const status = hcStatusClass(typeof terminal.status === 'string' ? terminal.status : null);
+  const states = {
+    idle: 'idle', working: 'working', blocked: 'blocked', done: 'done-unseen',
+    error: 'unknown', unreported: 'unknown', other: 'unknown',
+  } as const;
+  const state = states[status];
+  return decodeRuntimeObservation({ identity, revision: runtimeInteger(terminal.revision), state, reason: 'unknown', changed_at: null, source: 'hc-status' });
+}
+export type RuntimeInvalidation = 'updated' | 'reconnect' | 'events_lost' | 'disconnected' | { type: 'failure'; error: unknown };
+export interface RuntimeSnapshot {
+  bindings: readonly RuntimeIdentity[]; observations: readonly RuntimeObservation[]; unclaimed?: number;
+}
+/** A configured transport supplies bounded structured data, never subprocess output. */
+export interface RuntimeSource {
+  subscribe(invalidate: (event: RuntimeInvalidation) => void): Promise<() => void>;
+  snapshot(epoch: number): Promise<RuntimeSnapshot>;
+}
+
+/** Preserve only the typed public version facts, never an arbitrary error message. */
+export function runtimeUnavailableReason(error: unknown): RuntimeUnavailableReason | null {
+  if (!(error instanceof HcVersionMismatchError)) return null;
+  const { expected, actual } = error.check;
+  return { code: 'hc_version_mismatch', expected: { min_version: expected.min_version }, actual: { version: actual.version } };
+}
+
+/** Explicit lifecycle outside GET. Events invalidate snapshots; they never update task state. */
+export function createRuntimeStatusObserver(source: RuntimeSource, now: () => number = Date.now) {
+  let lifecycle = 0;
+  let epoch = 0, version = 0, connected = false, started = false, subscribed = false, stopSubscription: (() => void) | null = null;
+  let last: { snapshot: RuntimeSnapshot; at: string } | null = null;
+  let pending: Promise<void> | null = null;
+  let failed = false, reason: RuntimeUnavailableReason | null = null;
+  const revisions = new Map<string, RuntimeObservation[]>();
+  function invalidate(event: RuntimeInvalidation) {
+    if (!started) return;
+    version++;
+    failed = true;
+    if (typeof event === 'object') { connected = false; reason = runtimeUnavailableReason(event.error); return; }
+    if (event !== 'updated') reason = null;
+    if (event === 'reconnect' || event === 'events_lost') { epoch++; last = null; revisions.clear(); }
+    connected = event !== 'disconnected';
+    if (subscribed && connected) void Promise.resolve().then(refresh);
+  }
+  async function collect(owner: number) {
+    // Bound event storms. Unstable data is not published. A caller can retry later.
+    for (let retry = 0; retry < 3 && connected && started && owner === lifecycle; retry++) {
+      const readVersion = version, readEpoch = epoch;
+      try {
+        const snapshot = await source.snapshot(readEpoch);
+        if (readVersion !== version || readEpoch !== epoch || !connected || !started || owner !== lifecycle) continue;
+        const at = new Date(now()).toISOString();
+        // Validate all input before updating the cache or revision fence.
+        projectRuntimeOverlay(snapshot.bindings, snapshot.observations, at, epoch, now(), true, snapshot.unclaimed ?? 0);
+        const next = new Map<string, RuntimeObservation[]>();
+        const bound = runtimeBindingKeys(snapshot.bindings), unclaimed: RuntimeObservation[] = [];
+        for (const raw of snapshot.observations) {
+          const observation = decodeRuntimeObservation(raw), key = runtimeIdentityKey(observation.identity);
+          if (!bound.has(key) || observation.identity.source_epoch !== epoch) { unclaimed.push(observation); continue; }
+          const group = next.get(key) ?? [];
+          if (!group.length || observation.revision > group[0].revision) next.set(key, [observation]);
+          else if (observation.revision === group[0].revision && !group.some(old => JSON.stringify(old) === JSON.stringify(observation))) {
+            // Two variants suffice to keep this revision ambiguous.
+            if (group.length < 2) group.push(observation);
+          }
+        }
+        for (const [key, incoming] of next) {
+          const old = revisions.get(key);
+          if (!old) continue;
+          if (old[0].revision > incoming[0].revision) next.set(key, old);
+          else if (old[0].revision === incoming[0].revision) {
+            const variants = [...old, ...incoming].filter((item, index, all) => all.findIndex(other => JSON.stringify(other) === JSON.stringify(item)) === index);
+            next.set(key, variants.slice(0, 2));
+          }
+        }
+        const observations = [...unclaimed, ...[...next.values()].flat()];
+        projectRuntimeOverlay(snapshot.bindings, observations, at, epoch, now(), true, snapshot.unclaimed ?? 0);
+        const retained = new Map([...revisions, ...next]);
+        if (retained.size > RUNTIME_LIMIT) throw new Error('runtime_revision_limit');
+        last = { snapshot: { bindings: snapshot.bindings.map(decodeRuntimeIdentity), observations, unclaimed: snapshot.unclaimed ?? 0 }, at };
+        revisions.clear(); for (const [key, group] of retained) revisions.set(key, group);
+        failed = false; reason = null; return;
+      } catch (error) {
+        if (owner === lifecycle && started) {
+          failed = true;
+          if (readVersion === version && readEpoch === epoch) reason = runtimeUnavailableReason(error);
+        }
+        return;
+      }
+    }
+    if (owner === lifecycle && started) { failed = true; reason = null; }
+  }
+  function refresh(): Promise<void> {
+    if (!started || !connected || !subscribed) return Promise.resolve();
+    if (!pending) {
+      const request = collect(lifecycle).finally(() => { if (pending === request) pending = null; });
+      pending = request;
+    }
+    return pending;
+  }
+  return {
+    async start() {
+      if (started) throw new Error('runtime_already_started');
+      if (lifecycle > 0) { epoch++; version++; last = null; revisions.clear(); }
+      const owner = ++lifecycle;
+      started = true; connected = true; subscribed = false; reason = null;
+      try {
+        const close = await source.subscribe(event => { if (owner === lifecycle && started) invalidate(event); });
+        if (owner !== lifecycle || !started) { close(); return; }
+        stopSubscription = close; subscribed = true; await refresh();
+      } catch (error) {
+        if (owner === lifecycle) { started = false; subscribed = false; connected = false; failed = true; reason = runtimeUnavailableReason(error); }
+      }
+    },
+    refresh,
+    invalidate,
+    read(): RuntimeOverlay {
+      if (!last) return unavailableRuntimeOverlay(epoch, structuredClone(reason));
+      const overlay = projectRuntimeOverlay(last.snapshot.bindings, last.snapshot.observations, last.at, epoch, now(), connected, last.snapshot.unclaimed ?? 0);
+      return failed ? { ...overlay, status: 'unavailable', reason: structuredClone(reason) } : overlay;
+    },
+    stop() { lifecycle++; version++; started = false; subscribed = false; connected = false; failed = true; reason = null; pending = null; stopSubscription?.(); stopSubscription = null; },
+  };
+}
+
+export interface NativeRuntimeSource {
+  source_id: string; provider: NativeRuntimeProvider;
+  snapshot(): Promise<RuntimeCaptureSnapshot>;
+}
+interface NativeRuntimeFence {
+  generation: string; sequence: number; content: string; rejected_through: number;
+  retired: Set<string>;
+}
+/** Native sources have separate clocks and no dispatch binding authority. */
+export function createNativeRuntimeStatusObserver(sources: readonly NativeRuntimeSource[], now: () => number = Date.now) {
+  if (!sources.length || sources.length > NATIVE_RUNTIME_SOURCE_LIMIT || new Set(sources.map(s => s.source_id)).size !== sources.length) throw new Error('runtime_native_sources');
+  const fences = new Map<string, NativeRuntimeFence>();
+  const unavailable = (source: NativeRuntimeSource): NativeRuntimeSourceSummary => ({ source_id: source.source_id, provider: source.provider,
+    generation: null, capture_status: 'unavailable', heartbeat_at: null, freshness: 'unavailable', observations: [] });
+  let summaries = sources.map(unavailable), observedAt: string | null = null;
+  let started = false, stopped = false, pending: Promise<void> | null = null;
+  async function collect() {
+    const next: NativeRuntimeSourceSummary[] = [];
+    for (const source of sources) {
+      if (stopped) return;
+      try {
+        const snapshot = decodeRuntimeCaptureSnapshot(await source.snapshot()), clock = now();
+        if (stopped) return;
+        if (snapshot.source_id !== source.source_id || snapshot.provider !== source.provider) throw new Error('runtime_native_identity');
+        const old = fences.get(source.source_id), content = JSON.stringify(snapshot);
+        if (old) {
+          if (snapshot.generation !== old.generation) {
+            if (old.retired.has(snapshot.generation) || old.retired.size >= RUNTIME_LIMIT) throw new Error('runtime_native_generation');
+          } else {
+            if (snapshot.sequence < old.sequence || (snapshot.sequence === old.sequence && content !== old.content)) {
+              old.rejected_through = Math.max(old.rejected_through, old.sequence);
+              throw new Error('runtime_native_sequence');
+            }
+            if (snapshot.sequence <= old.rejected_through) throw new Error('runtime_native_sequence');
+          }
+        }
+        if (Date.parse(snapshot.heartbeat_at) > clock || snapshot.observations.some(o => Date.parse(o.event_received_at) > clock || (o.changed_at !== null && Date.parse(o.changed_at) > clock))) throw new Error('runtime_native_future');
+        const retired = old?.retired ?? new Set<string>();
+        if (old && old.generation !== snapshot.generation) retired.add(old.generation);
+        fences.set(source.source_id, { generation: snapshot.generation, sequence: snapshot.sequence, content, retired,
+          rejected_through: old?.generation === snapshot.generation ? old.rejected_through : -1 });
+        next.push({ source_id: snapshot.source_id, provider: snapshot.provider, generation: snapshot.generation,
+          capture_status: snapshot.capture_status, heartbeat_at: snapshot.heartbeat_at,
+          freshness: nativeRuntimeFreshness(snapshot, clock), observations: snapshot.capture_status === 'unavailable' ? [] : snapshot.observations });
+      } catch { next.push(unavailable(source)); }
+    }
+    if (!stopped) { summaries = next; observedAt = new Date(now()).toISOString(); }
+  }
+  function refresh(): Promise<void> {
+    if (!started || stopped) return Promise.resolve();
+    if (!pending) pending = collect().finally(() => { pending = null; });
+    return pending;
+  }
+  return {
+    async start() { if (started || stopped) throw new Error('runtime_already_started'); started = true; await refresh(); },
+    refresh,
+    read(): RuntimeOverlay {
+      const native_sources = summaries.map(source => ({ ...structuredClone(source), freshness: stopped ? 'unavailable' as const : nativeRuntimeFreshness(source, now()) }));
+      return { ...unavailableRuntimeOverlay(), status: !stopped && native_sources.some(s => s.freshness === 'fresh' || s.freshness === 'stale') ? 'ready' : 'unavailable',
+        observed_at: observedAt, native_sources };
+    },
+    stop() { stopped = true; },
+  };
+}

@@ -1,0 +1,175 @@
+// Development fixtures for GET /api/v1/setup. Shapes follow
+// src/core/setup/types.ts; every fixture passes the same decoder the browser
+// applies to served snapshots. Names and summaries mirror the real catalog,
+// route registry and agent fleet so the pages read like a real machine.
+
+import { unavailableSetupSnapshot } from '../../core/setup/decode';
+import type {
+  SetupFleetRole,
+  SetupHookEvent,
+  SetupHostSkillRoot,
+  SetupSkill,
+  SetupSkillHostRow,
+  SetupSnapshotV2,
+} from '../../core/setup/types';
+
+const ok = (state: 'ok link' | 'ok copy' = 'ok link'): SetupSkillHostRow => ({ state, ok: true });
+const bad = (state: SetupSkillHostRow['state']): SetupSkillHostRow => ({ state, ok: false });
+
+const HOOKS: SetupHookEvent[] = [
+  { event: 'SessionStart', routes: [{ route_id: 'default', matcher: null, hosts: ['claude', 'codex'] }] },
+  { event: 'PreToolUse', routes: [
+    { route_id: 'edit', matcher: 'Edit|Write', hosts: ['claude', 'codex'] },
+    { route_id: 'subagent', matcher: 'Agent', hosts: ['claude'] },
+  ] },
+  { event: 'UserPromptSubmit', routes: [
+    { route_id: 'inbox', matcher: null, hosts: ['claude', 'codex'] },
+  ] },
+  { event: 'SubagentStart', routes: [{ route_id: 'context', matcher: null, hosts: ['codex'] }] },
+  { event: 'Stop', routes: [{ route_id: 'default', matcher: null, hosts: ['claude', 'codex'] }] },
+];
+
+const SUMMARY: Readonly<Record<string, string>> = {
+  'repo-harness': 'Root router Skill; canonical entrypoint synced unconditionally to both hosts regardless of install profile.',
+  'repo-harness-setup': 'Canonical rule owner for installing, migrating, upgrading, repairing, scaffolding, and capability-configuring repo-harness.',
+  'repo-harness-check': 'Plan or review scoped work. Assess recorded verification and risk.',
+  'repo-harness-test': 'Testing router for the repo-harness source checkout: test selection, execution and CI lanes.',
+  'repo-harness-ship': 'Validates finished worktrees, commits through finish --no-merge, pushes branches, and creates GitHub PRs by default.',
+  'repo-harness-architecture': 'Inspects or updates an assigned architecture model, document or Mermaid diagram without refreshing the harness. A real responsibility change goes through a model ChangeSet and archctx projection.',
+  'obsidian-memory': "Cross-project long-term memory over the user's Obsidian brain vault.",
+  herdr: 'Required Herdr control skill. Install the hc manual from hc --skill under the repo-harness caller-context policy for both hosts.',
+  think: 'Waza planning skill: turns rough ideas into approved, decision-complete plans.',
+  hunt: 'Waza root-cause debugging skill.',
+};
+
+function skill(name: string, claude: SetupSkillHostRow | null, codex: SetupSkillHostRow | null): SetupSkill {
+  return { name, summary: SUMMARY[name] ?? null, catalog_hosts: ['claude', 'codex', 'pi'], hosts: { claude, codex, pi: null } };
+}
+
+/** Pi is not installed, so its root does not exist. */
+const SKILL_ROOTS: SetupHostSkillRoot[] = [
+  { host: 'claude', root: '~/.claude/skills', other_skills: ['frontend-design', 'pdf'] },
+  { host: 'codex', root: '~/.codex/skills', other_skills: [] },
+  { host: 'pi', root: '~/.pi/agent/skills', other_skills: null },
+];
+
+function readySkills(): SetupSkill[] {
+  return [
+    skill('repo-harness', ok(), ok()),
+    skill('repo-harness-setup', ok(), ok()),
+    skill('repo-harness-check', ok(), ok()),
+    skill('repo-harness-test', ok(), ok()),
+    skill('repo-harness-ship', ok(), ok()),
+    skill('repo-harness-architecture', ok(), ok()),
+    skill('obsidian-memory', ok(), ok()),
+    skill('herdr', ok('ok copy'), ok('ok copy')),
+    skill('think', ok('ok copy'), ok('ok copy')),
+    skill('hunt', ok('ok copy'), ok('ok copy')),
+  ];
+}
+
+const FLEET: readonly (Omit<SetupFleetRole, 'hosts'>)[] = [
+  { name: 'deep-reasoner', model: 'opus', effort: 'xhigh', description: 'Architecture research and judgment executor on Opus at xhigh effort.' },
+  { name: 'explorer', model: 'sonnet', effort: 'medium', description: 'Read-only codebase explorer on Sonnet at medium effort.' },
+  { name: 'harness-evaluator', model: 'opus', effort: 'high', description: 'Disposable-state harness behavior evaluator on Opus at high effort.' },
+];
+
+
+export function readySetup(now: number): SetupSnapshotV2 {
+  return {
+    projection_version: 'repo-harness.setup.v2', status: 'ready', reason: null,
+    collected_at: new Date(now - 3 * 60_000).toISOString(),
+    setup_status: 'attention',
+    summary: { ok: 33, warn: 1, fail: 0, na: 3, needs_agent: 1 },
+    checks: [
+      {
+        id: 'runtime.skills_cli', status: 'warn', title: 'Runtime capability: skills_cli',
+        detail: 'missing (optional); owner=external-skills-cli; required_for=Waza and Mermaid external skill bootstrap',
+        command: 'bunx skills --version',
+      },
+      {
+        id: 'doctor.security-config', status: 'needs_agent', title: 'Local hook and VS Code automatic task security scan',
+        detail: '2 finding(s): 0 high, 2 warn, 0 fail\nfirst=unmanaged-hook-command at [private path]',
+        command: 'rh security scan --json',
+      },
+    ],
+    hosts: [
+      { host: 'claude', reported: true, adapter_check: 'ok', detected: true, cli_version: null,
+        adapter: { configured: true, managed_entries: 5, expected_entries: 5, projection: 'consistent', projection_error: null, mismatches: [] } },
+      { host: 'codex', reported: true, adapter_check: 'ok', detected: true, cli_version: '0.162.0',
+        adapter: { configured: true, managed_entries: 5, expected_entries: 5, projection: 'consistent', projection_error: null, mismatches: [] } },
+      { host: 'pi', reported: true, adapter_check: null, detected: false, cli_version: null, adapter: null, package_check: 'na' },
+    ],
+    skills: readySkills(),
+    skill_roots: SKILL_ROOTS,
+    install_selection: 'all',
+    hooks: HOOKS,
+    hook_usage: null,
+    fleet: FLEET.map(role => ({ ...role, hosts: { claude: 'installed', codex: 'installed', pi: null } })),
+  };
+}
+
+/** The last good read is 25 minutes old, the newest run timed out, and the machine has drifted. */
+export function degradedSetup(now: number): SetupSnapshotV2 {
+  const skills = readySkills();
+  const replace = (name: string, next: SetupSkill) => { skills[skills.findIndex(row => row.name === name)] = next; };
+  replace('repo-harness-ship', skill('repo-harness-ship', ok(), bad('missing')));
+  replace('herdr', skill('herdr', bad('stale copy'), ok('ok copy')));
+  replace('obsidian-memory', skill('obsidian-memory', bad('dangling link'), ok()));
+  replace('think', skill('think', bad('ok copy'), ok('ok copy')));
+  return {
+    projection_version: 'repo-harness.setup.v2', status: 'stale', reason: 'setup_check_timeout',
+    collected_at: new Date(now - 25 * 60_000).toISOString(),
+    setup_status: 'blocked',
+    summary: { ok: 28, warn: 2, fail: 2, na: 3, needs_agent: 1 },
+    checks: [
+      {
+        id: 'runtime.skills_cli', status: 'warn', title: 'Runtime capability: skills_cli',
+        detail: 'missing (optional); owner=external-skills-cli', command: null,
+      },
+      {
+        id: 'status.adapter.codex', status: 'warn', title: 'Codex global hook adapter',
+        detail: '4/5 managed entries at [private path]\nprojection drift: 3 mismatches',
+        command: 'rh install --host codex',
+      },
+      {
+        id: 'doctor.skill-projection', status: 'fail', title: 'Host skills match their source and install ledger',
+        detail: 'codex repo-harness-ship: missing\nclaude herdr: stale copy\nclaude obsidian-memory: dangling link',
+        command: 'repo-harness skills sync',
+      },
+      {
+        id: 'tooling.agent_fleet', status: 'fail', title: 'External tooling: agent_fleet',
+        detail: 'missing; codex lacks harness-evaluator', command: 'rh install --host codex',
+      },
+      {
+        id: 'doctor.security-config', status: 'needs_agent', title: 'Local hook and VS Code automatic task security scan',
+        detail: '2 finding(s): 0 high, 2 warn, 0 fail', command: 'rh security scan --json',
+      },
+    ],
+    hosts: [
+      { host: 'claude', reported: true, adapter_check: 'ok', detected: true, cli_version: null,
+        adapter: { configured: true, managed_entries: 5, expected_entries: 5, projection: null, projection_error: null, mismatches: [] } },
+      { host: 'codex', reported: true, adapter_check: 'warn', detected: true, cli_version: '0.162.0',
+        adapter: { configured: true, managed_entries: 4, expected_entries: 5, projection: 'drift', projection_error: null, mismatches: [
+          { kind: 'missing', event: 'SubagentStart', route_id: 'context', field: null },
+          { kind: 'field-mismatch', event: 'Stop', route_id: 'default', field: 'timeout' },
+          { kind: 'unexpected', event: 'PreToolUse', route_id: null, field: null },
+        ] } },
+      { host: 'pi', reported: true, adapter_check: null, detected: false, cli_version: null, adapter: null, package_check: 'na' },
+    ],
+    skills,
+    skill_roots: SKILL_ROOTS,
+    install_selection: ['architecture', 'product'],
+    hooks: HOOKS,
+    hook_usage: null,
+    fleet: FLEET.map(role => ({
+      ...role,
+      hosts: { claude: 'installed', codex: role.name === 'harness-evaluator' ? 'missing' : 'installed', pi: null },
+    })),
+  };
+}
+
+/** The first background run has not finished. */
+export function loadingSetup(): SetupSnapshotV2 {
+  return unavailableSetupSnapshot('collection_pending');
+}

@@ -1,0 +1,16 @@
+schemaVersion: archcontext.node/v2
+id: component.evals-checks.primary
+kind: component
+name: "Verification Check Execution"
+status: active
+parent: capability.verification.evals-checks
+layer: "scripts"
+summary: "Executes the Verification Plan of the current review admission with exact snapshot, process result and evidence binding."
+responsibilities:
+  - Run the admitted Verification Plan through the verification-plan CLI.
+  - Run each declared plan check in a bounded, detached process group with one absolute deadline.
+  - Refuse evidence-producer commands inside the verifier before execution.
+source:
+  include:
+    - "scripts/verification-plan.ts"
+    - "scripts/verify-*.sh"

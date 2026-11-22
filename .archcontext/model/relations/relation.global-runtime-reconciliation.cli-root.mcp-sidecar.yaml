@@ -1,0 +1,6 @@
+schemaVersion: archcontext.relation/v1
+id: relation.global-runtime-reconciliation.cli-root.mcp-sidecar
+kind: calls
+source: component.global-runtime-reconciliation.cli-root
+target: capability.runtime-harness.mcp-sidecar
+intent: "Guard mcp serve and doctor on the mcp selection, load their actions after the guard, and list the MCP log roots for retention only when the plugin is selected"

@@ -1,0 +1,447 @@
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import type { Json } from 'archctx-contracts';
+import type { ModuleDetailV1, ModuleIndexV1, ModuleState } from '../core/architecture/module-view';
+import type { ModuleReviewPromptV1 } from '../core/review/module-review-prompt';
+import {
+  ARCHITECTURE_CAPABILITY_ID,
+  ARCHITECTURE_REFACTOR_STATUS_ORDER,
+  decodeArchitectureModuleDetail,
+  decodeArchitectureModuleIndex,
+  decodeArchitectureRefactorDecisions,
+  decodeArchitectureReviewPrompt,
+  type ArchitectureRefactorDecisionsV1,
+} from '../core/operator/architecture';
+import { ArchitectureHistory, type ArchitectureRefusal, type HistoryReader, type HistorySummary } from './ArchitectureHistory';
+import { ArchitectureMap, type ArchitectureSelect, type ArchitectureSelections, type ArchitectureBaseMap, type ArchitectureMapReader, type ArchitectureMapSummary } from './ArchitectureMap';
+import type { OperatorMessageKey, OperatorTranslate } from './i18n';
+import { ModuleGraph } from './ModuleGraph';
+import { answered, useObservationRefresh } from './useObservationRefresh';
+import { CopyButton } from './ui';
+
+/** A typed failure code from the route, or `null` when the body carries none. The board shows it and never parses messages. */
+function failureCode(body: unknown): string | null {
+  const code = (body as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && /^[a-z][a-z0-9_]{0,63}$/u.test(code) ? code : null;
+}
+
+/**
+ * Conditional read for the architecture routes. `null` means 304: the body the
+ * caller already shows is current, so the caller must not update state.
+ * A request with no typed answer rejects.
+ */
+export async function fetchArchitecture(path: string, etag: string | null, signal: AbortSignal): Promise<{ body: unknown; etag: string | null } | ArchitectureRefusal | null> {
+  const response = await fetch(path, { signal, cache: 'no-store', headers: etag === null ? {} : { 'If-None-Match': etag } });
+  if (response.status === 304) return null;
+  let body: unknown = null;
+  try { body = await response.json(); } catch { body = null; }
+  if (!response.ok) {
+    const reason = failureCode(body);
+    if (reason === null) throw new Error('unavailable');
+    return { state: 'unavailable', reason };
+  }
+  return { body, etag: response.headers.get('ETag') };
+}
+
+interface Read<T> { readonly path: string | null; readonly value: T | null; readonly error: string | null }
+
+/** Polls one path. The ETag belongs to the value on screen, so a 304 never shows another path's data. */
+function useArchitectureRead<T>(path: string | null, decode: (value: unknown) => T, generation: number): Read<T> {
+  const [read, setRead] = useState<Read<T>>({ path: null, value: null, error: null });
+  const shown = useRef<{ path: string; etag: string } | null>(null);
+  const request = useCallback(async (signal: AbortSignal): Promise<boolean> => {
+    if (path === null) return false;
+    const fail = (code: string) => {
+      // A failure on another path drops the shown body, so its ETag must go too.
+      if (shown.current?.path !== path) shown.current = null;
+      setRead(current => ({ path, value: current.path === path ? current.value : null, error: code }));
+    };
+    try {
+      const result = await fetchArchitecture(path, shown.current?.path === path ? shown.current.etag : null, signal);
+      if (signal.aborted) return false;
+      if (result === null) {
+        // Same object when there is no error to clear, so React skips the render.
+        setRead(current => current.error === null ? current : { ...current, error: null });
+        return true;
+      }
+      if ('state' in result) {
+        fail(result.reason);
+        return answered(result);
+      }
+      const value = decode(result.body);
+      shown.current = result.etag === null ? null : { path, etag: result.etag };
+      setRead({ path, value, error: null });
+      return true;
+    } catch (error) {
+      if (signal.aborted) return false;
+      fail(error instanceof Error && /^[a-z][a-z0-9_]{0,63}$/u.test(error.message) ? error.message : 'unavailable');
+      return false;
+    }
+  }, [path, decode]);
+  useObservationRefresh(request, JSON.stringify([path, generation]), { enabled: path !== null });
+  return read.path === path ? read : { path, value: null, error: null };
+}
+
+function repositoryPath(repositoryId: string): string {
+  return `/api/v1/repositories/${encodeURIComponent(repositoryId)}/architecture/modules`;
+}
+function historyPath(repositoryId: string): string {
+  return `/api/v1/repositories/${encodeURIComponent(repositoryId)}/architecture/history`;
+}
+function refactorPath(repositoryId: string): string {
+  return `/api/v1/repositories/${encodeURIComponent(repositoryId)}/architecture/refactor`;
+}
+
+/** The exact command the Bot runs for the shard on screen. */
+export function reviewPromptCommand(prompt: Pick<ModuleReviewPromptV1, 'capability_id' | 'shard' | 'mode' | 'base' | 'head'>): string {
+  const command = `rh arch module review-prompt ${prompt.capability_id} --shard ${prompt.shard.index}`;
+  return prompt.mode === 'diff' ? `${command} --base ${prompt.base} --head ${prompt.head}` : command;
+}
+
+function ReadStatus({ read, loading, t }: { readonly read: Read<unknown>; readonly loading: OperatorMessageKey; readonly t: OperatorTranslate }) {
+  if (read.error !== null) {
+    return <p className="architecture-notice" role="alert" data-error-code={read.error}>
+      {t(read.value === null ? 'architecture.failed' : 'architecture.refreshFailed', { code: read.error })}
+    </p>;
+  }
+  return read.value === null ? <p role="status">{t(loading)}</p> : null;
+}
+
+const STATE_TONE: Readonly<Record<string, string>> = {
+  valid: 'tone-ok', fresh: 'tone-ok', present: 'tone-ok', invalid: 'tone-danger', stale: 'tone-user', pending: 'tone-user', unknown: 'tone-unknown',
+};
+
+/** Three separate facts. They are never merged into one synced state. */
+function ModuleStates({ state, t }: { readonly state: ModuleState; readonly t: OperatorTranslate }) {
+  return <ul className="module-states" aria-label={t('architecture.states')}>
+    {(['model_valid', 'generated_summary', 'section3'] as const).map(kind => (
+      <li key={kind} className={`operator-badge ${STATE_TONE[state[kind]]}`} data-state-kind={kind} data-state-value={state[kind]}>
+        {t(`architecture.state.${kind}`)}: <strong>{t(`architecture.value.${state[kind]}`)}</strong>
+      </li>
+    ))}
+  </ul>;
+}
+
+function ModuleList({ index, onModule, t }: { readonly index: ModuleIndexV1; readonly onModule: (id: string) => void; readonly t: OperatorTranslate }) {
+  const domains = new Map<string, ModuleIndexV1['modules']>();
+  for (const module of index.modules) domains.set(module.domain, [...(domains.get(module.domain) ?? []), module]);
+  if (domains.size === 0) return <p className="empty-inline">{t('architecture.empty')}</p>;
+  return <div className="module-domains">
+    {[...domains].map(([domain, modules]) => (
+      <section key={domain} className="module-domain" data-domain={domain} aria-labelledby={`domain-${domain}`}>
+        <h3 id={`domain-${domain}`}>{domain} <span>{modules.length}</span></h3>
+        <ul>
+          {modules.map(module => <li key={module.id} className="module-row" data-module-id={module.id}>
+            <button type="button" className="module-row__open" onClick={() => onModule(module.id)}>
+              <strong>{module.name}</strong>
+              <code>{module.id}</code>
+            </button>
+            <span className="module-row__meta">{module.status} · {t('architecture.components', { count: module.components })}</span>
+            <ModuleStates state={module.state} t={t} />
+          </li>)}
+        </ul>
+      </section>
+    ))}
+  </div>;
+}
+
+function ReviewPromptPanel({ base, generation, t }: { readonly base: string; readonly generation: number; readonly t: OperatorTranslate }) {
+  const [shard, setShard] = useState(1);
+  const read = useArchitectureRead(`${base}/review-prompt?shard=${shard}`, decodeArchitectureReviewPrompt, generation);
+  const prompt = read.value;
+  const command = prompt ? reviewPromptCommand(prompt) : null;
+  return <section className="architecture-card review-prompt" aria-labelledby="review-prompt-heading">
+    <h3 id="review-prompt-heading">{t('architecture.prompt.title')}</h3>
+    <p className="detail-quiet">{t('architecture.prompt.boundary')}</p>
+    <ReadStatus read={read} loading="architecture.prompt.loading" t={t} />
+    {prompt && command && <>
+      <dl className="detail-list">
+        <div><dt>{t('architecture.prompt.digest')}</dt><dd><code className="mono-value review-prompt__digest">{prompt.digest}</code></dd></div>
+        <div><dt>{t('architecture.prompt.budget')}</dt><dd>{t('architecture.prompt.budgetValue', { used: prompt.budget.used_bytes, cap: prompt.budget.input_cap_bytes })}</dd></div>
+        <div><dt>{t('architecture.prompt.omitted')}</dt><dd>{prompt.budget.omitted_sections.length ? prompt.budget.omitted_sections.join(', ') : t('architecture.prompt.omittedNone')}</dd></div>
+        <div><dt><label htmlFor="review-prompt-shard">{t('architecture.prompt.shard')}</label></dt><dd>
+          <select id="review-prompt-shard" value={prompt.shard.index} onChange={event => setShard(Number(event.target.value))}>
+            {Array.from({ length: prompt.shard.count }, (_, index) => index + 1).map(index => (
+              <option key={index} value={index}>{t('architecture.prompt.shardOf', { index, count: prompt.shard.count })}</option>
+            ))}
+          </select>
+        </dd></div>
+      </dl>
+      {prompt.budget.incomplete && <p className="detail-quiet">{t('architecture.prompt.incomplete', { count: prompt.shard.count })}</p>}
+      <div className="copy-value review-prompt__command">
+        <code data-bot-command>{command}</code>
+        <CopyButton label={t('architecture.prompt.command')} value={command} t={t} />
+      </div>
+      <details className="review-prompt__text">
+        <summary>{t('architecture.prompt.text', { index: prompt.shard.index })}</summary>
+        <pre>{prompt.prompt}</pre>
+      </details>
+      <div className="review-prompt__actions">
+        <CopyButton label={t('architecture.prompt.textLabel', { index: prompt.shard.index })} value={prompt.prompt} t={t} />
+      </div>
+    </>}
+  </section>;
+}
+
+/** Flow steps and outcomes are model JSON. Only their string fields are shown, as text. */
+function field(value: Json, key: string): string | null {
+  const item = typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, Json>)[key] : undefined;
+  return typeof item === 'string' ? item : null;
+}
+
+function FlowLine({ value, outcome }: { readonly value: Json; readonly outcome: boolean }) {
+  const label = field(value, 'label') ?? field(value, 'id') ?? JSON.stringify(value);
+  const lead = outcome ? field(value, 'kind') : [field(value, 'from'), field(value, 'to')].every(Boolean) ? `${field(value, 'from')} → ${field(value, 'to')}` : null;
+  return <li>{lead && <code>{lead}</code>} {label}</li>;
+}
+
+function TextList({ items, empty }: { readonly items: readonly string[]; readonly empty: string }) {
+  return items.length ? <ul>{items.map((item, index) => <li key={index}>{item}</li>)}</ul> : <p className="detail-quiet">{empty}</p>;
+}
+
+function ModulePage({ detail, base, generation, onModule, t }: {
+  readonly detail: ModuleDetailV1;
+  readonly base: string;
+  readonly generation: number;
+  readonly onModule: (id: string) => void;
+  readonly t: OperatorTranslate;
+}) {
+  const { module } = detail;
+  const none = t('architecture.none');
+  return <article className="module-page" aria-labelledby="module-page-title">
+    <header className="module-page__header">
+      <p className="detail-eyebrow">{module.status} · <code>{module.id}</code></p>
+      <h2 id="module-page-title">{module.name}</h2>
+      <p>{module.summary}</p>
+      <ModuleStates state={detail.state} t={t} />
+    </header>
+    <ModuleGraph graph={detail.graph} onSelect={onModule} t={t} />
+    <div className="module-page__grid">
+      <section className="architecture-card" aria-labelledby="module-facts-heading">
+        <h3 id="module-facts-heading">{t('architecture.facts')}</h3>
+        <h4>{t('architecture.responsibilities')}</h4>
+        <TextList items={module.responsibilities} empty={none} />
+        <h4>{t('architecture.entrypoints')}</h4>
+        {module.entrypoints?.length ? <ul className="module-entrypoints">
+          {module.entrypoints.flatMap(entry => entry.symbols.map(symbol => <li key={`${entry.id}:${symbol.name}`}>
+            <code>{entry.path}</code> {symbol.name}
+            {symbol.sinks.map(sink => <span key={sink.id}> → <code>{sink.path}</code> {sink.symbol}</span>)}
+          </li>))}
+        </ul> : <p className="detail-quiet">{none}</p>}
+        <h4>{t('architecture.verification')}</h4>
+        {module.verification.length ? <ul>{module.verification.map(command => <li key={command}><code>{command}</code></li>)}</ul> : <p className="detail-quiet">{none}</p>}
+      </section>
+      <section className="architecture-card" aria-labelledby="module-flows-heading">
+        <h3 id="module-flows-heading">{t('architecture.flows')}</h3>
+        {detail.flows.length === 0 && <p className="detail-quiet">{none}</p>}
+        {detail.flows.map(flow => <div key={flow.id} className="module-flow">
+          <h4>{flow.name} <code>{flow.id}</code></h4>
+          {flow.applicability === 'not-applicable' ? <p>{t('architecture.flow.notApplicable', { rationale: flow.rationale })}</p> : <>
+            <p className="detail-eyebrow">{t('architecture.flow.steps')}</p>
+            <ul>{flow.steps.map((step, index) => <FlowLine key={index} value={step} outcome={false} />)}</ul>
+            <p className="detail-eyebrow">{t('architecture.flow.outcomes')}</p>
+            <ul>{flow.outcomes.map((outcome, index) => <FlowLine key={index} value={outcome} outcome />)}</ul>
+          </>}
+        </div>)}
+      </section>
+      <section className="architecture-card" aria-labelledby="module-section3-heading">
+        <h3 id="module-section3-heading">{t('architecture.section3')}</h3>
+        {detail.section3 === null ? <p className="detail-quiet">{t('architecture.section3.pending')}</p> : <pre className="module-section3">{detail.section3}</pre>}
+      </section>
+      <section className="architecture-card" aria-labelledby="module-docs-heading">
+        <h3 id="module-docs-heading">{t('architecture.docs')}</h3>
+        {detail.linked_docs.length === 0 ? <p className="detail-quiet">{t('architecture.docs.none')}</p>
+          : <ul className="module-docs">{detail.linked_docs.map(doc => <li key={doc.path}>
+            <code>{doc.path}</code> <span className="operator-badge tone-neutral">{doc.kind}</span> <span className="operator-badge tone-neutral">{doc.status ?? t('architecture.value.unknown')}</span>
+          </li>)}</ul>}
+      </section>
+      <ReviewPromptPanel key={module.id} base={base} generation={generation} t={t} />
+    </div>
+  </article>;
+}
+
+const REFACTOR_RECOMMENDATIONS_COMMAND = 'rh arch refactor recommendations';
+const REFACTOR_ACTIVE_STATUSES = new Set<string>(['accepted', 'acknowledged', 'deferred']);
+const REFACTOR_STATUS_TONE: Readonly<Record<typeof ARCHITECTURE_REFACTOR_STATUS_ORDER[number], string>> = {
+  accepted: 'tone-user',
+  acknowledged: 'tone-user',
+  deferred: 'tone-unknown',
+  resolved: 'tone-ok',
+  rejected: 'tone-neutral',
+  waived: 'tone-neutral',
+};
+
+function RefactorDecisionsView({ value, onModule, t }: {
+  readonly value: ArchitectureRefactorDecisionsV1;
+  readonly onModule: (id: string) => void;
+  readonly t: OperatorTranslate;
+}) {
+  const activeCount = value.counts.accepted + value.counts.acknowledged + value.counts.deferred;
+  const showRecommendationsHint = !value.adopted || value.decisions.length === 0 || activeCount > 0;
+  return <div className="architecture-map-view" data-refactor-view>
+    <ul className="module-states" data-refactor-counts>
+      {ARCHITECTURE_REFACTOR_STATUS_ORDER.map(status => (
+        <li key={status} className={`operator-badge ${REFACTOR_STATUS_TONE[status]}`} data-refactor-status={status}>
+          {t(`architecture.refactor.status.${status}`)}: <strong>{value.counts[status]}</strong>
+        </li>
+      ))}
+    </ul>
+    {showRecommendationsHint && <div className="copy-value">
+      <code data-refactor-command="recommendations">{REFACTOR_RECOMMENDATIONS_COMMAND}</code>
+      <CopyButton label={t('architecture.refactor.recommendationsCommand')} value={REFACTOR_RECOMMENDATIONS_COMMAND} t={t} />
+    </div>}
+    {!value.adopted ? <p className="empty-inline" data-refactor-empty="unadopted">{t('architecture.refactor.unadopted')}</p>
+      : value.decisions.length === 0 ? <p className="empty-inline" data-refactor-empty="none">{t('architecture.refactor.empty')}</p>
+      : <ul className="module-domains" data-refactor-decisions>
+        {value.decisions.map(item => {
+          const metrics = item.metrics ? Object.entries(item.metrics) : [];
+          return <li key={item.recommendation_id} className="architecture-card" data-refactor-decision={item.recommendation_id} data-status={item.status}>
+            <div className="module-states">
+              <span className={`operator-badge ${REFACTOR_STATUS_TONE[item.status]}`}>{t(`architecture.refactor.status.${item.status}`)}</span>
+              <code>{item.kind ?? item.category}</code>
+              <strong>{item.subject}</strong>
+              <code className="mono-value">{item.recommendation_id}</code>
+            </div>
+            {item.affected_node_ids.length > 0 && <div className="module-states" data-refactor-nodes>
+              {item.affected_node_ids.map(nodeId => ARCHITECTURE_CAPABILITY_ID.test(nodeId)
+                ? <button key={nodeId} type="button" className="module-row__open" onClick={() => onModule(nodeId)}><code>{nodeId}</code></button>
+                : <code key={nodeId}>{nodeId}</code>)}
+            </div>}
+            {metrics.length > 0 && <p className="mono-value" data-refactor-metrics>{metrics.map(([key, metric]) => `${key}=${metric ?? 'null'}`).join(' · ')}</p>}
+            <p data-refactor-reason>{item.reason}</p>
+            <p className="detail-quiet"><time dateTime={item.decided_at}>{item.decided_at}</time> · <code>{item.head_sha.slice(0, 7)}</code></p>
+            {REFACTOR_ACTIVE_STATUSES.has(item.status) && <div className="copy-value">
+              <code data-refactor-verify={item.recommendation_id}>{item.cli_verify_command}</code>
+              <CopyButton label={t('architecture.refactor.verifyCommand')} value={item.cli_verify_command} t={t} />
+            </div>}
+          </li>;
+        })}
+      </ul>}
+  </div>;
+}
+
+/**
+ * Read-only view of the committed architecture model. Every action is a command
+ * for the Bot to copy; the board sends no request that acts on it.
+ */
+/** Design order: the module base map (capabilities in domain groups), layers, sequence, topology, the module list, history, then refactor. */
+type ArchitectureView = 'map' | 'layers' | 'sequence' | 'topology' | 'modules' | 'history' | 'refactor';
+const ARCHITECTURE_VIEWS: readonly ArchitectureView[] = ['map', 'layers', 'sequence', 'topology', 'modules', 'history', 'refactor'];
+const BASE_MAPS: Readonly<Record<Exclude<ArchitectureView, 'modules' | 'history' | 'refactor'>, ArchitectureBaseMap>> = { map: 'modules', layers: 'layers', sequence: 'sequence', topology: 'topology' };
+
+/**
+ * The source of the view on screen, for the header row: the model commit (a map also has its
+ * collection time, branch and archctx version), or for History the pinned head and the milestones read.
+ */
+export type ArchitectureSource = ModelSource | HistorySummary;
+interface ModelSource { readonly commit: string; readonly map: MapSource | null }
+/** `headRef` is null for a detached HEAD. */
+interface MapSource { readonly collectedAt: string; readonly headRef: string | null; readonly archctxVersion: string }
+
+function ViewTabs({ view, counts, onChange, t }: {
+  readonly view: ArchitectureView;
+  /** Capabilities on the module map and flows on the sequence map once a map is read, and milestones once History is read. */
+  readonly counts: Partial<Record<ArchitectureView, number>>;
+  readonly onChange: (view: ArchitectureView) => void;
+  readonly t: OperatorTranslate;
+}) {
+  return <div className="architecture-tabs" role="tablist" aria-label={t('architecture.views')}>
+    {ARCHITECTURE_VIEWS.map((item, index) => (
+      <button key={item} type="button" role="tab" id={`architecture-tab-${item}`} aria-controls="architecture-view" aria-selected={view === item} tabIndex={view === item ? 0 : -1}
+        onClick={() => onChange(item)}
+        onKeyDown={event => {
+          if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft' && event.key !== 'Home' && event.key !== 'End') return;
+          const next = event.key === 'Home' ? 0 : event.key === 'End' ? ARCHITECTURE_VIEWS.length - 1
+            : (index + (event.key === 'ArrowRight' ? 1 : ARCHITECTURE_VIEWS.length - 1)) % ARCHITECTURE_VIEWS.length;
+          event.preventDefault(); onChange(ARCHITECTURE_VIEWS[next]!);
+          event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
+        }}
+      >{t(`architecture.view.${item}`)}{counts[item] !== undefined && <span className="architecture-tabs__count">{counts[item]}</span>}</button>
+    ))}
+  </div>;
+}
+
+/** The base-map selections of one repository and one shown map commit; another repository or commit empties them. */
+interface SelectionStore { readonly repositoryId: string; readonly commit: string | null; readonly selections: ArchitectureSelections }
+type StoreAction = { readonly type: 'select'; readonly select: ArchitectureSelect } | { readonly type: 'shown'; readonly repositoryId: string; readonly commit: string | null };
+function selectionStore(state: SelectionStore, action: StoreAction): SelectionStore {
+  if (action.type === 'select') return { ...state, selections: { ...state.selections, [action.select.view]: { scope: action.select.scope, id: action.select.id } } };
+  return action.repositoryId === state.repositoryId && action.commit === state.commit ? state : { repositoryId: action.repositoryId, commit: action.commit, selections: {} };
+}
+
+export function ArchitectureWorkspace({ repositoryId, github, moduleId, onModule, onSource, refreshGeneration, readMap, readHistory = fetchArchitecture, t }: {
+  readonly repositoryId: string;
+  /** `owner/name` on GitHub, for commit links in the history. */
+  readonly github: string | null;
+  readonly moduleId: string | null;
+  readonly onModule: (id: string | null) => void;
+  /** Receives the source of the view on screen, and `null` when the view has none or the workspace closes. */
+  readonly onSource: (source: ArchitectureSource | null) => void;
+  readonly refreshGeneration: number;
+  /** The map route's reader; fixtures inject one. */
+  readonly readMap?: ArchitectureMapReader;
+  /** The history route's reader; fixtures inject one. */
+  readonly readHistory?: HistoryReader;
+  readonly t: OperatorTranslate;
+}) {
+  const [view, setView] = useState<ArchitectureView>('map');
+  const [store, dispatchSelection] = useReducer(selectionStore, { repositoryId, commit: null, selections: {} });
+  // A new repository empties the selections during this render, whatever tab shows.
+  if (store.repositoryId !== repositoryId) dispatchSelection({ type: 'shown', repositoryId, commit: null });
+  const selections = store.repositoryId === repositoryId ? store.selections : {};
+  const select = useCallback((action: ArchitectureSelect) => dispatchSelection({ type: 'select', select: action }), []);
+  const root = repositoryPath(repositoryId);
+  const modulePath = moduleId === null ? null : `${root}/${moduleId}`;
+  const index = useArchitectureRead(moduleId === null && view === 'modules' ? root : null, decodeArchitectureModuleIndex, refreshGeneration);
+  const refactor = useArchitectureRead(moduleId === null && view === 'refactor' ? refactorPath(repositoryId) : null, decodeArchitectureRefactorDecisions, refreshGeneration);
+  const detail = useArchitectureRead(modulePath, decodeArchitectureModuleDetail, refreshGeneration);
+  // The tab counts of the last map stay while another view shows; a new repository starts without them.
+  // The map source is only the map on screen: the base map clears it when it shows no map or closes.
+  const [counts, setCounts] = useState<{ readonly repositoryId: string; readonly value: Partial<Record<ArchitectureView, number>> } | null>(null);
+  const [mapSource, setMapSource] = useState<(MapSource & { readonly commit: string }) | null>(null);
+  const [historySource, setHistorySource] = useState<HistorySummary | null>(null);
+  const count = useCallback((value: Partial<Record<ArchitectureView, number>>) => {
+    setCounts(current => ({ repositoryId, value: { ...current?.repositoryId === repositoryId ? current.value : {}, ...value } }));
+  }, [repositoryId]);
+  const onSummary = useCallback((summary: ArchitectureMapSummary | null) => {
+    setMapSource(summary === null ? null : { commit: summary.commit, collectedAt: summary.collectedAt, headRef: summary.headRef, archctxVersion: summary.archctxVersion });
+    // A new shown commit empties the selections; a closed map (null) keeps them.
+    if (summary !== null) dispatchSelection({ type: 'shown', repositoryId, commit: summary.commit });
+    if (summary !== null) count({ map: summary.modules, sequence: summary.flows });
+  }, [count, repositoryId]);
+  const onHistory = useCallback((summary: HistorySummary | null) => {
+    setHistorySource(summary);
+    if (summary !== null) count({ history: summary.total });
+  }, [count]);
+  useEffect(() => {
+    if (refactor.value !== null) count({ refactor: refactor.value.decisions.length });
+  }, [refactor.value, count]);
+  const commit = moduleId !== null ? detail.value?.commit : view === 'modules' ? index.value?.commit : view === 'history' || view === 'refactor' ? undefined : mapSource?.commit;
+  const shownMap = moduleId === null && view !== 'modules' && view !== 'history' && view !== 'refactor' ? mapSource : null;
+  const history = moduleId === null && view === 'history' ? historySource : null;
+  useEffect(() => {
+    onSource(history ?? (commit === undefined ? null : {
+      commit, map: shownMap === null ? null : { collectedAt: shownMap.collectedAt, headRef: shownMap.headRef, archctxVersion: shownMap.archctxVersion },
+    }));
+  }, [history, commit, shownMap, onSource]);
+  useEffect(() => () => onSource(null), [onSource]);
+  return <section className="architecture-workspace" aria-label={t('nav.architecture')}>
+    {moduleId === null ? <>
+      <ViewTabs view={view} counts={counts?.repositoryId === repositoryId ? counts.value : {}} onChange={setView} t={t} />
+      <div id="architecture-view" className="architecture-view" role="tabpanel" aria-labelledby={`architecture-tab-${view}`}>
+        {view === 'history' ? <ArchitectureHistory path={historyPath(repositoryId)} github={github} read={readHistory} refreshGeneration={refreshGeneration} selection={selections.history ?? null} select={select} onSummary={onHistory} t={t} />
+          : view === 'refactor' ? <>
+            <ReadStatus read={refactor} loading="architecture.refactor.loading" t={t} />
+            {refactor.value && <RefactorDecisionsView value={refactor.value} onModule={onModule} t={t} />}
+          </>
+          : view !== 'modules' ? <ArchitectureMap repositoryId={repositoryId} view={BASE_MAPS[view]} read={readMap} refreshGeneration={refreshGeneration} selections={selections} select={select} onModule={onModule} onSummary={onSummary} t={t} /> : <>
+            <ReadStatus read={index} loading="architecture.loading" t={t} />
+            {index.value && <ModuleList index={index.value} onModule={onModule} t={t} />}
+          </>}
+      </div>
+    </> : <>
+      <div><button type="button" className="operator-button operator-button--secondary" onClick={() => onModule(null)}>{t('architecture.back')}</button></div>
+      <ReadStatus read={detail} loading="architecture.module.loading" t={t} />
+      {detail.value && modulePath && <ModulePage detail={detail.value} base={modulePath} generation={refreshGeneration} onModule={onModule} t={t} />}
+    </>}
+  </section>;
+}

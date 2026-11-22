@@ -1,0 +1,3802 @@
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, lstatSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { legacySections } from '../../scripts/check-released-managed-values';
+import { tmpdir } from 'os';
+import { dirname, join } from 'path';
+import { spawnSync } from 'child_process';
+import { PassThrough, Writable } from 'stream';
+import { createHash } from 'crypto';
+import { checkMcpLocalConfigFile } from '../../src/cli/mcp/local-config-check';
+import { migrateSeatsConfiguration, runGlobalRuntimeSetup, verifyInstalledManagedRuntime } from '../../src/cli/commands/global-runtime';
+import { DEFAULT_SEATS_CONFIG, SeatsConfigMigrationRequiredError, decodeSeatsConfig } from '../../src/core/board/seats-settings';
+import { buildSeatLaunch } from '../../src/core/board/seat-launch';
+import { writePiFleetRoles } from '../../src/effects/board/pi-fleet-roles';
+import { applySeatsSettings, readSeatsConfiguration } from '../../src/effects/board/seats-configuration';
+import { runCli } from '../../src/cli/index';
+import { registerArchitecturePlugin, resolveOptionalRuntimeDeps, runTransactionalRuntimeRefresh } from '../../src/cli/runtime-transaction';
+import { bunStubPath, copyPackageRuntimeFixture, writeBunWrapper, writeShellExecutableFixture } from '../helpers/repo-fixture';
+import { ARCHITECTURE_DOCS_RENDERER_VERSION } from 'archctx-contracts';
+import { dependencies, devDependencies } from '../../package.json';
+import { installStateFixturePath, recordInstallOwnership, recordPluginSelection, RETIRED_CLI_LINES, seedGlobalPackageFixture, seedPathRecords } from '../helpers/install-ownership';
+import { writeFakeHc } from '../helpers/fake-hc';
+import wazaRules from '../../src/core/skill-surface/waza-shared-rules.json';
+import { syncWazaSharedRules } from "../../src/cli/installer/waza-rules";
+import { beginInstallHostTransaction, installProfileHostMutationPaths, installProfileTransactionPaths, installStateStatus, readInstallState, rollbackInstallHostTransaction, versions } from '../../src/cli/installer/install-profile';
+import { applyGlobalContextRefresh, GLOBAL_RULES_EDITED, GLOBAL_RULES_END, inspectGlobalContext, preflightGlobalContextRefresh, renderGlobalRulesBlock, setReportingLanguage } from '../../src/cli/installer/global-context';
+import { CandidateRequestProtocolRetiredError, assertReceiptSelection, encodeCandidateRequest, parseCandidateReceipt, parseCandidateRequest, type CandidateReconciliationRequest } from '../../src/cli/commands/candidate-reconciliation';
+import type { PluginId } from '../../src/core/skill-surface/plugin-manifest';
+import { openHostConfigGate } from '../../src/effects/host-config/gate';
+import { hostConfigPaths } from '../../src/effects/host-config/store';
+import { ownedPath, pathRecordIsCurrent, pathRecordKey, readPathRecords } from '../../src/effects/host-config/path-records';
+
+const ROOT = join(import.meta.dir, '..', '..');
+const runtimeHome = realpathSync(mkdtempSync(join(tmpdir(), 'repo-harness-runtime-home-')));
+const previousHome = process.env.HOME;
+const previousBunInstall = process.env.BUN_INSTALL;
+beforeAll(() => {
+  process.env.HOME = runtimeHome;
+  process.env.BUN_INSTALL = join(runtimeHome, '.bun');
+  seedGlobalPackageFixture();
+});
+afterAll(() => {
+  if (previousHome === undefined) delete process.env.HOME;
+  else process.env.HOME = previousHome;
+  if (previousBunInstall === undefined) delete process.env.BUN_INSTALL;
+  else process.env.BUN_INSTALL = previousBunInstall;
+  rmSync(runtimeHome, { recursive: true, force: true });
+});
+// The fake managed install follows the repository pins, so an upgrade needs no fixture edit.
+const ARCHCTX_PIN = dependencies.archctx;
+const ARCHCTX_CONTRACTS_PIN = dependencies['archctx-contracts'];
+const CODEGRAPH_PIN = devDependencies['@colbymchenry/codegraph'];
+const CLI = join(ROOT, 'src/cli/index.ts');
+const OBSIDIAN_PROVIDER = 'kepano/obsidian-skills#a1dc48e68138490d522c04cbf5822214c6eb1202';
+const FULL_PLUGINS = ['architecture', 'cross-review', 'mcp', 'operator', 'peer-runtime', 'platform', 'product', 'strategy-memory'] as const;
+
+test('bun fixture writes reject paths and symlinks outside their own temporary root', () => {
+  const temporary = mkdtempSync(join(process.platform === 'darwin' ? '/tmp' : tmpdir(), 'repo-harness-bun-guard-'));
+  const root = mkdtempSync(join(temporary, 'fixture-'));
+  const outside = `${root}-sibling`;
+  try {
+    mkdirSync(outside);
+    const inheritedHome = process.env.HOME;
+    const inheritedBunInstall = process.env.BUN_INSTALL;
+    try {
+      process.env.HOME = outside;
+      process.env.BUN_INSTALL = outside;
+      expect(sanitizedChildEnv(root)).toMatchObject({ HOME: root, BUN_INSTALL: join(root, '.bun') });
+    } finally {
+      if (inheritedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = inheritedHome;
+      if (inheritedBunInstall === undefined) delete process.env.BUN_INSTALL;
+      else process.env.BUN_INSTALL = inheritedBunInstall;
+    }
+    const sentinel = join(outside, 'bun');
+    writeFileSync(sentinel, 'keep outside bun\n');
+    symlinkSync(outside, join(root, 'linked-bin'), 'dir');
+    symlinkSync(sentinel, join(root, 'bun'));
+    const insideTarget = join(root, 'inside-bun');
+    writeFileSync(insideTarget, 'keep inside bun\n');
+    const outsideLink = join(outside, 'linked-bun');
+    symlinkSync(insideTarget, outsideLink);
+    for (const target of [root, sentinel, outsideLink, join(outside, 'missing', 'bun'), join(root, 'linked-bin', 'bun'), join(root, 'bun')]) {
+      expect(() => writeBunWrapper(root, target)).toThrow('Bun stub must stay under its test temporary root');
+      expect(() => writeShellExecutableFixture(root, target, '#!/bin/sh\nexit 0\n')).toThrow('Bun stub must stay under its test temporary root');
+      expect(readFileSync(sentinel, 'utf8')).toBe('keep outside bun\n');
+      expect(existsSync(join(outside, 'missing'))).toBe(false);
+      expect(lstatSync(outsideLink).isSymbolicLink()).toBe(true);
+      expect(readFileSync(insideTarget, 'utf8')).toBe('keep inside bun\n');
+    }
+    const bodyEscape = join(root, 'body-escape');
+    symlinkSync(sentinel, `${bodyEscape}.fixture-body`);
+    expect(() => writeShellExecutableFixture(root, bodyEscape, '#!/bin/sh\nexit 0\n')).toThrow('Bun stub must stay under its test temporary root');
+    expect(existsSync(bodyEscape)).toBe(false);
+    expect(lstatSync(`${bodyEscape}.fixture-body`).isSymbolicLink()).toBe(true);
+    expect(readFileSync(sentinel, 'utf8')).toBe('keep outside bun\n');
+
+    const alias = join(temporary, 'fixture-alias');
+    symlinkSync(root, alias, 'dir');
+    for (const rootSpelling of [root, realpathSync(root), alias]) {
+      for (const targetSpelling of [root, realpathSync(root), alias]) {
+        const safe = join(targetSpelling, 'safe-bun');
+        writeBunWrapper(rootSpelling, safe);
+        expect(readFileSync(safe, 'utf8')).toContain('exec ');
+        expect(lstatSync(safe).isSymbolicLink()).toBe(false);
+        const shell = join(targetSpelling, 'safe-shell');
+        writeShellExecutableFixture(rootSpelling, shell, '#!/bin/sh\nexit 0\n');
+        expect(readFileSync(`${shell}.fixture-body`, 'utf8')).toBe('#!/bin/sh\nexit 0\n');
+        expect(lstatSync(shell).isFile()).toBe(true);
+        expect(bunStubPath(rootSpelling, join(targetSpelling, 'missing', 'bun'))).toBe(join(targetSpelling, 'missing', 'bun'));
+      }
+      expect(() => writeBunWrapper(rootSpelling, sentinel)).toThrow('Bun stub must stay under its test temporary root');
+      expect(() => writeShellExecutableFixture(rootSpelling, join(alias, 'linked-bin', 'bun'), '#!/bin/sh\nexit 0\n')).toThrow('Bun stub must stay under its test temporary root');
+      expect(readFileSync(sentinel, 'utf8')).toBe('keep outside bun\n');
+    }
+  } finally { rmSync(temporary, { recursive: true, force: true }); }
+});
+
+test('update removes stored routing mode and hyper values once, keeps a null worker-light and fills a null gatekeeper-fallback and the credit mode keys', () => {
+  const home = mkdtempSync(join(tmpdir(), 'quota-mode-migration-'));
+  try {
+    mkdirSync(join(home, '.repo-harness'));
+    const path = join(home, '.repo-harness', 'config.json');
+    const { claude_saving_below_remaining: _claude, claude_hyper_at_or_above_remaining: _claudeHyper, agy_saving_below_remaining: _agy, exhausted_at_or_above_used: _exhausted, codex_credit_mode: _mode, codex_credit_floor: _floor, unavailable_pi_providers: _unavailable, ...routes } = DEFAULT_SEATS_CONFIG.routing;
+    const seats = { ...DEFAULT_SEATS_CONFIG, 'worker-light': null,
+      routing: { ...routes, important_fast: ['worker-opus', 'worker-neon', 'worker'] as const, simple_fast: ['worker'] as const,
+        mode: 'hyper', hyper: { claude: { model: 'opus', effort: 'high' }, advisor: { model: 'opus', effort: 'max' }, codex: { model: 'gpt-6-astra', effort: 'high' } } } };
+    expect(() => decodeSeatsConfig(seats)).toThrow(expect.objectContaining({ code: 'seats_config_migration_required' }));
+    const original = JSON.stringify({ seats, security: { mode: 'strict' } });
+    writeFileSync(path, original);
+    expect(migrateSeatsConfiguration({ HOME: home })).toBe(true);
+    const migrated = readFileSync(path, 'utf8');
+    expect(JSON.parse(migrated)).toEqual({ seats: { ...DEFAULT_SEATS_CONFIG, 'worker-light': null,
+      routing: { ...DEFAULT_SEATS_CONFIG.routing, important_fast: ['worker-opus', 'worker-neon', 'worker'], simple_fast: ['worker'] } }, security: { mode: 'strict' } });
+    expect(decodeSeatsConfig(JSON.parse(migrated).seats).routing).toEqual({
+      ...DEFAULT_SEATS_CONFIG.routing, important_fast: ['worker-opus', 'worker-neon', 'worker'], simple_fast: ['worker'],
+    });
+    expect(migrateSeatsConfiguration({ HOME: home })).toBe(false);
+    expect(readFileSync(path, 'utf8')).toBe(migrated);
+    for (const routing of [{ ...seats.routing, mode: 'other' }, { ...seats.routing, hyper: {} }, { ...seats.routing, extra: true }]) {
+      const invalid = JSON.stringify({ seats: { ...seats, routing } });
+      writeFileSync(path, invalid);
+      expect(() => migrateSeatsConfiguration({ HOME: home })).toThrow('seats_config_invalid');
+      expect(readFileSync(path, 'utf8')).toBe(invalid);
+    }
+    const { 'gatekeeper-fallback': _fallback, ...withoutFallback } = DEFAULT_SEATS_CONFIG;
+    expect(() => decodeSeatsConfig(withoutFallback)).toThrow(expect.objectContaining({ code: 'seats_config_migration_required' }));
+    writeFileSync(path, JSON.stringify({ seats: withoutFallback }));
+    expect(migrateSeatsConfiguration({ HOME: home })).toBe(true);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ seats: DEFAULT_SEATS_CONFIG });
+    const stored = { ...DEFAULT_SEATS_CONFIG, routing: { ...routes, claude_saving_below_remaining: 30, codex_hyper_at_or_above_remaining: 70 } };
+    expect(() => decodeSeatsConfig(stored)).toThrow(expect.objectContaining({ code: 'seats_config_migration_required' }));
+    writeFileSync(path, JSON.stringify({ seats: stored }));
+    expect(migrateSeatsConfiguration({ HOME: home })).toBe(true);
+    expect(JSON.parse(readFileSync(path, 'utf8')).seats.routing)
+      .toEqual({ ...DEFAULT_SEATS_CONFIG.routing, claude_saving_below_remaining: 30 });
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('update migrates 12-seat configs to 11 seats, remaps routing, strips disallowed fleet roles, and preserves stored runtimes', () => {
+  const home = mkdtempSync(join(tmpdir(), 'council-migration-'));
+  try {
+    const directory = join(home, '.repo-harness');
+    mkdirSync(directory);
+    const path = join(directory, 'config.json');
+    const env = { HOME: home };
+    const { council: _council, 'worker-opus': workerOpus, 'worker-neon': workerNeon, routing, ...rest } = DEFAULT_SEATS_CONFIG;
+    const { agy_saving_below_remaining: _agy, ...legacyRouting } = routing;
+    const legacySeats = {
+      ...rest,
+      planner: { runtime: 'claude', model: 'opus', advisor_model: null, effort: 'high', tools: ['net', 'read', 'shell'], fleet: ['deep-reasoner', 'explorer'] },
+      'worker-important': { ...workerOpus, fleet: ['deep-reasoner', 'explorer'] },
+      'worker-important-fast': { ...workerNeon, fleet: ['deep-reasoner', 'explorer'] },
+      'gatekeeper-deep': { ...DEFAULT_SEATS_CONFIG.gatekeeper, runtime: 'codex', model: 'gpt-6.1-terra' },
+      advisor: { ...rest.advisor, runtime: 'claude', model: 'sonnet', fleet: ['deep-reasoner', 'explorer'] },
+      'worker-light': { ...rest['worker-light']!, fleet: ['explorer'] },
+      routing: {
+        ...legacyRouting,
+        important_deep: ['worker-important', 'worker-important-fast', 'worker-deep'],
+        important_fast: ['worker-important', 'worker-important-fast', 'worker', 'worker-light'],
+        simple_deep: ['worker-important-fast', 'worker-deep'],
+        frontend: ['worker-important', 'worker-important-fast'],
+      },
+      pi_sub_agent_models: { explorer: 'custom/model' },
+    };
+    const agents = { enabled: ['claude'], uses: { docs: [], review: [] }, default_docs: null };
+    expect(decodeSeatsConfig(undefined).council).toBeNull();
+    expect(() => decodeSeatsConfig(legacySeats)).toThrow(SeatsConfigMigrationRequiredError);
+    writeFileSync(path, JSON.stringify({ seats: legacySeats, agents }));
+    expect(migrateSeatsConfiguration(env)).toBe(true);
+    const migrated = readFileSync(path, 'utf8');
+    const parsed = JSON.parse(migrated);
+    expect(parsed.agents).toEqual(agents);
+    expect('planner' in parsed.seats).toBe(false);
+    expect('worker-important' in parsed.seats).toBe(false);
+    expect('worker-important-fast' in parsed.seats).toBe(false);
+    expect('gatekeeper-deep' in parsed.seats).toBe(false);
+    expect(parsed.seats.council).toEqual({ runtime: 'claude', model: 'fable', advisor_model: null, effort: 'high', tools: ['net', 'read', 'shell'], fleet: ['explorer'] });
+    expect(parsed.seats['worker-opus'].fleet).toEqual(['explorer']);
+    expect(parsed.seats['worker-neon'].fleet).toEqual(['explorer']);
+    expect(parsed.seats['worker-light'].fleet).toEqual([]);
+    expect(parsed.seats.advisor).toEqual({ ...rest.advisor, runtime: 'claude', model: 'sonnet', fleet: ['deep-reasoner', 'explorer'] });
+    expect(parsed.seats.routing).toEqual({ ...DEFAULT_SEATS_CONFIG.routing });
+    expect(parsed.seats.pi_sub_agent_models).toEqual({ explorer: 'custom/model' });
+    expect(migrateSeatsConfiguration(env)).toBe(false);
+    expect(readFileSync(path, 'utf8')).toBe(migrated);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('update removes the Codex hyper threshold once, preserves other settings, and refuses malformed sections without writing', () => {
+  const home = mkdtempSync(join(tmpdir(), 'codex-hyper-migration-'));
+  try {
+    mkdirSync(join(home, '.repo-harness'));
+    const path = join(home, '.repo-harness', 'config.json');
+    const seats = { ...DEFAULT_SEATS_CONFIG,
+      advisor: { ...DEFAULT_SEATS_CONFIG.advisor, runtime: 'pi', model: 'magpie/codex/gpt-6-astra', effort: null },
+      routing: { ...DEFAULT_SEATS_CONFIG.routing, claude_saving_below_remaining: 30 } };
+    for (const threshold of [0, 50, 100]) {
+      const stored = { ...seats, routing: { ...seats.routing, codex_hyper_at_or_above_remaining: threshold } };
+      expect(() => decodeSeatsConfig(stored)).toThrow(expect.objectContaining({ code: 'seats_config_migration_required' }));
+      writeFileSync(path, JSON.stringify({ seats: stored, security: { mode: 'strict' } }));
+      expect(migrateSeatsConfiguration({ HOME: home })).toBe(true);
+      const migrated = readFileSync(path, 'utf8');
+      expect(JSON.parse(migrated)).toEqual({ seats, security: { mode: 'strict' } });
+      expect(migrateSeatsConfiguration({ HOME: home })).toBe(false);
+      expect(readFileSync(path, 'utf8')).toBe(migrated);
+    }
+    for (const routing of [
+      ...[-1, 101, null, '50'].map(value => ({ ...seats.routing, codex_hyper_at_or_above_remaining: value })),
+      { ...seats.routing, codex_hyper_at_or_above_remaining: 50, extra: true },
+      { ...seats.routing, codex_hyper_at_or_above_remaining: 50, claude_saving_below_remaining: -1 },
+    ]) {
+      const original = JSON.stringify({ seats: { ...seats, routing } });
+      writeFileSync(path, original);
+      expect(() => migrateSeatsConfiguration({ HOME: home })).toThrow('seats_config_invalid');
+      expect(readFileSync(path, 'utf8')).toBe(original);
+    }
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('update strips retired fleet roles once and leaves the saved seats ready for all three launchers', () => {
+  const home = mkdtempSync(join(tmpdir(), 'seat-fleet-migration-'));
+  try {
+    const directory = join(home, '.repo-harness');
+    mkdirSync(directory);
+    const path = join(directory, 'config.json');
+    const bun = join(home, 'bun');
+    writeExecutable(home, bun, '#!/bin/bash\nif [[ "$1" == "--version" ]]; then echo 1.4.0; fi\nexit 0\n');
+    const env = { ...sanitizedChildEnv(home), REPO_HARNESS_HOME: directory, REPO_HARNESS_BUN_EXECUTABLE: bun };
+    const fleet = ['deep-reasoner', 'explorer'];
+    const legacyFleet = ['deep-reasoner', 'deep-worker', 'explorer', 'fast-worker', 'gatekeeper', 'harness-evaluator', 'root-cause-prover'];
+    const seats = { ...DEFAULT_SEATS_CONFIG,
+      orchestrator: { ...DEFAULT_SEATS_CONFIG.orchestrator, fleet: ['gatekeeper'] },
+      advisor: { ...DEFAULT_SEATS_CONFIG.advisor, advisor_model: null, fleet: [...fleet, 'gatekeeper'] },
+      worker: { ...DEFAULT_SEATS_CONFIG.worker, runtime: 'codex' as const, model: 'custom-codex-model', effort: 'low', tools: ['edit', 'read', 'shell'], fleet: legacyFleet },
+      'worker-opus': { ...DEFAULT_SEATS_CONFIG['worker-opus'], model: 'custom-claude-model', fleet: legacyFleet },
+      'worker-light': { ...DEFAULT_SEATS_CONFIG['worker-light']!, model: 'magpie/codex/gpt-6.1-terra', fleet: legacyFleet },
+      routing: { ...DEFAULT_SEATS_CONFIG.routing, simple_fast: ['worker-light', 'worker'], claude_saving_below_remaining: 35 },
+    };
+    const agents = { enabled: ['claude', 'codex', 'pi'], uses: { review: [], docs: [] }, default_docs: null };
+    const original = JSON.stringify({ agents, seats, custom: 'keep me' });
+    writeFileSync(path, original);
+    expect(() => decodeSeatsConfig(JSON.parse(readFileSync(path, 'utf8')).seats)).toThrow(SeatsConfigMigrationRequiredError);
+    const update = runGlobalRuntimeSetup({
+      sourceRoot: ROOT, cwd: home, plugins: [], updateMode: true, installCli: false,
+      syncSkill: false, hostAdapters: false, externalSkills: false, codegraph: false, env,
+    });
+    expect(update.exitCode, update.stdout).toBe(0);
+    expect(update.steps).toContainEqual(expect.objectContaining({ step: 'migrate seats configuration', status: 'ok' }));
+    const backup = readdirSync(directory).find(name => name.startsWith('config.json.bak-'))!;
+    expect(readFileSync(join(directory, backup), 'utf8')).toBe(original);
+    const migrated = readSeatsConfiguration(env);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ agents, custom: 'keep me', seats: { ...seats,
+      orchestrator: { ...seats.orchestrator, fleet: [] },
+      advisor: { ...seats.advisor, fleet },
+      worker: { ...seats.worker, fleet: ['explorer'] },
+      'worker-opus': { ...seats['worker-opus'], fleet: ['explorer'] },
+      'worker-light': { ...seats['worker-light'], fleet: [] },
+    } });
+    expect(migrateSeatsConfiguration(env)).toBe(false);
+
+    const saved = { ...migrated.seats, worker: { ...migrated.seats.worker, effort: 'medium' } };
+    expect(applySeatsSettings({ expected_revision: migrated.revision, seats: saved }, env).changed_keys).toEqual(['seats.worker.effort']);
+    const current = readSeatsConfiguration(env).seats;
+    expect(current).toEqual(saved);
+    const codex = buildSeatLaunch('worker', current.worker, 'seats', []);
+    expect(codex.argv).toEqual(expect.arrayContaining(['codex', 'custom-codex-model']));
+    expect(codex.brief).toContain('`explorer`');
+    const claude = buildSeatLaunch('worker-opus', current['worker-opus'], 'seats', legacyFleet);
+    expect(claude.argv).toEqual(expect.arrayContaining(['claude', 'custom-claude-model', '--disallowedTools', 'Agent(deep-reasoner)']));
+    expect(claude.brief).toContain('`explorer`');
+    const piSeat = current.advisor;
+    const roles = writePiFleetRoles(piSeat.fleet, env);
+    const pi = buildSeatLaunch('advisor', piSeat, 'seats', [], { piRoleDirectory: roles });
+    expect(pi.argv).toEqual(expect.arrayContaining(['pi', `PI_SUBAGENT_EXTRA_AGENT_DIRS=${roles}`]));
+    expect(readdirSync(roles).sort()).toEqual(['rh-deep-reasoner.md', 'rh-explorer.md']);
+
+    const malformed = JSON.stringify({ seats: { ...seats, worker: { ...seats.worker, fleet: ['fast-worker', 'unknown-role'] } } });
+    writeFileSync(path, malformed);
+    expect(() => migrateSeatsConfiguration(env)).toThrow('seats_config_invalid: seats.worker.fleet');
+    expect(readFileSync(path, 'utf8')).toBe(malformed);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('update keeps one exact configuration backup for both migrations, skips unchanged files and stops on backup failure', () => {
+  const timestamp = '2026-11-17T00:00:00.000Z';
+  const clock = spyOn(Date.prototype, 'toISOString').mockReturnValue(timestamp);
+  try {
+    for (const kind of ['both', 'threshold-only', 'brain-only', 'unchanged', 'backup-failure'] as const) {
+      const home = mkdtempSync(join(tmpdir(), 'update-config-backup-'));
+      try {
+        const directory = join(home, '.repo-harness');
+        mkdirSync(directory);
+        const path = join(directory, 'config.json');
+        const backup = `${path}.bak-${timestamp.replace(/[:.]/g, '-')}-update`;
+        const routing = kind === 'brain-only' || kind === 'unchanged' ? DEFAULT_SEATS_CONFIG.routing
+          : { ...DEFAULT_SEATS_CONFIG.routing, codex_hyper_at_or_above_remaining: 70 };
+        const seats = kind === 'both' || kind === 'backup-failure'
+          ? { ...DEFAULT_SEATS_CONFIG, routing, 'gatekeeper-fallback': undefined } : { ...DEFAULT_SEATS_CONFIG, routing };
+        const original = Buffer.from(`${JSON.stringify({ seats, ...(kind === 'unchanged' || kind === 'threshold-only' ? {} : { brainRoot: '/old-vault' }), custom: '雪' }, null, 4)}\r\n`);
+        writeFileSync(path, original);
+        if (kind === 'backup-failure') mkdirSync(backup);
+        const bun = join(home, 'bun');
+        writeExecutable(home, bun, '#!/bin/bash\nif [[ "$1" == "--version" ]]; then echo 1.4.0; fi\nexit 0\n');
+        const result = runGlobalRuntimeSetup({
+          sourceRoot: ROOT, cwd: home, plugins: [], updateMode: true, installCli: false,
+          syncSkill: false, hostAdapters: false, externalSkills: false, codegraph: false,
+          env: { ...sanitizedChildEnv(home), HOME: home, REPO_HARNESS_HOME: directory, BUN_INSTALL: join(home, '.bun'), REPO_HARNESS_BUN_EXECUTABLE: bun },
+        });
+        const backups = readdirSync(directory).filter(name => name.startsWith('config.json.bak-'));
+        if (kind === 'backup-failure') {
+          expect(result.exitCode).toBe(1);
+          expect(result.steps.at(-1)).toMatchObject({ step: 'migrate seats configuration', status: 'failed' });
+          expect(result.steps.at(-1)?.detail).toContain(backup);
+          expect(result.steps.at(-1)?.detail).toContain('retry');
+          expect(readFileSync(path)).toEqual(original);
+          expect(lstatSync(backup).isDirectory()).toBe(true);
+          continue;
+        }
+        expect(result.steps.find(step => step.step === 'migrate seats configuration')?.status, result.stdout).toBe(kind === 'both' || kind === 'threshold-only' ? 'ok' : 'skipped');
+        expect(result.steps.find(step => step.step === 'remove the retired brainRoot configuration key')?.status).toBe(kind === 'unchanged' || kind === 'threshold-only' ? 'skipped' : 'ok');
+        expect(backups).toEqual(kind === 'unchanged' ? [] : [backup.slice(directory.length + 1)]);
+        if (kind === 'unchanged') expect(readFileSync(path)).toEqual(original);
+        else {
+          expect(readFileSync(backup)).toEqual(original);
+          expect(result.stdout).toContain(backup);
+          expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ seats: DEFAULT_SEATS_CONFIG, custom: '雪' });
+        }
+      } finally { rmSync(home, { recursive: true, force: true }); }
+    }
+  } finally { clock.mockRestore(); }
+});
+
+test('update preflight stops on a refused mcp.local.json before the seats write and quotes no file content', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-mcp-preflight-'));
+  const home = join(tmp, 'home');
+  const fakeBin = join(tmp, 'bin');
+  try {
+    mkdirSync(join(home, '.repo-harness'), { recursive: true });
+    mkdirSync(fakeBin, { recursive: true });
+    const bunLog = join(tmp, 'bun.log');
+    writeExecutable(tmp, join(fakeBin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nif [[ "\${1:-}" == "--version" ]]; then echo 1.3.14; fi\nexit 0\n`);
+    const config = join(home, '.repo-harness', 'config.json');
+    writeFileSync(config, JSON.stringify({ seats: { ...DEFAULT_SEATS_CONFIG, 'worker-light': null, 'gatekeeper-fallback': undefined } }));
+    const before = readFileSync(config, 'utf8');
+    const run = () => runGlobalRuntimeSetup({
+      sourceRoot: ROOT, cwd: tmp, plugins: ['mcp'], mcpLocalConfigCheck: checkMcpLocalConfigFile, installCli: false, updateMode: true, syncSkill: false, hostAdapters: false, externalSkills: false, codegraph: false,
+      env: { ...sanitizedChildEnv(home), HOME: home, REPO_HARNESS_HOME: join(home, '.repo-harness'), BUN_INSTALL: join(home, '.bun'), PATH: `${fakeBin}:${process.env.PATH ?? ''}`, REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun') },
+    });
+    const mcp = join(home, '.repo-harness', 'mcp.local.json');
+    writeFileSync(mcp, '{"version":2,"permissions":{"allowedRoots":["/private/secret-root"]}}');
+    const refused = run();
+    expect(refused.exitCode).toBe(1);
+    expect(refused.steps.at(-1)).toMatchObject({ step: 'check MCP local config', status: 'failed', detail: expect.stringContaining('unsupported version; set "version": 3.') });
+    expect(refused.steps.some(step => step.step === 'migrate seats configuration')).toBe(false);
+    expect(readFileSync(config, 'utf8')).toBe(before);
+    expect(existsSync(bunLog)).toBe(false);
+    writeFileSync(mcp, '{"version":3,"permissions":{"allowedRoots":"/private/secret-root"}}');
+    expect(run().stdout).toContain('permissions.allowedRoots must be an array');
+    writeFileSync(mcp, '{"version":["/private/secret-root"]}');
+    expect(run().stdout).not.toContain('secret-root');
+    writeFileSync(mcp, '{"allowedRoots": ["/private/secret-root"] oops');
+    const malformed = run();
+    expect(malformed.exitCode).toBe(1);
+    expect(malformed.stdout).toContain('the file is not valid JSON.');
+    expect(malformed.stdout).not.toContain('secret-root');
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+});
+
+// An explicit list never grows, so a host `pi` on the developer PATH cannot change the recorded selection.
+function recordExplicitFullSelection(home: string, plugins: readonly PluginId[] = FULL_PLUGINS): void {
+  recordInstallOwnership([], { HOME: home });
+  const path = installStateFixturePath({ HOME: home });
+  writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf-8')), ...versions(plugins), selection: plugins }));
+}
+
+function singleFileSkillIntegrity(content: string): string {
+  const hash = createHash('sha256');
+  hash.update(`F\0SKILL.md\0${Buffer.byteLength(content)}\0`);
+  hash.update(content);
+  hash.update('\0');
+  return `sha256:${hash.digest('hex')}`;
+}
+
+function singleFileManagedTreeHash(content: string): string {
+  const hash = createHash('sha256');
+  hash.update('F\0SKILL.md\0');
+  hash.update(content);
+  hash.update('\0');
+  return `sha256:${hash.digest('hex')}`;
+}
+
+function writeExecutable(temporaryRoot: string, filePath: string, content: string): void {
+  bunStubPath(temporaryRoot, filePath);
+  if (filePath.endsWith('/bun') && content.startsWith('#!/bin/bash\n')) {
+    const lines = content.split('\n');
+    const log = lines.findIndex((line) => line.includes('"$*"') && line.includes('>>'));
+    lines.splice(log < 0 ? 1 : log + 1, 0, `if [[ "\${1:-}" == add && "\${2:-}" == -g && "\${3:-}" == repo-harness-operator-web@* ]]; then
+  spec="$3"; version="\${spec#repo-harness-operator-web@}"
+  dest="\${BUN_INSTALL:-$HOME/.bun}/install/global/node_modules/repo-harness-operator-web"
+  mkdir -p "$dest"; printf '{"name":"repo-harness-operator-web","version":"%s"}' "$version" > "$dest/package.json"; exit 0
+fi`);
+    content = lines.join('\n');
+  }
+  const interpreter = content.split('\n', 1)[0];
+  if (interpreter === '#!/bin/sh' || interpreter === '#!/bin/bash') {
+    writeShellExecutableFixture(temporaryRoot, filePath, content);
+    return;
+  }
+  writeFileSync(filePath, content);
+  chmodSync(filePath, 0o755);
+}
+
+function setupConsoleFixture(home: string, source: string): void {
+  const consoleRoot = join(source, 'packages', 'operator-web');
+  mkdirSync(join(consoleRoot, 'dist'), { recursive: true });
+  const manifest = readFileSync(join(source, 'package.json'), 'utf8');
+  const version = JSON.parse(manifest).version;
+  writeFileSync(join(consoleRoot, 'package.json'), JSON.stringify({ name: 'repo-harness-operator-web', version }));
+  writeFileSync(join(consoleRoot, 'dist', 'index.html'), '<html></html>');
+  const cli = join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness');
+  if (!existsSync(join(cli, 'package.json'))) {
+    mkdirSync(cli, { recursive: true });
+    writeFileSync(join(cli, 'package.json'), manifest);
+  }
+}
+
+// scripts/check-agent-tooling.sh (invoked by the CodeGraph configure step)
+// resolves `skills` from PATH; the probe itself only runs under
+// --probe-skills-cli. This stub keeps both paths off the real installation.
+function writeFakeSkillsCli(temporaryRoot: string, fakeBin: string): void {
+  writeExecutable(temporaryRoot,
+    join(fakeBin, 'skills'),
+    `#!/bin/bash\nif [[ "$*" == "ls -g --json" ]]; then echo '[]'; exit 0; fi\nexit 1\n`,
+  );
+}
+
+function writeOfficialCodexPluginFixture(pluginRoot: string): void {
+  mkdirSync(join(pluginRoot, 'scripts'), { recursive: true });
+  mkdirSync(join(pluginRoot, '.claude-plugin'), { recursive: true });
+  mkdirSync(join(pluginRoot, 'schemas'), { recursive: true });
+  writeFileSync(join(pluginRoot, 'scripts', 'codex-companion.mjs'), '// fixture\n');
+  writeFileSync(join(pluginRoot, '.claude-plugin', 'plugin.json'), JSON.stringify({
+    name: 'codex',
+    version: '1.0.6',
+    author: { name: 'OpenAI' },
+  }));
+  writeFileSync(join(pluginRoot, 'schemas', 'review-output.schema.json'), JSON.stringify({
+    required: ['verdict', 'summary', 'findings', 'next_steps'],
+    properties: {
+      verdict: { enum: ['approve', 'needs-attention'] },
+      findings: { items: { properties: { severity: { enum: ['critical', 'high', 'medium', 'low'] } } } },
+    },
+  }));
+}
+
+function writeReadyOfficialCodexPluginCli(temporaryRoot: string, fakeBin: string, home: string): void {
+  const pluginRoot = join(home, '.claude', 'plugins', 'cache', 'openai-codex', 'codex', '1.0.6');
+  writeOfficialCodexPluginFixture(pluginRoot);
+  writeExecutable(temporaryRoot, join(fakeBin, 'claude'), [
+    '#!/bin/bash',
+    'if [[ "$*" == "plugin list --json" ]]; then',
+    `  printf '%s\\n' '${JSON.stringify([{ id: 'codex@openai-codex', version: '1.0.6', enabled: true, installPath: pluginRoot }])}'`,
+    '  exit 0',
+    'fi',
+    'exit 9',
+    '',
+  ].join('\n'));
+}
+
+/**
+ * List every entry under `root`, but stop at a symbolic link instead of walking its target.
+ * The global package fixture at `.bun/install/global/node_modules/repo-harness` links into the
+ * checkout, so walking it would list files that parallel test processes write there, such as
+ * junit XML under `.ai/harness/runs/junit/`. The link itself stays in the listing.
+ */
+function listTreeWithoutSymlinkDescent(root: string, prefix = ''): string[] {
+  return readdirSync(prefix ? join(root, prefix) : root, { withFileTypes: true }).flatMap((entry) => {
+    const relative = prefix ? join(prefix, entry.name) : entry.name;
+    if (entry.isSymbolicLink() || !entry.isDirectory()) return [relative];
+    return [relative, ...listTreeWithoutSymlinkDescent(root, relative)];
+  });
+}
+
+function sanitizedChildEnv(home: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, BUN_INSTALL: join(home, '.bun') };
+  // Machine shells (zshenv) can export an explicit node runtime authority that
+  // outranks PATH resolution; these tests fake node via fakeBin-first PATH and
+  // must resolve exactly like CI, where no such export exists.
+  delete env.REPO_HARNESS_NODE_BIN;
+  return env;
+}
+
+function setupFakeSource(root: string): void {
+  mkdirSync(join(root, 'scripts'), { recursive: true });
+  mkdirSync(join(root, 'assets', 'skills', 'repo-harness-cross-review'), { recursive: true });
+  // installWazaSkills()/installMermaidSkill()/syncCrossReviewSkills() now read
+  // sourceRoot's skill-surface manifest (see loadSkillSurfaceCatalog in
+  // global-runtime.ts); a real copy keeps this synthetic package tree
+  // loadable exactly like the real repo.
+  mkdirSync(join(root, 'assets', 'skill-commands'), { recursive: true });
+  copyFileSync(
+    join(ROOT, 'assets', 'skill-commands', 'manifest.json'),
+    join(root, 'assets', 'skill-commands', 'manifest.json'),
+  );
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'repo-harness', version: '9.9.9' }, null, 2));
+  writeFileSync(join(root, 'assets', 'skills', 'repo-harness-cross-review', 'SKILL.md'), 'repo-harness-cross-review\n');
+  writeExecutable(root,
+    join(root, 'scripts', 'sync-codex-installed-copies.sh'),
+    '#!/bin/bash\nset -euo pipefail\necho "sync runtime link=${REPO_HARNESS_LINK_INSTALLED_COPIES:-unset}"\n',
+  );
+  writeExecutable(root,
+    join(root, 'scripts', 'install-agent-fleet.sh'),
+    '#!/bin/bash\nset -euo pipefail\necho "fleet installed"\n',
+  );
+}
+
+function setObsidianSkillIntegrity(root: string, name: string, integrity: string | null): void {
+  const manifestPath = join(root, 'assets', 'skill-commands', 'manifest.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+  const pkg = manifest.packages.find((entry: { name: string }) => entry.name === name);
+  if (!pkg) throw new Error(`${name} missing from fixture manifest`);
+  pkg.integrity = integrity;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+function setObsidianSkillIntegrities(root: string): void {
+  const manifestPath = join(root, 'assets', 'skill-commands', 'manifest.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+  for (const name of ['obsidian-markdown', 'obsidian-cli']) {
+    const pkg = manifest.packages.find((entry: { name: string }) => entry.name === name);
+    if (!pkg) throw new Error(`${name} missing from fixture manifest`);
+    pkg.integrity = singleFileSkillIntegrity(`# ${name}\n`);
+  }
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+function writeFakeCodegraph(temporaryRoot: string, fakeBin: string, logFile: string): void {
+  writeExecutable(temporaryRoot,
+    join(fakeBin, 'codegraph'),
+    [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      `echo "codegraph $*" >> "${logFile}"`,
+      'case "${1:-}" in',
+      '  "--version") echo "0.9.6" ;;',
+      '  "status") echo "CodeGraph Status"; echo "Index is up to date" ;;',
+      '  "install")',
+      // codegraph 1.6.2 prints this snippet for `install --print-config codex` and writes nothing.
+      '    if [[ "$*" == "install --print-config codex" ]]; then',
+      '      printf \'%s\\n\' "# Add to $HOME/.codex/config.toml" "" \'[mcp_servers.codegraph]\' \'command = "codegraph"\' \'args = ["serve", "--mcp"]\'',
+      '      exit 0',
+      '    fi',
+      '    echo "installed" ;;',
+      '  *) exit 1 ;;',
+      'esac',
+      '',
+    ].join('\n'),
+  );
+}
+
+function setupManagedRuntimeReadback(temporaryRoot: string, home: string, fakeBin: string, harnessVersion = '9.9.9'): void {
+  writeReadyOfficialCodexPluginCli(temporaryRoot, fakeBin, home);
+  const globalModules = join(home, '.bun', 'install', 'global', 'node_modules');
+  const harness = join(globalModules, 'repo-harness');
+  const archctx = join(globalModules, 'archctx');
+  mkdirSync(harness, { recursive: true });
+  writeFileSync(join(home, '.bun', 'install', 'global', 'package.json'), JSON.stringify({ dependencies: {} }));
+  seedGlobalPackageFixture({ HOME: home, BUN_INSTALL: join(home, '.bun') }, { mutable: true });
+  mkdirSync(join(archctx, 'bin'), { recursive: true });
+  mkdirSync(join(globalModules, 'archctx-contracts'), { recursive: true });
+  mkdirSync(join(globalModules, '@colbymchenry', 'codegraph'), { recursive: true });
+  writeFileSync(join(harness, 'package.json'), JSON.stringify({
+    name: 'repo-harness',
+    version: harnessVersion,
+    dependencies: { archctx: ARCHCTX_PIN, 'archctx-contracts': ARCHCTX_CONTRACTS_PIN },
+  }));
+  writeFileSync(join(archctx, 'package.json'), JSON.stringify({
+    name: 'archctx',
+    version: ARCHCTX_PIN,
+    engines: { node: '>=22.22 <26' },
+    bin: { archctx: './bin/archctx.mjs' },
+    dependencies: { '@colbymchenry/codegraph': CODEGRAPH_PIN },
+  }));
+  writeExecutable(temporaryRoot, join(archctx, 'bin', 'archctx.mjs'), '#!/usr/bin/env node\n');
+  writeFileSync(join(globalModules, 'archctx-contracts', 'package.json'), JSON.stringify({ name: 'archctx-contracts', version: ARCHCTX_CONTRACTS_PIN }));
+  writeFileSync(join(globalModules, '@colbymchenry', 'codegraph', 'package.json'), JSON.stringify({ name: '@colbymchenry/codegraph', version: CODEGRAPH_PIN }));
+  const systemNode = spawnSync('node', ['-p', 'process.execPath'], { encoding: 'utf-8' }).stdout.trim();
+  writeExecutable(temporaryRoot, join(fakeBin, 'node'), [
+    '#!/bin/bash',
+    'if [[ "${1:-}" == "--version" ]]; then echo v24.11.0; exit 0; fi',
+    `if [[ "\${1:-}" == *"/archctx/bin/archctx.mjs" && "\${2:-}" == "daemon" ]]; then printf '%s\\n' '{"schemaVersion":"archcontext.envelope/v1","ok":true,"data":{"running":false}}'; exit 0; fi`,
+    `if [[ "\${1:-}" == *"/archctx/bin/archctx.mjs" ]]; then printf '%s\\n' '${JSON.stringify({
+      schemaVersion: 'archcontext.capabilities/v1',
+      package: { name: 'archctx', version: ARCHCTX_PIN },
+      protocols: {
+        projectionRequest: 'archcontext.projection-request/v1',
+        projectionResult: 'archcontext.projection-result/v3',
+        architectureRefreshSignal: 'archcontext.architecture-refresh-signal/v2',
+      },
+      renderers: { architectureDocs: ARCHITECTURE_DOCS_RENDERER_VERSION, agentContext: 'archcontext.agent-context-renderer/v2' },
+      features: ['architecture-docs-renderer-v2', 'architecture-refresh-signal-v1', 'projection-apply-receipt-v1', 'projection-prior-committed-applies-v1', 'projection-protocol-v2'],
+    })}'; exit 0; fi`,
+    `exec "${systemNode}" "$@"`,
+    '',
+  ].join('\n'));
+}
+
+function installCandidateRuntimeFixture(home: string, version: string): string {
+  const candidate = join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness');
+  rmSync(candidate, { recursive: true, force: true });
+  copyPackageRuntimeFixture(ROOT, candidate);
+  const manifestPath = join(candidate, 'package.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { version?: string };
+  manifest.version = version;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  symlinkSync(join(ROOT, 'node_modules'), join(candidate, 'node_modules'), 'dir');
+  return candidate;
+}
+
+describe('registry-bound CLI update (#701)', () => {
+  function runUpdateFixture(options: {
+    previous?: string;
+    installed?: string;
+    registryOutput?: string;
+    registryExit?: number;
+    cliVersion?: string;
+    cliExit?: number;
+    channel?: 'latest' | 'next';
+    version?: string;
+    installExit?: number;
+  } = {}) {
+    const root = mkdtempSync(join(tmpdir(), 'repo-harness-registry-update-'));
+    const home = join(root, 'home');
+    const source = join(root, 'source');
+    const bin = join(root, 'bin');
+    const logPath = join(root, 'bun.log');
+    const installed = options.installed ?? '0.22.1';
+    const harness = join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness');
+    try {
+      mkdirSync(bin, { recursive: true });
+      writeFakeHc(bin);
+      mkdirSync(source, { recursive: true });
+      setupFakeSource(source);
+      setupManagedRuntimeReadback(root, home, bin, options.previous ?? '0.21.2');
+      writeFileSync(join(root, 'registry.json'), options.registryOutput ?? '"0.22.1"');
+      writeFileSync(join(root, 'installed.json'), JSON.stringify({
+        name: 'repo-harness', version: installed,
+        dependencies: { archctx: ARCHCTX_PIN, 'archctx-contracts': ARCHCTX_CONTRACTS_PIN },
+      }));
+      // Model the package manager's side effect. Registry and installed versions
+      // are independent inputs, so a zero exit can still leave an old CLI.
+      writeExecutable(root, join(bin, 'bun'), [
+        '#!/bin/bash',
+        `printf '%s\\n' "$*" >> "${logPath}"`,
+        'if [[ "${1:-}" == "--version" ]]; then echo 1.4.3; exit 0; fi',
+        // Bun 1.4.3 rejects `pm view` in a directory without package.json; the caller cwd (root) has none.
+        `if [[ "\${1:-}" == "pm" && "\${2:-}" == "view" && ! -f "$PWD/package.json" ]]; then echo "error: No package.json was found for directory \\"$PWD\\"" >&2; exit 1; fi`,
+        `if [[ "\${1:-}" == "pm" && "\${2:-}" == "view" ]]; then cat "${join(root, 'registry.json')}"; exit ${options.registryExit ?? 0}; fi`,
+        `if [[ "\${1:-}" == "add" && "\${2:-}" == "-g" ]]; then cp "${join(root, 'installed.json')}" "${join(harness, 'package.json')}"; exit ${options.installExit ?? 0}; fi`,
+        `if [[ "\${1:-}" == "${join(harness, 'src', 'cli', 'index.ts')}" && "\${2:-}" == "--version" ]]; then echo '${options.cliVersion ?? installed}'; exit ${options.cliExit ?? 0}; fi`,
+        'exit 97',
+        '',
+      ].join('\n'));
+      const env: NodeJS.ProcessEnv = {
+        ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'),
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+        REPO_HARNESS_BUN_EXECUTABLE: join(bin, 'bun'),
+      };
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: source, cwd: root, plugins: [], target: 'codex',
+        installSpec: `repo-harness@${options.version ?? options.channel ?? 'latest'}`, updateMode: true,
+        syncSkill: false, hostAdapters: false, externalSkills: false, codegraph: false,
+        env,
+      });
+      return { result, commands: readFileSync(logPath, 'utf-8').trim().split('\n') };
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test('explicit versions bypass the Bun manifest cache without resolving a channel', () => {
+    const { result, commands } = runUpdateFixture({ version: '0.22.1' });
+    expect(result.exitCode).toBe(0);
+    expect(commands).toContain('add -g repo-harness@0.22.1 --no-cache');
+    expect(commands.some(command => command.startsWith('pm view '))).toBe(false);
+  });
+
+  test('rejects a successful Bun install that leaves an older CLI than registry latest', () => {
+    const { result, commands } = runUpdateFixture({ installed: '0.21.2' });
+    expect(result.exitCode).toBe(1);
+    expect(result.lines).toContain('[runtime] failed: install repo-harness CLI - spec=repo-harness@0.22.1; installed CLI version mismatch: expected=0.22.1; actual=0.21.2; package=0.21.2');
+    expect(commands).toContain('pm view repo-harness@latest version --json --no-cache');
+    expect(commands).toContain('add -g repo-harness@0.22.1 --no-cache');
+    expect(commands.some(command => command.startsWith('add -g repo-harness@latest'))).toBe(false);
+    expect(result.steps.at(-1)?.step).toBe('install repo-harness CLI');
+  });
+
+  test('reports the prior and installed versions after an exact update', () => {
+    const { result, commands } = runUpdateFixture();
+    expect(result.exitCode).toBe(0);
+    expect(result.lines).toContain('[runtime] ok: install repo-harness CLI - spec=repo-harness@0.22.1; 0.21.2 -> 0.22.1');
+    expect(commands.indexOf('pm view repo-harness@latest version --json --no-cache')).toBeLessThan(commands.indexOf('add -g repo-harness@0.22.1 --no-cache'));
+  });
+
+  test('reports already current only after version readback', () => {
+    const { result, commands } = runUpdateFixture({ previous: '0.22.1' });
+    expect(result.exitCode).toBe(0);
+    expect(result.lines).toContain('[runtime] ok: install repo-harness CLI - spec=repo-harness@0.22.1; already at 0.22.1');
+    expect(commands.some(command => command.endsWith('/src/cli/index.ts --version'))).toBe(true);
+  });
+
+  test('resolves next to an exact prerelease without the manifest cache', () => {
+    const { result, commands } = runUpdateFixture({ channel: 'next', registryOutput: '"0.23.0-rc.1"', installed: '0.23.0-rc.1' });
+    expect(result.exitCode).toBe(0);
+    expect(commands).toContain('pm view repo-harness@next version --json --no-cache');
+    expect(commands).toContain('add -g repo-harness@0.23.0-rc.1 --no-cache');
+    expect(result.lines).toContain('[runtime] ok: install repo-harness CLI - spec=repo-harness@0.23.0-rc.1; 0.21.2 -> 0.23.0-rc.1');
+  });
+
+  test('stops before installing when the registry lookup fails', () => {
+    const { result, commands } = runUpdateFixture({ registryExit: 1 });
+    expect(result.exitCode).toBe(1);
+    expect(result.steps.at(-1)).toMatchObject({ status: 'failed', detail: 'unable to resolve repo-harness@latest from registry' });
+    expect(commands.some(command => command.startsWith('add '))).toBe(false);
+  });
+
+  test('rejects malformed registry data without a cached install fallback', () => {
+    for (const registryOutput of ['0.22.1', '{}', '["0.22.1"]', '"latest"', '"^0.22.1"', '""', '"/tmp/package"', '"0.22.1-01"', '"0.22.1-.."', '"01.22.1"']) {
+      const { result, commands } = runUpdateFixture({ registryOutput });
+      expect(result.exitCode, registryOutput).toBe(1);
+      expect(result.steps.at(-1)).toMatchObject({ status: 'failed', detail: expect.stringContaining('invalid registry version') });
+      expect(commands.some(command => command.startsWith('add '))).toBe(false);
+    }
+  });
+
+  test('rejects a CLI mismatch even when the package manifest has the expected version', () => {
+    const { result } = runUpdateFixture({ cliVersion: '0.21.2' });
+    expect(result.exitCode).toBe(1);
+    expect(result.steps.at(-1)?.detail).toContain('expected=0.22.1; actual=0.21.2; package=0.22.1');
+  });
+
+  test('rejects failed CLI readback even when its output names the expected version', () => {
+    const { result } = runUpdateFixture({ cliExit: 1 });
+    expect(result.exitCode).toBe(1);
+    expect(result.steps.at(-1)?.detail).toContain('installed CLI version mismatch');
+  });
+
+  test('stops at a failed install without reading back or refreshing host surfaces', () => {
+    const { result, commands } = runUpdateFixture({ installExit: 1 });
+    expect(result.exitCode).toBe(1);
+    expect(result.steps.at(-1)).toMatchObject({ status: 'failed', detail: 'spec=repo-harness@0.22.1' });
+    expect(commands.some(command => command.endsWith('/src/cli/index.ts --version'))).toBe(false);
+  });
+});
+
+describe('install command global runtime bootstrap', () => {
+  test('the CLI rejects Bun 1.3.14 before command dispatch', async () => {
+    const originalVersion = process.versions.bun;
+    Object.defineProperty(process.versions, 'bun', { value: '1.3.14', configurable: true, writable: true });
+    try {
+      await expect(runCli(['bun', CLI, '--version'])).rejects.toThrow(
+        'repo-harness requires Bun >= 1.4.0; found 1.3.14. Upgrade Bun and retry.',
+      );
+    } finally {
+      Object.defineProperty(process.versions, 'bun', { value: originalVersion, configurable: true, writable: true });
+    }
+  });
+
+  test('upgrades an old Bun runtime before any global install or update steps', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-init-bun-floor-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(home, '.bun', 'bin');
+    const source = join(tmp, 'source');
+    const bunLog = join(tmp, 'bun.log');
+    const upgradedMarker = join(tmp, 'upgraded');
+    try {
+      mkdirSync(home, { recursive: true });
+      // Core always runs the agent fleet helper; the stub keeps the fake Bun log to the runtime floor calls.
+      setupFakeSource(source);
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      writeExecutable(
+        tmp, join(fakeBin, 'bun'),
+        [
+          '#!/bin/bash',
+          `printf '%s\n' "$*" >> "${bunLog}"`,
+          `if [[ "\${1:-}" == "upgrade" ]]; then touch "${upgradedMarker}"; exit 0; fi`,
+          `if [[ "\${1:-}" == "--version" ]]; then [[ -f "${upgradedMarker}" ]] && echo "1.4.0" || echo "1.3.14"; exit 0; fi`,
+          'exit 99',
+          '',
+        ].join('\n'),
+      );
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        plugins: ['architecture'],
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.steps[0]).toMatchObject({
+        step: 'ensure Bun runtime',
+        status: 'ok',
+        detail: 'upgraded=1.4.0; minimum=1.4.0',
+      });
+      expect(readFileSync(bunLog, 'utf-8')).toBe('--version\nupgrade\n--version\n');
+      expect(JSON.parse(readFileSync(join(home, '.repo-harness/config.json'), 'utf8')).architecture).toEqual({
+        projection_provider: 'archctx', projection_apply: 'manual', projection_timeout_ms: 120000,
+      });
+      expect(result.steps.find((step) => step.step === 'global architecture projection')?.status).toBe('ok');
+      expect(JSON.parse(readFileSync(join(home, '.repo-harness/config.json'), 'utf8')).refactor_recommendations).toBeUndefined();
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('an old package-manager-owned Bun fails closed with its manager upgrade command', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-init-managed-bun-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'Cellar', 'bun', '1.3.14', 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeExecutable(
+        tmp, join(fakeBin, 'bun'),
+        [
+          '#!/bin/bash',
+          `printf '%s\n' "$*" >> "${bunLog}"`,
+          'if [[ "${1:-}" == "--version" ]]; then echo "1.3.14"; exit 0; fi',
+          'exit 99',
+          '',
+        ].join('\n'),
+      );
+
+      const result = runGlobalRuntimeSetup({
+        plugins: FULL_PLUGINS,
+        cwd: repo,
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.steps[0]?.status).toBe('failed');
+      expect(result.steps[0]?.stderr).toContain('run `brew upgrade bun`, then retry');
+      expect(readFileSync(bunLog, 'utf-8')).toBe('--version\n');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('CLI subprocesses stay bound to the validated launcher Bun when PATH contains an older Bun', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-init-path-mismatch-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      writeExecutable(
+        tmp, join(fakeBin, 'bun'),
+        `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nif [[ "\${1:-}" == "--version" ]]; then echo 1.0.0; exit 0; fi\nexit 99\n`,
+      );
+      const childEnv: NodeJS.ProcessEnv = {
+        ...sanitizedChildEnv(home),
+        HOME: home,
+        BUN_INSTALL: join(home, '.bun'),
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        REPO_HARNESS_CLAUDE_EXECUTABLE: join(fakeBin, 'claude'),
+      };
+      const harnessVersion = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version as string;
+      setupManagedRuntimeReadback(tmp, home, fakeBin, harnessVersion);
+      // Keep launcher validation local: a missing managed link would run a real Bun package install.
+      mkdirSync(join(home, '.bun', 'bin'), { recursive: true });
+      symlinkSync(join(home, '.bun', 'install', 'global', 'node_modules', 'archctx', 'bin', 'archctx.mjs'), join(home, '.bun', 'bin', 'archctx'));
+      writeFileSync(join(home, '.bun', 'install', 'global', 'package.json'), JSON.stringify({ dependencies: { archctx: ARCHCTX_PIN } }));
+      recordExplicitFullSelection(home, FULL_PLUGINS.filter(id => id !== 'operator'));
+      delete childEnv.REPO_HARNESS_BUN_EXECUTABLE;
+
+      const res = spawnSync(
+        process.execPath,
+        [
+          CLI,
+          'update',
+          '--no-cli',
+          '--no-sync-skill',
+          '--no-hooks',
+          '--no-external-skills',
+          '--no-codegraph',
+          '--json',
+        ],
+        { cwd: repo, encoding: 'utf-8', env: childEnv },
+      );
+
+      expect(res.status, `${res.stderr}\n${res.stdout}`).toBe(0);
+      const steps = JSON.parse(res.stdout).steps as Array<{ step: string; status: string; command?: string[] }>;
+      const runtimeStep = steps.find((step) => step.step === 'ensure Bun runtime')!;
+      expect(runtimeStep.status).toBe('skipped');
+      expect(runtimeStep.command?.[0]).toBe(process.execPath);
+      expect(steps.find((step) => step.step === 'install repo-harness CLI')?.status).toBe('skipped');
+      expect(steps.find((step) => step.step === 'official Codex plugin')).toBeUndefined();
+      expect(existsSync(bunLog)).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('the agent fleet helper runs on the validated Bun when that executable is not named bun', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-init-fleet-bun-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    // npm-distributed Bun ships its executable as node_modules/bun/bin/bun.exe.
+    const validatedBun = join(tmp, 'npm', 'node_modules', 'bun', 'bin', 'bun.exe');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      mkdirSync(join(validatedBun, '..'), { recursive: true });
+      writeBunWrapper(tmp, validatedBun);
+      writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.0.0; exit 0; fi\nexit 99\n');
+      writeFakeHc(fakeBin);
+      writeReadyOfficialCodexPluginCli(tmp, fakeBin, home);
+      const source = join(tmp, 'source');
+      copyPackageRuntimeFixture(ROOT, source);
+      setupConsoleFixture(home, source);
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        target: 'codex',
+        plugins: FULL_PLUGINS,
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+          REPO_HARNESS_BUN_EXECUTABLE: validatedBun,
+        },
+      });
+
+      expect(result.steps.find((step) => step.step === 'ensure Bun runtime')).toMatchObject({
+        status: 'skipped',
+        command: [validatedBun, '--version'],
+      });
+      const fleet = result.steps.find((step) => step.step === 'install agent fleet');
+      expect(fleet?.status, `${fleet?.stderr ?? ''}${fleet?.stdout ?? ''}`).toBe('ok');
+      for (const [host, ext] of [['claude', 'md'], ['codex', 'toml']]) {
+        expect(readdirSync(join(home, `.${host}`, 'agents')).sort()).toEqual(
+          ['deep-reasoner', 'explorer', 'harness-evaluator'].map(role => `${role}.${ext}`),
+        );
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('installs CLI, hooks, Waza, and CodeGraph without setup-plugins.sh', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-init-'));
+    const source = join(tmp, 'node_modules', 'repo-harness');
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    const bunxLog = join(tmp, 'bunx.log');
+    const codegraphLog = join(tmp, 'codegraph.log');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      setupFakeSource(source);
+      setupConsoleFixture(home, source);
+      const globalDist = join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness', 'dist');
+      mkdirSync(globalDist, { recursive: true });
+      copyFileSync(join(ROOT, 'dist', 'hook-entry.js'), join(globalDist, 'hook-entry.js'));
+      writeReadyOfficialCodexPluginCli(tmp, fakeBin, home);
+      mkdirSync(join(home, '.agents', 'rules'), { recursive: true });
+      writeFileSync(join(home, '.agents', 'rules', 'anti-patterns.md'), 'anti\n');
+      writeFileSync(join(home, '.agents', 'rules', 'chinese.md'), 'zh\n');
+      writeFileSync(join(home, '.agents', 'rules', 'durable-context.md'), 'durable\n');
+      writeFileSync(join(home, '.agents', 'rules', 'english.md'), 'en\n');
+      writeFakeCodegraph(tmp, fakeBin, codegraphLog);
+      // A lock entry with no staged skill and no record, as a killed rh call leaves it (D4b).
+      writeFileSync(join(home, '.agents', '.skill-lock.json'), `${JSON.stringify({ skills: { mermaid: { source: 'BfdCampos/dotfiles' } } }, null, 2)}\n`);
+      writeExecutable(tmp, join(fakeBin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nif [[ "\${1:-}" == "--version" ]]; then echo 1.4.0; fi\nexit 0\n`);
+      // The install/init provider-driven external-skills bootstrap invokes
+      // `bunx skills add ...` directly. The CodeGraph MCP configure step shells
+      // out to the real scripts/check-agent-tooling.sh, whose Waza status probe
+      // resolves the `skills` binary from PATH instead of going through bunx, so
+      // that one is stubbed separately below.
+      writeFakeSkillsCli(tmp, fakeBin);
+      // The fake Skills CLI writes the staged skills and its lock entries, and a lock key that no declaration names.
+      writeExecutable(tmp, join(fakeBin, 'bunx'), [`#!${process.execPath}`,
+        "const fs = require('fs'); const path = require('path'); const args = process.argv.slice(2);",
+        `fs.appendFileSync(${JSON.stringify(bunxLog)}, args.join(' ') + '\\n');`,
+        "if (args[0] === 'skills@1.9.0' && args[1] === 'add') {",
+        "  const lock = path.join(process.env.HOME, '.agents', '.skill-lock.json');",
+        "  const data = fs.existsSync(lock) ? JSON.parse(fs.readFileSync(lock, 'utf8')) : { skills: {} };",
+        "  data.version = 3;",
+        "  for (const name of args.slice(args.indexOf('-s') + 1, args.indexOf('-y'))) {",
+        "    fs.mkdirSync(path.join(process.env.HOME, '.agents', 'skills', name), { recursive: true });",
+        "    fs.writeFileSync(path.join(process.env.HOME, '.agents', 'skills', name, 'SKILL.md'), '# ' + name + '\\n');",
+        "    data.skills[name] = { source: args[2] };",
+        "  }",
+        "  fs.writeFileSync(lock, JSON.stringify(data, null, 2) + '\\n');",
+        "}", ''].join('\n'));
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        target: 'codex',
+        plugins: FULL_PLUGINS,
+        externalSkills: true,
+        codegraph: true,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+          REPO_HARNESS_CODEGRAPH_ALLOW_REPO_LOCAL: '0',
+        },
+      });
+
+      expect(result.exitCode, result.stdout).toBe(0);
+      expect(readFileSync(bunLog, 'utf-8').trim().split('\n')).toContain(`add -g ${source}`);
+      expect(result.steps.find((step) => step.step === 'sync repo-harness skill runtime')?.stdout).toContain(
+        'sync runtime',
+      );
+      expect(existsSync(join(home, '.codex', 'hooks.json'))).toBe(true);
+      expect(readFileSync(bunxLog, 'utf-8')).toContain(
+        'skills@1.9.0 add tw93/Waza -g -a codex -s think hunt check health -y',
+      );
+      expect(readFileSync(join(home, '.codex', 'rules', 'anti-patterns.md'), 'utf-8')).toBe('anti\n');
+      expect(readFileSync(bunxLog, 'utf-8')).toContain(
+        'skills@1.9.0 add BfdCampos/dotfiles -g -a codex -s mermaid -y',
+      );
+      expect(readFileSync(bunxLog, 'utf-8')).not.toContain(OBSIDIAN_PROVIDER);
+      expect(existsSync(join(home, '.codex', 'skills', 'repo-harness-cross-review', 'SKILL.md'))).toBe(true);
+      expect(existsSync(join(home, '.claude', 'skills', 'repo-harness-cross-review', 'SKILL.md'))).toBe(false);
+      expect(readFileSync(bunxLog, 'utf-8')).not.toContain('feature-dev');
+      // rh stores no vault configuration: the seats migration writes the file, and it carries no brainRoot.
+      expect(JSON.parse(readFileSync(join(home, '.repo-harness', 'config.json'), 'utf-8'))).not.toHaveProperty('brainRoot');
+      expect(readFileSync(codegraphLog, 'utf-8')).toContain('codegraph install --print-config codex');
+      // CodeGraph's own global installer is not a delegated writer: rh writes its printed config through the gate.
+      expect(readFileSync(codegraphLog, 'utf-8')).not.toContain('--target');
+      // The Skills CLI owns only the staged skills and their lock entries; the lock key outside them is reported.
+      const lock = join(home, '.agents', '.skill-lock.json');
+      const ledger = JSON.parse(readFileSync(join(home, '.repo-harness', 'config', 'ledger.json'), 'utf-8'));
+      const staged = ['think', 'hunt', 'check', 'health', 'mermaid'];
+      expect(staged.map((skill) => ledger.paths[pathRecordKey({ HOME: home }, join(home, '.agents', 'skills', skill))]?.host)).toEqual(staged.map(() => 'staged'));
+      expect(ledger.fragments.filter((fragment: { file: string }) => fragment.file === realpathSync(lock)).map((fragment: { selector: string }) => fragment.selector))
+        .toEqual(['think', 'hunt', 'check', 'health'].map((skill) => `skills.${skill}`));
+      expect(result.steps.find((step) => step.step === 'configure Mermaid skill')?.detail).toContain(`kept unowned lock entry skills.mermaid in ${lock}`);
+      expect(result.steps.find((step) => step.step === 'configure Waza skills')?.detail).toContain(`host_config_unattributed_diff: ${realpathSync(lock)} sha256:`);
+      expect(readFileSync(join(home, '.codex', 'config.toml'), 'utf-8')).toContain('[mcp_servers.codegraph]\ncommand = "codegraph"\nargs = ["serve", "--mcp", "--path", "."]\n');
+      // Regression guard: the Waza status probe inside check-agent-tooling.sh
+      // resolves the `skills` binary from PATH and never re-routes through
+      // bunx, whose package resolution made the probe budget report a false
+      // "timed-out" on working installations.
+      expect(readFileSync(bunxLog, 'utf-8')).not.toContain('skills ls -g --json');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test('explicit Obsidian bundle installs, verifies, and reprojects both pinned Skills without an executable dependency', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-obsidian-skills-'));
+    const source = join(tmp, 'source');
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunxLog = join(tmp, 'bunx.log');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      setupFakeSource(source);
+      writeReadyOfficialCodexPluginCli(tmp, fakeBin, home);
+      setObsidianSkillIntegrities(source);
+      writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.4.0; fi\nexit 0\n');
+      writeFakeSkillsCli(tmp, fakeBin);
+      writeExecutable(tmp, join(fakeBin, 'bunx'), `#!/bin/bash
+printf '%s\n' "$*" >> "${bunxLog}"
+if [[ " $* " == *" ${OBSIDIAN_PROVIDER} "* ]]; then
+  for skill in obsidian-markdown obsidian-cli; do
+    mkdir -p "$HOME/.agents/skills/$skill"
+    printf '# %s\n' "$skill" > "$HOME/.agents/skills/$skill/SKILL.md"
+  done
+fi
+exit 0
+`);
+      const env = {
+        ...sanitizedChildEnv(home),
+        HOME: home,
+        BUN_INSTALL: join(home, '.bun'),
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'),
+      };
+
+      const installed = runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        target: 'both',
+        plugins: ['strategy-memory'],
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        obsidianSkills: true,
+        codegraph: false,
+        env,
+      });
+      expect(installed.exitCode).toBe(0);
+      expect(readFileSync(bunxLog, 'utf-8')).toContain(
+        `skills@1.9.0 add ${OBSIDIAN_PROVIDER} -g -a codex -s obsidian-markdown obsidian-cli -y`,
+      );
+      for (const skill of ['obsidian-markdown', 'obsidian-cli']) {
+        expect(existsSync(join(home, '.agents', 'skills', skill, 'SKILL.md'))).toBe(true);
+        expect(existsSync(join(home, '.claude', 'skills', skill, 'SKILL.md'))).toBe(true);
+        expect(existsSync(join(home, '.codex', 'skills', skill, 'SKILL.md'))).toBe(true);
+      }
+      expect(existsSync(join(fakeBin, 'obsidian'))).toBe(false);
+
+      for (const skill of ['obsidian-markdown', 'obsidian-cli']) {
+        writeFileSync(join(home, '.agents', 'skills', skill, 'SKILL.md'), `# old ${skill}\n`);
+      }
+      mkdirSync(join(home, '.repo-harness'), { recursive: true });
+      writeFileSync(installStateFixturePath({ HOME: home }), `${JSON.stringify({
+        protocol: 5,
+        selection: ['strategy-memory'],
+        ...versions(['strategy-memory']),
+        transaction_id: 'obsidian-fixture',
+        applied_at: '2026-08-21T00:00:00.000Z',
+        previous: null,
+      }, null, 2)}\n`);
+      seedPathRecords({ HOME: home }, { ...readPathRecords({ HOME: home }), ...Object.fromEntries(['obsidian-markdown', 'obsidian-cli'].map((skill) => [
+        pathRecordKey({ HOME: home }, join(home, '.agents', 'skills', skill)),
+        { owner: 'strategy-memory', host: 'staged', kind: 'created', baseline: { state: 'unknown' }, committed: { type: 'directory', sha256: singleFileManagedTreeHash(`# old ${skill}\n`) } },
+      ] as const)) });
+
+      rmSync(join(home, '.codex', 'skills', 'obsidian-cli'));
+      const verifiedUpdate = runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        target: 'both',
+        plugins: ['strategy-memory'],
+        updateMode: true,
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        obsidianSkills: true,
+        codegraph: false,
+        env,
+      });
+      expect(verifiedUpdate.exitCode).toBe(0);
+      expect(verifiedUpdate.steps.find((step) => step.step === 'configure Obsidian companion Skills'))
+        .toMatchObject({ status: 'ok' });
+      expect(existsSync(join(home, '.codex', 'skills', 'obsidian-cli', 'SKILL.md'))).toBe(true);
+      expect(readFileSync(join(home, '.agents', 'skills', 'obsidian-cli', 'SKILL.md'), 'utf-8'))
+        .toBe('# obsidian-cli\n');
+      expect(readFileSync(bunxLog, 'utf-8').trim().split('\n')).toHaveLength(2);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test('update mode reconciles mandatory dependencies and refreshes explicitly selected Waza, Mermaid, and CodeGraph', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-managed-update-'));
+    const source = join(tmp, 'source');
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    const bunxLog = join(tmp, 'bunx.log');
+    const codegraphLog = join(tmp, 'codegraph.log');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      setupFakeSource(source);
+      setupManagedRuntimeReadback(tmp, home, fakeBin);
+      for (const skill of ['think', 'hunt', 'check', 'health', 'mermaid']) {
+        mkdirSync(join(home, '.agents', 'skills', skill), { recursive: true });
+        writeFileSync(join(home, '.agents', 'skills', skill, 'SKILL.md'), `# stale ${skill}\n`);
+      }
+      mkdirSync(join(home, '.agents', 'rules'), { recursive: true });
+      mkdirSync(join(home, '.codex', 'rules'), { recursive: true });
+      for (const rule of ['anti-patterns.md', 'chinese.md', 'durable-context.md', 'english.md']) {
+        writeFileSync(join(home, '.agents', 'rules', rule), '# stale rule\n');
+        writeFileSync(join(home, '.codex', 'rules', rule), '# stale rule\n');
+      }
+      const stagingRules = wazaRules.files.map((rule) => join(home, '.agents', 'rules', rule));
+      recordInstallOwnership([], { HOME: home });
+      recordInstallOwnership([...stagingRules, ...wazaRules.files.map(rule => join(home, '.codex/rules', rule))], { HOME: home });
+      // The staged skills are rh's: an update refreshes them through the Skills CLI.
+      seedPathRecords({ HOME: home }, { ...readPathRecords({ HOME: home }), ...Object.fromEntries(['think', 'hunt', 'check', 'health', 'mermaid'].map((skill) => [
+        pathRecordKey({ HOME: home }, join(home, '.agents', 'skills', skill)),
+        { owner: 'core', host: 'staged', kind: 'created', baseline: { state: 'unknown' }, committed: { type: 'directory', sha256: singleFileManagedTreeHash(`# stale ${skill}\n`) } },
+      ] as const)) });
+      writeFakeCodegraph(tmp, fakeBin, codegraphLog);
+      writeExecutable(tmp, join(fakeBin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nif [[ "\${1:-}" == "--version" ]]; then echo 1.4.0; fi\nif [[ "\${3:-}" == archctx@* ]]; then mkdir -p "$HOME/.bun/bin"; ln -sf "$HOME/.bun/install/global/node_modules/archctx/bin/archctx.mjs" "$HOME/.bun/bin/archctx"; fi\nexit 0\n`);
+      writeFakeSkillsCli(tmp, fakeBin);
+      writeExecutable(tmp, join(fakeBin, 'bunx'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunxLog}"\nexit 0\n`);
+      writeExecutable(tmp, join(fakeBin, 'curl'), `#!/bin/bash
+set -euo pipefail
+output=''
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == '--output' ]]; then output="$2"; shift; fi
+  shift
+done
+if [[ -n "$output" ]]; then printf '# refreshed rule\\n' > "$output"; else printf '# refreshed rule\\n'; fi
+`);
+
+      const update = (options: { plugins: readonly PluginId[]; codegraph?: boolean }) => runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        target: 'codex',
+        installSpec: 'repo-harness@9.9.9',
+        updateMode: true,
+        externalSkills: true,
+        syncSkill: false,
+        hostAdapters: false,
+        ...options,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+          REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'),
+          REPO_HARNESS_CODEGRAPH_ALLOW_REPO_LOCAL: '0',
+        },
+      });
+      // The 0.32 bin link that Bun keeps after the rename, and a user file that still calls the old command.
+      const retiredLink = join(home, '.bun', 'bin', 'repo-harness');
+      const cliEntry = join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness', 'src', 'cli', 'index.ts');
+      mkdirSync(dirname(cliEntry), { recursive: true });
+      if (!existsSync(cliEntry)) writeFileSync(cliEntry, '#!/usr/bin/env bun\n');
+      mkdirSync(dirname(retiredLink), { recursive: true });
+      symlinkSync(cliEntry, retiredLink);
+      mkdirSync(join(home, '.codex'), { recursive: true });
+      // Host-file notice path: each call and the prose line give a notice; the exclusions and the managed rules block that update writes do not.
+      const agents = join(home, '.codex', 'AGENTS.md');
+      // The refresh renders the rules block from the source template.
+      const template = join(source, 'assets', 'reference-configs', 'global-working-rules.md');
+      mkdirSync(dirname(template), { recursive: true });
+      copyFileSync(join(ROOT, 'assets', 'reference-configs', 'global-working-rules.md'), template);
+      const userText = [...RETIRED_CLI_LINES.calls, RETIRED_CLI_LINES.prose, ...RETIRED_CLI_LINES.excluded].join('\n');
+      const managedBlock = renderGlobalRulesBlock(ROOT, { preset: 'en', instruction: 'Use English to report to user.' });
+      writeFileSync(agents, `${userText}\n${managedBlock}`);
+      const result = update({ plugins: FULL_PLUGINS });
+
+      expect(result.exitCode).toBe(0);
+      expect(lstatSync(retiredLink, { throwIfNoEntry: false })).toBeUndefined();
+      expect(result.steps.find((step) => step.step === 'retire the repo-harness command link')?.detail).toBe(`Removed ${retiredLink}. The command is rh.`);
+      const named = RETIRED_CLI_LINES.calls.length + 1;
+      expect(result.steps.find((step) => step.step === 'find repo-harness command calls in user files')?.detail).toBe(
+        `${named} line(s) in files that you own name repo-harness; update does not change them. Change each line that calls it to rh: ${Array.from({ length: named }, (_, index) => `${agents}:${index + 1}`).join(', ')}.`);
+      expect(readFileSync(agents, 'utf8')).toStartWith(userText);
+      // Update keeps an edited rules block, so the scan reads it as user text.
+      const call = RETIRED_CLI_LINES.calls[0]!;
+      const editedBlock = managedBlock.replace(GLOBAL_RULES_END, `${call}\n${GLOBAL_RULES_END}`);
+      writeFileSync(agents, editedBlock);
+      expect(update({ plugins: FULL_PLUGINS }).steps.find((step) => step.step === 'find repo-harness command calls in user files')?.detail)
+        .toContain(`${agents}:${editedBlock.split('\n').indexOf(call) + 1}`);
+      expect(readFileSync(agents, 'utf8')).toBe(editedBlock);
+      // A file at the link path without the exact proof stays, with its removal command.
+      writeFileSync(retiredLink, 'owner file');
+      const retireDetail = () => update({ plugins: FULL_PLUGINS }).steps.find((step) => step.step === 'retire the repo-harness command link')?.detail;
+      expect(retireDetail()).toBe(`${retiredLink} is not proved to be this package's launcher; it stays. Remove it by hand when you do not need it: rm '${retiredLink}'. The command is rh.`);
+      expect(readFileSync(retiredLink, 'utf8')).toBe('owner file');
+      rmSync(retiredLink);
+      // Windows launchers are never removed: they get a notice with the PowerShell removal command.
+      const exe = `${retiredLink}.exe`;
+      const record = `${retiredLink}.bunx`;
+      writeFileSync(exe, 'launcher');
+      writeFileSync(record, Buffer.from('..\\install\\global\\node_modules\\repo-harness\\src\\cli\\index.ts', 'utf16le'));
+      expect(retireDetail()).toBe(`${exe}, ${record} stays: update does not remove Windows launchers. Remove them in PowerShell: Remove-Item -LiteralPath '${exe}', '${record}'. The command is rh.`);
+      expect([existsSync(exe), existsSync(record)]).toEqual([true, true]);
+      rmSync(exe);
+      rmSync(record);
+      expect(result.steps.find((step) => step.step === 'verify managed runtime dependencies')).toMatchObject({ status: 'ok' });
+      expect(result.steps.find((step) => step.step === 'verify managed runtime dependencies')?.detail).toContain(`archctx@${ARCHCTX_PIN}`);
+      const archctxLink = join(home, '.bun', 'bin', 'archctx');
+      expect(realpathSync(archctxLink)).toBe(realpathSync(join(home, '.bun', 'install', 'global', 'node_modules', 'archctx', 'bin', 'archctx.mjs')));
+      expect(update({ plugins: FULL_PLUGINS }).exitCode).toBe(0);
+      rmSync(archctxLink);
+      writeFileSync(archctxLink, 'owner file');
+      const conflict = update({ plugins: FULL_PLUGINS });
+      expect(conflict.exitCode).toBe(1);
+      expect(conflict.steps.find(step => step.step === 'verify managed runtime dependencies')?.detail).toContain('RH_ARCHCTX_BIN_CONFLICT');
+      expect(readFileSync(archctxLink, 'utf8')).toBe('owner file');
+      rmSync(archctxLink);
+      symlinkSync(join(home, 'missing-archctx'), archctxLink);
+      expect(update({ plugins: FULL_PLUGINS }).steps.find(step => step.step === 'verify managed runtime dependencies')?.detail).toContain('Move or remove it');
+      rmSync(archctxLink);
+      const bunScript = readFileSync(join(fakeBin, 'bun.fixture-body'), 'utf8');
+      writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.4.0; fi\nexit 0\n');
+      expect(update({ plugins: FULL_PLUGINS }).steps.find(step => step.step === 'verify managed runtime dependencies')?.detail).toContain('RH_ARCHCTX_BIN_READBACK');
+      writeShellExecutableFixture(tmp, join(fakeBin, 'bun'), bunScript);
+      expect(readFileSync(bunxLog, 'utf-8')).toContain('skills@1.9.0 add tw93/Waza -g -a codex -s think hunt check health -y');
+      expect(readFileSync(bunxLog, 'utf-8')).toContain('skills@1.9.0 add BfdCampos/dotfiles -g -a codex -s mermaid -y');
+      expect(readFileSync(bunLog, 'utf-8')).toContain(`add -g @colbymchenry/codegraph@${CODEGRAPH_PIN}`);
+      expect(result.steps.find((step) => step.step === 'ensure CodeGraph CLI')?.detail).toBe(`updated=${CODEGRAPH_PIN}`);
+      expect(readFileSync(join(home, '.codex', 'rules', 'chinese.md'), 'utf-8')).toBe('# refreshed rule\n');
+      expect(readFileSync(join(home, '.agents', 'rules', 'chinese.md'), 'utf-8')).toBe('# refreshed rule\n');
+
+      // A plain update's candidate request allows CodeGraph (codegraph: true); without architecture it runs no CodeGraph step.
+      rmSync(bunLog);
+      const withoutArchitecture = update({ plugins: FULL_PLUGINS.filter(id => id !== 'architecture'), codegraph: true });
+      expect(withoutArchitecture.exitCode, JSON.stringify(withoutArchitecture.steps.filter(step => step.status === 'failed'))).toBe(0);
+      expect(withoutArchitecture.steps.filter(step => step.step.includes('CodeGraph'))).toEqual([
+        { step: 'ensure CodeGraph CLI', status: 'skipped', detail: 'architecture plugin not selected' },
+        { step: 'configure CodeGraph MCP', status: 'skipped', detail: 'architecture plugin not selected' },
+      ]);
+      expect(readFileSync(bunLog, 'utf-8')).not.toContain('@colbymchenry/codegraph');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test('update mode preserves the working CLI and fails closed when Bun leaves a stale mandatory dependency tree', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-managed-update-repair-'));
+    const source = join(tmp, 'source');
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      setupFakeSource(source);
+      setupManagedRuntimeReadback(tmp, home, fakeBin);
+      const archctxManifest = join(home, '.bun', 'install', 'global', 'node_modules', 'archctx', 'package.json');
+      const stale = JSON.parse(readFileSync(archctxManifest, 'utf-8'));
+      stale.version = '0.3.0';
+      writeFileSync(archctxManifest, JSON.stringify(stale));
+      writeExecutable(tmp, join(fakeBin, 'bun'), [
+        '#!/bin/bash',
+        `printf '%s\\n' "$*" >> "${bunLog}"`,
+        'if [[ "${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi',
+        'exit 0',
+        '',
+      ].join('\n'));
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        plugins: ['architecture'],
+        installSpec: 'repo-harness@9.9.9',
+        updateMode: true,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+          REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'),
+        },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.steps.find((step) => step.step === 'verify managed runtime dependencies')).toMatchObject({
+        status: 'failed',
+        detail: expect.stringContaining('managed runtime mismatch'),
+      });
+      const log = readFileSync(bunLog, 'utf-8');
+      expect(log.match(/add -g repo-harness@9\.9\.9/g)).toHaveLength(1);
+      expect(log).not.toContain('remove -g repo-harness');
+      expect(existsSync(join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness', 'package.json'))).toBe(true);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test('update mode moves the managed archctx link of the previous pin to the candidate pin that Bun nested under the candidate', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-managed-update-nested-'));
+    const source = join(tmp, 'source');
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    try {
+      for (const dir of [source, home, repo, fakeBin]) mkdirSync(dir, { recursive: true });
+      setupFakeSource(source);
+      setupManagedRuntimeReadback(tmp, home, fakeBin);
+      const globalRoot = join(home, '.bun', 'install', 'global');
+      const topArchctx = join(globalRoot, 'node_modules', 'archctx');
+      const nestedArchctx = join(globalRoot, 'node_modules', 'repo-harness', 'node_modules', 'archctx');
+      const candidateManifest = readFileSync(join(topArchctx, 'package.json'), 'utf8');
+      const candidateManifestCopy = join(tmp, 'archctx-candidate.json');
+      writeFileSync(candidateManifestCopy, candidateManifest);
+      // Parent state: the global manifest and the top-level package hold the previous pin, and the managed link points to it.
+      writeFileSync(join(globalRoot, 'package.json'), JSON.stringify({ dependencies: { archctx: '0.12.0' } }));
+      writeFileSync(join(topArchctx, 'package.json'), JSON.stringify({ ...JSON.parse(candidateManifest), version: '0.12.0' }));
+      mkdirSync(join(nestedArchctx, 'bin'), { recursive: true });
+      writeFileSync(join(nestedArchctx, 'package.json'), candidateManifest);
+      writeExecutable(tmp, join(nestedArchctx, 'bin', 'archctx.mjs'), '#!/usr/bin/env node\n');
+      const link = join(home, '.bun', 'bin', 'archctx');
+      mkdirSync(join(home, '.bun', 'bin'), { recursive: true });
+      symlinkSync(join(topArchctx, 'bin', 'archctx.mjs'), link);
+      // `bun add -g archctx@<pin>` puts the pin at the top level and keeps the nested copy, as Bun 1.4.3 does (#2669).
+      writeExecutable(tmp, join(fakeBin, 'bun'), [
+        '#!/bin/bash',
+        `printf '%s\\n' "$*" >> "${bunLog}"`,
+        'if [[ "${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi',
+        `if [[ "\${3:-}" == archctx@* ]]; then cp "${candidateManifestCopy}" "${join(topArchctx, 'package.json')}"; printf '{"dependencies":{"archctx":"%s"}}' "\${3#archctx@}" > "${join(globalRoot, 'package.json')}"; fi`,
+        'exit 0',
+        '',
+      ].join('\n'));
+
+      const update = () => runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        plugins: ['architecture'],
+        installSpec: 'repo-harness@9.9.9',
+        updateMode: true,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+          REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'),
+        },
+      });
+      const result = update();
+
+      expect(result.exitCode, JSON.stringify(result.steps.filter(step => step.status === 'failed'))).toBe(0);
+      expect(result.steps.find((step) => step.step === 'verify managed runtime dependencies'), JSON.stringify(result.steps.filter(step => step.status === 'failed'))).toMatchObject({ status: 'ok' });
+      expect(JSON.parse(readFileSync(join(globalRoot, 'package.json'), 'utf8')).dependencies.archctx).toBe(ARCHCTX_PIN);
+      expect(JSON.parse(readFileSync(join(topArchctx, 'package.json'), 'utf8')).version).toBe(ARCHCTX_PIN);
+      expect(realpathSync(link)).toBe(realpathSync(join(topArchctx, 'bin', 'archctx.mjs')));
+      expect(existsSync(join(nestedArchctx, 'package.json'))).toBe(true);
+      // The next update finds the link at the pin and installs archctx no second time.
+      const again = update();
+      expect(again.steps.find((step) => step.step === 'verify managed runtime dependencies'), JSON.stringify(again.steps.filter(step => step.status === 'failed'))).toMatchObject({ status: 'ok' });
+      expect(readFileSync(bunLog, 'utf8').match(/add -g archctx@/g)).toHaveLength(1);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test('fails closed before host projection when the pinned Obsidian Skill tree digest drifts', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-obsidian-skill-integrity-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const isolatedHomeLog = join(tmp, 'isolated-home.log');
+    const isolatedRuntimeLog = join(tmp, 'isolated-runtime.log');
+    const hostileBunInstall = join(tmp, 'hostile-bun-install');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      mkdirSync(hostileBunInstall, { recursive: true });
+      writeExecutable(
+        tmp, join(fakeBin, 'bun'),
+        '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.4.0; fi\nexit 0\n',
+      );
+      writeFakeSkillsCli(tmp, fakeBin);
+      writeExecutable(tmp, join(fakeBin, 'bunx'), `#!/bin/bash
+printf '%s\n' "$HOME" > "${isolatedHomeLog}"
+printf '%s\n%s\n%s\n%s\n' "$BUN_INSTALL" "$BUN_INSTALL_CACHE_DIR" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" > "${isolatedRuntimeLog}"
+mkdir -p "$BUN_INSTALL"
+printf 'isolated\n' > "$BUN_INSTALL/probe"
+mkdir -p "$HOME/.agents/skills/obsidian-markdown" "$HOME/.codex/skills/obsidian-markdown"
+printf '# drifted obsidian-markdown\n' > "$HOME/.agents/skills/obsidian-markdown/SKILL.md"
+printf '# premature host projection\n' > "$HOME/.codex/skills/obsidian-markdown/SKILL.md"
+exit 0
+`);
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: ROOT,
+        cwd: repo,
+        target: 'codex',
+        plugins: ['strategy-memory'],
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        obsidianSkills: true,
+        codegraph: false,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: hostileBunInstall,
+          XDG_STATE_HOME: join(home, '.local', 'state'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.steps.find((step) => step.step === 'configure Obsidian companion Skills')).toMatchObject({
+        status: 'failed',
+      });
+      expect(result.steps.find((step) => step.step === 'configure Obsidian companion Skills')?.detail).toContain(
+        'isolated staging integrity mismatch',
+      );
+      expect(readFileSync(isolatedHomeLog, 'utf-8').trim()).not.toBe(home);
+      const [isolatedBunInstall, isolatedBunCache, isolatedXdgCache, isolatedXdgState] = readFileSync(isolatedRuntimeLog, 'utf-8').trim().split('\n');
+      expect(isolatedBunInstall).toBe(join(readFileSync(isolatedHomeLog, 'utf-8').trim(), '.bun'));
+      expect(isolatedBunCache).toBe(join(isolatedBunInstall, 'install', 'cache'));
+      expect(isolatedXdgCache).toBe(join(readFileSync(isolatedHomeLog, 'utf-8').trim(), '.cache'));
+      expect(isolatedXdgState).toBe(join(readFileSync(isolatedHomeLog, 'utf-8').trim(), '.local', 'state'));
+      expect(existsSync(join(hostileBunInstall, 'probe'))).toBe(false);
+      expect(existsSync(join(home, '.agents', 'skills', 'obsidian-markdown'))).toBe(false);
+      expect(existsSync(join(home, '.codex', 'skills', 'obsidian-markdown'))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects a pre-existing Obsidian Skill staging symlink even when its target matches the pinned digest', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-obsidian-skill-staging-symlink-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const outside = join(tmp, 'outside');
+    try {
+      mkdirSync(join(home, '.agents', 'skills'), { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(join(outside, 'SKILL.md'), '# obsidian-markdown\n');
+      symlinkSync(outside, join(home, '.agents', 'skills', 'obsidian-markdown'), 'dir');
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: ROOT,
+        cwd: repo,
+        target: 'codex',
+        plugins: ['strategy-memory'],
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        obsidianSkills: true,
+        codegraph: false,
+        env: { ...sanitizedChildEnv(home), HOME: home },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.steps.find((step) => step.step === 'configure Obsidian companion Skills')).toMatchObject({
+        status: 'failed',
+        detail: expect.stringContaining('refusing non-canonical integrity staging root'),
+      });
+      expect(existsSync(join(home, '.codex', 'skills', 'obsidian-markdown'))).toBe(false);
+      expect(readFileSync(join(outside, 'SKILL.md'), 'utf-8')).toBe('# obsidian-markdown\n');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test.each(['outside directory', 'dangling link'] as const)('rejects a shared skills root that is a link to an %s instead of blessing its realpath', (shape) => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-obsidian-skill-root-symlink-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const outside = join(tmp, 'outside');
+    try {
+      mkdirSync(join(home, '.agents'), { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(join(outside, 'obsidian-markdown'), { recursive: true });
+      writeFileSync(join(outside, 'obsidian-markdown', 'SKILL.md'), '# obsidian-markdown\n');
+      symlinkSync(shape === 'dangling link' ? join(tmp, 'missing') : outside, join(home, '.agents', 'skills'), 'dir');
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: ROOT,
+        cwd: repo,
+        target: 'codex',
+        plugins: ['strategy-memory'],
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        obsidianSkills: true,
+        codegraph: false,
+        env: { ...sanitizedChildEnv(home), HOME: home },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.steps.find((step) => step.step === 'configure Obsidian companion Skills')).toMatchObject({
+        status: 'failed',
+        detail: expect.stringContaining('staging parent escapes canonical authority'),
+      });
+      expect(existsSync(join(home, '.codex', 'skills', 'obsidian-markdown'))).toBe(false);
+      expect(readFileSync(join(outside, 'obsidian-markdown', 'SKILL.md'), 'utf-8'))
+        .toBe('# obsidian-markdown\n');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('preflights unowned Obsidian Skill host paths before committing shared staging', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-obsidian-skill-host-preflight-'));
+    const source = join(tmp, 'source');
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunxLog = join(tmp, 'bunx.log');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      setupFakeSource(source);
+      setObsidianSkillIntegrities(source);
+      mkdirSync(join(home, '.codex', 'skills', 'obsidian-markdown'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'skills', 'obsidian-markdown', 'SKILL.md'), '# user-owned\n');
+      writeFakeSkillsCli(tmp, fakeBin);
+      writeExecutable(tmp, join(fakeBin, 'bunx'), `#!/bin/bash\nprintf '%s\\n' "$*" > "${bunxLog}"\nexit 0\n`);
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        target: 'codex',
+        plugins: ['strategy-memory'],
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        obsidianSkills: true,
+        codegraph: false,
+        env: { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'), PATH: `${fakeBin}:${process.env.PATH ?? ''}` },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.steps.find((step) => step.step === 'configure Obsidian companion Skills')).toMatchObject({
+        status: 'failed',
+        detail: expect.stringContaining('refusing to refresh unowned host skill'),
+      });
+      expect(existsSync(bunxLog)).toBe(false);
+      expect(existsSync(join(home, '.agents', 'skills', 'obsidian-markdown'))).toBe(false);
+      expect(readFileSync(join(home, '.codex', 'skills', 'obsidian-markdown', 'SKILL.md'), 'utf-8'))
+        .toBe('# user-owned\n');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('linked host skill roots follow the gate and keep unrelated user entries', () => {
+    const temporary = mkdtempSync(join(tmpdir(), 'rh-linked-host-'));
+    const source = join(temporary, 'source'), home = join(temporary, 'home'), outside = join(temporary, 'outside'), bin = join(temporary, 'bin');
+    try {
+      mkdirSync(join(home, '.codex'), { recursive: true }); mkdirSync(outside); mkdirSync(bin);
+      setupFakeSource(source); setObsidianSkillIntegrities(source); writeFakeHc(bin); writeFakeSkillsCli(temporary, bin);
+      writeExecutable(temporary, join(bin, 'bun'), '#!/bin/bash\nif [[ "$1" == --version ]]; then echo 1.4.0; exit 0; fi\nexit 0\n');
+      writeExecutable(temporary, join(bin, 'bunx'), '#!/bin/bash\nfor skill in obsidian-markdown obsidian-cli; do mkdir -p "$HOME/.agents/skills/$skill"; printf "# %s\\n" "$skill" > "$HOME/.agents/skills/$skill/SKILL.md"; done\n');
+      writeFileSync(join(outside, 'keep.txt'), 'user\n'); symlinkSync(outside, join(home, '.codex/skills'), 'dir');
+      const env = { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'), PATH: bin + ':' + process.env.PATH, REPO_HARNESS_BUN_EXECUTABLE: join(bin, 'bun') };
+      const result = runGlobalRuntimeSetup({ sourceRoot: source, cwd: temporary, target: 'codex', plugins: ['strategy-memory'], installCli: false,
+        syncSkill: false, hostAdapters: false, externalSkills: false, obsidianSkills: true, codegraph: false, env });
+      expect(result.exitCode, result.stderr).toBe(0);
+      for (const name of ['obsidian-markdown', 'obsidian-cli']) {
+        expect(readFileSync(join(outside, name, 'SKILL.md'), 'utf8')).toBe('# ' + name + '\n');
+        expect(ownedPath(env, join(home, '.codex/skills', name))?.owner).toBe('strategy-memory');
+      }
+      expect(readFileSync(join(outside, 'keep.txt'), 'utf8')).toBe('user\n');
+    } finally { rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  test('dangling host skill roots return a failed step and compensate committed staging', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-obsidian-skill-host-root-dangling-'));
+    const source = join(tmp, 'source');
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    try {
+      mkdirSync(join(home, '.codex'), { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      setupFakeSource(source);
+      setObsidianSkillIntegrities(source);
+      symlinkSync(join(tmp, 'missing-host-root'), join(home, '.codex', 'skills'), 'dir');
+      writeFakeSkillsCli(tmp, fakeBin);
+      writeExecutable(tmp, join(fakeBin, 'bunx'), `#!/bin/bash
+mkdir -p "$HOME/.agents/skills/obsidian-markdown"
+printf '# obsidian-markdown\\n' > "$HOME/.agents/skills/obsidian-markdown/SKILL.md"
+exit 0
+`);
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        target: 'codex',
+        plugins: ['strategy-memory'],
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        obsidianSkills: true,
+        codegraph: false,
+        env: { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'), PATH: `${fakeBin}:${process.env.PATH ?? ''}` },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.steps.find((step) => step.step === 'configure Obsidian companion Skills')).toMatchObject({ status: 'failed' });
+      expect(existsSync(join(home, '.agents', 'skills', 'obsidian-markdown'))).toBe(false);
+      expect(existsSync(join(tmp, 'missing-host-root'))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('fails closed before any write when an explicit Obsidian dependency is absent from the catalog', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-obsidian-skill-missing-catalog-'));
+    const source = join(tmp, 'source');
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      setupFakeSource(source);
+      const manifestPath = join(source, 'assets', 'skill-commands', 'manifest.json');
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+      manifest.packages = manifest.packages.filter(
+        ({ name }: { name: string }) => name !== 'obsidian-markdown',
+      );
+      writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+      expect(() => runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        target: 'codex',
+        plugins: ['strategy-memory'],
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        obsidianSkills: true,
+        codegraph: false,
+        env: { ...sanitizedChildEnv(home), HOME: home },
+      })).toThrow('required package "obsidian-markdown" is not in this catalog');
+      expect(existsSync(join(home, '.agents', 'skills', 'obsidian-cli'))).toBe(false);
+      expect(existsSync(join(home, '.codex', 'skills', 'obsidian-cli'))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('fails closed before provider execution when explicit Obsidian Skill integrity is absent', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-obsidian-skill-missing-integrity-'));
+    const source = join(tmp, 'source');
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      setupFakeSource(source);
+      setObsidianSkillIntegrity(source, 'obsidian-markdown', null);
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        target: 'codex',
+        plugins: ['strategy-memory'],
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        obsidianSkills: true,
+        codegraph: false,
+        env: { ...sanitizedChildEnv(home), HOME: home },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.steps.find((step) => step.step === 'configure Obsidian companion Skills')).toEqual({
+        step: 'configure Obsidian companion Skills',
+        status: 'failed',
+        detail: 'catalog package obsidian-markdown requires a pinned tree integrity digest',
+      });
+      expect(existsSync(join(home, '.agents', 'skills', 'obsidian-markdown'))).toBe(false);
+      expect(existsSync(join(home, '.codex', 'skills', 'obsidian-markdown'))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('repairs Bun dependency loop by reinstalling CLI from a packed tarball and drops superseded release tarballs', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-cli-loop-'));
+    const source = join(tmp, 'source');
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    const npmLog = join(tmp, 'npm.log');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      setupFakeSource(source);
+      const packDir = join(home, '.repo-harness', 'packages');
+      setupConsoleFixture(home, source);
+      mkdirSync(packDir, { recursive: true });
+      for (const name of ['repo-harness-9.9.8.tgz', 'repo-harness-0.10.0-local.tgz', 'other-1.0.0.tgz']) writeFileSync(join(packDir, name), '');
+      writeReadyOfficialCodexPluginCli(tmp, fakeBin, home);
+      writeExecutable(
+        tmp, join(fakeBin, 'bun'),
+        [
+          '#!/bin/bash',
+          'set -euo pipefail',
+          `printf '%s\\n' "$*" >> "${bunLog}"`,
+          'if [[ "${1:-}" == "--version" ]]; then echo "1.4.0"; exit 0; fi',
+          `if [[ "$*" == "add -g ${source}" ]]; then`,
+          '  echo "error: DependencyLoop" >&2',
+          '  echo "Resolution: repo-harness@../../../Projects/repo-harness" >&2',
+          '  echo "Dependency: repo-harness@^9.9.9" >&2',
+          '  exit 1',
+          'fi',
+          'exit 0',
+          '',
+        ].join('\n'),
+      );
+      writeExecutable(tmp,
+        join(fakeBin, 'npm'),
+        [
+          '#!/bin/bash',
+          'set -euo pipefail',
+          `printf '%s\\n' "$*" >> "${npmLog}"`,
+          'if [[ "${1:-}" == "pack" ]]; then',
+          '  destination=""',
+          '  for ((i=1; i<=$#; i++)); do',
+          '    if [[ "${!i}" == "--pack-destination" ]]; then',
+          '      next=$((i + 1))',
+          '      destination="${!next}"',
+          '    fi',
+          '  done',
+          '  mkdir -p "$destination"',
+          '  touch "$destination/repo-harness-9.9.9.tgz"',
+          '  printf \'[{"filename":"repo-harness-9.9.9.tgz"}]\\n\'',
+          '  exit 0',
+          'fi',
+          'exit 1',
+          '',
+        ].join('\n'),
+      );
+
+      const result = runGlobalRuntimeSetup({
+        plugins: FULL_PLUGINS,
+        sourceRoot: source,
+        cwd: repo,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+        env: { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'), PATH: `${fakeBin}:${process.env.PATH ?? ''}` },
+      });
+
+      expect(result.exitCode, result.stdout).toBe(0);
+      const install = result.steps.find((step) => step.step === 'install repo-harness CLI');
+      expect(install?.status).toBe('ok');
+      expect(install?.detail).toBe('version=9.9.9; repaired=packed-tarball');
+      const bunCommands = readFileSync(bunLog, 'utf-8').trim().split('\n');
+      expect(bunCommands[0]).toBe('--version');
+      expect(bunCommands[1]).toBe(`add -g ${source}`);
+      expect(bunCommands[2]).toBe('remove -g repo-harness');
+      expect(bunCommands[3]).toBe(`add -g ${join(home, '.repo-harness', 'packages', 'repo-harness-9.9.9.tgz')}`);
+      expect(existsSync(join(home, '.repo-harness', 'packages', 'repo-harness-9.9.9.tgz'))).toBe(true);
+      expect(readdirSync(packDir).sort()).toEqual(['other-1.0.0.tgz', 'repo-harness-0.10.0-local.tgz', 'repo-harness-9.9.9.tgz']);
+      expect(readFileSync(npmLog, 'utf-8')).toContain('pack --json --pack-destination');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('full setup keeps an unowned bundled skill and commits the other skills', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-full-cross-review-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      const source = join(tmp, 'source');
+      copyPackageRuntimeFixture(ROOT, source);
+      setupConsoleFixture(home, source);
+      writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.4.0; fi\nexit 0\n');
+
+      const portal = join(home, '.claude/skills/repo-harness-herdr-portal');
+      mkdirSync(portal, { recursive: true });
+      writeFileSync(join(portal, 'SKILL.md'), 'user portal\n');
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        target: 'claude',
+        plugins: FULL_PLUGINS,
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        codegraph: false,
+        env: { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'), PATH: `${fakeBin}:${process.env.PATH ?? ''}` },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.steps.find((step) => step.step === 'configure Waza skills')?.status).toBe('skipped');
+      expect(result.steps.find(step => step.step === 'cross-review skill repo-harness-herdr-portal')).toMatchObject({
+        status: 'skipped', detail: expect.stringContaining(`rh has no record of it, so rh does not replace it: ${portal}`),
+      });
+      expect(readFileSync(join(portal, 'SKILL.md'), 'utf8')).toBe('user portal\n');
+      expect(result.steps.find((step) => step.step === 'cross-review skill repo-harness-cross-review')?.status).toBe('ok');
+      expect(existsSync(join(home, '.claude', 'skills', 'repo-harness-cross-review', 'SKILL.md'))).toBe(true);
+      expect(existsSync(join(home, '.claude', 'skills', 'merge-gate', 'SKILL.md'))).toBe(false);
+      expect(existsSync(join(home, '.agents', 'skills', 'think'))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('a core-only selection can install explicitly requested marketplace skills without adding the cross-review plugin', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-minimal-no-cross-review-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunxLog = join(tmp, 'bunx.log');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi\nexit 0\n');
+      writeFakeSkillsCli(tmp, fakeBin);
+      // Provider rule (skills CLI): one distinct agent skillsDir selects copy
+      // mode, which writes only that agent's root; claude-code alone skips staging.
+      writeExecutable(tmp, join(fakeBin, 'bunx'), `#!/bin/bash
+printf '%s\\n' "$*" >> "${bunxLog}"
+if [[ "\${1:-}" == "skills@1.9.0" && "\${2:-}" == "add" ]]; then
+  if [[ " $* " == *" tw93/Waza "* ]]; then
+    names='think hunt check health'
+    mkdir -p "$HOME/.agents/rules"
+    for rule in anti-patterns.md chinese.md durable-context.md english.md; do printf '# rule\\n' > "$HOME/.agents/rules/$rule"; done
+  else
+    names='mermaid'
+  fi
+  if [[ " $* " == *" -a claude-code -s "* ]]; then root="$HOME/.claude/skills"; else root="$HOME/.agents/skills"; fi
+  for skill in $names; do
+    mkdir -p "$root/$skill"
+    printf '# %s\\n' "$skill" > "$root/$skill/SKILL.md"
+  done
+fi
+exit 0
+`);
+
+      const runInstall = () => runGlobalRuntimeSetup({
+        sourceRoot: ROOT,
+        cwd: repo,
+        target: 'both',
+        plugins: [],
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: true,
+        codegraph: false,
+        env: { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'), PATH: `${fakeBin}:${process.env.PATH ?? ''}` },
+      });
+      const first = runInstall();
+      expect(first.exitCode).toBe(0);
+      // The second run preflights the host paths that the first run linked.
+      const result = runInstall();
+
+      expect(result.exitCode).toBe(0);
+      expect(result.steps.find((step) => step.step === 'cross-review skills')).toMatchObject({
+        status: 'skipped',
+        detail: 'cross-review and peer-runtime plugins not selected',
+      });
+      expect(readFileSync(bunxLog, 'utf-8')).toContain('skills@1.9.0 add tw93/Waza -g -a codex -s think hunt check health -y');
+      expect(readFileSync(bunxLog, 'utf-8')).toContain('skills@1.9.0 add BfdCampos/dotfiles -g -a codex -s mermaid -y');
+      expect(realpathSync(join(home, '.claude', 'skills', 'think'))).toBe(realpathSync(join(home, '.agents', 'skills', 'think')));
+      expect(existsSync(join(home, '.claude', 'skills', 'mermaid', 'SKILL.md'))).toBe(true);
+      expect(realpathSync(join(home, '.codex', 'skills', 'mermaid'))).toBe(realpathSync(join(home, '.agents', 'skills', 'mermaid')));
+      expect(lstatSync(join(home, '.codex', 'skills', 'mermaid')).isSymbolicLink()).toBe(true);
+      expect(existsSync(join(home, '.claude', 'skills', 'repo-harness-cross-review'))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('full refuses a partial unowned host skill projection', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-partial-skill-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      const source = join(tmp, 'source');
+      copyPackageRuntimeFixture(ROOT, source);
+      setupConsoleFixture(home, source);
+      for (const skill of ['think', 'hunt', 'check', 'health', 'mermaid']) {
+        mkdirSync(join(home, '.agents', 'skills', skill), { recursive: true });
+        writeFileSync(join(home, '.agents', 'skills', skill, 'SKILL.md'), `# ${skill}\n`);
+      }
+      mkdirSync(join(home, '.codex', 'skills', 'think'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'skills', 'think', 'SKILL.md'), '# think\n');
+      writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi\nexit 0\n');
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: source,
+        cwd: repo,
+        target: 'both',
+        plugins: FULL_PLUGINS,
+        installCli: false,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: true,
+        codegraph: false,
+        env: { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'), PATH: `${fakeBin}:${process.env.PATH ?? ''}` },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.steps.find(({ step }) => step === 'configure Waza skills')).toMatchObject({
+        status: 'failed',
+        detail: expect.stringContaining('refusing to refresh unowned host skill'),
+      });
+      expect(existsSync(join(home, '.claude', 'skills', 'think'))).toBe(false);
+      expect(existsSync(join(home, '.claude', 'skills', 'mermaid'))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('update mode checks the mandatory closure even when CLI installation is disabled', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-managed-update-no-cli-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      setupManagedRuntimeReadback(tmp, home, fakeBin, '9.9.8');
+      writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.4.0; fi\nexit 0\n');
+
+      const result = runGlobalRuntimeSetup({
+        sourceRoot: ROOT,
+        cwd: repo,
+        plugins: [],
+        installCli: false,
+        installSpec: 'repo-harness@9.9.9',
+        updateMode: true,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+          REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'),
+        },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.steps.find((step) => step.step === 'verify managed runtime dependencies')).toMatchObject({ status: 'failed' });
+      expect(result.steps.some((step) => step.step === 'install host adapters')).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('the installed candidate handoff checks its closure before projecting host files', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-candidate-handoff-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const codexSkills = join(tmp, 'codex-skills');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      setupManagedRuntimeReadback(tmp, home, fakeBin, JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version as string);
+      const globalHarness = join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness');
+      rmSync(globalHarness, { recursive: true, force: true });
+      seedGlobalPackageFixture({ HOME: home, BUN_INSTALL: join(home, '.bun') });
+      writeExecutable(tmp, join(fakeBin, 'node'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo v22.21.0; exit 0; fi\nexit 1\n');
+      recordPluginSelection({ HOME: home });
+
+      const result = spawnSync('bash', [join(ROOT, 'scripts', 'sync-codex-installed-copies.sh')], {
+        cwd: repo,
+        encoding: 'utf8',
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${dirname(process.execPath)}:/usr/bin:/bin`,
+          // Sabotaging PATH alone is not enough: resolveCompatibleNodeRuntime falls through to a
+          // tier-3 scan of trusted machine paths (/usr/local/bin, hostedtoolcache, nvm) that finds a
+          // real Node 24 on CI. Pin the tier-1 explicit authority at the incompatible fake so the
+          // closure check fails closed before PATH and candidate scanning are reached.
+          REPO_HARNESS_NODE_BIN: join(fakeBin, 'node'),
+          REPO_HARNESS_SOURCE_ROOT: ROOT,
+          CODEX_SKILLS_ROOT: codexSkills,
+        },
+      });
+
+      expect(result.status, `${result.stderr}\n${result.stdout}`).toBe(1);
+      expect(result.stderr).toContain('must satisfy Node >=22.22 <26');
+      expect(existsSync(codexSkills)).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test('npx cache sources force copy-based installed skill sync', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-init-npx-'));
+    const source = join(tmp, '_npx', 'abc123', 'node_modules', 'repo-harness');
+    const home = join(tmp, 'home');
+    const fakeBin = join(tmp, 'bin');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(home, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      setupFakeSource(source);
+      setupConsoleFixture(home, source);
+      writeReadyOfficialCodexPluginCli(tmp, fakeBin, home);
+      writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.4.0; fi\nexit 0\n');
+      writeExecutable(tmp, join(fakeBin, 'npx'), '#!/bin/bash\nexit 0\n');
+
+      const result = runGlobalRuntimeSetup({
+        plugins: FULL_PLUGINS,
+        sourceRoot: source,
+        installCli: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.steps.find((step) => step.step === 'sync repo-harness skill runtime')?.stdout).toContain(
+        'link=0',
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('skips CLI self-install when running from the Bun global package source', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-init-self-install-'));
+    const home = join(tmp, 'home');
+    const source = join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    const npmLog = join(tmp, 'npm.log');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      setupFakeSource(source);
+      setupConsoleFixture(home, source);
+      writeReadyOfficialCodexPluginCli(tmp, fakeBin, home);
+      writeExecutable(tmp, join(fakeBin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nif [[ "\${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi\nexit 42\n`);
+      writeExecutable(tmp, join(fakeBin, 'npm'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${npmLog}"\nexit 42\n`);
+
+      const result = runGlobalRuntimeSetup({
+        plugins: FULL_PLUGINS,
+        sourceRoot: source,
+        cwd: repo,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        },
+      });
+
+      const installStep = result.steps.find((step) => step.step === 'install repo-harness CLI');
+      expect(result.exitCode).toBe(0);
+      expect(installStep?.status).toBe('skipped');
+      expect(installStep?.detail).toContain('already installed from Bun global package source');
+      expect(readFileSync(bunLog, 'utf-8')).toBe('--version\n');
+      expect(existsSync(npmLog)).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('skips CLI self-install when Bun global package links to the workspace source', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-init-linked-source-'));
+    const home = join(tmp, 'home');
+    const source = join(tmp, 'workspace', 'repo-harness');
+    const globalPackage = join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(join(globalPackage, '..'), { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      setupFakeSource(source);
+      writeReadyOfficialCodexPluginCli(tmp, fakeBin, home);
+      symlinkSync(source, globalPackage, 'dir');
+      setupConsoleFixture(home, source);
+      writeExecutable(tmp, join(fakeBin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nif [[ "\${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi\nexit 42\n`);
+
+      const result = runGlobalRuntimeSetup({
+        plugins: FULL_PLUGINS,
+        sourceRoot: source,
+        cwd: repo,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        },
+      });
+
+      const installStep = result.steps.find((step) => step.step === 'install repo-harness CLI');
+      expect(result.exitCode).toBe(0);
+      expect(installStep?.status).toBe('skipped');
+      expect(installStep?.detail).toContain('already installed from Bun global package source');
+      expect(readFileSync(bunLog, 'utf-8')).toBe('--version\n');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('skip detail appends an update hint when a newer version is available', () => {
+    registerArchitecturePlugin();
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-init-update-hint-'));
+    const home = join(tmp, 'home');
+    const source = join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      setupFakeSource(source);
+      setupConsoleFixture(home, source);
+      writeReadyOfficialCodexPluginCli(tmp, fakeBin, home);
+      writeExecutable(tmp, join(fakeBin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nif [[ "\${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi\nexit 42\n`);
+
+      const result = runGlobalRuntimeSetup({
+        plugins: FULL_PLUGINS,
+        sourceRoot: source,
+        cwd: repo,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+          REPO_HARNESS_CHECK_UPDATES: '1',
+          // readLatestPackageVersion() now receives this injected env directly
+          // (see doctor.ts), so the override is set here instead of mutating
+          // live process.env.
+          REPO_HARNESS_LATEST_VERSION: '99.0.0',
+        },
+      });
+
+      const installStep = result.steps.find((step) => step.step === 'install repo-harness CLI');
+      expect(result.exitCode).toBe(0);
+      expect(installStep?.status).toBe('skipped');
+      expect(installStep?.detail).toBe(
+        'already installed from Bun global package source; version=9.9.9; latest=99.0.0 available — run: rh update',
+      );
+      expect(readFileSync(bunLog, 'utf-8')).toBe('--version\n');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('skip detail is unchanged when update checks are disabled or the override is current', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-init-update-hint-current-'));
+    const home = join(tmp, 'home');
+    const source = join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      setupFakeSource(source);
+      setupConsoleFixture(home, source);
+      writeExecutable(tmp, join(fakeBin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nif [[ "\${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi\nexit 42\n`);
+
+      const baseEnv: NodeJS.ProcessEnv = {
+        ...sanitizedChildEnv(home),
+        HOME: home,
+        BUN_INSTALL: join(home, '.bun'),
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+      };
+      delete baseEnv.REPO_HARNESS_LATEST_VERSION;
+      delete baseEnv.REPO_HARNESS_CHECK_UPDATES;
+      const runOpts = {
+        plugins: FULL_PLUGINS,
+        sourceRoot: source,
+        cwd: repo,
+        syncSkill: false,
+        hostAdapters: false,
+        externalSkills: false,
+        codegraph: false,
+      };
+      const expectedDetail = 'already installed from Bun global package source; version=9.9.9';
+
+      const unsetStep = runGlobalRuntimeSetup({ ...runOpts, env: baseEnv }).steps.find(
+        (step) => step.step === 'install repo-harness CLI',
+      );
+      expect(unsetStep?.status).toBe('skipped');
+      expect(unsetStep?.detail).toBe(expectedDetail);
+
+      // Explicit update checks can still use a caller-provided registry result
+      // without spawning the registry client.
+      const equalStep = runGlobalRuntimeSetup({
+        ...runOpts,
+        env: {
+          ...baseEnv,
+          REPO_HARNESS_CHECK_UPDATES: '1',
+          REPO_HARNESS_LATEST_VERSION: '9.9.9',
+        },
+      }).steps.find((step) => step.step === 'install repo-harness CLI');
+      expect(equalStep?.status).toBe('skipped');
+      expect(equalStep?.detail).toBe(expectedDetail);
+
+      expect(readFileSync(bunLog, 'utf-8')).toBe('--version\n--version\n');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('CLI exposes install help for npx users without legacy plugin options', () => {
+    const res = spawnSync(process.execPath, [CLI, 'install', '--help'], {
+      cwd: ROOT,
+      encoding: 'utf-8',
+    });
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain('Usage: rh install');
+    expect(res.stdout).toContain('--target <target>');
+    expect(res.stdout).toContain('--no-cli');
+    expect(res.stdout).not.toContain('--with-reverse-skill');
+    expect(res.stdout).toContain('--with-obsidian-skills');
+    expect(res.stdout).not.toContain('--brain-root');
+    expect(res.stdout).not.toContain('--with-optional');
+    expect(res.stdout).not.toContain('--project-type');
+    expect(res.stdout).not.toContain('setup-plugins');
+  }, 30_000);
+
+  test('CLI install rejects the removed --with-reverse-skill flag before any host write', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-cli-install-reverse-flag-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      const res = spawnSync(process.execPath, [
+        CLI, 'install', '--no-plugins', '--target', 'codex', '--no-cli', '--no-sync-skill', '--no-hooks',
+        '--no-external-skills', '--no-codegraph', '--with-reverse-skill', '--json',
+      ], { cwd: repo, encoding: 'utf-8', env: { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun') } });
+
+      expect(res.status, `${res.stderr}\n${res.stdout}`).not.toBe(0);
+      expect(res.stderr).toContain("unknown option '--with-reverse-skill'");
+      for (const surface of ['.repo-harness', '.codex', '.agents']) expect(existsSync(join(home, surface))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('CLI update refreshes user-level runtime without touching the current repo', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-cli-update-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      mkdirSync(join(home, '.repo-harness'), { recursive: true });
+      setupManagedRuntimeReadback(tmp, home, fakeBin);
+      installCandidateRuntimeFixture(home, JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf-8')).version as string);
+      writeFileSync(installStateFixturePath({ HOME: home }), `${JSON.stringify({
+        protocol: 5,
+        selection: FULL_PLUGINS,
+        ...versions(FULL_PLUGINS),
+        transaction_id: 'existing-full-install',
+        applied_at: '2026-07-14T00:00:00.000Z',
+        previous: null,
+      })}\n`);
+      const candidateVersion = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf-8')).version;
+      const migrationInput = join(tmp, 'candidate-config.json');
+      const originalConfig = JSON.stringify({ seats: DEFAULT_SEATS_CONFIG, brainRoot: '/retired' });
+      writeFileSync(migrationInput, originalConfig);
+      writeExecutable(tmp, join(fakeBin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nif [[ "\${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi\nif [[ "\${1:-}" == "pm" && "\${2:-}" == "view" ]]; then printf '%s\\n' '${JSON.stringify(candidateVersion)}'; exit 0; fi\nif [[ "\${1:-}" == "add" && "\${2:-}" == "-g" && "\${3:-}" == repo-harness@* ]]; then cp "${migrationInput}" "$HOME/.repo-harness/config.json"; fi\nif [[ "\${1:-}" == */src/cli/index.ts ]]; then exec "${process.execPath}" "$@"; fi\nif [[ "\${3:-}" == archctx@* ]]; then mkdir -p "$HOME/.bun/bin"; ln -sf "$HOME/.bun/install/global/node_modules/archctx/bin/archctx.mjs" "$HOME/.bun/bin/archctx"; fi\nexit 0\n`);
+
+      const runUpdate = () => spawnSync(
+        process.execPath,
+        [
+          CLI,
+          'update',
+          '--no-sync-skill',
+          '--no-hooks',
+          '--no-external-skills',
+          '--no-codegraph',
+          '--json',
+        ],
+        {
+          cwd: repo,
+          encoding: 'utf-8',
+          env: {
+            ...sanitizedChildEnv(home),
+            HOME: home,
+            REPO_HARNESS_HOME: join(home, '.repo-harness'),
+            BUN_INSTALL: join(home, '.bun'),
+            PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+            REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'),
+            REPO_HARNESS_CLAUDE_EXECUTABLE: join(fakeBin, 'claude'),
+          },
+        },
+      );
+      const res = runUpdate();
+
+      expect(res.status, `${res.stderr}\n${res.stdout}`).toBe(0);
+      const result = JSON.parse(res.stdout);
+      expect(readFileSync(bunLog, 'utf-8')).toContain('pm view repo-harness@latest version --json --no-cache');
+      expect(readFileSync(bunLog, 'utf-8')).toContain(`add -g repo-harness@${candidateVersion}`);
+      const backupName = readdirSync(join(home, '.repo-harness')).find(name => name.startsWith('config.json.bak-'));
+      expect(backupName).toBeDefined();
+      const backup = join(home, '.repo-harness', backupName!);
+      expect(readFileSync(backup, 'utf8')).toBe(originalConfig);
+      expect(result.steps.find((step: { step: string }) => step.step === 'reconcile installed candidate runtime').detail).toContain(backup);
+      expect(result.steps.find((step: { step: string }) => step.step === 'reconcile installed candidate runtime')).toMatchObject({
+        status: 'ok',
+        detail: expect.stringContaining('scope=partial'),
+      });
+      expect(result.steps.find((step: { step: string }) => step.step === 'check MCP local config')).toMatchObject({ status: 'skipped' });
+      writeFileSync(join(home, '.repo-harness', 'mcp.local.json'), '{"version":2,"permissions":{"allowedRoots":["/private/secret-root"]}}');
+      const refused = runUpdate();
+      expect(refused.status).toBe(1);
+      const refusedSteps: { step: string; status: string; detail?: string }[] = JSON.parse(refused.stdout).steps;
+      expect(refusedSteps.at(-1)).toMatchObject({ step: 'check MCP local config', status: 'failed', detail: expect.stringContaining('unsupported version; set "version": 3.') });
+      expect(refused.stdout).not.toContain('secret-root');
+      expect(refusedSteps.some(step => step.step === 'migrate seats configuration')).toBe(false);
+      expect(existsSync(join(home, '.repo-harness', 'config.json'))).toBe(true);
+      expect(existsSync(join(repo, '.ai'))).toBe(false);
+      expect(existsSync(join(repo, 'tasks'))).toBe(false);
+      expect(existsSync(join(repo, 'plans'))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test.each(['moved SKILL.md', 'dangling link'])('a complete update commits sibling skills when the gate keeps the edited sole cross-review skill (%s)', edit => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-cli-update-refused-skill-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const plugins = ['cross-review', 'peer-runtime'] as const;
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      mkdirSync(join(home, '.repo-harness'), { recursive: true });
+      setupManagedRuntimeReadback(tmp, home, fakeBin);
+      const candidateVersion = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf-8')).version as string;
+      installCandidateRuntimeFixture(home, candidateVersion);
+      // The complete projection requires the launcher that `bun add -g` links.
+      mkdirSync(join(home, '.bun', 'bin'), { recursive: true });
+      writeExecutable(tmp, join(home, '.bun', 'bin', 'rh'), '#!/bin/sh\n');
+      writeFileSync(installStateFixturePath({ HOME: home }), `${JSON.stringify({
+        protocol: 5, selection: plugins, ...versions(plugins), transaction_id: 'before-refusal',
+        applied_at: '2026-07-14T00:00:00.000Z', previous: null,
+      })}\n`);
+      writeExecutable(tmp, join(fakeBin, 'bun'), `#!/bin/bash\nif [[ "\${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi\nif [[ "\${1:-}" == "pm" && "\${2:-}" == "view" ]]; then printf '%s\\n' '${JSON.stringify(candidateVersion)}'; exit 0; fi\nif [[ "\${1:-}" == *.ts || "\${1:-}" == - ]]; then exec "${process.execPath}" "$@"; fi\nexit 0\n`);
+      const env = {
+        ...sanitizedChildEnv(home),
+        HOME: home,
+        REPO_HARNESS_HOME: join(home, '.repo-harness'),
+        BUN_INSTALL: join(home, '.bun'),
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'),
+        REPO_HARNESS_CLAUDE_EXECUTABLE: join(fakeBin, 'claude'),
+      };
+      // rh wrote the only cross-review copy; the user then moved its SKILL.md out or replaced it with a dangling link.
+      const crossReview = join(home, '.claude', 'skills', 'repo-harness-cross-review');
+      mkdirSync(dirname(crossReview), { recursive: true });
+      openHostConfigGate({ env }).writePaths([{ path: crossReview, owner: 'cross-review', entry: { type: 'directory', source: join(ROOT, 'assets', 'skills', 'repo-harness-cross-review') } }]);
+      const danglingTarget = join(tmp, 'missing-cross-review');
+      let kept: string[] = [];
+      if (edit === 'dangling link') {
+        rmSync(crossReview, { recursive: true });
+        symlinkSync(danglingTarget, crossReview);
+      } else {
+        renameSync(join(crossReview, 'SKILL.md'), join(tmp, 'SKILL.md'));
+        kept = readdirSync(crossReview).sort();
+      }
+
+      const res = spawnSync(process.execPath, [CLI, 'update', '--target', 'claude', '--no-external-skills', '--no-codegraph', '--json'], { cwd: repo, encoding: 'utf-8', env });
+
+      expect(res.status, `${res.stderr}\n${res.stdout}`).toBe(0);
+      expect((JSON.parse(res.stdout).steps as { step: string }[]).find(step => step.step === 'reconcile installed candidate runtime')).toMatchObject({
+        status: 'ok', detail: expect.stringContaining('scope=complete'),
+        stderr: expect.stringContaining(`it changed since rh wrote it, so rh does not replace it: ${crossReview}`),
+      });
+      if (edit === 'dangling link') expect(readlinkSync(crossReview)).toBe(danglingTarget);
+      else expect(readdirSync(crossReview).sort()).toEqual(kept);
+      expect(existsSync(join(home, '.claude', 'skills', 'repo-harness-herdr-portal', 'SKILL.md'))).toBe(true);
+      const installed = readInstallState(env);
+      expect(installed?.transaction_id).not.toBe('before-refusal');
+      // Status still reports the refused copy until the user moves it out.
+      expect(installStateStatus(installed!, env).drift).toMatchObject({ missing_owners: ['cross-review'], surface_drift: [] });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('update host transaction compensates Obsidian Skill projections when a later step fails', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-cli-update-obsidian-rollback-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const staging = join(home, '.agents', 'skills', 'obsidian-markdown');
+    const projected = join(home, '.codex', 'skills', 'obsidian-markdown');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+
+      const result = runTransactionalRuntimeRefresh({
+        cwd: repo,
+        target: 'codex',
+        plugins: FULL_PLUGINS,
+        obsidianSkills: true,
+        env: { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun') },
+      }, options => {
+        // The Skills CLI writes the staging copy as a delegated writer, as the runtime step runs it.
+        openHostConfigGate({ env: { ...sanitizedChildEnv(home), HOME: home } }).delegate([{ path: staging, owner: 'strategy-memory' }], () => {
+          mkdirSync(staging, { recursive: true });
+          writeFileSync(join(staging, 'SKILL.md'), '# obsidian-markdown\n');
+        }, { transaction: options.transaction });
+        mkdirSync(join(home, '.codex', 'skills'), { recursive: true });
+        openHostConfigGate({ env: { ...sanitizedChildEnv(home), HOME: home } }).writePaths([{ path: projected, owner: 'strategy-memory', entry: { type: 'symlink', target: staging } }], { transaction: options.transaction });
+        return {
+          exitCode: 1,
+          steps: [
+            { step: 'configure Obsidian companion Skills', status: 'ok', detail: 'projected 1 host skills' },
+            { step: 'cross-review skills', status: 'failed', detail: 'refusing to overwrite unowned host skill' },
+          ],
+          lines: [],
+          stdout: '',
+          stderr: '',
+        };
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(existsSync(staging)).toBe(false);
+      expect(existsSync(projected)).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('an injected environment without HOME refuses instead of using process HOME', () => {
+    const temporary = mkdtempSync(join(tmpdir(), 'rh-injected-home-'));
+    try {
+      let ran = false;
+      expect(() => runTransactionalRuntimeRefresh({ plugins: [], env: { BUN_INSTALL: join(temporary, '.bun') } }, () => {
+        ran = true;
+        return { exitCode: 0, steps: [], lines: [], stdout: '', stderr: '' };
+      })).toThrow('HOME is required and must be an absolute path');
+      expect(ran).toBe(false);
+      expect(readdirSync(temporary)).toEqual([]);
+    } finally { rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  test('candidate runtime fixture copies published inputs and excludes local state', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'candidate-package-boundary-'));
+    const source = join(tmp, 'source');
+    const destination = join(tmp, 'candidate');
+    try {
+      mkdirSync(join(source, 'src'), { recursive: true });
+      mkdirSync(join(source, '.ai/harness/runs'), { recursive: true });
+      mkdirSync(join(source, 'tests'), { recursive: true });
+      writeFileSync(join(source, 'package.json'), JSON.stringify({ files: ['src/', 'README.md'] }));
+      writeFileSync(join(source, 'src/entry.ts'), 'export const runtime = true;\n');
+      writeFileSync(join(source, 'README.md'), 'Published readme\n');
+      writeFileSync(join(source, '.ai/harness/runs/local.json'), '{"local":true}\n');
+      writeFileSync(join(source, 'tests/local.test.ts'), 'Local test\n');
+      copyPackageRuntimeFixture(source, destination);
+      expect(readFileSync(join(destination, 'src/entry.ts'), 'utf8')).toBe('export const runtime = true;\n');
+      expect(readFileSync(join(destination, 'README.md'), 'utf8')).toBe('Published readme\n');
+      expect(readFileSync(join(destination, 'package.json'), 'utf8')).toBe(readFileSync(join(source, 'package.json'), 'utf8'));
+      expect(existsSync(join(destination, '.ai'))).toBe(false);
+      expect(existsSync(join(destination, 'tests'))).toBe(false);
+      expect(existsSync(join(source, '.ai/harness/runs/local.json'))).toBe(true);
+    } finally { rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  test('CLI update --version installs the requested package version', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-cli-update-version-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      // update keeps the recorded selection, so it needs an install state.
+      recordExplicitFullSelection(home);
+      setupManagedRuntimeReadback(tmp, home, fakeBin);
+      installCandidateRuntimeFixture(home, '9.9.9');
+      writeExecutable(tmp, join(fakeBin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nif [[ "\${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi\nif [[ "\${1:-}" == */src/cli/index.ts ]]; then exec "${process.execPath}" "$@"; fi\nif [[ "\${3:-}" == archctx@* ]]; then mkdir -p "$HOME/.bun/bin"; ln -sf "$HOME/.bun/install/global/node_modules/archctx/bin/archctx.mjs" "$HOME/.bun/bin/archctx"; fi\nexit 0\n`);
+
+      const res = spawnSync(
+        process.execPath,
+        [
+          CLI,
+          'update',
+          '--version',
+          '9.9.9',
+          '--no-sync-skill',
+          '--no-hooks',
+          '--no-external-skills',
+          '--no-codegraph',
+          '--json',
+        ],
+        {
+          cwd: repo,
+          encoding: 'utf-8',
+          env: {
+            ...sanitizedChildEnv(home),
+            HOME: home,
+            BUN_INSTALL: join(home, '.bun'),
+            PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+            REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'),
+            REPO_HARNESS_CLAUDE_EXECUTABLE: join(fakeBin, 'claude'),
+          },
+        },
+      );
+
+      expect(res.status, `${res.stderr}\n${res.stdout}`).toBe(0);
+      expect(JSON.parse(res.stdout).steps.find((step: { step: string }) => step.step === 'install repo-harness CLI')?.detail).toBe(
+        'spec=repo-harness@9.9.9',
+      );
+      expect(readFileSync(bunLog, 'utf-8')).toContain('add -g repo-harness@9.9.9');
+      expect(readFileSync(bunLog, 'utf-8')).toContain('add -g repo-harness-operator-web@9.9.9 --no-cache');
+      expect(JSON.parse(readFileSync(join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness-operator-web', 'package.json'), 'utf8')).version).toBe('9.9.9');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('CLI update refuses retired protocol-1 state before any write', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-cli-update-legacy-profile-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    try {
+      mkdirSync(join(home, '.repo-harness'), { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFileSync(installStateFixturePath({ HOME: home }), `${JSON.stringify({
+        protocol: 1,
+        profile: 'product-planning',
+        components: [
+          'cli', 'effective-state', 'scope-worktree-check-guards', 'handoff', 'host-adapters',
+          'adaptive-workflow', 'codegraph-conditional', 'planning-integrations',
+        ],
+        transaction_id: 'existing-planning-install',
+        applied_at: '2026-07-14T00:00:00.000Z',
+        ownership_manifest: [],
+        previous: null,
+      })}\n`);
+      writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.4.0; fi\nexit 0\n');
+
+      const res = spawnSync(process.execPath, [
+        CLI,
+        'update',
+        '--no-cli',
+        '--no-sync-skill',
+        '--no-hooks',
+        '--no-external-skills',
+        '--no-codegraph',
+        '--json',
+      ], {
+        cwd: repo,
+        encoding: 'utf-8',
+        env: {
+          ...sanitizedChildEnv(home),
+          HOME: home,
+          BUN_INSTALL: join(home, '.bun'),
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+          REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'),
+        },
+      });
+
+      expect(res.status).not.toBe(0);
+      expect(res.stderr).toContain('is protocol 1, which this package no longer reads');
+      expect(existsSync(join(home, '.repo-harness', 'config.json'))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('CLI update --dry-run lists the local host-config items of the selection and starts no installer', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-cli-update-dry-run-'));
+    const home = join(tmp, 'home');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    try {
+      const env = sanitizedChildEnv(home);
+      seedGlobalPackageFixture(env);
+      const settings = join(home, '.claude', 'settings.json');
+      mkdirSync(dirname(settings), { recursive: true });
+      writeFileSync(settings, '{"statusLine":{"type":"command","command":"user-line"}}\n');
+      mkdirSync(fakeBin, { recursive: true });
+      writeFileSync(join(fakeBin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nexit 0\n`);
+      chmodSync(join(fakeBin, 'bun'), 0o755);
+      const before = listTreeWithoutSymlinkDescent(home).sort();
+      // The fixture link stays listed, so a missing global package cannot pass as an unchanged home.
+      expect(before).toContain(join('.bun', 'install', 'global', 'node_modules', 'repo-harness'));
+      const res = spawnSync(process.execPath, [CLI, 'update', '--dry-run', '--json', '--target', 'claude', '--override', `${settings}#statusLine`], {
+        cwd: tmp, encoding: 'utf-8',
+        env: { ...env, PATH: `${fakeBin}:${process.env.PATH ?? ''}`, REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'), BUN_RUNTIME_TRANSPILER_CACHE_PATH: '0' },
+      });
+      expect(res.status, res.stderr).toBe(0);
+      const output = JSON.parse(res.stdout);
+      expect(output.candidate_changes).toBe('unavailable');
+      expect(output.host_config.items).toContainEqual({ path: realpathSync(settings), selector: 'statusLine', action: 'override' });
+      expect(existsSync(bunLog)).toBe(false);
+      expect(listTreeWithoutSymlinkDescent(home).sort()).toEqual(before);
+      // The working directory gets no repository write either.
+      expect(readdirSync(tmp).sort()).toEqual(['bin', 'home']);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('CLI top-level --version still prints the CLI version', () => {
+    const res = spawnSync(process.execPath, [CLI, '--version'], {
+      cwd: ROOT,
+      encoding: 'utf-8',
+    });
+
+    expect(res.status).toBe(0);
+    expect(res.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+  }, 30_000);
+
+  test('CLI update rejects the retired --check and --no-runtime-refresh options', () => {
+    for (const retired of ['--check', '--no-runtime-refresh', '--check-updates']) {
+      const res = spawnSync(process.execPath, [CLI, 'update', retired], {
+        cwd: ROOT,
+        encoding: 'utf-8',
+      });
+      expect(res.status).not.toBe(0);
+      expect(res.stderr).toContain(`unknown option '${retired}'`);
+      // The parser rejects the option before the action runs, so no step starts.
+      expect(res.stdout).toBe('');
+    }
+  }, 30_000);
+
+  test('CLI exposes update help for user-level refresh', () => {
+    const res = spawnSync(process.execPath, [CLI, 'update', '--help'], {
+      cwd: ROOT,
+      encoding: 'utf-8',
+    });
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain('Usage: rh update');
+    expect(res.stdout).toContain('--version <version>');
+    expect(res.stdout).toContain('--channel <channel>');
+    expect(res.stdout).not.toContain('--check');
+    expect(res.stdout).not.toContain('--no-runtime-refresh');
+    expect(res.stdout).toContain('--with-external-skills');
+    expect(res.stdout).not.toContain('--with-reverse-skill');
+    expect(res.stdout).toContain('--with-obsidian-skills');
+    expect(res.stdout).toContain('--configure-codegraph');
+    expect(res.stdout).toContain('--no-cli');
+    expect(res.stdout).not.toContain('--repo <path>');
+    expect(res.stdout).toContain('--dry-run');
+    expect(res.stdout).not.toContain('--interactive');
+  }, 30_000);
+
+  test('CLI install defaults non-interactively to every runnable plugin with its selected optional ecosystems', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-cli-install-non-tty-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const fakeBin = join(tmp, 'bin');
+    const bunLog = join(tmp, 'bun.log');
+    const bunxLog = join(tmp, 'bunx.log');
+    const codegraphLog = join(tmp, 'codegraph.log');
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      writeReadyOfficialCodexPluginCli(tmp, fakeBin, home);
+      writeFakeCodegraph(tmp, fakeBin, codegraphLog);
+      const source = join(tmp, 'source');
+      copyPackageRuntimeFixture(ROOT, source);
+      const sourceModules = join(source, 'node_modules');
+      mkdirSync(sourceModules);
+      for (const name of readdirSync(join(ROOT, 'node_modules'))) {
+        symlinkSync(join(ROOT, 'node_modules', name), join(sourceModules, name));
+      }
+      setupConsoleFixture(home, source);
+      const seedGlobalPackage = `import { seedGlobalPackageFixture } from ${JSON.stringify(new URL('../helpers/install-ownership.ts', import.meta.url).href)}; seedGlobalPackageFixture(process.env, { mutable: true });`;
+      writeExecutable(tmp, join(fakeBin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$*" >> "${bunLog}"\nif [[ "\${1:-}" == "--version" ]]; then echo 1.4.0; exit 0; fi\nif [[ "\${1:-}" == "-" || "\${1:-}" == "-e" || "\${1:-}" == *.ts ]]; then exec "${process.execPath}" "$@"; fi\nif [[ " $* " == *" add -g "* ]]; then mkdir -p "$HOME/.bun/bin"; printf '#!/bin/sh\\n' > "$HOME/.bun/bin/rh"; chmod +x "$HOME/.bun/bin/rh"; "${process.execPath}" -e '${seedGlobalPackage.replaceAll("'", "'\\''")}' || exit $?; fi\nexit 0\n`);
+      writeFakeSkillsCli(tmp, fakeBin);
+      writeExecutable(tmp, join(fakeBin, 'bunx'), `#!/bin/bash
+printf '%s\\n' "$*" >> "${bunxLog}"
+if [[ "\${1:-}" == "skills@1.9.0" && "\${2:-}" == "add" ]]; then
+  if [[ " $* " == *" tw93/Waza "* ]]; then
+    names='think hunt check health'
+    mkdir -p "$HOME/.agents/rules"
+    for rule in anti-patterns.md chinese.md durable-context.md english.md; do printf '# rule\\n' > "$HOME/.agents/rules/$rule"; done
+  else
+    names='mermaid'
+  fi
+  for skill in $names; do
+    mkdir -p "$HOME/.agents/skills/$skill"
+    printf '# %s\\n' "$skill" > "$HOME/.agents/skills/$skill/SKILL.md"
+  done
+fi
+exit 0
+`);
+
+      // spawnSync's stdio pipes are never a TTY (isTTY is undefined), so this
+      // exercises the non-interactive branch of runGlobalRuntimeBootstrap.
+      // Passing input (even empty) closes stdin immediately, so a wrongly
+      // interactive code path would fail fast on EOF instead of hanging.
+      // Use process.execPath (not literal 'bun') since PATH below is
+      // overridden with a fake bin dir; a literal 'bun' command would
+      // resolve to the fake shim and never actually run the CLI script.
+      const res = spawnSync(
+        process.execPath,
+        [join(source, 'src/cli/index.ts'), 'install', '--target', 'codex'],
+        {
+          cwd: repo,
+          encoding: 'utf-8',
+          input: '',
+          timeout: 20000,
+          env: {
+            ...sanitizedChildEnv(home),
+            HOME: home,
+            BUN_INSTALL: join(home, '.bun'),
+            PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+            REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'),
+            REPO_HARNESS_CLAUDE_EXECUTABLE: join(fakeBin, 'claude'),
+            REPO_HARNESS_CODEGRAPH_ALLOW_REPO_LOCAL: '0',
+          },
+        },
+      );
+
+      expect(res.status).toBe(0);
+      // peer-runtime commands are available on Codex; its portal skill stays Claude-only.
+      const codexPlugins = FULL_PLUGINS;
+      expect(res.stdout).toContain(`[plugins] ${codexPlugins.join(',')}`);
+      expect(res.stdout).not.toContain('[plugins] skipped peer-runtime:');
+      expect(existsSync(join(home, '.codex', 'skills', 'repo-harness-herdr-portal'))).toBe(false);
+      expect(res.stdout).toContain('install repo-harness CLI');
+      expect(readFileSync(bunxLog, 'utf-8')).toContain('skills@1.9.0 add tw93/Waza');
+      expect(readFileSync(codegraphLog, 'utf-8')).toContain('codegraph install');
+      expect(JSON.parse(readFileSync(join(home, '.repo-harness', 'install-state.json'), 'utf-8')).plugins.map(({ id }: { id: string }) => id)).toEqual(codexPlugins);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 25000);
+});
+
+describe('resolveOptionalRuntimeDeps (interactive optional-dep prompts)', () => {
+  test('non-interactive defaults optional ecosystems off', async () => {
+    const result = await resolveOptionalRuntimeDeps({ target: 'both' }, undefined, { interactive: false });
+    expect(result).toEqual({ externalSkills: false, codegraph: false });
+  });
+
+  test('non-interactive still honors explicit --no-* flags without prompting', async () => {
+    const result = await resolveOptionalRuntimeDeps(
+      { target: 'both', externalSkills: false, codegraph: false },
+      undefined,
+      { interactive: false },
+    );
+    expect(result).toEqual({ externalSkills: false, codegraph: false });
+  });
+
+  test('interactive mode prompts, and answering "n" skips both optional deps', async () => {
+    const input = new PassThrough();
+    ['n\n', 'n\n'].forEach((answer, index) => {
+      setTimeout(() => input.write(answer), index * 5);
+    });
+    setTimeout(() => input.end(), 20);
+    const outputChunks: string[] = [];
+    const output = new Writable({
+      write(chunk, _encoding, callback) {
+        outputChunks.push(String(chunk));
+        callback();
+      },
+    });
+
+    const result = await resolveOptionalRuntimeDeps({ target: 'both' }, undefined, {
+      interactive: true,
+      input,
+      output,
+    });
+
+    expect(result).toEqual({ externalSkills: false, codegraph: false });
+    expect(outputChunks.join('')).toContain('Install external skills');
+    expect(outputChunks.join('')).toContain('Install CodeGraph CLI');
+  });
+
+  test('interactive mode keeps optional ecosystems off when the answer is blank', async () => {
+    const input = new PassThrough();
+    ['\n', '\n'].forEach((answer, index) => {
+      setTimeout(() => input.write(answer), index * 5);
+    });
+    setTimeout(() => input.end(), 20);
+    const output = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+
+    const result = await resolveOptionalRuntimeDeps({ target: 'both' }, undefined, {
+      interactive: true,
+      input,
+      output,
+    });
+
+    expect(result).toEqual({ externalSkills: false, codegraph: false });
+  });
+
+  test('interactive mode does not prompt for a flag explicitly passed on the CLI', async () => {
+    const input = new PassThrough();
+    // Only externalSkills should be prompted (codegraph was explicit via
+    // --no-codegraph); a single "n" answer must apply to that one prompt.
+    setTimeout(() => input.write('n\n'), 5);
+    setTimeout(() => input.end(), 20);
+    const output = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    const cmd = { getOptionValueSource: (key: string) => (key === 'codegraph' ? 'cli' : 'default') };
+
+    const result = await resolveOptionalRuntimeDeps({ target: 'both', codegraph: false }, cmd, {
+      interactive: true,
+      input,
+      output,
+    });
+
+    expect(result).toEqual({ externalSkills: false, codegraph: false });
+  });
+});
+
+
+test('managed runtime readback reports stale shared daemon after a successful package handshake', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-daemon-readback-'));
+  try {
+    const home = join(tmp, 'home');
+    const fakeBin = join(tmp, 'bin');
+    mkdirSync(fakeBin, { recursive: true });
+    setupManagedRuntimeReadback(tmp, home, fakeBin);
+    const source = join(tmp, 'source');
+    mkdirSync(source);
+    writeFileSync(join(source, 'package.json'), JSON.stringify({ name: 'repo-harness', version: '9.9.9' }));
+    const nodePath = join(fakeBin, 'node.fixture-body');
+    const original = readFileSync(nodePath, 'utf8');
+    writeFileSync(nodePath, original.replace('"data":{"running":false}', `"data":{"running":true,"versionUnsupported":{"reason":"product-version-mismatch","expected":"${ARCHCTX_PIN}","received":"0.2.3","action":"upgrade-archctx-runtime","command":"archctx daemon upgrade"}}`));
+    registerArchitecturePlugin();
+    const result = verifyInstalledManagedRuntime({ sourceRoot: source, cwd: tmp, plugins: ['architecture'], env: {
+      ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'),
+      PATH: `${fakeBin}:${process.env.PATH ?? ''}`, REPO_HARNESS_BUN_EXECUTABLE: process.execPath,
+    } });
+    expect(result.status).toBe('failed');
+    expect(result.detail).toContain('received 0.2.3');
+    expect(result.detail).toContain('User authorization required');
+    expect(readFileSync(nodePath, 'utf8')).toContain('"received":"0.2.3"');
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+});
+
+
+test('daemon maintenance preserves the verified candidate and hoisted dependencies in an update transaction', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-daemon-maintenance-transaction-'));
+  try {
+    const home = join(tmp, 'home');
+    const fakeBin = join(tmp, 'bin');
+    const source = join(tmp, 'source');
+    mkdirSync(fakeBin, { recursive: true });
+    writeFakeHc(fakeBin);
+    // The stub agent fleet helper runs under core.
+    setupFakeSource(source);
+    setupManagedRuntimeReadback(tmp, home, fakeBin, '1.0.0');
+    writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.4.0; fi\nif [[ "${3:-}" == archctx@* ]]; then mkdir -p "$HOME/.bun/bin"; ln -sf "$HOME/.bun/install/global/node_modules/archctx/bin/archctx.mjs" "$HOME/.bun/bin/archctx"; fi\nexit 0\n');
+    const globalModules = join(home, '.bun/install/global/node_modules');
+    const harnessManifest = join(globalModules, 'repo-harness/package.json');
+    writeFileSync(harnessManifest, JSON.stringify({ name: 'repo-harness', version: '1.0.0', dependencies: { archctx: '0.2.3', 'archctx-contracts': '0.2.3' } }));
+    const options = { sourceRoot: source, cwd: tmp, target: 'codex' as const, plugins: ['architecture'] as const,
+      installCli: false, installSpec: 'repo-harness@9.9.9', updateMode: true,
+      syncSkill: false, hostAdapters: false, externalSkills: false, codegraph: false,
+      env: { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'),
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`, REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun') } };
+    const result = runTransactionalRuntimeRefresh(options, (transactionOptions) => {
+      setupManagedRuntimeReadback(tmp, home, fakeBin, '9.9.9');
+      const body = join(fakeBin, 'node.fixture-body');
+      writeFileSync(body, readFileSync(body, 'utf8').replace('"data":{"running":false}', `"data":{"running":true,"versionUnsupported":{"reason":"product-version-mismatch","expected":"${ARCHCTX_PIN}","received":"0.2.3","action":"upgrade-archctx-runtime","command":"archctx daemon upgrade"}}`));
+      return runGlobalRuntimeSetup(transactionOptions);
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.steps.find((step) => step.step === 'verify managed runtime dependencies')?.status).toBe('ok');
+    expect(result.steps.find((step) => step.step === 'check shared ArchContext daemon')).toMatchObject({ status: 'skipped', detail: expect.stringContaining('User authorization required') });
+    expect(JSON.parse(readFileSync(harnessManifest, 'utf8')).version).toBe('9.9.9');
+    for (const packageName of ['archctx', 'archctx-contracts']) {
+      expect(JSON.parse(readFileSync(join(globalModules, packageName, 'package.json'), 'utf8')).version)
+        .toBe(JSON.parse(readFileSync(harnessManifest, 'utf8')).dependencies[packageName]);
+    }
+    expect(verifyInstalledManagedRuntime(options).status).toBe('failed');
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('a fleet failure after the CLI install restores the predecessor hoisted archctx packages', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-update-archctx-rollback-'));
+  try {
+    const home = join(tmp, 'home');
+    const fakeBin = join(tmp, 'bin');
+    const predecessor = join(tmp, 'predecessor');
+    mkdirSync(fakeBin, { recursive: true });
+    mkdirSync(predecessor);
+    writeFileSync(join(predecessor, 'package.json'), JSON.stringify({ name: 'repo-harness', version: '1.0.0' }));
+    setupManagedRuntimeReadback(tmp, home, fakeBin, '1.0.0');
+    const globalModules = join(home, '.bun/install/global/node_modules');
+    const env = { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'),
+      PATH: `${fakeBin}:${process.env.PATH ?? ''}`, REPO_HARNESS_BUN_EXECUTABLE: process.execPath };
+    const result = runTransactionalRuntimeRefresh({ cwd: tmp, target: 'codex', plugins: ['architecture'], env }, () => {
+      writeFileSync(join(globalModules, 'repo-harness/package.json'), JSON.stringify({
+        name: 'repo-harness', version: '9.9.9', dependencies: { archctx: '9.9.9', 'archctx-contracts': '9.9.9' },
+      }));
+      for (const packageName of ['archctx', 'archctx-contracts']) {
+        writeFileSync(join(globalModules, packageName, 'package.json'), JSON.stringify({ name: packageName, version: '9.9.9' }));
+      }
+      return {
+        exitCode: 1,
+        steps: [
+          { step: 'install repo-harness CLI', status: 'ok', detail: 'spec=repo-harness@9.9.9' },
+          { step: 'install agent fleet', status: 'failed', detail: 'user-edited fleet file' },
+        ],
+        lines: [], stdout: '', stderr: '',
+      };
+    });
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(readFileSync(join(globalModules, 'archctx/package.json'), 'utf8')).version).toBe(ARCHCTX_PIN);
+    expect(JSON.parse(readFileSync(join(globalModules, 'archctx-contracts/package.json'), 'utf8')).version).toBe(ARCHCTX_CONTRACTS_PIN);
+    expect(verifyInstalledManagedRuntime({ sourceRoot: predecessor, cwd: tmp, plugins: ['architecture'], env }).status).toBe('ok');
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+});
+
+describe('Waza shared rule refresh', () => {
+  /** The ledger's path records, keyed as the product keys a host path. */
+  const recordsOf = (env: NodeJS.ProcessEnv) => Object.entries(readPathRecords(env)).filter(([key]) => wazaRules.files.some(rule => key.endsWith('/rules/' + rule)));
+  const keysOf = (env: NodeJS.ProcessEnv, paths: readonly string[]) => paths.map(path => pathRecordKey(env, path)).sort();
+  const staleRecords = (env: NodeJS.ProcessEnv) => recordsOf(env).filter(([key, record]) => !pathRecordIsCurrent(key, record)).map(([key]) => key);
+  /** The state and ledger bytes: the ownership records live in the ledger. */
+  const storedBytes = (env: NodeJS.ProcessEnv) => [installStateFixturePath(env), hostConfigPaths(env).ledger].map(path => existsSync(path) ? readFileSync(path) : null);
+  function withRules(body: (fixture: {
+    home: string; upstream: string; fakeBin: string; env: NodeJS.ProcessEnv;
+    paths: string[]; run: (refresh?: boolean, target?: 'both' | 'claude' | 'codex') => ReturnType<typeof syncWazaSharedRules>;
+    setup: (refresh?: boolean) => ReturnType<typeof runGlobalRuntimeSetup>;
+  }) => void): void {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-waza-refresh-'));
+    const home = join(tmp, 'home');
+    const upstream = join(tmp, 'upstream');
+    const fakeBin = join(tmp, 'bin');
+    const paths: string[] = [];
+    try {
+      mkdirSync(fakeBin, { recursive: true });
+      writeFakeHc(fakeBin);
+      mkdirSync(upstream, { recursive: true });
+      for (const root of ['.agents', '.claude', '.codex']) {
+        mkdirSync(join(home, root, 'rules'), { recursive: true });
+        for (const rule of wazaRules.files) {
+          const path = join(home, root, 'rules', rule);
+          writeFileSync(path, `# old ${rule}\n`);
+          paths.push(path);
+        }
+      }
+      for (const rule of wazaRules.files) writeFileSync(join(upstream, rule), `# new ${rule}\npassword=example\n`);
+      for (const skill of ['think', 'hunt', 'check', 'health', 'mermaid']) {
+        mkdirSync(join(home, '.agents', 'skills', skill), { recursive: true });
+        writeFileSync(join(home, '.agents', 'skills', skill, 'SKILL.md'), `# ${skill}\n`);
+      }
+      recordInstallOwnership([], { HOME: home });
+      recordInstallOwnership(paths, { HOME: home });
+      writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "$1" == "--version" ]]; then echo 1.4.0; fi\n');
+      // Skills CLI does not write shared rules.
+      writeExecutable(tmp, join(fakeBin, 'bunx'), '#!/bin/bash\nexit 0\n');
+      writeFakeSkillsCli(tmp, fakeBin);
+      writeExecutable(tmp, join(fakeBin, 'curl'), `#!/bin/bash
+set -euo pipefail
+output=''
+url=''
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output) output="$2"; shift ;;
+    https://*) url="$1" ;;
+  esac
+  shift
+done
+printf '%s\\n' "$url" >> "$HOME/fetch.log"
+case "$url" in
+  ${wazaRules.rawBaseUrl}/rules/*) source="$WAZA_FIXTURE_UPSTREAM/\${url##*/}" ;;
+  ${wazaRules.rawBaseUrl}/skills/*/SKILL.md) skill="\${url%/SKILL.md}"; source="$HOME/.agents/skills/\${skill##*/}/SKILL.md" ;;
+  *) echo 'unexpected URL' >&2; exit 2 ;;
+esac
+if [[ -f "$WAZA_FIXTURE_UPSTREAM/fail-\${url##*/}" ]]; then echo 'fixture HTTP 503' >&2; exit 22; fi
+if [[ -n "$output" ]]; then cat "$source" > "$output"; else cat "$source"; fi
+`);
+      const env = { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'), WAZA_FIXTURE_UPSTREAM: upstream,
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`, REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun') };
+      body({ home, upstream, fakeBin, env, paths,
+        run: (refresh = true, target = 'both') => syncWazaSharedRules(home, target === 'both' ? ['claude', 'codex'] : [target], env, refresh),
+        setup: (refresh = false) => runGlobalRuntimeSetup({
+        sourceRoot: ROOT, cwd: tmp, env, target: 'both', plugins: [],
+        installCli: false, syncSkill: false, hostAdapters: false, codegraph: false,
+        externalSkills: true, updateMode: refresh,
+      }) });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  test.each(['both', 'codex'] as const)('refresh keeps current receipts and leaves unselected files alone: %s', target => {
+    withRules(({ home, upstream, env, paths, run }) => {
+      const unselected = paths.filter(path => target === 'codex' && path.includes('/.claude/'));
+      const before = unselected.map(path => ({ bytes: readFileSync(path), record: ownedPath(env, path), ino: lstatSync(path).ino }));
+      expect(run(true, target).status).toBe('ok');
+      expect(unselected.map(path => ({ bytes: readFileSync(path), record: ownedPath(env, path), ino: lstatSync(path).ino }))).toEqual(before);
+      expect(staleRecords(env)).toEqual([]);
+      for (const path of paths.filter(path => !unselected.includes(path))) expect(readFileSync(path)).toEqual(readFileSync(join(upstream, path.split('/').at(-1)!)));
+      writeFileSync(join(upstream, 'english.md'), '# next English\n');
+      expect(run(true, target).status).toBe('ok');
+      expect(readFileSync(join(home, '.codex/rules/english.md'), 'utf8')).toBe('# next English\n');
+      expect(unselected.map(path => ({ bytes: readFileSync(path), record: ownedPath(env, path), ino: lstatSync(path).ino }))).toEqual(before);
+    });
+  });
+
+  test.each(['both', 'codex'] as const)('a stale receipt refuses even when the bytes match upstream: %s', target => {
+    withRules(({ upstream, env, paths, run }) => {
+      for (const path of paths) writeFileSync(path, readFileSync(join(upstream, path.split('/').at(-1)!)));
+      const before = paths.map(path => readFileSync(path)), records = storedBytes(env);
+      expect(run(true, target).status).toBe('failed');
+      expect(paths.map(path => readFileSync(path))).toEqual(before);
+      expect(storedBytes(env)).toEqual(records);
+    });
+  });
+
+  test('new rules are recorded by the gate without an install state', () => {
+    withRules(({ home, upstream, env, paths, run }) => {
+      for (const path of paths) rmSync(path);
+      recordInstallOwnership([], env); rmSync(installStateFixturePath(env));
+      expect(run().status).toBe('ok');
+      expect(recordsOf(env).map(([key]) => key).sort()).toEqual(keysOf(env, paths));
+      expect(readInstallState(env)).toBeNull();
+      writeFileSync(join(upstream, 'english.md'), '# next English\n');
+      expect(run().status).toBe('ok');
+      expect(staleRecords(env)).toEqual([]);
+      expect(readFileSync(join(home, '.agents/rules/english.md'), 'utf8')).toBe('# next English\n');
+    });
+  });
+
+  test('a fresh setup records its rules before the selection commit', () => {
+    withRules(({ home, env, paths, setup }) => {
+      for (const root of ['.agents', '.claude', '.codex']) rmSync(join(home, root, 'rules'), { recursive: true });
+      rmSync(installStateFixturePath(env));
+      const runtime = setup(false);
+      expect(runtime.exitCode, runtime.stderr).toBe(0);
+      expect(runtime.steps.find(({ step }) => step === 'sync Waza shared rules')).toMatchObject({ status: 'ok' });
+      expect(recordsOf(env).map(([key]) => key).sort()).toEqual(keysOf(env, paths));
+      expect(staleRecords(env)).toEqual([]);
+      expect(readInstallState(env)).toBeNull();
+    });
+  });
+
+  for (const upstreamState of ['stale', 'current'] as const) for (const evidence of ['matching', 'mismatched', 'no hosts', 'one host', 'unselected host', 'binary'] as const) {
+    test('unrecorded rules stay unrecorded: ' + upstreamState + ', ' + evidence, () => {
+      withRules(({ home, upstream, env, paths, run }) => {
+        recordInstallOwnership([], env);
+        if (upstreamState === 'current') for (const rule of wazaRules.files) copyFileSync(join(home, '.agents/rules', rule), join(upstream, rule));
+        if (evidence === 'mismatched') writeFileSync(join(home, '.codex/rules/english.md'), '# user host edit\n');
+        if (evidence === 'no hosts' || evidence === 'one host') for (const rule of wazaRules.files) rmSync(join(home, '.claude/rules', rule));
+        if (evidence === 'no hosts' || evidence === 'unselected host') for (const rule of wazaRules.files) rmSync(join(home, '.codex/rules', rule));
+        if (evidence === 'binary') for (const root of ['.agents', '.claude', '.codex']) writeFileSync(join(home, root, 'rules/english.md'), Buffer.from([35, 32, root === '.codex' ? 129 : 128, 10]));
+        const snapshot = () => paths.map(path => existsSync(path) ? readFileSync(path) : null);
+        const before = snapshot(), state = storedBytes(env);
+        const result = run(true, evidence === 'unselected host' ? 'codex' : 'both');
+        expect(result.status).toBe('failed');
+        expect(result.detail).toContain('rh has no record of it');
+        expect(result.detail).toContain('Move the rule to a backup directory. If it is a staging rule, move any existing host copies of the same rule there too.');
+        expect(snapshot()).toEqual(before);
+        expect(storedBytes(env)).toEqual(state);
+        expect(recordsOf(env)).toHaveLength(0);
+      });
+    });
+  }
+
+  test('a targeted refresh keeps an edited unselected host and refuses it when selected', () => {
+    withRules(({ home, env, paths, run }) => {
+      const edited = join(home, '.claude/rules/english.md'); writeFileSync(edited, '# user edit\n');
+      expect(run(true, 'codex').status).toBe('ok');
+      expect(readFileSync(edited, 'utf8')).toBe('# user edit\n');
+      expect(pathRecordIsCurrent(pathRecordKey(env, edited), ownedPath(env, edited)!)).toBe(false);
+      const before = paths.map(path => readFileSync(path)), state = storedBytes(env);
+      expect(run(true, 'claude').status).toBe('failed');
+      expect(paths.map(path => readFileSync(path))).toEqual(before);
+      expect(storedBytes(env)).toEqual(state);
+    });
+  });
+
+  for (const failure of ['fetch', 'empty', 'staging edit', 'host edit'] as const) {
+    test(failure + ' leaves every rule and receipt unchanged', () => {
+      withRules(({ home, upstream, env, paths, run }) => {
+        if (failure === 'fetch') writeFileSync(join(upstream, 'fail-english.md'), 'fail');
+        if (failure === 'empty') writeFileSync(join(upstream, 'english.md'), '');
+        if (failure === 'staging edit') writeFileSync(join(home, '.agents/rules/english.md'), '# user staging edit\n');
+        if (failure === 'host edit') writeFileSync(join(home, '.codex/rules/english.md'), '# user host edit\n');
+        const before = paths.map(path => readFileSync(path)), state = storedBytes(env);
+        const result = run();
+        expect(result.status).toBe('failed');
+        expect(result.detail).toContain(failure === 'fetch' ? 'fixture HTTP 503' : failure === 'empty' ? 'empty response' : 'it changed since rh wrote it');
+        expect(paths.map(path => readFileSync(path))).toEqual(before);
+        expect(storedBytes(env)).toEqual(state);
+      });
+    });
+  }
+
+  test('a non-directory staging rules path fails without changing host rules or receipts', () => {
+    withRules(({ home, env, paths, run }) => {
+      const staging = join(home, '.agents/rules');
+      const hosts = paths.filter(path => !path.startsWith(staging + '/'));
+      const before = hosts.map(path => readFileSync(path)), state = storedBytes(env);
+      rmSync(staging, { recursive: true }); writeFileSync(staging, 'user file\n');
+      const result = run();
+      expect(result.status).toBe('failed');
+      expect(result.detail).toContain(staging);
+      expect(readFileSync(staging, 'utf8')).toBe('user file\n');
+      expect(hosts.map(path => readFileSync(path))).toEqual(before);
+      expect(storedBytes(env)).toEqual(state);
+    });
+  });
+
+  test('non-update sync uses current ownership and never fetches staging content', () => {
+    withRules(({ home, env, paths, run }) => {
+      const before = paths.map(path => readFileSync(path)), state = storedBytes(env);
+      expect(run(false).status).toBe('ok');
+      expect(existsSync(join(home, 'fetch.log'))).toBe(false);
+      expect(paths.map(path => readFileSync(path))).toEqual(before);
+      expect(storedBytes(env)).toEqual(state);
+    });
+  });
+
+  test('a current host can advance from owned staging during non-update sync', () => {
+    withRules(({ home, run }) => {
+      expect(run(true, 'codex').status).toBe('ok');
+      expect(run(false, 'claude').status).toBe('ok');
+      expect(readFileSync(join(home, '.claude/rules/english.md'))).toEqual(readFileSync(join(home, '.agents/rules/english.md')));
+    });
+  });
+});
+
+describe('Codex Waza projection', () => {
+  for (const mode of ['relative', 'absolute', 'missing', 'unknown-directory'] as const) {
+    test(`Waza projection handles ${mode} paths without user-content deletion`, () => {
+      const tmp = mkdtempSync('/tmp/rh-waza-projection-');
+      const home = join(tmp, 'home');
+      const bin = join(tmp, 'bin');
+      try {
+        mkdirSync(bin, { recursive: true });
+        writeFakeHc(bin);
+        for (const name of ['think', 'hunt', 'check', 'health', 'mermaid']) {
+          const stage = join(home, '.agents/skills', name);
+          mkdirSync(stage, { recursive: true });
+          writeFileSync(join(stage, 'SKILL.md'), `---\nname: ${name}\n---\n# ${name}\n`);
+          const dest = join(home, '.codex/skills', name);
+          mkdirSync(dirname(dest), { recursive: true });
+          if (mode === 'relative') symlinkSync(`../../.agents/skills/${name}`, dest);
+          if (mode === 'absolute') symlinkSync(stage, dest);
+        }
+        const think = join(home, '.codex/skills/think');
+        if (mode === 'unknown-directory') {
+          mkdirSync(think); writeFileSync(join(think, 'SKILL.md'), 'user instructions\n');
+        }
+        // Only the runtime version probe is external. All skill bytes are staged.
+        // The core agent fleet helper runs its stdin script on the real Bun.
+        writeExecutable(tmp, join(bin, 'bun'), `#!/bin/bash\nif [[ "$1" == "--version" ]]; then echo 1.4.0; exit 0; fi\nif [[ "$1" == "-" ]]; then exec "${process.execPath}" "$@"; fi\nexit 9\n`);
+        writeExecutable(tmp, join(bin, 'bunx'), '#!/bin/bash\nexit 9\n');
+        writeExecutable(tmp, join(bin, 'curl'), '#!/bin/bash\nwhile [[ $# -gt 0 ]]; do if [[ "$1" == --output ]]; then out="$2"; shift; fi; shift; done\nprintf "# rule\\n" > "$out"\n');
+        const env = { ...sanitizedChildEnv(home), HOME: home, BUN_INSTALL: join(home, '.bun'), PATH: `${bin}:${process.env.PATH ?? ''}` };
+        const result = runGlobalRuntimeSetup({ sourceRoot: ROOT, cwd: tmp, target: 'codex', plugins: [],
+          installCli: false, syncSkill: false, hostAdapters: false, externalSkills: true, codegraph: false, env });
+        const waza = result.steps.find(step => step.step === 'configure Waza skills');
+        expect(waza?.status).toBe(mode === 'missing' ? 'ok' : 'failed');
+        if (mode !== 'missing') {
+          expect(result.exitCode).toBe(1);
+          expect(waza?.detail).toContain('refusing to refresh unowned host skill');
+          expect(waza?.detail).toContain('then run: rh install --target codex');
+          if (mode === 'unknown-directory') {
+            expect(lstatSync(think).isDirectory()).toBe(true);
+            expect(readFileSync(join(think, 'SKILL.md'), 'utf8')).toBe('user instructions\n');
+          } else expect(readlinkSync(think)).toBe(mode === 'relative' ? '../../.agents/skills/think' : join(home, '.agents/skills/think'));
+        } else {
+          expect(result.exitCode, result.stderr).toBe(0);
+          for (const name of ['think', 'hunt', 'check', 'health']) {
+            const dest = join(home, '.codex/skills', name);
+            expect(lstatSync(dest).isSymbolicLink()).toBe(true);
+            expect(readlinkSync(dest)).toBe(join(home, '.agents/skills', name));
+          }
+        }
+      } finally { rmSync(tmp, { recursive: true, force: true }); }
+    });
+  }
+});
+
+describe('Global Working Rules refresh during install and update', () => {
+  const userBefore = '## Model Routing\n\nUse the orchestrator model.\n\n';
+  const userBetween = '## Herdr 跨 harness 协作\n\n- Talk to the peer pane.\n\n';
+  const userAfter = '## Disk hygiene on the Mac mini\n\n- Keep the disk clean.\n';
+  // Sync replaces only released text; the current template is a released template.
+  const released = new Map(legacySections(readFileSync(join(ROOT, 'assets/reference-configs/global-working-rules.md'), 'utf8').match(/```md\n([\s\S]*?)\n```/)![1]!));
+  const mixedLegacy = [
+    userBefore,
+    `${released.get('# Global Working Rules')}\n\n`,
+    `${released.get('## Sufficiency and Stop Boundaries')}\n\n`,
+    userBetween,
+    `${released.get('## Progressive Due Diligence')}\n\n`,
+    userAfter,
+  ].join('');
+  // A block that v0.23.1 wrote: it records no reporting language.
+  const releasedUnrecorded = readFileSync(join(ROOT, 'tests/fixtures/global-rules/released-v0.23.1-en.md'), 'utf8');
+
+  function withRulesRuntime(body: (fixture: {
+    home: string;
+    path: string;
+    run: (
+      reportLanguage?: 'follow' | 'zh-CN' | 'en',
+      updateMode?: boolean,
+      target?: 'codex' | 'both',
+    ) => ReturnType<typeof runGlobalRuntimeSetup>;
+  }) => void): void {
+    const tmp = mkdtempSync(join(tmpdir(), 'repo-harness-global-rules-refresh-'));
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const source = join(tmp, 'source');
+    const fakeBin = join(tmp, 'bin');
+    try {
+      for (const dir of [home, repo, source, fakeBin, join(home, '.codex')]) mkdirSync(dir, { recursive: true });
+      setupFakeSource(source);
+      mkdirSync(join(source, 'assets', 'reference-configs'), { recursive: true });
+      copyFileSync(
+        join(ROOT, 'assets', 'reference-configs', 'global-working-rules.md'),
+        join(source, 'assets', 'reference-configs', 'global-working-rules.md'),
+      );
+      writeExecutable(tmp, join(fakeBin, 'bun'), '#!/bin/bash\nif [[ "${1:-}" == "--version" ]]; then echo 1.4.0; fi\nexit 0\n');
+      writeFakeHc(fakeBin);
+      const env = {
+        ...sanitizedChildEnv(home),
+        HOME: home,
+        BUN_INSTALL: join(home, '.bun'),
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        REPO_HARNESS_BUN_EXECUTABLE: join(fakeBin, 'bun'),
+      };
+      body({
+        home,
+        path: join(home, '.codex', 'AGENTS.md'),
+        run: (reportLanguage, updateMode = true, target = 'codex') => runGlobalRuntimeSetup({
+          sourceRoot: source,
+          cwd: repo,
+          target,
+          plugins: [],
+          updateMode,
+          installCli: false,
+          syncSkill: false,
+          hostAdapters: false,
+          externalSkills: false,
+          codegraph: false,
+          reportLanguage,
+          env,
+        }),
+      });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  const rulesStep = (result: ReturnType<typeof runGlobalRuntimeSetup>) =>
+    result.steps.find((step) => step.step === 'refresh global working rules');
+  const backupDir = (home: string) => join(home, '.repo-harness', 'global-context-backups');
+  const vaultDir = (home: string) => join(home, '.repo-harness', 'config', 'vault');
+
+  test('setting the language replaces both recorded presets, keeps user text and keeps no whole-file copy', () => withRulesRuntime(({ home, path }) => {
+    const claudePath = join(home, '.claude', 'CLAUDE.md');
+    mkdirSync(dirname(claudePath), { recursive: true });
+    const codex = `${userBefore}${renderGlobalRulesBlock(ROOT, { preset: 'en', instruction: 'Use English to report to user.' })}`;
+    const claude = `${userBefore}${renderGlobalRulesBlock(ROOT, { preset: 'custom', instruction: 'Report in French.' })}`;
+    writeFileSync(path, codex);
+    writeFileSync(claudePath, claude);
+    const result = setReportingLanguage(home, ROOT, ['codex', 'claude'], 'zh-CN');
+    expect([result.status, result.changed_hosts]).toEqual(['ok', ['codex', 'claude']]);
+    for (const file of [path, claudePath]) {
+      const saved = readFileSync(file, 'utf8');
+      expect(saved).toStartWith(userBefore);
+      expect(inspectGlobalContext(saved, ROOT).language?.preset).toBe('zh-CN');
+    }
+    expect(setReportingLanguage(home, ROOT, ['codex', 'claude'], 'zh-CN').changed_hosts).toEqual([]);
+    expect(existsSync(backupDir(home))).toBe(false);
+    expect(readdirSync(vaultDir(home))).toEqual([]);
+  }));
+
+  test('an unbalanced second host refuses the whole language change before writing; a linked one is the same file', () => withRulesRuntime(({ home, path }) => {
+    const claudePath = join(home, '.claude', 'CLAUDE.md');
+    mkdirSync(dirname(claudePath), { recursive: true });
+    writeFileSync(path, userBefore);
+    const broken = '<!-- BEGIN: repo-harness global-working-rules -->\n';
+    writeFileSync(claudePath, broken);
+    expect(setReportingLanguage(home, ROOT, ['codex', 'claude'], 'en').status).toBe('skipped');
+    expect(readFileSync(claudePath, 'utf8')).toBe(broken);
+    rmSync(claudePath);
+    symlinkSync(path, claudePath);
+    expect(setReportingLanguage(home, ROOT, ['codex', 'claude'], 'en')).toMatchObject({ status: 'ok', changed_hosts: ['codex', 'claude'] });
+    const saved = readFileSync(path, 'utf8');
+    expect(saved.split(GLOBAL_RULES_END)).toHaveLength(2);
+    expect(saved).toStartWith(userBefore);
+    expect(lstatSync(claudePath).isSymbolicLink()).toBe(true);
+  }));
+
+  test('setting the language installs missing, unmanaged and unrecorded rules through the existing merge', () => {
+    for (const current of [null, userBefore, mixedLegacy, releasedUnrecorded]) {
+      withRulesRuntime(({ home, path }) => {
+        if (current === null) rmSync(path, { force: true });
+        else writeFileSync(path, current);
+        expect(setReportingLanguage(home, ROOT, ['codex'], 'follow').status).toBe('ok');
+        const saved = readFileSync(path, 'utf8');
+        expect(inspectGlobalContext(saved, ROOT)).toMatchObject({ state: 'managed-current', language: { preset: 'follow' } });
+        if (current?.includes(userBefore)) expect(saved).toStartWith(userBefore);
+      });
+    }
+  });
+
+  // An older parent CLI hands update to the candidate without a report language.
+  test('a candidate-style update without a language skips legacy and unrecorded files and exits 0', () => withRulesRuntime(({ home, path, run }) => {
+    const claudePath = join(home, '.claude', 'CLAUDE.md');
+    const unrecorded = releasedUnrecorded;
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(path, mixedLegacy);
+    writeFileSync(claudePath, unrecorded);
+    const result = run(undefined, true, 'both');
+    expect(result.exitCode).toBe(0);
+    const step = rulesStep(result);
+    expect(step?.status).toBe('skipped');
+    expect(step?.detail).toContain(`skipped-legacy:${path} (legacy repo-harness rules without markers; run \`rh update --report-language follow|zh-CN|en\``);
+    expect(step?.detail).toContain(`skipped-unrecorded:${claudePath} (managed block has no recorded reporting language; run \`rh update --report-language follow|zh-CN|en\`)`);
+    expect(readFileSync(path, 'utf-8')).toBe(mixedLegacy);
+    expect(readFileSync(claudePath, 'utf-8')).toBe(unrecorded);
+  }), 30_000);
+
+  test('a symlinked instruction file is followed: the target gets the block and the link stays', () => withRulesRuntime(({ home, path, run }) => {
+    const target = join(home, 'dotfiles-AGENTS.md');
+    writeFileSync(target, userBefore);
+    symlinkSync(target, path);
+    const result = run('zh-CN');
+    expect(result.exitCode).toBe(0);
+    expect(rulesStep(result)).toMatchObject({ status: 'ok', detail: `appended:${path}` });
+    expect(inspectGlobalContext(readFileSync(target, 'utf-8'), ROOT).state).toBe('managed-current');
+    expect(lstatSync(path).isSymbolicLink()).toBe(true);
+  }), 30_000);
+
+  test.skipIf(process.getuid?.() === 0)('an unreadable rules file stays out of the backup and is skipped inside the update transaction', () => withRulesRuntime(({ home, path }) => {
+    writeFileSync(path, mixedLegacy);
+    chmodSync(path, 0o000);
+    try {
+      const env = {
+        ...sanitizedChildEnv(home),
+        HOME: home,
+        BUN_INSTALL: join(home, '.bun'),
+        PATH: `${join(home, '..', 'bin')}:${process.env.PATH ?? ''}`,
+        REPO_HARNESS_BUN_EXECUTABLE: join(home, '..', 'bin', 'bun'),
+      };
+      expect(installProfileHostMutationPaths(env)).not.toContain(path);
+      expect(installProfileHostMutationPaths(env)).toContain(join(home, '.claude', 'CLAUDE.md'));
+      const result = runTransactionalRuntimeRefresh({
+        sourceRoot: join(home, '..', 'source'), cwd: join(home, '..', 'repo'), target: 'codex', plugins: [],
+        updateMode: true, installCli: false, syncSkill: false, hostAdapters: false, externalSkills: false,
+        codegraph: false, reportLanguage: 'en', env,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(rulesStep(result)?.status).toBe('skipped');
+      expect(rulesStep(result)?.detail).toContain(`skipped-unreadable:${path} (`);
+      expect(rulesStep(result)?.detail).toContain('make it a readable regular file to enable managed sync');
+    } finally {
+      chmodSync(path, 0o644);
+    }
+    expect(readFileSync(path, 'utf-8')).toBe(mixedLegacy);
+  }), 30_000);
+
+  test('a CRLF file with a recorded header stays CRLF and a second update is a no-op', () => withRulesRuntime(({ home, path, run }) => {
+    const crlf = (text: string) => text.replace(/\n/g, '\r\n');
+    const expected = crlf(`${userBefore}${renderGlobalRulesBlock(ROOT, { preset: 'en', instruction: 'Use English to report to user.' })}\n${userAfter}`);
+    writeFileSync(path, expected);
+    expect(inspectGlobalContext(expected, ROOT).state).toBe('managed-current');
+    const unchanged = run();
+    expect(rulesStep(unchanged)).toMatchObject({ status: 'ok', detail: `unchanged:${path}` });
+    expect(readFileSync(path, 'utf-8')).toBe(expected);
+
+    // A released block in CRLF is proved managed and refreshed in CRLF.
+    const stale = crlf(`${userBefore}${releasedUnrecorded}\n${userAfter}`);
+    writeFileSync(path, stale);
+    const refreshed = run('en');
+    expect(rulesStep(refreshed)).toMatchObject({ status: 'ok', detail: `updated:${path}` });
+    expect(readFileSync(path, 'utf-8')).toBe(expected);
+    expect(rulesStep(run())).toMatchObject({ status: 'ok', detail: `unchanged:${path}` });
+    expect(existsSync(backupDir(home))).toBe(false);
+  }), 60_000);
+
+  test('a file that changes between preflight and apply fails with the re-run message', () => withRulesRuntime(({ home, path }) => {
+    writeFileSync(path, mixedLegacy);
+    const plan = preflightGlobalContextRefresh(ROOT, home, ['codex'], 'en');
+    expect(plan.files[0]?.outcome).toBe('write');
+    writeFileSync(path, `${mixedLegacy}\n## Added later\n`);
+    expect(applyGlobalContextRefresh(plan, home)).toEqual({
+      status: 'failed',
+      detail: `failed:${path} (changed after preflight; re-run)`,
+    });
+    expect(readFileSync(path, 'utf-8')).toBe(`${mixedLegacy}\n## Added later\n`);
+  }));
+
+  test.skipIf(process.getuid?.() === 0)('a failed vault copy before a legacy migration leaves the rules file unwritten and stops update', () => withRulesRuntime(({ home, path, run }) => {
+    writeFileSync(path, mixedLegacy);
+    mkdirSync(vaultDir(home), { recursive: true });
+    chmodSync(vaultDir(home), 0o500);
+    try {
+      const applied = applyGlobalContextRefresh(preflightGlobalContextRefresh(ROOT, home, ['codex'], 'en'), home);
+      expect(applied.status).toBe('failed');
+      expect(applied.detail).toStartWith(`failed:${path} (EACCES`);
+      // In update mode the failed refresh is the last step: no later host write and no user-file notice run.
+      const update = run('en');
+      expect(update.exitCode).toBe(1);
+      expect(update.steps.at(-1)).toMatchObject({ step: 'refresh global working rules', status: 'failed' });
+    } finally {
+      chmodSync(vaultDir(home), 0o700);
+    }
+    expect(readFileSync(path, 'utf-8')).toBe(mixedLegacy);
+  }));
+
+  test('a failed install transaction restores both rules files, also a linked target with an adopted block', () => withRulesRuntime(({ home, path }) => {
+    const env = { ...process.env, HOME: home, BUN_INSTALL: join(home, '.bun') };
+    const claudePath = join(home, '.claude', 'CLAUDE.md');
+    const target = join(home, 'dotfiles-CLAUDE.md');
+    const claude = `${userBefore}${releasedUnrecorded}`;
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(path, mixedLegacy);
+    writeFileSync(target, claude);
+    symlinkSync(target, claudePath);
+    const transaction = beginInstallHostTransaction(installProfileTransactionPaths(env), env);
+    const applied = applyGlobalContextRefresh(preflightGlobalContextRefresh(ROOT, home, ['codex', 'claude'], 'en'), home);
+    expect(applied.status).toBe('ok');
+    expect(readFileSync(path, 'utf-8')).not.toBe(mixedLegacy);
+    expect(readFileSync(target, 'utf-8')).not.toBe(claude);
+    rollbackInstallHostTransaction(transaction);
+    expect(readFileSync(path, 'utf-8')).toBe(mixedLegacy);
+    expect(readFileSync(target, 'utf-8')).toBe(claude);
+    expect(lstatSync(claudePath).isSymbolicLink()).toBe(true);
+
+    // A linked target with legacy sections only: the rollback puts back the vault copy that the migration took.
+    const legacyTarget = join(home, 'dotfiles-AGENTS.md');
+    rmSync(path);
+    writeFileSync(legacyTarget, mixedLegacy);
+    symlinkSync(legacyTarget, path);
+    const linked = beginInstallHostTransaction(installProfileTransactionPaths(env), env);
+    expect(applyGlobalContextRefresh(preflightGlobalContextRefresh(ROOT, home, ['codex'], 'en'), home).status).toBe('ok');
+    expect(readFileSync(legacyTarget, 'utf-8')).not.toBe(mixedLegacy);
+    rollbackInstallHostTransaction(linked);
+    expect(readFileSync(legacyTarget, 'utf-8')).toBe(mixedLegacy);
+    expect(lstatSync(path).isSymbolicLink()).toBe(true);
+  }));
+
+  test('a valid block with a released section outside it: the whole file goes to the vault before the migration, and a revert gives it back', () => withRulesRuntime(({ home, path }) => {
+    const block = renderGlobalRulesBlock(ROOT, { preset: 'en', instruction: 'Use English to report to user.' });
+    const original = `${userBefore}${block}\n${released.get('## Progressive Due Diligence')}\n\n${userAfter}`;
+    const claudePath = join(home, '.claude', 'CLAUDE.md');
+    const target = join(home, 'dotfiles-CLAUDE.md');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(path, original);
+    writeFileSync(target, original);
+    symlinkSync(target, claudePath);
+    expect(applyGlobalContextRefresh(preflightGlobalContextRefresh(ROOT, home, ['codex', 'claude'], 'en'), home).status).toBe('ok');
+    const ledger = JSON.parse(readFileSync(join(home, '.repo-harness', 'config', 'ledger.json'), 'utf8'));
+    for (const file of [path, target]) {
+      expect(readFileSync(file, 'utf8'), file).not.toBe(original);
+      const backup = String(ledger.files[realpathSync(file)].backup).replace('sha256:', '');
+      expect(readFileSync(join(vaultDir(home), backup), 'utf8'), file).toBe(original);
+    }
+    expect(openHostConfigGate({ env: { HOME: home } }).revert([path, claudePath]).map((entry) => entry.action)).toEqual(['text_removed', 'text_removed']);
+    for (const file of [path, target]) expect(readFileSync(file, 'utf8'), file).toBe(original);
+    expect(lstatSync(claudePath).isSymbolicLink()).toBe(true);
+    if (process.getuid?.() === 0) return;
+    // No vault copy, no migration.
+    const other = `${original}## Later\n`;
+    writeFileSync(path, other);
+    chmodSync(vaultDir(home), 0o500);
+    try { expect(applyGlobalContextRefresh(preflightGlobalContextRefresh(ROOT, home, ['codex'], 'en'), home).status).toBe('failed'); }
+    finally { chmodSync(vaultDir(home), 0o700); }
+    expect(readFileSync(path, 'utf8')).toBe(other);
+  }));
+
+  test('a flag migrates the legacy span, keeps every user section, and a second update is a no-op', () => withRulesRuntime(({ home, path, run }) => {
+    writeFileSync(path, mixedLegacy);
+    const migrated = run('zh-CN');
+    expect(migrated.exitCode).toBe(0);
+    expect(rulesStep(migrated)).toMatchObject({
+      status: 'ok',
+      detail: `migrated-legacy:${path} (replaced: Global Working Rules, Sufficiency and Stop Boundaries, Progressive Due Diligence; kept user sections: Model Routing, Herdr 跨 harness 协作, Disk hygiene on the Mac mini)`,
+    });
+    const block = renderGlobalRulesBlock(ROOT, { preset: 'zh-CN', instruction: 'Use Chinese to report to user.' });
+    const expected = `${userBefore}${block}\n${userBetween}${userAfter}`;
+    const content = readFileSync(path, 'utf-8');
+    expect(content).toBe(expected);
+    for (const removed of ['Rule 0: old wording.', 'Old stop rule.', '### P1: Architecture Map', 'Old map rule.']) {
+      expect(content).not.toContain(removed);
+    }
+
+    const again = run();
+    expect(again.exitCode).toBe(0);
+    expect(rulesStep(again)).toMatchObject({ status: 'ok', detail: `unchanged:${path}` });
+    expect(readFileSync(path, 'utf-8')).toBe(expected);
+
+    // An edited block is no released block: update keeps it, with or without a flag.
+    const edited = expected.replace('Rule 0:', 'Old rule 0:');
+    writeFileSync(path, edited);
+    expect(rulesStep(run('en'))).toMatchObject({ status: 'skipped', detail: `skipped-edited:${path} (${GLOBAL_RULES_EDITED})` });
+    expect(readFileSync(path, 'utf-8')).toBe(edited);
+
+    // The migration took out text with no ledger record, so the vault holds the file before it and a revert puts it back.
+    writeFileSync(path, expected);
+    expect(openHostConfigGate({ env: { ...process.env, HOME: home } }).revert([path])).toEqual([{ path, action: 'text_removed', baseline: 'proved' }]);
+    expect(readFileSync(path, 'utf-8')).toBe(mixedLegacy);
+  }), 60_000);
+
+  test('an unrecorded block needs a flag, and install also runs the refresh', () => withRulesRuntime(({ path, run }) => {
+    const unrecorded = `${userBefore}${releasedUnrecorded}`;
+    writeFileSync(path, unrecorded);
+    const unsynced = run(undefined, false);
+    expect(unsynced.exitCode).toBe(0);
+    expect(rulesStep(unsynced)?.status).toBe('skipped');
+    expect(rulesStep(unsynced)?.detail).toContain('managed block has no recorded reporting language');
+    expect(readFileSync(path, 'utf-8')).toBe(unrecorded);
+
+    const recorded = run('en', false);
+    expect(recorded.exitCode).toBe(0);
+    expect(rulesStep(recorded)).toMatchObject({ status: 'ok', detail: `updated:${path}` });
+    expect(readFileSync(path, 'utf-8'))
+      .toBe(`${userBefore}${renderGlobalRulesBlock(ROOT, { preset: 'en', instruction: 'Use English to report to user.' })}`);
+  }), 60_000);
+
+  test('a file without rules is skipped without a flag and never created', () => withRulesRuntime(({ path, run }) => {
+    const skipped = run();
+    expect(skipped.exitCode).toBe(0);
+    expect(rulesStep(skipped)?.status).toBe('skipped');
+    expect(rulesStep(skipped)?.detail).toContain('not opted in; run `rh update --report-language follow|zh-CN|en` to install the rules');
+    expect(existsSync(path)).toBe(false);
+
+    const created = run('follow');
+    expect(rulesStep(created)).toMatchObject({ status: 'ok', detail: `created:${path}` });
+    expect(inspectGlobalContext(readFileSync(path, 'utf-8'), ROOT).state).toBe('managed-current');
+  }), 60_000);
+
+  test('the candidate request carries only a valid report language and refuses retired protocol 1 and 2 requests', () => {
+    const request = {
+      protocol: 3, transaction_id: 't', transaction_backup_root: '/tmp/b', parent_token: 'p', cwd: '/tmp',
+      candidate: { root: '/tmp/c', version: '9.9.9', package_digest: 'sha256:00' },
+      target: 'codex', sync_skill: false, host_adapters: false, external_skills: false,
+      obsidian_skills: false, codegraph: false,
+    } as const;
+    expect(parseCandidateRequest(encodeCandidateRequest({ ...request, report_language: 'zh-CN' }), '9.9.9').report_language).toBe('zh-CN');
+    expect(parseCandidateRequest(encodeCandidateRequest(request), '9.9.9').report_language).toBeUndefined();
+    expect(() => parseCandidateRequest(encodeCandidateRequest({ ...request, report_language: 'custom' as 'en' }), '9.9.9')).toThrow('invalid shape');
+    const overrides = [{ path: '/home/u/.claude/settings.json', selector: 'statusLine' }];
+    expect(parseCandidateRequest(encodeCandidateRequest({ ...request, overrides }), '9.9.9').overrides).toEqual(overrides);
+    // A released candidate ignores the field, so a receipt with no echo of the selection fails the parent's step.
+    const receipt = { protocol: 3, transaction_id: 't', candidate_package_root: '/tmp/c', candidate_version: '0.35.0', candidate_package_digest: 'sha256:00',
+      route_registry_digest: 'sha256:00', selected_target: 'codex', adapter_projection_digests: {}, ownership_manifest_digest: null, reconciliation_scope: 'partial', verified_at: 'now' } as const;
+    expect(() => assertReceiptSelection(overrides, parseCandidateReceipt(JSON.stringify(receipt)))).toThrow('candidate 0.35.0 did not apply the --override selection');
+    expect(() => assertReceiptSelection(overrides, parseCandidateReceipt(JSON.stringify({ ...receipt, overrides })))).not.toThrow();
+    expect(() => assertReceiptSelection(undefined, parseCandidateReceipt(JSON.stringify(receipt)))).not.toThrow();
+    // A selection this version cannot read, and a field it does not know, are refused, not dropped.
+    for (const invalid of [{ overrides: [{ path: 'relative', selector: 'statusLine' }] }, { overrides: [{ path: '/a', selector: '' }] }, { future_field: true }]) {
+      expect(() => parseCandidateRequest(encodeCandidateRequest({ ...request, ...invalid } as unknown as CandidateReconciliationRequest), '9.9.9')).toThrow('invalid shape');
+    }
+    // A released parent before request protocol 3 cannot drive this candidate; the candidate names the direct bootstrap.
+    for (const protocol of [1, 2]) {
+      expect(() => parseCandidateRequest(encodeCandidateRequest({ ...request, protocol, reverse_skill: false } as unknown as CandidateReconciliationRequest), '9.9.9'))
+        .toThrow(new CandidateRequestProtocolRetiredError(protocol, '9.9.9'));
+    }
+    // A protocol 3 request that still carries a retired field is refused, not silently ignored.
+    for (const retired of [{ profile: 'full' }, { reverse_skill: true }, { reverse_skill: false }]) {
+      expect(() => parseCandidateRequest(encodeCandidateRequest({ ...request, ...retired } as unknown as CandidateReconciliationRequest), '9.9.9')).toThrow('invalid shape');
+    }
+  });
+});

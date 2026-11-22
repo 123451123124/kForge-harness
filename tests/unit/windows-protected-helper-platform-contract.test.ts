@@ -1,0 +1,400 @@
+import { describe, expect, test } from 'bun:test';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, type Stats } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { spawnSync } from 'child_process';
+import {
+  discoverWindowsProtectedHelperContract,
+  resolveProtectedHelperPlatform,
+  validateWindowsProtectedHelperContract,
+  writeWindowsProtectedHelperContract,
+  type ProtectedHelperFileAccess,
+  type WindowsProtectedHelperContract,
+} from '../../src/effects/runtime/protected-helper-platform';
+import { protectedChildEnv } from '../../src/effects/runtime/helper-runner';
+
+const GIT_ROOT = 'C:\\Program Files\\Git';
+const CONTRACT: WindowsProtectedHelperContract = {
+  protocol: 1,
+  platform: 'win32',
+  distribution: 'git-for-windows',
+  git_root: GIT_ROOT,
+  git_bin: `${GIT_ROOT}\\cmd\\git.exe`,
+  bash_bin: `${GIT_ROOT}\\bin\\bash.exe`,
+  posix_tools_dir: `${GIT_ROOT}\\usr\\bin`,
+  system_tools_dir: 'C:\\Windows\\System32',
+  temp_dir: 'C:\\Users\\Ada\\AppData\\Local\\Temp',
+};
+
+type FakePathKind = 'file' | 'directory' | 'symlink' | 'missing';
+
+function fakeStats(kind: FakePathKind): Stats {
+  return {
+    isFile: () => kind === 'file',
+    isDirectory: () => kind === 'directory',
+    isSymbolicLink: () => kind === 'symlink',
+  } as Stats;
+}
+
+function access(
+  overrides: Record<string, FakePathKind> = {},
+  realpaths: Record<string, string> = {},
+): ProtectedHelperFileAccess {
+  const entries: Array<[string, FakePathKind]> = [
+    [CONTRACT.git_root, 'directory'],
+    [CONTRACT.git_bin, 'file'],
+    [CONTRACT.bash_bin, 'file'],
+    [CONTRACT.posix_tools_dir, 'directory'],
+    [CONTRACT.system_tools_dir, 'directory'],
+    [`${CONTRACT.system_tools_dir}\\taskkill.exe`, 'file'],
+    [CONTRACT.temp_dir, 'directory'],
+    ...Object.entries(overrides),
+  ];
+  const kinds = new Map(entries.map(([path, kind]) => [path.toLowerCase(), kind] as const));
+  return {
+    exists: (path) => (kinds.get(path.toLowerCase()) ?? 'missing') !== 'missing',
+    lstat: (path) => fakeStats(kinds.get(path.toLowerCase()) ?? 'missing'),
+    realpath: (path) => realpaths[path.toLowerCase()] ?? path,
+    readFile: () => {
+      throw new Error('not used');
+    },
+  };
+}
+
+describe('Windows protected-helper platform contract', () => {
+  test('binds Git, Bash, and POSIX tools to one Git-for-Windows root', () => {
+    expect(validateWindowsProtectedHelperContract(CONTRACT, access())).toEqual(CONTRACT);
+
+    const runtime = resolveProtectedHelperPlatform({
+      platform: 'win32',
+      accountHome: 'C:\\Users\\Ada',
+      bunExecutable: 'C:\\Users\\Ada\\.bun\\bin\\bun.exe',
+      contract: CONTRACT,
+      fileAccess: access(),
+      nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+      nativeTempDirectory: CONTRACT.temp_dir,
+    });
+    expect(runtime.pathDelimiter).toBe(';');
+    expect(runtime.pathEntries).toContain(`${GIT_ROOT}\\usr\\bin`);
+    expect(runtime.pathEntries).toContain('C:\\Windows\\System32');
+    expect(runtime.tempDir).toBe('C:\\Users\\Ada\\AppData\\Local\\Temp');
+    expect(runtime.systemRoot).toBe('C:\\Windows');
+    expect(runtime.taskkillBin).toBe('C:\\Windows\\System32\\taskkill.exe');
+    expect(runtime.tempDir).toBe(CONTRACT.temp_dir);
+    expect(runtime.pathEntries.indexOf(`${GIT_ROOT}\\cmd`)).toBeLessThan(
+      runtime.pathEntries.indexOf('C:\\Users\\Ada\\.bun\\bin'),
+    );
+  });
+
+  test('rejects cross-installation, symlinked, and extended contracts', () => {
+    expect(() => validateWindowsProtectedHelperContract({
+      ...CONTRACT,
+      bash_bin: 'D:\\Tools\\Git\\bin\\bash.exe',
+    }, access({ 'D:\\Tools\\Git\\bin\\bash.exe': 'file' }))).toThrow('Git-for-Windows root');
+
+    expect(() => validateWindowsProtectedHelperContract(CONTRACT, access({
+      [CONTRACT.bash_bin]: 'symlink',
+    }))).toThrow('regular file');
+
+    expect(() => validateWindowsProtectedHelperContract({ ...CONTRACT, fallback: 'PATH' }, access())).toThrow('unknown field');
+
+    const { temp_dir: _tempDir, ...missingTemp } = CONTRACT;
+    expect(() => validateWindowsProtectedHelperContract(missingTemp, access())).toThrow('missing field: temp_dir');
+
+    const escapedGit = 'D:\\attacker\\git.exe';
+    expect(() => validateWindowsProtectedHelperContract(CONTRACT, access({
+      [escapedGit]: 'file',
+    }, {
+      [CONTRACT.git_bin.toLowerCase()]: escapedGit,
+    }))).toThrow('Git-for-Windows root');
+  });
+
+  test('sanitized child environment ignores caller binary and path overrides', () => {
+    const runtime = resolveProtectedHelperPlatform({
+      platform: 'win32',
+      accountHome: 'C:\\Users\\Ada',
+      bunExecutable: 'C:\\Users\\Ada\\.bun\\bin\\bun.exe',
+      contract: CONTRACT,
+      fileAccess: access(),
+      nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+      nativeTempDirectory: CONTRACT.temp_dir,
+    });
+    const env = protectedChildEnv({
+      PATH: 'C:\\attacker',
+      HOME: 'C:\\attacker-home',
+      REPO_HARNESS_GIT_BIN: 'C:\\attacker\\git.exe',
+      REPO_HARNESS_BASH_BIN: 'C:\\attacker\\bash.exe',
+      BASH_ENV: 'C:\\attacker\\inject.sh',
+      LANG: 'en_US.UTF-8',
+    }, runtime);
+
+    expect(env.PATH).not.toContain('attacker');
+    expect(env.HOME).toBe('C:\\Users\\Ada');
+    expect(env.REPO_HARNESS_GIT_BIN).toBe(CONTRACT.git_bin);
+    expect(env.REPO_HARNESS_BASH_BIN).toBe(CONTRACT.bash_bin);
+    expect(env.OS).toBe('Windows_NT');
+    expect(env.SystemRoot).toBe('C:\\Windows');
+    expect(env.TEMP).toBe('C:\\Users\\Ada\\AppData\\Local\\Temp');
+    expect(env.BASH_ENV).toBeUndefined();
+    expect(env.LANG).toBe('en_US.UTF-8');
+  });
+
+  test('discovers quoted install PATH entries once and rejects stale runtime state', () => {
+    const discovered = discoverWindowsProtectedHelperContract({
+      env: {
+        PATH: `"${GIT_ROOT}\\cmd";${CONTRACT.system_tools_dir}`,
+        PATHEXT: '.EXE',
+        SystemRoot: 'C:\\Windows',
+        WINDIR: 'C:\\Windows',
+        TEMP: CONTRACT.temp_dir,
+      },
+      fileAccess: access(),
+      nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+      nativeTempDirectory: CONTRACT.temp_dir,
+    });
+    expect(discovered.git_root.toLowerCase()).toBe(CONTRACT.git_root.toLowerCase());
+    expect(discovered.git_bin.toLowerCase()).toBe(CONTRACT.git_bin.toLowerCase());
+    expect(discovered.system_tools_dir.toLowerCase()).toBe(CONTRACT.system_tools_dir.toLowerCase());
+
+    expect(() => discoverWindowsProtectedHelperContract({
+      env: {
+        PATH: `"${GIT_ROOT}\\cmd";C:\\attacker\\System32`,
+        SystemRoot: 'C:\\Windows',
+        TEMP: CONTRACT.temp_dir,
+      },
+      fileAccess: access({
+        'C:\\attacker\\System32\\taskkill.exe': 'file',
+      }),
+      nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+      nativeTempDirectory: CONTRACT.temp_dir,
+    })).toThrow('native System32');
+
+    expect(() => discoverWindowsProtectedHelperContract({
+      env: {
+        PATH: `"${GIT_ROOT}\\cmd";${CONTRACT.system_tools_dir}`,
+        SystemRoot: 'C:\\Windows',
+      },
+      fileAccess: access(),
+      nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+    })).toThrow('requires an absolute TEMP directory');
+
+    expect(() => discoverWindowsProtectedHelperContract({
+      env: {
+        PATH: `"${GIT_ROOT}\\cmd";${CONTRACT.system_tools_dir}`,
+        SystemRoot: 'C:\\Windows',
+        TEMP: 'relative\\temp',
+      },
+      fileAccess: access(),
+      nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+      nativeTempDirectory: 'relative\\temp',
+    })).toThrow('native temp directory must be an absolute Windows path');
+
+    const configPath = 'C:\\Users\\Ada\\.repo-harness\\config.json';
+    const staleAccess: ProtectedHelperFileAccess = {
+      ...access({
+        'C:\\Users\\Ada\\.repo-harness': 'directory',
+        [configPath]: 'file',
+      }),
+      readFile: () => JSON.stringify({ protectedHelperRuntime: { ...CONTRACT, protocol: 2 } }),
+    };
+    expect(() => resolveProtectedHelperPlatform({
+      platform: 'win32',
+      accountHome: 'C:\\Users\\Ada',
+      configPath,
+      fileAccess: staleAccess,
+      nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+    })).toThrow('protocol must be 1');
+    // JSON.parse quotes an identifier-shaped token of the file; the error names the file only (I1, #3164).
+    expect(() => resolveProtectedHelperPlatform({
+      platform: 'win32', accountHome: 'C:\\Users\\Ada', configPath,
+      fileAccess: { ...staleAccess, readFile: () => '{"protectedHelperRuntime": sk_FAKE_SECRET_12345}' },
+      nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+    })).toThrow(new Error(`${configPath}: the file is not valid JSON`));
+
+    expect(() => resolveProtectedHelperPlatform({
+      platform: 'win32',
+      accountHome: 'C:\\Users\\Ada',
+      configPath: 'C:\\missing\\config.json',
+      fileAccess: access(),
+      nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+    })).toThrow('run rh install or rh update');
+
+    expect(() => resolveProtectedHelperPlatform({
+      platform: 'win32',
+      accountHome: 'C:\\Users\\Ada',
+      configPath,
+      fileAccess: {
+        ...access({
+          'C:\\Users\\Ada\\.repo-harness': 'symlink',
+          [configPath]: 'file',
+        }),
+        readFile: () => JSON.stringify({ protectedHelperRuntime: CONTRACT }),
+      },
+      nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+    })).toThrow('config directory must be a non-symlink directory');
+  });
+
+  for (const layout of ['cmd', 'bin', 'mingw32\\bin', 'mingw64\\bin', 'ucrt64\\bin', 'clangarm64\\bin']) {
+    test(`discovers ${layout} first on PATH and pins a supported Git wrapper`, () => {
+      const gitDirectory = `${GIT_ROOT}\\${layout}`;
+      const discovered = discoverWindowsProtectedHelperContract({
+        env: { PATH: `"${gitDirectory}";${GIT_ROOT}\\cmd;${CONTRACT.system_tools_dir}`, TEMP: CONTRACT.temp_dir },
+        fileAccess: access({
+          [gitDirectory]: 'directory',
+          [`${gitDirectory}\\git.exe`]: 'file',
+          [`${GIT_ROOT}\\${layout.split('\\')[0]}`]: 'directory',
+        }),
+        nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+        nativeTempDirectory: CONTRACT.temp_dir,
+      });
+      expect(discovered).toEqual({
+        ...CONTRACT,
+        git_bin: layout === 'bin' ? `${GIT_ROOT}\\bin\\git.exe` : CONTRACT.git_bin,
+      });
+    });
+  }
+
+  for (const name of ['mingw32', 'mingw64', 'ucrt64', 'clangarm64']) {
+    test(`preserves a public bin installation whose root is named ${name}`, () => {
+      const root = `D:\\Apps\\${name}`;
+      const directContract = {
+        ...CONTRACT,
+        git_root: root,
+        git_bin: `${root}\\bin\\git.exe`,
+        bash_bin: `${root}\\bin\\bash.exe`,
+        posix_tools_dir: `${root}\\usr\\bin`,
+      };
+      const discover = (overrides: Record<string, FakePathKind> = {}) => discoverWindowsProtectedHelperContract({
+        env: { PATH: `${root}\\bin;${CONTRACT.system_tools_dir}`, TEMP: CONTRACT.temp_dir },
+        fileAccess: access({
+          [root]: 'directory',
+          [directContract.git_bin]: 'file',
+          [directContract.bash_bin]: 'file',
+          [directContract.posix_tools_dir]: 'directory',
+          // A complete parent installation must not take over a public one.
+          'D:\\Apps': 'directory',
+          'D:\\Apps\\cmd\\git.exe': 'file',
+          'D:\\Apps\\bin\\bash.exe': 'file',
+          'D:\\Apps\\usr\\bin': 'directory',
+          [`${root}\\bin`]: 'directory',
+          ...overrides,
+        }),
+        nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+        nativeTempDirectory: CONTRACT.temp_dir,
+      });
+      expect(discover()).toEqual(directContract);
+      for (const required of [directContract.bash_bin, directContract.posix_tools_dir]) {
+        expect(() => discover({ [required]: 'missing' })).toThrow('is missing');
+        expect(() => discover({ [required]: 'symlink' })).toThrow('non-symlink');
+      }
+    });
+  }
+
+  test('internal Git discovery refuses incomplete or redirected installations', () => {
+    const internalDirectory = `${GIT_ROOT}\\mingw64\\bin`;
+    const internalGit = `${internalDirectory}\\git.exe`;
+    const discover = (overrides: Record<string, FakePathKind>, realpaths: Record<string, string> = {}) =>
+      discoverWindowsProtectedHelperContract({
+        env: { PATH: `${internalDirectory};${GIT_ROOT}\\cmd;${CONTRACT.system_tools_dir}`, TEMP: CONTRACT.temp_dir },
+        fileAccess: access({
+          [`${GIT_ROOT}\\mingw64`]: 'directory',
+          [internalDirectory]: 'directory',
+          [internalGit]: 'file',
+          ...overrides,
+        }, realpaths),
+        nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+        nativeTempDirectory: CONTRACT.temp_dir,
+      });
+    for (const required of [CONTRACT.git_root, CONTRACT.git_bin, CONTRACT.bash_bin, CONTRACT.posix_tools_dir]) {
+      expect(() => discover({ [required]: 'missing' })).toThrow('is missing');
+      expect(() => discover({ [required]: 'symlink' })).toThrow('non-symlink');
+    }
+    const escapedGit = 'D:\\OtherGit\\cmd\\git.exe';
+    expect(() => discover({ [escapedGit]: 'file' }, {
+      [CONTRACT.git_bin.toLowerCase()]: escapedGit,
+    })).toThrow('Git-for-Windows root');
+    for (const directory of [`${GIT_ROOT}\\mingw64`, internalDirectory]) {
+      expect(() => discover({ [directory]: 'symlink' })).toThrow('non-symlink');
+    }
+  });
+
+  test('does not search arbitrary ancestors or other PATH installs for a Git root', () => {
+    for (const layout of ['tools\\bin', 'mingw64\\nested\\bin']) {
+      const directory = `${GIT_ROOT}\\${layout}`;
+      expect(() => discoverWindowsProtectedHelperContract({
+        env: { PATH: `${directory};${GIT_ROOT}\\cmd;${CONTRACT.system_tools_dir}`, TEMP: CONTRACT.temp_dir },
+        fileAccess: access({
+          [directory]: 'directory',
+          [`${directory}\\git.exe`]: 'file',
+        }),
+        nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+        nativeTempDirectory: CONTRACT.temp_dir,
+      })).toThrow('is missing');
+    }
+    const internalGit = `${GIT_ROOT}\\mingw64\\bin\\git.exe`;
+    expect(() => validateWindowsProtectedHelperContract({ ...CONTRACT, git_bin: internalGit }, access({
+      [internalGit]: 'file',
+    }))).toThrow('cmd\\git.exe or bin\\git.exe');
+  });
+
+  test('persists the contract atomically without replacing sibling user config', () => {
+    const home = mkdtempSync(join(tmpdir(), 'repo-harness-windows-platform-config-'));
+    const configDir = join(home, '.repo-harness');
+    const configPath = join(configDir, 'config.json');
+    try {
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(configPath, `${JSON.stringify({ seats: { untouched: true } })}\n`);
+
+      expect(writeWindowsProtectedHelperContract(CONTRACT, home).changed).toBe(true);
+      const persisted = JSON.parse(readFileSync(configPath, 'utf-8'));
+      expect(persisted.seats).toEqual({ untouched: true });
+      expect(persisted.protectedHelperRuntime).toEqual(CONTRACT);
+      expect(writeWindowsProtectedHelperContract(CONTRACT, home).changed).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects a symlinked optional mingw tool directory instead of widening PATH', () => {
+    const mingw = `${GIT_ROOT}\\mingw64\\bin`;
+    expect(() => resolveProtectedHelperPlatform({
+      platform: 'win32',
+      accountHome: 'C:\\Users\\Ada',
+      contract: CONTRACT,
+      fileAccess: access({ [mingw]: 'symlink' }),
+      nativeSystemToolsDirectory: CONTRACT.system_tools_dir,
+      nativeTempDirectory: CONTRACT.temp_dir,
+    })).toThrow('non-symlink directory');
+  });
+
+  const testPosix = process.platform === 'win32' ? test.skip : test;
+  testPosix('direct protected TypeScript helpers ignore caller runtime overrides', () => {
+    const home = mkdtempSync(join(tmpdir(), 'repo-harness-direct-helper-env-'));
+    const marker = join(home, 'fake-git-ran');
+    const fakeGit = join(home, 'git');
+    try {
+      writeFileSync(fakeGit, `#!/bin/sh\ntouch "${marker}"\nexit 99\n`);
+      chmodSync(fakeGit, 0o755);
+      const result = spawnSync(process.execPath, [join(import.meta.dir, '..', '..', 'scripts', 'merge-gate.ts'), 'fingerprint', '--base', 'HEAD', '--format', 'required'], {
+        cwd: join(import.meta.dir, '..', '..'),
+        encoding: 'utf-8',
+        env: {
+          ...process.env,
+          REPO_HARNESS_GIT_BIN: fakeGit,
+          REPO_HARNESS_PROTECTED_PATH: home,
+          REPO_HARNESS_PROTECTED_TMPDIR: home,
+        },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim()).toMatch(/^(?:true|false)$/);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('ship does not require jq for the merge gate', () => {
+    const ship = readFileSync(join(import.meta.dir, '..', '..', 'scripts', 'ship-worktrees.sh'), 'utf-8');
+    expect(ship).not.toContain('merge gate preflight requires jq');
+  });
+});

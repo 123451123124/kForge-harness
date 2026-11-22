@@ -1,0 +1,198 @@
+# public-surface/adoption 架构文档
+<!-- BEGIN ARCHCONTEXT:generated target="projection_target.entity.capability-public-surface-adoption" rendererVersion="archcontext.docs-renderer/v6" outputDigest="sha256:9abad6f210fe0652aebdaed9489e41e8c22ecdb89ccb3b31f74fd3cf081a2a98" -->
+> **狀態**:`active`
+> **Capability ID**:`capability.public-surface.adoption`(kind `capability`)
+> **Matched Prefixes**:`src/core/adoption/**`
+> **Local Contracts**:`AGENTS.md`、`CLAUDE.md`
+> **事實優先級**:倉庫當前狀態 > 本文檔機器區 > 本文檔人工區。機器區(引言、§1、§2)由 ArchContext 從架構模型與源碼度量投影生成,手改會在下次投影被覆蓋。本文檔不記錄出處;本次投影所驗證的 commit 見 `docs/architecture/.projection-manifest.json`。
+
+Plans and applies repository adoption through the canonical filesystem transaction boundary.
+
+## 1. P1:能力架構地圖
+
+### 1.1 架構圖
+
+```mermaid
+flowchart LR
+  p1_capability_public_surface_adoption_30ebba6e["Adoption"]:::component
+  p1_component_adoption_cli_layer_fffb9daa["Adoption (cli)"]:::component
+  p1_component_adoption_effects_layer_337cfde8["Adoption (effects)"]:::component
+  p1_component_adoption_primary_8ecdbd06["Adoption Transaction"]:::component
+  p1_component_adoption_tests_layer_93307fc5["Adoption (tests)"]:::component
+  p1_capability_public_surface_adoption_30ebba6e -->|"Apply repository adoption"| p1_component_adoption_primary_8ecdbd06
+  classDef actor fill:#111827,color:#ffffff,stroke:#f9fafb,stroke-width:2px
+  classDef component fill:#075985,color:#ffffff,stroke:#bae6fd,stroke-width:2px
+  classDef datastore fill:#3f6212,color:#ffffff,stroke:#d9f99d,stroke-width:2px
+  classDef external fill:#7c2d12,color:#ffffff,stroke:#fed7aa,stroke-width:2px
+```
+
+- Proof: `proven` (`sha256:acb2ef929acde979a66c42db08087e9085f74acfd15249f123b63bdcc63fbf64`).
+- Semantic nodes: `5`; declared relations: `1`.
+
+### 1.2 模組職責表
+
+| 宣告入口 | 錨點 | 職責 |
+| --- | --- | --- |
+| `entrypoint.adoption.primary` | `src/cli/commands/adoption-plan.ts#runAdoptionApply` | `sink.adoption.primary` → `src/effects/fs-transaction.ts#applyAdoptionPlan` |
+
+組件入口:
+
+- 組件均未宣告 `source.entrypoints`。
+
+### 1.3 規模信號
+
+- 規模量級:`10–20` 個文件 / `500–1000` 行
+- 匹配前綴:`src/core/adoption/**`
+- 推導:掃描 `source.include` 減 `source.exclude`,跳過 `.git/` 與 `node_modules/`,再按 1–2–5 階梯分桶。精確計數不入本文檔:量級足以回答「這個能力有多大」,而逐行計數會讓覆蓋範圍內任何一次源碼改動都改寫本文檔。
+
+### 1.4 依賴邊界
+
+出向關係:
+
+- `depends-on` → `capability.workflow-engine.contract-assets` — Read the workflow contract asset for adoption.
+- `depends-on` → `capability.runtime-harness.evidence-ledger` — Hash adoption plans and report file transaction errors.
+- `depends-on` → `capability.workflow-engine.execution-primitives` — Run bounded processes for adoption and file transactions.
+- `depends-on` → `capability.runtime-harness.global-runtime-reconciliation` — Use the legacy inventory during adoption planning.
+- `depends-on` → `capability.runtime-harness.hook-adapters` — Use installer setup during repository migration.
+- `depends-on` → `component.execution-primitives.repository-registry` — Read registered repository identity for adoption planning.
+- `depends-on` → `capability.workflow-engine.workflow-state` — Resolve worktree locations during adoption planning.
+- `calls` → `component.adoption.primary` — Apply repository adoption
+
+入向關係:
+
+- `depends-on` ← `capability.runtime-harness.architecture` — Resolve the source checkout for the projection writer.
+- `calls` ← `component.contract-assets.template-projection` — Plan and apply the transactional adoption for repository init
+- `depends-on` ← `capability.verification.evals-checks` — Test Adoption behavior through its source modules.
+- `calls` ← `capability.runtime-harness.evidence-ledger` — Resolve blob and log paths inside the repository with the shared path-safety helper
+- `calls` ← `component.global-runtime-reconciliation.cli-diagnostics` — Inspect the workflow marker, strip managed hooks and plan the adoption for the doctor and setup check reports
+- `calls` ← `component.global-runtime-reconciliation.cli-root` — Register the adoption-plan command and run the adoption plan for the setup check
+- `calls` ← `component.global-runtime-reconciliation.primary` — Classify retired surfaces with the adoption fingerprints and back up removals in an FsTransaction manifest under the target lock
+- `calls` ← `component.hook-adapters.host-installer` — Share the managed hook command fingerprints with the adoption migration
+- `calls` ← `component.hook-adapters.session-lifecycle` — Check the one-release run summary cleanup paths with the shared path safety rules
+- `depends-on` ← `capability.runtime-harness.operator` — Build the adoption plan for language settings.
+
+組件出向關係:
+
+- `component.adoption.cli-layer`:
+  - 無。
+- `component.adoption.effects-layer`:
+  - 無。
+- `component.adoption.primary`:
+  - 無。
+- `component.adoption.tests-layer`:
+  - 無。
+
+### 1.5 組件結構
+
+| 組件 | 名稱 | 規模量級 | 宣告入口 |
+| --- | --- | --- | --- |
+| `component.adoption.cli-layer` | Adoption (cli) | `2–5` 個文件 / `200–500` 行 | 未宣告 |
+| `component.adoption.effects-layer` | Adoption (effects) | `5–10` 個文件 / `1000–2000` 行 | 未宣告 |
+| `component.adoption.primary` | Adoption Transaction | 未宣告 `source.include` | 未宣告 |
+| `component.adoption.tests-layer` | Adoption (tests) | `5–10` 個文件 / `2000–5000` 行 | 未宣告 |
+
+## 2. P2:端到端數據流
+
+> **Proof**: `proven` (`sha256:acb2ef929acde979a66c42db08087e9085f74acfd15249f123b63bdcc63fbf64`); selectors `1/1`.
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"background":"#0d1117","actorBkg":"#312e81","actorBorder":"#c4b5fd","actorTextColor":"#ffffff","signalColor":"#e5e7eb","signalTextColor":"#e5e7eb","labelBoxBkgColor":"#4c1d95","labelBoxBorderColor":"#c4b5fd","labelTextColor":"#ffffff","noteBkgColor":"#78350f","noteBorderColor":"#fcd34d","noteTextColor":"#ffffff","sequenceNumberColor":"#ffffff"}}}%%
+sequenceDiagram
+  autonumber
+  participant p2_capability_4262990f as Adoption
+  participant p2_component_7b8d80ff as Adoption Transaction
+  p2_capability_4262990f->>p2_component_7b8d80ff: Dispatch Adoption Transaction
+  alt Apply repository adoption completes
+  p2_capability_4262990f->>p2_component_7b8d80ff: Invoke Adoption Transaction
+    Note over p2_capability_4262990f: Return success receipt
+  else Apply repository adoption is rejected or fails
+  p2_capability_4262990f->>p2_component_7b8d80ff: Propagate Adoption Transaction failure
+    Note over p2_capability_4262990f: Return typed failure
+  end
+```
+<!-- END ARCHCONTEXT:generated target="projection_target.entity.capability-public-surface-adoption" -->
+## 3. P3：设计决策与不变量
+
+### 3.1 必须保持的不变量
+
+1. **单一事实源。** `assets/workflow-contract.v1.json` 和 `standard-plan.ts` 的默认值定义 canonical 字节。plan、manifest、registry 和 Markdown 视图都是投影。
+2. **规划层无副作用。** `src/core/adoption/**` 只放纯计算（operation 模型、回滚、摘要），不 import `fs`、`path` 或 `src/effects/**`。读文件系统的规划器在 `src/effects/adoption/**`。`planAdoption`（`src/effects/adoption/plan.ts:22`）只读文件系统，不写。`--dry-run` 的输出和 apply 执行的是同一个 operation 模型。
+3. **前置条件在规划期固化。** 每个 operation 带 `expectedContentHash` 或 `expectedAbsent`（`src/core/adoption/operations.ts:27`、`:29`）。规划与执行之间若有并发编辑，执行失败，不覆盖。
+4. **回滚策略在规划期固化。** `rollbackMetadataForOperation`（`src/core/adoption/rollback.ts:11`）为每个 operation 生成回滚说明。`--dry-run` 输出因此也是一份回滚说明书。
+5. **executor 只有一个调用点。** `applyAdoptionPlan` 在 `src/` 中只被 `src/cli/commands/adoption-plan.ts:163` 调用。
+6. **失败关闭。** 非法路径、哈希不符、归属不明、不支持的 kind 都让流程停止或告警。流程不靠扩大删除范围继续。
+7. **保护用户归属。** `.gitignore` 只改受管区块（`src/core/adoption/managed-block.ts:54`）。hook 配置只删 repo-harness 自有的命令对象（`managed-hook-config.ts:49-53`）。known-generated 清理只删字节匹配声明指纹的文件。
+8. **manifest 与文件效果同属一个事务。** apply 在第一个失败的 operation 处停止，后续 operation 不执行。manifest 落盘后，executor 按 manifest 自动回滚已完成的 operation（`src/effects/fs-transaction.ts:697`）。manifest 写入失败也使事务失败并回滚（`:579`）。回滚只碰本事务拥有的目标，apply 之后的用户编辑不会被覆盖。`init` 文本报告给出回滚结果和未恢复的文件。
+9. **self-host apply 保持关闭。** `runAdoptionApply` 对 `mode === "self-host"` 返回 `self_host_review_required`。`standard-plan.ts` 中 `buildStandardOperations` 的不可执行 `runCheck` 是第二道防线。
+10. **不再生成退役的 task artifacts。** adoption 不创建 todos、notes 或 reviews，不重写旧 todo 文件。lessons 和 contracts 仍保留；Issue/PR 持有当前工作状态。
+11. **目标仓库必须是明确的 Git 工作树。** `validateRepoAdoptionTarget` 拒绝 HOME，也拒绝不在 Git 工作树内的 cwd（`src/cli/repo-adoption/target.ts`）。`init` 和 `adoption-plan` 共用这一个校验。
+
+### 3.2 关键权衡
+
+| 决策 | 权衡 |
+| --- | --- |
+| 规划与执行分离，所有条件判断前移到规划期 | 消除"预演说改 A，实际改了 B"。代价是 `standard-plan.ts` 涨到 850 行，十几个 `add*Operations` 步骤共享一个按顺序填充的数组。 |
+| 每个目标一个 `exclusive-directory-lock` 目录锁（`withTargetLock`，`fs-transaction.ts:233`），没有全事务锁 | 两个并发 `init` 不会覆盖同一个文件。前置条件和内容判断在锁内复核，等锁的写入方不会覆盖另一方在等待期间的修改。持锁进程死亡后，下一次写入回收这把锁。代价是两个事务可以交错出"一半来自事务 A、一半来自事务 B"的仓库状态，自动回滚只撤销本事务的 operation。 |
+| 每次写入都把原字节完整备份到 `.ai/harness/backups/fs-transaction/`（`fs-transaction.ts:34`） | 回滚按字节恢复原内容，非 UTF-8 文件也不变。代价是这个目录没有保留期或 GC，单调增长。 |
+| 全量 preflight 后串行执行 | 执行前一次性发现问题。代价是 operation 增多后时间窗变长，"target content changed after planning"更常见。可用性先下降，正确性不变。 |
+
+### 3.3 10x 规模下先垮的点
+
+1. **preflight 与 apply 之间的时间窗**（见 §3.2）。
+2. **锁粒度。** 10x 并发下，事务交错是第一个真正的正确性缺口。
+3. **备份体积**（见 §3.2）。
+4. **`standard-plan.ts` 的顺序耦合。** 再加几类迁移，步骤顺序会变成隐式契约。拆分的触发条件是出现第二个独立的 plan producer。行数本身不是触发条件。
+
+### 3.4 刻意不做的事
+
+- 不为 `mergeJson`（`operations.ts:60`）补 executor。没有 producer 就没有需求。这个类型是历史遗留。如需清理，应作为独立工作包删除类型。
+- 不引入独立 workspace package。本 capability 与 CLI 同包发布，没有第二个独立消费者。
+- 不加 shell 兼容 apply 路径、experimental apply flag 或第二套 plan parser。
+
+### 3.5 事务规划与恢复
+
+专题文档已并入本节。
+
+- `standard-plan.ts` 是 `init` 与 `runInit()` 共同消费的唯一 mutation plan。两者都经过 `planAdoption`；`planAdoption` 对 self-host 源码 checkout 有短路分支，这时 `standard-plan.ts` 不被调用。`runAdoptionApply` 另外显式阻断 self-host（§3.1 第 9 条）。
+- plan 覆盖 scaffold/state 文件、typed hook 投影、模板、reference stub、workflow archive、known-generated 清理、deployment scaffold 和 managed-block 更新。写入前拒绝畸形 managed JSON、symlink、unsafe path、已占用的 move target 和归属不明的目标。
+- HRD-09 迁移把退役的 generated hook asset 按精确相对路径和 `sha256` 写进 workflow-contract migration manifest。`addLegacyCleanup()`（`src/effects/adoption/standard-plan.ts#addLegacyCleanup`）只在当前字节匹配声明指纹时删除；不匹配就告警并保留，通配符和未声明指纹被拒绝。repo-local `.codex/hooks.json` 只由显式 migration step 解析；managed command detector 删除 repo-harness 自有的命令，保留 custom commands、unrelated events 和 sibling hook blocks。删除、`gitUntrack`、adapter rewrite 与 typed helper 投影由同一个 `FsTransaction` 提交，没有 post-apply shell cleanup，也没有 runtime dual-read。self-host 源码 checkout 不进入下游 generated-runtime cleanup。
+- 事务在 apply 后持久化 manifest 和 registry projection，然后刷新 handoff 与 strict workflow evidence。每次写入把原字节和 content hash 存入 `.ai/harness/backups/fs-transaction/<transaction>/manifest.json`。remove 把旧文件移入 transaction backup area；move 记录 source 和 destination。manifest 落盘失败是 failed apply，不是 success。rollback 只恢复 transaction-owned operation，并拒绝覆盖 apply 之后的用户编辑。
+- `rh init rollback --transaction <manifest>` 只在 target 仍归本事务时恢复 backup 和 Git index。`gitUntrack` rollback 恢复记录的 index mode 和 blob，不 stage 当前工作树字节。apply 只记录一个 `100644` 或 `100755` 的 stage-0 entry；mutation 前拒绝 unmerged entry、其他 mode 和 intent-to-add entry。changed target、changed index entry、missing blob、occupied restore path、symlink（含 dangling）或 invalid manifest 给出结构化失败，不覆盖用户数据。manifest 没有 index entry 时，提示用户手动运行 `git add -- <path>`。
+
+### 3.6 归属与开放问题
+
+- `src/cli/repo-adoption/**` 归本 capability 所有。
+- `rh init` 通过 `addLegacyCleanup()`（`src/effects/adoption/standard-plan.ts#addLegacyCleanup`）删除 repo-local hook 配置中的 repo-harness 命令。清理与其他 adoption 操作共用 `FsTransaction`。`rh migrate` 已在 #2937 删除。
+- `src/effects/path-safety.ts` 被 `src/core/evidence/` 和 `src/effects/evidence/` 下的 7 个文件 import（归属提议 §7 风险 3）。这条反向依赖会在 evidence-ledger 建立后成为一条进入本 capability 的跨 capability 边。它是否应该移到共享位置？没有记录。
+
+---
+
+## 4. 历史决策记录（append-only）
+
+此前版本的 `docs/architecture/modules/public-surface/adoption.md` 不含任何带日期的决策章节，因此本节目前为空。后续所有带日期的决策条目在此按时间追加，原文保留、不得改写。
+
+### 2026-10-11 归属扩展与 P3 复核
+
+- include 增加 `src/cli/repo-adoption/**`。
+- P3 改为"必须保持的不变量 / 关键权衡"结构，并按当前源码更新行号（`standard-plan.ts` 850 行，`withTargetLock` 在 `fs-transaction.ts:226`）。
+
+### 2026-10-25 事务原子化与目标锁迁移（#902）
+
+- `applyAdoptionPlan` 在第一个失败处停止，并按 manifest 自动回滚已完成的 operation。原因：旧实现在失败后继续执行，只能手动回滚。
+- `withTargetLock` 从 `O_EXCL` 文件锁改为 `exclusive-directory-lock`，并回收死亡持有者留下的锁。原因：写入方崩溃后，旧锁让目标永久报 "target is locked"。旧版本留下的文件锁不是目录，新锁拒绝它，需要手动删除。
+- 文件写入的前置条件移入目标锁内；备份和恢复改为按字节处理。
+
+---
+
+## 5. Verification
+
+```bash
+bun test tests/cli/adoption-plan.test.ts
+bun run check:type
+bun src/cli/index.ts init --repo . --dry-run
+```
+
+## Optimization Backlog
+
+- 决定 `rh migrate` 是否并入 FsTransaction（见 §3.6）。
+- 在 arch-context#296 之后，删除与 evals-checks 重复的测试条目（`tests/cli/adoption-plan.test.ts`、`tests/fixtures/adoption/**`），`verification` 命令保持不变。

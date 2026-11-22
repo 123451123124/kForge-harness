@@ -1,0 +1,52 @@
+schemaVersion: archcontext.flow/v1
+id: flow.hook-adapters.primary
+capabilityId: capability.runtime-harness.hook-adapters
+name: "Dispatch a host hook route"
+applicability: required
+participants:
+  - id: capability
+    nodeId: capability.runtime-harness.hook-adapters
+  - id: route-runtime
+    nodeId: component.hook-adapters.primary
+  - id: edit-guards
+    nodeId: component.hook-adapters.edit-guards
+steps:
+  - id: dispatch
+    from: capability
+    to: route-runtime
+    label: "Resolve the typed handler for the route"
+    evidence:
+      entrypointId: entrypoint.hook-adapters.primary
+      sourceSymbol: "runHook"
+      sinkId: sink.hook-adapters.primary
+outcomes:
+  - id: success
+    kind: success
+    label: "The typed handler returns a structured result"
+    steps:
+      - id: invoke-guard
+        from: route-runtime
+        to: edit-guards
+        label: "Run the bound handler such as the PreToolUse.edit mutation guard"
+        evidence:
+          entrypointId: entrypoint.hook-adapters.handler-bindings
+          sourceSymbol: "handlers"
+          sinkId: sink.hook-adapters.mutation-guard
+    terminal:
+      participant: route-runtime
+      label: "Shape the host output and append one telemetry record"
+  - id: error
+    kind: error
+    label: "An unknown route or unbound handler fails closed"
+    steps:
+      - id: invoke-error
+        from: capability
+        to: route-runtime
+        label: "Return the route failure"
+        evidence:
+          entrypointId: entrypoint.hook-adapters.primary
+          sourceSymbol: "runHook"
+          sinkId: sink.hook-adapters.primary
+    terminal:
+      participant: capability
+      label: Return typed failure

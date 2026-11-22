@@ -1,0 +1,249 @@
+# workflow-engine/workflow-state 架構文檔
+
+<!-- BEGIN ARCHCONTEXT:generated target="projection_target.entity.capability-workflow-engine-workflow-state" rendererVersion="archcontext.docs-renderer/v6" outputDigest="sha256:98edc98951948c0c27cba96ec83011b2fc6fcfa4e58285331fb9fa9cbdc64c3e" -->
+> **狀態**:`active`
+> **Capability ID**:`capability.workflow-engine.workflow-state`(kind `capability`)
+> **Matched Prefixes**:`src/core/state/**`、`src/effects/state/**`、`src/core/workflow/**`、`interfaces/**`、`src/core/worktree-location.mjs`、`src/core/worktree-location.d.mts`、`src/cli/commands/state.ts`
+> **Local Contracts**:`AGENTS.md`、`CLAUDE.md`
+> **事實優先級**:倉庫當前狀態 > 本文檔機器區 > 本文檔人工區。機器區(引言、§1、§2)由 ArchContext 從架構模型與源碼度量投影生成,手改會在下次投影被覆蓋。本文檔不記錄出處;本次投影所驗證的 commit 見 `docs/architecture/.projection-manifest.json`。
+
+Resolves deterministic Effective State, worktree safety and the continuation ledger.
+
+## 1. P1:能力架構地圖
+
+### 1.1 架構圖
+
+```mermaid
+flowchart LR
+  p1_capability_workflow_engine_execution_primitives_b3033934["Execution Primitives"]:::component
+  p1_capability_workflow_engine_workflow_state_c0df5f05["Workflow State"]:::component
+  p1_component_workflow_state_continuation_ledger_379dbd7c["Continuation Ledger"]:::component
+  p1_component_workflow_state_continuation_ledger_effects_763fc01a["Continuation Ledger (effects)"]:::component
+  p1_component_workflow_state_coordination_plane_01b22a1b["Task Session Admission and Historical Worktree Safety"]:::component
+  p1_component_workflow_state_coordination_plane_core_3d2e2fd5["Task Session Admission and Historical Worktree Safety (core)"]:::component
+  p1_component_workflow_state_primary_d0fb4045["Effective State Resolver"]:::component
+  p1_component_workflow_state_primary_cli_1f36a09d["Effective State Resolver (cli)"]:::component
+  p1_component_workflow_state_primary_effects_8c542428["Effective State Resolver (effects)"]:::component
+  p1_component_workflow_state_primary_scripts_401176d3["Effective State Resolver (scripts)"]:::component
+  p1_component_workflow_state_continuation_ledger_379dbd7c -->|"Serialize attempt ledger appends under a directory lock and write them durably"| p1_capability_workflow_engine_execution_primitives_b3033934
+  p1_component_workflow_state_continuation_ledger_379dbd7c -->|"Project the continuation envelope from read-only Effective State"| p1_component_workflow_state_primary_d0fb4045
+  p1_capability_workflow_engine_workflow_state_c0df5f05 -->|"Observe task session admission and retain explicit historical task parsing and exact worktree safety"| p1_component_workflow_state_coordination_plane_01b22a1b
+  p1_component_workflow_state_coordination_plane_01b22a1b -->|"Append claim attempt receipts and read owner ledgers as progress evidence"| p1_component_workflow_state_continuation_ledger_379dbd7c
+  p1_component_workflow_state_coordination_plane_01b22a1b -->|"Take task and backlog locks#44; read the worktree topology#44; and write coordination records durably"| p1_capability_workflow_engine_execution_primitives_b3033934
+  p1_component_workflow_state_coordination_plane_01b22a1b -->|"Read artifacts and owner Effective State through the shared resolver"| p1_component_workflow_state_primary_d0fb4045
+  p1_capability_workflow_engine_workflow_state_c0df5f05 -->|"Resolve Effective State under the state lock"| p1_component_workflow_state_primary_d0fb4045
+  p1_component_workflow_state_primary_d0fb4045 -->|"Take the state lock and commit the version owner under the Git common dir"| p1_capability_workflow_engine_execution_primitives_b3033934
+  classDef actor fill:#111827,color:#ffffff,stroke:#f9fafb,stroke-width:2px
+  classDef component fill:#075985,color:#ffffff,stroke:#bae6fd,stroke-width:2px
+  classDef datastore fill:#3f6212,color:#ffffff,stroke:#d9f99d,stroke-width:2px
+  classDef external fill:#7c2d12,color:#ffffff,stroke:#fed7aa,stroke-width:2px
+```
+
+- Proof: `proven` (`sha256:b94d780940f56d13f0ad717fb382850ea802dfcc3a9b52962e2da8504f83a54e`).
+- Semantic nodes: `10`; declared relations: `8`.
+
+### 1.2 模組職責表
+
+| 宣告入口 | 錨點 | 職責 |
+| --- | --- | --- |
+| `entrypoint.workflow-state.primary` | `src/effects/state/resolve-effective-state.ts#resolveEffectiveState` | `sink.workflow-state.primary` → `src/effects/state/state-lock.ts#withStateLock` |
+| `entrypoint.workflow-state.primary` | `src/effects/state/resolve-effective-state.ts#resolveEffectiveStateUnlocked` | `sink.workflow-state.project` → `src/core/state/project-effective-state.ts#projectEffectiveState` |
+| `entrypoint.workflow-state.primary` | `src/effects/state/resolve-effective-state.ts#resolveAndCommitEffectiveState` | `sink.workflow-state.version-commit` → `src/effects/state/git-state-version-store.ts#commitStateVersionAfter` |
+| `entrypoint.workflow-state.state-lock` | `src/effects/state/state-lock.ts#withStateLock` | `sink.workflow-state.directory-lock` → `src/effects/locking/exclusive-directory-lock.ts#withExclusiveDirectoryLock` |
+| `entrypoint.workflow-state.version-owner` | `src/effects/state/git-state-version-store.ts#commitStateVersionAfter` | `sink.workflow-state.git-common-dir` → `src/effects/git/common-directory.ts#resolveGitCommonDirectory` |
+
+組件入口:
+
+- 組件均未宣告 `source.entrypoints`。
+
+### 1.3 規模信號
+
+- 規模量級:`20–50` 個文件 / `2000–5000` 行
+- 匹配前綴:`src/core/state/**`、`src/effects/state/**`、`src/core/workflow/**`、`interfaces/**`、`src/core/worktree-location.mjs`、`src/core/worktree-location.d.mts`、`src/cli/commands/state.ts`
+- 推導:掃描 `source.include` 減 `source.exclude`,跳過 `.git/` 與 `node_modules/`,再按 1–2–5 階梯分桶。精確計數不入本文檔:量級足以回答「這個能力有多大」,而逐行計數會讓覆蓋範圍內任何一次源碼改動都改寫本文檔。
+
+### 1.4 依賴邊界
+
+出向關係:
+
+- `calls` → `component.workflow-state.coordination-plane` — Observe task session admission and retain explicit historical task parsing and exact worktree safety
+- `depends-on` → `capability.verification.acceptance-review` — Read the diff fingerprint for Effective State.
+- `depends-on` → `capability.runtime-harness.evidence-ledger` — Hash workflow state inputs and projections.
+- `depends-on` → `capability.runtime-harness.global-runtime-reconciliation` — Resolve the helper platform for coordination worktrees.
+- `calls` → `component.workflow-state.primary` — Resolve Effective State under the state lock
+
+入向關係:
+
+- `reads` ← `component.acceptance-review.primary` — Observe Git and files read-only and resolve the workflow profile for the review subject
+- `depends-on` ← `capability.public-surface.adoption` — Resolve worktree locations during adoption planning.
+- `depends-on` ← `capability.organization.board` — Read coordination worktree topology during closeout.
+- `calls` ← `component.contract-assets.contract-worktree-lifecycle` — Create and remove task worktrees and sweep merged managed worktrees at start under the worktree topology lock
+- `depends-on` ← `capability.verification.evals-checks` — Test Workflow State behavior through its source modules.
+- `depends-on` ← `capability.runtime-harness.evidence-ledger` — Read state artifacts and read-only observations for evidence.
+- `reads` ← `component.architecture.archctx-closure` — Read the capability ownership type for archctx resolve results
+- `calls` ← `component.global-runtime-reconciliation.cli-diagnostics` — Read the workflow policy and the capability registry authority for the doctor report
+- `calls` ← `component.global-runtime-reconciliation.cli-root` — Register the state command
+- `calls` ← `component.hook-adapters.edit-guards` — Canonicalize edit paths and resolve the owners of edited paths
+- `calls` ← `component.hook-adapters.primary` — Resolve effective state read-only at most once per hook event
+- `calls` ← `component.hook-adapters.session-lifecycle` — Read Effective State snapshots and capability ownership for session context
+- `reads` ← `component.mcp-sidecar.primary` — Resolve effective state read-only for the state MCP tools
+- `depends-on` ← `component.operator.console-collectors` — Reuse inspectWorktree and the sweep merge predicates for the read-only worktree inventory.
+- `depends-on` ← `capability.runtime-harness.operator` — Read state types and artifacts for Operator projections.
+- `depends-on` ← `capability.organization.publication` — Read workflow policy and no-progress state for publication readiness.
+- `reads` ← `component.strategy-reflection.primary` — Resolve effective state read-only for strategy context
+- `depends-on` ← `capability.runtime-harness.task-agent-host` — Read admitted sessions and task session lists through the shared core selector and session types
+- `reads` ← `component.task-fleet.primary` — Read provider issue and admitted session board observations without Sprint or lease authority
+
+組件出向關係:
+
+- `component.workflow-state.continuation-ledger`:
+  - `calls` → `capability.workflow-engine.execution-primitives` — Serialize attempt ledger appends under a directory lock and write them durably
+  - `calls` → `component.workflow-state.primary` — Project the continuation envelope from read-only Effective State
+- `component.workflow-state.continuation-ledger-effects`:
+  - 無。
+- `component.workflow-state.coordination-plane`:
+  - `calls` → `component.workflow-state.continuation-ledger` — Append claim attempt receipts and read owner ledgers as progress evidence
+  - `calls` → `capability.workflow-engine.execution-primitives` — Take task and backlog locks, read the worktree topology, and write coordination records durably
+  - `calls` → `component.workflow-state.primary` — Read artifacts and owner Effective State through the shared resolver
+- `component.workflow-state.coordination-plane-core`:
+  - 無。
+- `component.workflow-state.primary`:
+  - `calls` → `capability.workflow-engine.contract-assets` — Match changed paths to capability ids through the pure capability registry
+  - `calls` → `capability.workflow-engine.execution-primitives` — Take the state lock and commit the version owner under the Git common dir
+- `component.workflow-state.primary-cli`:
+  - 無。
+- `component.workflow-state.primary-effects`:
+  - 無。
+- `component.workflow-state.primary-scripts`:
+  - 無。
+
+### 1.5 組件結構
+
+| 組件 | 名稱 | 規模量級 | 宣告入口 |
+| --- | --- | --- | --- |
+| `component.workflow-state.continuation-ledger` | Continuation Ledger | `2–5` 個文件 / `200–500` 行 | 未宣告 |
+| `component.workflow-state.continuation-ledger-effects` | Continuation Ledger (effects) | `2–5` 個文件 / `100–200` 行 | 未宣告 |
+| `component.workflow-state.coordination-plane` | Task Session Admission and Historical Worktree Safety | `5–10` 個文件 / `1000–2000` 行 | 未宣告 |
+| `component.workflow-state.coordination-plane-core` | Task Session Admission and Historical Worktree Safety (core) | `2–5` 個文件 / `20–50` 行 | 未宣告 |
+| `component.workflow-state.primary` | Effective State Resolver | `5–10` 個文件 / `500–1000` 行 | 未宣告 |
+| `component.workflow-state.primary-cli` | Effective State Resolver (cli) | `1–2` 個文件 / `200–500` 行 | 未宣告 |
+| `component.workflow-state.primary-effects` | Effective State Resolver (effects) | `5–10` 個文件 / `1000–2000` 行 | 未宣告 |
+| `component.workflow-state.primary-scripts` | Effective State Resolver (scripts) | 未宣告 `source.include` | 未宣告 |
+
+## 2. P2:端到端數據流
+
+> **Proof**: `proven` (`sha256:b94d780940f56d13f0ad717fb382850ea802dfcc3a9b52962e2da8504f83a54e`); selectors `5/5`.
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"background":"#0d1117","actorBkg":"#312e81","actorBorder":"#c4b5fd","actorTextColor":"#ffffff","signalColor":"#e5e7eb","signalTextColor":"#e5e7eb","labelBoxBkgColor":"#4c1d95","labelBoxBorderColor":"#c4b5fd","labelTextColor":"#ffffff","noteBkgColor":"#78350f","noteBorderColor":"#fcd34d","noteTextColor":"#ffffff","sequenceNumberColor":"#ffffff"}}}%%
+sequenceDiagram
+  autonumber
+  participant p2_capability_4262990f as Workflow State
+  participant p2_resolver_55db5581 as Effective State Resolver
+  participant p2_primitives_8dae000d as Execution Primitives
+  p2_capability_4262990f->>p2_resolver_55db5581: Serialize resolution under the repository state lock
+  p2_resolver_55db5581->>p2_primitives_8dae000d: Take the canonical-ancestor directory-token lock
+  p2_capability_4262990f->>p2_resolver_55db5581: Collect artifacts with a stability re-read and project the pure state
+  alt Sources stay stable and the version commit succeeds
+  p2_resolver_55db5581->>p2_primitives_8dae000d: Confirm the sources and commit the shared version owner under the Git common dir
+    Note over p2_resolver_55db5581: Return the Effective State with its state_version
+  else Owner commit fails or sources move after the stability loop
+  p2_capability_4262990f->>p2_resolver_55db5581: Retry the whole round once on a source mismatch
+    Note over p2_capability_4262990f: Throw a typed failure and expose no consumed version
+  end
+```
+<!-- END ARCHCONTEXT:generated target="projection_target.entity.capability-workflow-engine-workflow-state" -->
+
+## 3. P3:設計決策與不變量
+
+Effective State 的决定、冻结不变量与 P2 解析轨迹已并入本章。Provider board、admission 与 worktree 安全的决策并入 `organization/task-fleet`。本文只保留本 capability 的边界与组件划分。
+
+### 3.1 必须保持的不变量
+
+1. **GitHub issue/PR 拥有当前任务身份。** Effective State 投影 Git、worktree 和 capability 事实。Handoff/resume 指针和 review/verification evidence 是 recovery 或 acceptance 输入，不授予任务所有权。Effective State 没有持久化的 JSON 读模型，旧 `.ai/harness/state/effective.json` 没有 reader。
+2. **纯核心不做 IO。** `src/core/state`、`src/core/workflow` 与 `src/core/capabilities` 是一个纯核心（`scripts/check-state-boundaries.ts:36-40`）。它们不能导入 `fs`、`child_process` 等运行时模块（`:106-130`），也不能导入 `src/cli` 或 `src/effects`（`:277`）。门禁命令是 `bun run check:state-boundaries`。
+3. **版本 owner 是唯一的持久化输出。** `commitStateVersionAfter` 在 Git common dir 的锁内先重读权威源哈希，再写版本记录。revision 未变时它不写文件（`src/effects/state/git-state-version-store.ts:125-143`）。写入失败不会暴露已消耗的版本号。
+4. **写路径在仓库状态锁内串行。** 生产代码里只有 `rh state resolve` 调用 `resolveEffectiveState`。它先取 `.ai/harness/state/effective.lock`（`src/effects/state/state-lock.ts:3-7`）。锁目录从 canonical repository root 起逐级创建并验证；任何 symlink、非目录或 identity 变化都 fail closed。artifact 路径必须同时按 POSIX 与 Win32 语法保持在仓库内。源在稳定性循环之后又变化时，整轮只重试一次，第二次仍不一致就抛 `StateResolutionUnstableError`（`src/effects/state/resolve-effective-state.ts#resolveStableEffectiveState`）。
+5. **只读路径不写任何东西。** `resolveEffectiveStateReadOnly` 走同一个稳定性循环，但不取锁，也不分配版本。它不取版本锁，直接报告最后发布的 `state_version`（`src/effects/state/resolve-effective-state.ts#resolveEffectiveStateReadOnly`）。每个 hook 事件、MCP `summarize_repo_harness_state`、board 与 continuation envelope 都只用这条路径。
+6. **身份来自 GitHub issue/PR。** `task_id` 只是一个符合 `TASK_DIGEST_PATTERN` 的路径片段（`src/core/state/coordination-identity.ts:7`）。Sprint 行解析已删除。
+7. **任务锁保护保留的写入。** manual inbox 和 feedback 在任务锁中校验历史 owner。lease transition 和 cleanup writer 已删除。
+8. **board 不取锁，也不授予执行权限。** 双采样暴露 torn read。GitHub issue 和 PR 保存当前任务 authority。
+9. **attempt ledger 不进入 Effective State。** 收据不是 `EffectiveState`、`state_revision` 的输入。断路器只在路由表给出可执行路由后运行（`src/core/state/project-continuation-envelope.ts` 文件头）。
+10. **停滞判定没有计数器。** 当前 unit 的尾部连续两条 `completed` 收据且 before/after token 等于当前 token，即判定 `no_progress`（`src/core/state/no-progress.ts:6`、`:20-35`）。无法解析的行 fail closed，不跳过（`src/core/state/attempt-ledger.ts:29-31`）。
+11. **公开 envelope 与版本语义固定。** 公开 envelope 是 `protocol: 2`、`kind: "repo-harness-effective-state"`；protocol 1 以 `effective_state_protocol_unsupported` fail closed。`state_revision` 由有序 source-hash 投影内容派生；`state_version` 持久、单调，revision 不变时稳定。只有 `state resolve` 分配版本；只读调用报告最后发布的版本，该版本可能属于另一个 revision。
+12. **linked worktree 共享一个版本 owner。** 版本记录在 Git common dir，不是 worktree 本地计数器。并发 linked-worktree publisher 得到连续的 `1..N`，一次发布失败不消耗版本号。
+13. **foreign worktree ownership 阻断。** 不推断 owner。CLI exit 语义保持：`0` 表示 resolved/unblocked，`1` 表示 resolved/blocked 或既有 operational failure，`2` 表示 usage 或 unknown-field error。blocked 的 `--field` 输出保持抑制。
+14. **workflow profile 解析确定且 fail closed。** 必需风险信号缺失、无效或低于计算出的 risk floor 时失败。workflow-only 编辑不扩大 implementation scope；strict-category token 仍抬高 safety floor。
+15. **adapter 只渲染、触发或 guard。** CLI、hook 与 MCP adapter 共用 core/effects 的同一组 surfaces。adapter 不拥有 workflow policy、artifact semantics 或 capability matching，也不复制 state 算法。Stop 发布 checkpoint 与 handoff/resume 视图，所以只读解析不代表每个 hook 事件都零写入。没有 feature flag、兼容 fallback 或第二套 steady-state 实现。
+16. **MCP 工件写入以 revision 为前置条件。** MCP workflow-artifact 写工具要求 `expected_sha256`，布尔 `overwrite` 被拒绝，不重新解释。写入经过 symlink 与 regular-file guard、hash precondition、temp + fsync + rename + parent fsync。跨进程锁仍未实现，所以 guard 只在一个 server process 内精确，跨进程仍有 check-to-rename 窗口。
+
+### 3.2 关键权衡
+
+| 决策 | 权衡 |
+| --- | --- |
+| 共享协调面是本 capability 的组件，不是独立 capability（2026-10-11 用户决定） | 协调面复用 Effective State 的工件读取、只读解析与纯核心门禁。它独立成 capability 会把这些调用变成跨 capability 依赖。代价是本 capability 有 50 个文件、约 13.9k 行，需要组件表来说明内部边界 |
+| 版本 owner 放在 Git common dir，而不是 worktree 本地 | 所有 linked worktree 共享一个单调版本（§3.1 第 12 条）。代价是每次发布都要解析 common dir 并取第二把锁 |
+| board 无锁读取，用双采样暴露撕裂 | 观察者不会串行化所有 agent。代价是读者可能拿到 `changed_during_read` 文档，只能当诊断用 |
+| hook、MCP 与 continuation ledger 只读 Effective State（2026-10-25 扩展到 hook 与 MCP） | SessionStart、MCP 摘要与 `state next` 保持零写入。SessionStart 的快乐路径从三次解析降到两次。代价是它们看到的 `state_version` 是最后发布的版本，可能属于另一个 revision。判断内容变化要比较 `state_revision` |
+| CLI 通过依赖注入把 resolver 传给命令函数 | 命令函数可以在测试中替换 resolver。代价是 CodeGraph 只记录 `references` 边，flow 选择器只能从 effects 层开始 |
+| adapter 只渲染、触发或 guard | 每个 host 适配器共享同一套 pure projection 与 effects。代价是 adapter 不能针对 host 做语义特化，只能在渲染层表达差异 |
+
+### 3.3 组件
+
+组件 footprint 是组件节点上的 `source.include`。数字来自 `archctx refactor scan`（2026-10-11）。
+
+| 组件 | 文件 / 行 | 职责 | 主要出向关系 |
+| --- | ---: | --- | --- |
+| `component.workflow-state.primary`（Effective State Resolver） | 17 / 4,434 | 工件解析、风险 profile、稳定读取、版本发布、`state` CLI、`interfaces/**`、边界门禁 | execution-primitives（状态锁与版本锁）、contract-assets（能力注册表） |
+| `component.workflow-state.coordination-plane`（Shared Coordination Plane） | 28 / 8,924 | worktree 安全与 task session admission 观察 | primary（工件读取与 owner 只读解析）、continuation-ledger（attempt 收据）、execution-primitives（任务锁、worktree 拓扑） |
+| `component.workflow-state.continuation-ledger`（Continuation Ledger） | 5 / 540 | continuation 路由表、attempt ledger、no-progress 断路器 | primary（只读 Effective State）、execution-primitives（ledger 追加锁） |
+
+coordination-plane 用文件名通配符声明 footprint（例如 `src/effects/state/coordination-*.ts`）。新的 `coordination-*` 文件自动归入该组件。其他新文件只归入 capability，直到有人把它加入某个组件。
+
+### 3.4 10x 规模下先垮的点
+
+1. **同步的 Git 与源收集。** 早期设计已记录：第一个 10x 压力点是重复的同步 Git 与源收集，不是纯投影。hook 侧现在走无锁的只读解析，剩余的重试边界记在 `hook-adapters.md` §3.4 第 5 条。
+2. **`coordination-identity.ts` 只保留 task-id 路径形状。** 任务身份由 GitHub issue/PR 提供。旧 Sprint 行解析、`projectCanonicalTasks` 与 `assertUniqueCanonicalTaskIds` 已删除。
+
+锁的已知边界：PID reuse 可让 stale token 看起来仍 live；bounded timeout 与人工清理保持 mutual exclusion，且不引入 host-native 依赖。最终 identity check 之后的 hostile ancestor rename 需要 `openat`/dirfd，超出 portable Bun/Node boundary；静态与中间 symlink redirection 会被拒绝。
+
+## 4. 歷史決策記錄(append-only)
+
+### 2026-10-11 Capability node minted
+
+- 本 capability 第一次进入架构模型。之前 `src/core/state/**`、`src/effects/state/**`、`src/core/workflow/**` 等 50 个文件没有任何 capability 节点（`docs/researches/20261011-archctx-signal-and-architecture-coverage.md`）。
+- 共享协调面作为组件进入本 capability。早期协调面文档中“不 mint capability node”的记录已同步更新。
+- `src/effects/review/diff-fingerprint.ts` 不归本 capability。并行的 acceptance-review 分组整体认领了 `src/effects/review/**`。
+
+### 2026-11-03 删除 provider 看板、hook 看板切片与 session 发现链（#1507）
+
+- 删除 state 的 `board` 子命令、[src/core/state/provider-board.ts](https://github.com/Ancienttwo/repo-harness/blob/a525f8716ecbda4dd1f0426ca0b2047a768ced58/src/core/state/provider-board.ts)、[src/effects/state/collect-provider-board-inputs.ts](https://github.com/Ancienttwo/repo-harness/blob/a525f8716ecbda4dd1f0426ca0b2047a768ced58/src/effects/state/collect-provider-board-inputs.ts) 与 [src/effects/state/collect-slice-inputs.ts](https://github.com/Ancienttwo/repo-harness/blob/a525f8716ecbda4dd1f0426ca0b2047a768ced58/src/effects/state/collect-slice-inputs.ts)。`flow.workflow-state.board` 与 `entrypoint.workflow-state.board` 一起删除。
+- 删除 `readAdmittedTaskSessions`、`observeAdmittedSessionSource` 与 admitted session selector。PR #1541 合并后它们没有读者。`TASK_SESSIONS_MAX_ENTRIES` 留在 [src/core/sessions/task-sessions.ts](https://github.com/Ancienttwo/repo-harness/blob/65e8c8c6cee08416c6ebd16c4c0ff8bf766b50dc/src/core/sessions/task-sessions.ts)，因为 `src/effects/operator/execution-state.ts` 用它限制会话目录数。
+- coordination-plane 改名为 Task Session Admission and Historical Worktree Safety。它保留 session 观察失败码与只读 git runner，operator 的 task diff 与 doc session 读取用它们。
+
+## Optimization Backlog
+
+以下是回边与边界缺口。它们是重构证据，不是声明的关系。
+
+- **primary → continuation-ledger 回边。** `src/cli/commands/state.ts:15-20`、`:27` 承载 `state attempt`、`state attempt-repair` 与 `state next`。处理方式同上。
+- **coordination-plane 读取 task session 记录。** `src/effects/state/coordination-worktree-topology.ts:14` 从 `src/effects/terminal/task-session-record.ts`（execution-primitives）读取 `taskWorktreeRuntimeClosed`，在 prune 前确认 task runtime 已关闭。#1402 后 workflow-state 不导入 task-agent-host，模型也不再声明 coordination-plane → task-agent-host。coordination-plane 拥有 `src/effects/terminal/task-session-admission.ts`。inbox 调用 `observeCurrentTaskSession`，并传入自己的拒绝函数，所以错误类与消息不变。
+- **`diff-fingerprint.ts` 的归属（after arch-context#296）。** 早期设计把 Git review-subject 观察记为 Effective State 的实现边界，`resolve-effective-state.ts:11` 导入它。现在它归 acceptance-review。exclude 可用后，再决定是否把这一个文件移回本 capability。
+- **primary 的跨 capability 依赖。** `resolve-effective-state.ts:6-7` 导入 `scripts/acceptance-receipt.ts` 与 `src/effects/evidence/verification-execution.ts`。集成按边数决定方向。acceptance-review → workflow-state 有 38 条边（主要是 `readonly-observation.ts`），反向只有 7 条。模型声明 acceptance-review → workflow-state。primary → acceptance-review 是回边，不声明。`verification-execution.ts` 归 evidence-ledger，所以没有 workflow-state → evals-checks 的边。模型声明 primary → evidence-ledger。
+- **workflow-state 不导入 publication（#907）。** `observeProviderBranchMergeCommit` 只被 worktree prune 调用，它在 `src/effects/state/coordination-provider-merge.ts`。模型中没有 `relation.workflow-state.imports.publication`。
+- **coordination-plane footprint 用文件名 glob。** 它包含 `src/effects/state/coordination-*.ts` 与 `src/core/worktree-*`。新增同名模式的文件自动进入组件。
+- **到 evidence-ledger 的方向（集成决定）。** 本 capability → evidence-ledger 有 28 条边（主要是 `atomic-append.ts`）。evidence-ledger → 本 capability 有 21 条边（`readonly-observation.ts` 与 `artifact-parsers.ts`）。模型声明 coordination-plane、continuation-ledger 与 primary → evidence-ledger。反向记在 evidence-ledger 的 Backlog。#907 把 `atomic-append.ts` 与 `readonly-observation.ts` 移到 execution-primitives。现在 `src/effects/state` 不导入 `src/effects/evidence`。这些 relation 需要按新边复审。
+
+## 2026-10-18: Slice C snapshot boundary
+
+State snapshot no longer reads a task contract. Its contract presence and path
+fields are removed. Recovery policy no longer contains `reviews_dir` or
+`notes_dir`. Historical operator reads and worktree safety remain separate
+from current GitHub task authority.
+
+## 2026-10-25: Read-only adapters
+
+Every hook event and the MCP state summary use the read-only resolution. They
+take no lock and write no state, and they report the last published
+`state_version`. `rh state resolve` is the only version allocator.
+The `.ai/harness/state/effective.json` cache had no reader and is deleted with
+its writer.

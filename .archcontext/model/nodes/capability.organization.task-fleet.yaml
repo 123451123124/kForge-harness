@@ -1,0 +1,37 @@
+schemaVersion: "archcontext.node/v2"
+id: "capability.organization.task-fleet"
+kind: "capability"
+name: "Task Fleet"
+status: "active"
+layer: "core"
+summary: "Owns admitted task message storage, records admitted manual provider feedback and registers repositories."
+responsibilities:
+  - "Store immutable admitted messages and separate receipts fenced by admission digest and exact claim reference and revision; preserve explicit historical reads."
+  - "Record manual feedback against the exact admitted claim and provider PR evidence; the Publication feedback store keeps the feedback facts and separate delivery receipts."
+source:
+  include:
+    - "src/core/fleet/**"
+    - "src/effects/fleet/**"
+    - "src/cli/commands/fleet.ts"
+  entrypoints:
+    - id: "entrypoint.task-fleet.command"
+      path: "src/cli/commands/fleet.ts"
+      symbols:
+        - name: "buildFleetCommand"
+          sinks:
+            - id: "sink.task-fleet.send-message"
+              path: "src/effects/fleet/task-inbox.ts"
+              symbol: "sendTaskMessage"
+            - id: "sink.task-fleet.deliver-message"
+              path: "src/effects/fleet/task-inbox.ts"
+              symbol: "deliverTaskInbox"
+extensions:
+  harnessTier: "plugin"
+  harnessContract: "Surface"
+  contractFiles:
+    agents: "AGENTS.md"
+    claude: "CLAUDE.md"
+  lspProfile: "typescript-lsp"
+  verification:
+    - "bun run test:files tests/effects/task-inbox.test.ts tests/effects/task-inbox-layout-migration.test.ts tests/cli/fleet-task-inbox.test.ts tests/unit/task-message-v1.test.ts --timeout 60000 --max-concurrency 1"
+    - "bun run check:type"

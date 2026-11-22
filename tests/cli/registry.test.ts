@@ -1,0 +1,631 @@
+import { describe, expect, test } from 'bun:test';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join, resolve } from 'path';
+import {
+  ALL_TARGETS,
+  getTarget,
+  listTargetIds,
+} from '../../src/cli/installer/targets/registry';
+import { codexTarget } from '../../src/cli/installer/targets/codex';
+import { claudeTarget } from '../../src/cli/installer/targets/claude';
+import type { Location } from '../../src/cli/installer/types';
+import {
+  applyRepoHarnessRegistryBatch,
+  backfillRepoHarnessRegistry,
+  readRegisteredRepoHarnessRepos,
+  readRepoHarnessRegistryStrictSnapshot,
+  RepoHarnessRegistryStrictError,
+  repoHarnessAuthorizationRevision,
+  repoHarnessCheckoutRejection,
+  repoHarnessRepoIdFor,
+  registerRepoHarnessRepo,
+  setRepoHarnessPanePrefix,
+} from '../../src/effects/repo-registry';
+import { spawnSync } from 'child_process';
+
+describe('installer target registry', () => {
+  test('ALL_TARGETS lists codex then claude in stable order', () => {
+    expect(ALL_TARGETS.length).toBe(2);
+    expect(ALL_TARGETS[0].id).toBe('codex');
+    expect(ALL_TARGETS[1].id).toBe('claude');
+  });
+
+  test('ALL_TARGETS is frozen so plug-in order cannot drift at runtime', () => {
+    expect(Object.isFrozen(ALL_TARGETS)).toBe(true);
+  });
+
+  test('getTarget returns the registered instance by id', () => {
+    expect(getTarget('codex')).toBe(codexTarget);
+    expect(getTarget('claude')).toBe(claudeTarget);
+  });
+
+  test('getTarget returns undefined for unknown id', () => {
+    expect(getTarget('cursor')).toBeUndefined();
+    expect(getTarget('')).toBeUndefined();
+    expect(getTarget('CODEX')).toBeUndefined();
+  });
+
+  test('listTargetIds matches registry order', () => {
+    expect(listTargetIds()).toEqual(['codex', 'claude']);
+  });
+
+  test('codex supportsLocation is global-only (Phase 0 verified contract)', () => {
+    expect(codexTarget.supportsLocation('global')).toBe(true);
+    expect(codexTarget.supportsLocation('local' as Location)).toBe(false);
+  });
+
+  test('claude supportsLocation is global-only', () => {
+    expect(claudeTarget.supportsLocation('global')).toBe(true);
+    expect(claudeTarget.supportsLocation('local' as Location)).toBe(false);
+  });
+});
+
+describe('repo registration persistence', () => {
+  test('fleet strict registry reader rejects malformed authority instead of silently returning no repositories', () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'repo-harness-registry-fleet-strict-'));
+    const home = join(fixtureRoot, 'home');
+    const env = { ...process.env, REPO_HARNESS_HOME: home };
+    try {
+      mkdirSync(home, { recursive: true });
+      writeFileSync(join(home, 'registered-repos.json'), '{"version":1,"repos":"not-an-array"}\n');
+      expect(() => readRepoHarnessRegistryStrictSnapshot({ env, adoptedOnly: false })).toThrow(RepoHarnessRegistryStrictError);
+      try {
+        readRepoHarnessRegistryStrictSnapshot({ env, adoptedOnly: false });
+      } catch (error) {
+        expect((error as RepoHarnessRegistryStrictError).code).toBe('fleet_registry_invalid');
+      }
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('fleet strict registry reader retains every authorized row and stamps exact authority bytes', () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'repo-harness-registry-fleet-snapshot-'));
+    const home = join(fixtureRoot, 'home');
+    const repo = join(fixtureRoot, 'repo');
+    const env = { ...process.env, REPO_HARNESS_HOME: home };
+    try {
+      mkdirSync(home, { recursive: true });
+      mkdirSync(repo, { recursive: true });
+      const canonicalRepo = realpathSync(repo);
+      writeFileSync(join(home, 'registered-repos.json'), `${JSON.stringify({
+        version: 1,
+        authorizationRevision: 4,
+        repos: [{
+          id: repoHarnessRepoIdFor(canonicalRepo), path: canonicalRepo, accessMode: 'read_only', source: 'manual',
+          registeredAt: '2026-08-23T00:00:00.000Z', lastSeenAt: '2026-08-23T00:00:00.000Z',
+        }],
+      })}\n`);
+      const snapshot = readRepoHarnessRegistryStrictSnapshot({ env, adoptedOnly: false });
+      expect(snapshot.authorizationRevision).toBe(4);
+      expect(snapshot.repos).toEqual([expect.objectContaining({ id: repoHarnessRepoIdFor(canonicalRepo), path: canonicalRepo })]);
+      expect(snapshot.registryRevision).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('fleet strict registry reader rejects repository ids that are not derived from the canonical path', () => {
+    const rejectedIds = [
+      '/Users/alice/private-client/repository',
+      String.raw`C:\Users\alice\private-client\repository`,
+      'repo_safe\ncontrol',
+      'token=secret-value',
+      '${HOME}/private-client/repository',
+    ];
+
+    for (const [index, id] of rejectedIds.entries()) {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), `repo-harness-registry-id-${index}-`));
+      const home = join(fixtureRoot, 'home');
+      const repo = join(fixtureRoot, 'repo');
+      const env = { ...process.env, REPO_HARNESS_HOME: home };
+      try {
+        mkdirSync(home, { recursive: true });
+        mkdirSync(repo, { recursive: true });
+        const canonicalRepo = realpathSync(repo);
+        writeFileSync(join(home, 'registered-repos.json'), `${JSON.stringify({
+          version: 1,
+          authorizationRevision: 0,
+          repos: [{
+            id,
+            path: canonicalRepo,
+            accessMode: 'read_only',
+            source: 'manual',
+            registeredAt: '2026-08-23T00:00:00.000Z',
+            lastSeenAt: '2026-08-23T00:00:00.000Z',
+          }],
+        })}\n`);
+
+        expect(() => readRepoHarnessRegistryStrictSnapshot({ env, adoptedOnly: false })).toThrow(RepoHarnessRegistryStrictError);
+      } finally {
+        rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('registry writers replace a persisted non-derived id with the canonical derived id', () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'repo-harness-registry-id-write-'));
+    const home = join(fixtureRoot, 'home');
+    const repo = join(fixtureRoot, 'repo');
+    const env = { ...process.env, REPO_HARNESS_HOME: home };
+    try {
+      mkdirSync(join(repo, '.ai', 'harness'), { recursive: true });
+      writeFileSync(join(repo, '.ai', 'harness', 'policy.json'), '{}\n');
+      mkdirSync(home, { recursive: true });
+      writeFileSync(join(home, 'registered-repos.json'), `${JSON.stringify({
+        version: 1,
+        authorizationRevision: 0,
+        repos: [{
+          id: '/Users/alice/private-client/repository',
+          path: repo,
+          accessMode: 'read_only',
+          source: 'manual',
+          registeredAt: '2026-08-23T00:00:00.000Z',
+          lastSeenAt: '2026-08-23T00:00:00.000Z',
+        }],
+      })}\n`);
+
+      applyRepoHarnessRegistryBatch([{ repoRoot: repo, source: 'manual', accessMode: 'read_write' }], { env });
+      const persisted = JSON.parse(readFileSync(join(home, 'registered-repos.json'), 'utf-8')) as {
+        repos: Array<{ id: string; path: string }>;
+      };
+      expect(persisted.repos).toEqual([{ id: repoHarnessRepoIdFor(realpathSync(repo)), path: realpathSync(repo) }].map((expected) => expect.objectContaining(expected)));
+      expect(readRepoHarnessRegistryStrictSnapshot({ env, adoptedOnly: false }).repos[0].id).toBe(repoHarnessRepoIdFor(realpathSync(repo)));
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('registry writers keep a hand-set pane prefix, and the strict reader refuses a duplicate prefix', () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'repo-harness-registry-pane-prefix-'));
+    const home = join(fixtureRoot, 'home');
+    const env = { ...process.env, REPO_HARNESS_HOME: home };
+    const registryPath = join(home, 'registered-repos.json');
+    try {
+      const [first, second] = ['first', 'second'].map((name) => {
+        const repo = join(fixtureRoot, name);
+        mkdirSync(join(repo, '.ai', 'harness'), { recursive: true });
+        writeFileSync(join(repo, '.ai', 'harness', 'policy.json'), '{}\n');
+        return realpathSync(repo);
+      });
+      const entry = (path: string, panePrefix: string) => ({
+        id: repoHarnessRepoIdFor(path), path, accessMode: 'read_only', source: 'manual',
+        registeredAt: '2026-11-03T00:00:00.000Z', lastSeenAt: '2026-11-03T00:00:00.000Z', panePrefix,
+      });
+      mkdirSync(home, { recursive: true });
+      writeFileSync(registryPath, JSON.stringify({ version: 1, authorizationRevision: 0, repos: [entry(first!, 'rh')] }));
+      applyRepoHarnessRegistryBatch([{ repoRoot: first!, source: 'manual', accessMode: 'read_write' }], { env });
+      expect(readRepoHarnessRegistryStrictSnapshot({ env, adoptedOnly: false }).repos[0]).toEqual(expect.objectContaining({ accessMode: 'read_write', panePrefix: 'rh' }));
+
+      writeFileSync(registryPath, JSON.stringify({ version: 1, authorizationRevision: 0, repos: [entry(first!, 'rh'), entry(second!, 'rh')] }));
+      expect(() => readRepoHarnessRegistryStrictSnapshot({ env, adoptedOnly: false })).toThrow('duplicate pane prefix rh');
+
+      rmSync(registryPath);
+      expect(() => setRepoHarnessPanePrefix(second!, 'sc', { env })).toThrow('not registered');
+      expect(existsSync(registryPath)).toBe(false);
+      writeFileSync(registryPath, JSON.stringify({ version: 1, authorizationRevision: 0, repos: [entry(first!, 'rh')] }));
+      const unregistered = readFileSync(registryPath, 'utf8');
+      expect(() => setRepoHarnessPanePrefix(second!, 'sc', { env })).toThrow('not registered');
+      expect(readFileSync(registryPath, 'utf8')).toBe(unregistered);
+
+      const other = { ...entry(second!, 'sc'), accessMode: 'read_write', source: 'adopt', lastSeenAt: '2026-11-04T00:00:00.000Z' };
+      const { panePrefix: _none, ...unset } = entry(first!, 'x');
+      const write = (repos: object[]) => writeFileSync(registryPath, JSON.stringify({ version: 1, authorizationRevision: 7, repos }));
+      write([unset, other]);
+      expect(() => setRepoHarnessPanePrefix(first!, 'sc', { env })).toThrow('already set');
+      expect(readRepoHarnessRegistryStrictSnapshot({ env, adoptedOnly: false }).repos.find((repo) => repo.path === first)?.panePrefix).toBeUndefined();
+      expect(() => setRepoHarnessPanePrefix(first!, 'Bad', { env })).toThrow('pane prefix must match');
+
+      const before = readFileSync(registryPath, 'utf8');
+      expect(setRepoHarnessPanePrefix(second!, 'sc', { env }).changed).toBe(false);
+      expect(readFileSync(registryPath, 'utf8')).toBe(before);
+
+      expect(setRepoHarnessPanePrefix(first!, 'rh', { env }).changed).toBe(true);
+      const after = JSON.parse(readFileSync(registryPath, 'utf8'));
+      expect(after.authorizationRevision).toBe(7);
+      expect(after.repos).toEqual([{ ...unset, panePrefix: 'rh' }, other].sort((l, r) => l.path.localeCompare(r.path)));
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('fleet strict registry reader rejects a symlinked registry authority file', () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'repo-harness-registry-fleet-symlink-'));
+    const home = join(fixtureRoot, 'home');
+    const target = join(fixtureRoot, 'outside-registry.json');
+    const env = { ...process.env, REPO_HARNESS_HOME: home };
+    try {
+      mkdirSync(home, { recursive: true });
+      writeFileSync(target, '{"version":1,"authorizationRevision":0,"repos":[]}\n');
+      symlinkSync(target, join(home, 'registered-repos.json'));
+      expect(() => readRepoHarnessRegistryStrictSnapshot({ env, adoptedOnly: false })).toThrow(RepoHarnessRegistryStrictError);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('batch authorization validates every repo and commits one revision atomically', () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'repo-harness-registry-batch-'));
+    const env = { ...process.env, REPO_HARNESS_HOME: join(fixtureRoot, 'home') };
+    const adoptedA = join(fixtureRoot, 'repo-a');
+    const adoptedB = join(fixtureRoot, 'repo-b');
+    const unadopted = join(fixtureRoot, 'not-adopted');
+    try {
+      for (const repo of [adoptedA, adoptedB]) {
+        mkdirSync(join(repo, '.ai', 'harness'), { recursive: true });
+        writeFileSync(join(repo, '.ai', 'harness', 'policy.json'), '{}\n');
+      }
+      mkdirSync(unadopted, { recursive: true });
+      let prepared = false;
+      expect(() => applyRepoHarnessRegistryBatch([
+        { repoRoot: adoptedA, source: 'manual', accessMode: 'read_write' },
+        { repoRoot: unadopted, source: 'manual', accessMode: 'read_write' },
+      ], { env, beforeCommit: () => { prepared = true; } })).toThrow('not repo-harness adopted');
+      expect(prepared).toBe(false);
+      expect(readRegisteredRepoHarnessRepos({ env })).toEqual([]);
+      expect(repoHarnessAuthorizationRevision(env)).toBe(0);
+
+      let preparedRevision = -1;
+      const result = applyRepoHarnessRegistryBatch([
+        { repoRoot: adoptedA, source: 'manual', accessMode: 'read_write' },
+        { repoRoot: adoptedB, source: 'manual', accessMode: 'read_write' },
+      ], { env, bumpAuthorizationRevision: true, beforeCommit: (revision) => { preparedRevision = revision; } });
+      expect(preparedRevision).toBe(1);
+      expect(result.authorizationRevision).toBe(1);
+      expect(readRegisteredRepoHarnessRepos({ env }).map(({ accessMode }) => accessMode)).toEqual(['read_write', 'read_write']);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('batch authorization restores prepared config when the registry commit fails', async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'repo-harness-registry-commit-failure-'));
+    const registryHome = join(fixtureRoot, 'home');
+    const adopted = join(fixtureRoot, 'repo');
+    const configPath = join(fixtureRoot, 'mcp.local.json');
+    const registryModule = resolve(import.meta.dir, '../../src/effects/repo-registry.ts');
+    const workerScript = `
+      import { mock } from 'bun:test';
+      import * as actualFs from 'node:fs';
+      const originalRenameSync = actualFs.renameSync.bind(actualFs);
+      const originalWriteFileSync = actualFs.writeFileSync.bind(actualFs);
+      mock.module('fs', () => ({
+        ...actualFs,
+        renameSync(source, target) {
+          if (String(target).endsWith('registered-repos.json')) {
+            const error = new Error('injected registry commit failure');
+            error.code = 'EIO';
+            throw error;
+          }
+          return originalRenameSync(source, target);
+        },
+      }));
+      const registry = await import(process.env.REGISTRY_MODULE + '?commit-failure');
+      const adopted = process.env.ADOPTED_REPO;
+      const configPath = process.env.CONFIG_PATH;
+      let failure = '';
+      try {
+        registry.applyRepoHarnessRegistryBatch([
+          { repoRoot: adopted, source: 'manual', accessMode: 'read_write' },
+        ], {
+          beforeCommit: (revision) => originalWriteFileSync(configPath, 'new:' + revision),
+          onCommitFailure: () => originalWriteFileSync(configPath, 'old'),
+        });
+      } catch (error) {
+        failure = error instanceof Error ? error.message : String(error);
+      }
+      process.stdout.write(JSON.stringify({
+        failure,
+        config: actualFs.readFileSync(configPath, 'utf-8'),
+        repos: registry.readRegisteredRepoHarnessRepos(),
+        revision: registry.repoHarnessAuthorizationRevision(),
+      }));
+    `;
+
+    try {
+      mkdirSync(join(adopted, '.ai', 'harness'), { recursive: true });
+      writeFileSync(join(adopted, '.ai', 'harness', 'policy.json'), '{}\n');
+      writeFileSync(configPath, 'old');
+      const worker = Bun.spawn(['bun', '-e', workerScript], {
+        cwd: resolve(import.meta.dir, '../..'),
+        env: {
+          ...process.env,
+          REPO_HARNESS_HOME: registryHome,
+          REGISTRY_MODULE: registryModule,
+          ADOPTED_REPO: adopted,
+          CONFIG_PATH: configPath,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, output, errorOutput] = await Promise.all([
+        worker.exited,
+        new Response(worker.stdout).text(),
+        new Response(worker.stderr).text(),
+      ]);
+      expect(exitCode, errorOutput).toBe(0);
+      expect(JSON.parse(output)).toEqual({
+        failure: 'injected registry commit failure',
+        config: 'old',
+        repos: [],
+        revision: 0,
+      });
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('removes its newly created lock when owner metadata persistence fails', async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'repo-harness-registry-lock-failure-'));
+    const registryHome = join(fixtureRoot, 'home');
+    const registryModule = resolve(import.meta.dir, '../../src/effects/repo-registry.ts');
+    const workerScript = `
+      import { mock } from 'bun:test';
+      import * as actualFs from 'node:fs';
+      const originalWriteFileSync = actualFs.writeFileSync.bind(actualFs);
+      const originalExistsSync = actualFs.existsSync.bind(actualFs);
+      let failOwnerWrite = true;
+      mock.module('fs', () => ({
+        ...actualFs,
+        writeFileSync(target, ...args) {
+          if (typeof target === 'number' && failOwnerWrite) {
+            failOwnerWrite = false;
+            const error = new Error('injected owner metadata write failure');
+            error.code = 'EIO';
+            throw error;
+          }
+          return originalWriteFileSync(target, ...args);
+        },
+      }));
+      const registry = await import(process.env.REGISTRY_MODULE + '?lock-failure');
+      let firstError = '';
+      try {
+        registry.bumpRepoHarnessAuthorizationRevision();
+      } catch (error) {
+        firstError = error instanceof Error ? error.message : String(error);
+      }
+      const lockPath = registry.repoHarnessRegisteredReposPath() + '.lock';
+      const lockExistsAfterFailure = originalExistsSync(lockPath);
+      const revision = registry.bumpRepoHarnessAuthorizationRevision();
+      process.stdout.write(JSON.stringify({ firstError, lockExistsAfterFailure, revision }));
+    `;
+
+    try {
+      mkdirSync(registryHome, { recursive: true });
+      const worker = Bun.spawn(['bun', '-e', workerScript], {
+        cwd: resolve(import.meta.dir, '../..'),
+        env: {
+          ...process.env,
+          REPO_HARNESS_HOME: registryHome,
+          REGISTRY_MODULE: registryModule,
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, output, errorOutput] = await Promise.all([
+        worker.exited,
+        new Response(worker.stdout).text(),
+        new Response(worker.stderr).text(),
+      ]);
+      expect(exitCode, errorOutput).toBe(0);
+      expect(JSON.parse(output)).toEqual({
+        firstError: 'injected owner metadata write failure',
+        lockExistsAfterFailure: false,
+        revision: 1,
+      });
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('serializes concurrent registrations, access updates, and authorization revision bumps', async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'repo-harness-registry-concurrency-'));
+    const registryHome = join(fixtureRoot, 'home');
+    const startPath = join(fixtureRoot, 'start');
+    const registryModule = resolve(import.meta.dir, '../../src/effects/repo-registry.ts');
+    const workerCount = 10;
+    const bumpsPerWorker = 30;
+    const workerScript = `
+      import { existsSync } from 'fs';
+      const registry = await import(process.env.REGISTRY_MODULE);
+      while (!existsSync(process.env.START_PATH)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+      registry.registerRepoHarnessRepo(process.env.TEST_REPO, 'manual');
+      registry.setRepoHarnessAccessMode(process.env.TEST_REPO, 'read_write');
+      for (let index = 0; index < Number(process.env.BUMP_COUNT); index += 1) {
+        registry.bumpRepoHarnessAuthorizationRevision();
+      }
+    `;
+
+    try {
+      mkdirSync(registryHome, { recursive: true });
+      const repos = Array.from({ length: workerCount }, (_, index) => join(fixtureRoot, `repo-${index}`));
+      for (const repo of repos) {
+        mkdirSync(join(repo, '.ai', 'harness'), { recursive: true });
+        writeFileSync(join(repo, '.ai', 'harness', 'policy.json'), '{}\n');
+      }
+
+      const workers = repos.map((repo) => Bun.spawn(['bun', '-e', workerScript], {
+        cwd: resolve(import.meta.dir, '../..'),
+        env: {
+          ...process.env,
+          REPO_HARNESS_HOME: registryHome,
+          REGISTRY_MODULE: registryModule,
+          START_PATH: startPath,
+          TEST_REPO: repo,
+          BUMP_COUNT: String(bumpsPerWorker),
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }));
+      writeFileSync(startPath, 'go\n');
+
+      const exitCodes = await Promise.all(workers.map((worker) => worker.exited));
+      const errors = await Promise.all(workers.map(async (worker) => new Response(worker.stderr).text()));
+      expect(exitCodes, errors.filter(Boolean).join('\n')).toEqual(Array(workerCount).fill(0));
+
+      const registryPath = join(registryHome, 'registered-repos.json');
+      expect(existsSync(registryPath)).toBe(true);
+      const registry = JSON.parse(readFileSync(registryPath, 'utf-8')) as {
+        authorizationRevision: number;
+        repos: Array<{ path: string; accessMode: string }>;
+      };
+      expect(registry.authorizationRevision).toBe(workerCount * (bumpsPerWorker + 1));
+      expect(registry.repos).toHaveLength(workerCount);
+      expect(registry.repos.every((repo) => repo.accessMode === 'read_write')).toBe(true);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('reads legacy "adopt" source registry entries without error or data loss', () => {
+    // The "adopt" CLI command is retired and no longer writes this source value, but
+    // registries already on disk from before the rename still hold entries with it.
+    // normalizeSource() must keep accepting and round-tripping it read-only.
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'repo-harness-registry-legacy-source-'));
+    const home = join(fixtureRoot, 'home');
+    const env = { ...process.env, REPO_HARNESS_HOME: home };
+    const legacyRepo = join(fixtureRoot, 'legacy-repo');
+    try {
+      mkdirSync(join(legacyRepo, '.ai', 'harness'), { recursive: true });
+      writeFileSync(join(legacyRepo, '.ai', 'harness', 'policy.json'), '{}\n');
+      mkdirSync(home, { recursive: true });
+      writeFileSync(join(home, 'registered-repos.json'), JSON.stringify({
+        version: 1,
+        authorizationRevision: 0,
+        repos: [
+          {
+            id: 'repo_legacy0000000',
+            path: legacyRepo,
+            accessMode: 'read_only',
+            source: 'adopt',
+            registeredAt: '2026-01-01T00:00:00.000Z',
+            lastSeenAt: '2026-01-01T00:00:00.000Z',
+          },
+        ],
+      }, null, 2));
+
+      const repos = readRegisteredRepoHarnessRepos({ env });
+      expect(repos).toHaveLength(1);
+      expect(repos[0].source).toBe('adopt');
+      expect(repos[0].path).toBe(realpathSync(legacyRepo));
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('registry writes accept only primary checkouts', () => {
+  function git(cwd: string, ...args: string[]): void {
+    const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+  }
+
+  // A real primary checkout with a tracked adoption marker and one linked worktree.
+  function checkoutFixture(prefix: string) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+    const home = join(root, 'home');
+    const env = { ...process.env, REPO_HARNESS_HOME: home };
+    const primary = join(root, 'primary');
+    mkdirSync(join(primary, '.ai', 'harness'), { recursive: true });
+    writeFileSync(join(primary, '.ai', 'harness', 'policy.json'), '{}\n');
+    git(primary, 'init', '-q', '-b', 'main');
+    git(primary, 'add', '-A');
+    git(primary, 'commit', '-qm', 'base');
+    const linked = join(root, 'linked');
+    git(primary, 'worktree', 'add', '-q', '-b', 'feature', linked);
+    const registry = join(home, 'registered-repos.json');
+    return { root, home, env, primary: realpathSync(primary), linked: realpathSync(linked), registry };
+  }
+
+  test('a linked worktree is rejected at write and the reason names the primary checkout', () => {
+    const f = checkoutFixture('repo-harness-registry-linked-');
+    try {
+      const result = registerRepoHarnessRepo(f.linked, 'init', { env: f.env });
+      expect(result.registered).toBe(false);
+      expect(result.path).toBe(f.linked);
+      expect(result.reason).toContain(`register the primary checkout ${f.primary} instead`);
+      expect(existsSync(f.registry)).toBe(false);
+
+      expect(() => applyRepoHarnessRegistryBatch([{ repoRoot: f.linked, source: 'mcp-setup' }], { env: f.env }))
+        .toThrow(f.primary);
+      expect(existsSync(f.registry)).toBe(false);
+
+      const primary = registerRepoHarnessRepo(f.primary, 'init', { env: f.env });
+      expect(primary.registered).toBe(true);
+      expect(readRegisteredRepoHarnessRepos({ env: f.env }).map((repo) => repo.path)).toEqual([f.primary]);
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  test('the checkout probe ignores an inherited GIT_DIR', () => {
+    const f = checkoutFixture('repo-harness-registry-git-env-');
+    try {
+      const plain = join(f.root, 'plain');
+      mkdirSync(plain);
+      const linkedGitDir = join(f.primary, '.git', 'worktrees', 'linked');
+      const inherited = { ...f.env, GIT_DIR: linkedGitDir, GIT_WORK_TREE: f.linked, GIT_COMMON_DIR: join(f.primary, '.git') };
+      expect(repoHarnessCheckoutRejection(f.primary, inherited)).toBeNull();
+      expect(repoHarnessCheckoutRejection(plain, inherited)).toBeNull();
+      expect(repoHarnessCheckoutRejection(f.linked, inherited)).toEqual(
+        expect.objectContaining({ reason: 'not_primary_checkout' }),
+      );
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  test('backfill registers valid primary checkouts as manual and reports each rejected path', () => {
+    const f = checkoutFixture('repo-harness-registry-backfill-');
+    try {
+      const missing = join(f.root, 'missing');
+      const unadopted = join(f.root, 'unadopted');
+      mkdirSync(unadopted);
+      const result = backfillRepoHarnessRegistry([f.primary, missing, unadopted, f.linked], { env: f.env });
+      expect(result.registered).toEqual([{ id: repoHarnessRepoIdFor(f.primary), path: f.primary }]);
+      expect(result.already_registered).toEqual([]);
+      expect(result.rejected.map(({ path, reason }) => ({ path, reason }))).toEqual([
+        { path: missing, reason: 'missing' },
+        { path: realpathSync(unadopted), reason: 'not_adopted' },
+        { path: f.linked, reason: 'not_primary_checkout' },
+      ]);
+      expect(result.rejected[2]!.message).toContain(f.primary);
+      expect(readRegisteredRepoHarnessRepos({ env: f.env })).toEqual([
+        expect.objectContaining({ path: f.primary, source: 'manual', accessMode: 'read_only' }),
+      ]);
+
+      // An existing row keeps its source; a second backfill reports it unchanged.
+      writeFileSync(f.registry, readFileSync(f.registry, 'utf8').replace('"manual"', '"init"'));
+      const before = readFileSync(f.registry, 'utf8');
+      const again = backfillRepoHarnessRegistry([f.primary], { env: f.env });
+      expect(again.registered).toEqual([]);
+      expect(again.already_registered).toEqual([{ id: repoHarnessRepoIdFor(f.primary), path: f.primary }]);
+      expect(readFileSync(f.registry, 'utf8')).toBe(before);
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  test('fleet register exits non-zero when any path is rejected and still registers the valid ones', () => {
+    const f = checkoutFixture('repo-harness-registry-backfill-cli-');
+    try {
+      const cli = resolve(import.meta.dir, '../../src/cli/index.ts');
+      const result = spawnSync(process.execPath, [cli, 'fleet', 'register', f.linked, f.primary], { env: f.env, encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(1);
+      const output = JSON.parse(result.stdout);
+      expect(output.ok).toBe(false);
+      expect(output.registered).toEqual([{ id: repoHarnessRepoIdFor(f.primary), path: f.primary }]);
+      expect(output.rejected).toEqual([expect.objectContaining({ path: f.linked, reason: 'not_primary_checkout' })]);
+      expect(readRegisteredRepoHarnessRepos({ env: f.env }).map((repo) => repo.path)).toEqual([f.primary]);
+
+      const clean = spawnSync(process.execPath, [cli, 'fleet', 'register', f.primary], { env: f.env, encoding: 'utf8' });
+      expect(clean.status, clean.stderr).toBe(0);
+      expect(JSON.parse(clean.stdout)).toEqual(expect.objectContaining({ ok: true, rejected: [] }));
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+});

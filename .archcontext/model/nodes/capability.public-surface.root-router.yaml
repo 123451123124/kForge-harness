@@ -1,0 +1,52 @@
+schemaVersion: archcontext.node/v2
+id: capability.public-surface.root-router
+kind: capability
+name: Root Router
+status: active
+layer: cli
+summary: Routes repository-level product and agent context into capability-specific contracts.
+responsibilities:
+  - Own the root public contract, product entry documentation, and top-level agent routing.
+  - Route root instruction readers to .ai/harness/policy.json#rules for enabled rules and parameter values, and to src/core/ci/rules.ts for rule meanings and repair steps.
+source:
+  include:
+    - "agents/openai.yaml"
+    - "docs/CHANGELOG.md"
+    - "docs/changelog.d/**"
+    - "docs/images/**"
+    - "references/bot-control.md"
+    - "references/handoff.md"
+    - "references/workflow-packaging-rubric.md"
+    - "SKILL.md"
+    - "references/pm-boundary.md"
+    - "README.md"
+    - "AGENTS.md"
+    - "CLAUDE.md"
+    - "docs/spec.md"
+    - "docs/usage.md"
+    - "docs/control-bot-boundary.md"
+    - "docs/bot-onboarding.md"
+    - "docs/prds/**"
+    - "README.es.md"
+    - "README.fr.md"
+    - "README.ja.md"
+    - "README.zh-CN.md"
+    - "src/cli/commands/docs.ts"
+  entrypoints:
+    - id: entrypoint.root-router.primary
+      path: "src/cli/commands/adoption-plan.ts"
+      symbols:
+        - name: "runAdoptionPlan"
+          sinks:
+            - id: sink.root-router.primary
+              path: "src/cli/commands/adoption-plan.ts"
+              symbol: "createPlan"
+extensions:
+  harnessTier: "core"
+  contractFiles:
+    agents: "AGENTS.md"
+    claude: "CLAUDE.md"
+  lspProfile: "typescript-lsp"
+  verification:
+    - "bun scripts/inspect-project-state.ts --repo . --format text"
+    - "bun src/cli/index.ts init --repo . --dry-run"

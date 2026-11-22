@@ -1,0 +1,96 @@
+import { ROUTES, routesForHost } from '../src/cli/hook/route-registry';
+import { antigravityEnvironment, antigravityHookMatcher } from '../src/cli/hook/host-adapter';
+import { getHandlerForRoute } from '../src/cli/hook/handler-registry';
+import { describe, test, expect } from "bun:test";
+import { readFileSync, existsSync } from "fs";
+import { join } from "path";
+
+const ROOT = join(import.meta.dir, "..");
+
+function read(relPath: string): string {
+  return readFileSync(join(ROOT, relPath), "utf-8");
+}
+
+describe("Hook contracts", () => {
+  test("route registry binds every public tuple to exactly one typed handler", () => {
+    const routes = read("src/cli/hook/route-registry.ts");
+    const registry = read("src/cli/hook/handler-registry.ts");
+    const runtime = read("src/cli/hook/runtime.ts");
+    expect(routes).toContain("readonly handler: HookHandlerId");
+    expect(routes).not.toContain("readonly scripts");
+    expect(registry).toContain("getHandlerForRoute");
+    expect(runtime).toContain("getHandlerForRoute");
+    expect(runtime).not.toContain("run-hook.sh");
+    expect(existsSync(join(ROOT, "assets/hooks/run-hook.sh"))).toBe(false);
+  });
+
+  test("the installed inbox tuple resolves to the notice handler", () => {
+    const route = ROUTES.find(route => route.event === 'UserPromptSubmit' && route.routeId === 'inbox');
+    expect(route).toMatchObject({ hosts: ['claude', 'codex', 'pi'], handler: 'agent-notice' });
+    if (!route) throw new Error('inbox adapter tuple is missing');
+    expect(getHandlerForRoute(route).id).toBe('agent-notice');
+  });
+
+
+  test("one typed handler owns each subagent route", () => {
+    const returnChannel = read("src/cli/hook/return-channel.ts");
+    expect(returnChannel).toContain("[repo-harness:return-channel]");
+    expect(returnChannel).toContain("updatedInput");
+    // #691 finding 9: the handler returns a typed permission; the host renderer writes permissionDecision.
+    expect(returnChannel).toContain("decision: 'allow'");
+    expect(read("src/cli/hook/subagent-context.ts")).toContain("[repo-harness:subagent-context]");
+  });
+
+  test("no hook grants standing delegation authorization", () => {
+    const sessionStart = read("src/cli/hook/session-context.ts");
+    expect(sessionStart).not.toContain("Delegation Standing Authorization");
+    expect(sessionStart).not.toContain("effectiveDelegationMode");
+  });
+
+
+  test("session-start should not spend the global budget on cross-review availability or a plan capture", () => {
+    const script = read("src/cli/hook/session-context.ts");
+    expect(script).not.toContain("[CrossReview]");
+    expect(script).not.toContain("Pending Plan Capture");
+    expect(script).not.toContain("capture-plan");
+    expect(script).not.toContain("references.plan");
+    expect(script).not.toContain("claude-review");
+    expect(script).not.toContain("worth the tokens");
+  });
+
+  test("in-process stop handler writes no recovery view and resolves no workflow state", () => {
+    const handler = read("src/cli/hook/stop-handler.ts");
+    // #691 finding 10 removed the private Stop payload type, the only place that named last_assistant_message.
+    expect(handler).toContain("stop_hook_active");
+    expect(handler).toContain("publishCheckpointFromLedger");
+    expect(handler).not.toContain("renderRecoveryHandoff");
+    expect(handler).not.toContain("renderRecoveryResume");
+    expect(handler).not.toContain("handoff/current.md");
+    expect(handler).not.toContain("handoff/resume.md");
+    // #695: no readiness lines, no state resolution, no events.jsonl append.
+    expect(handler).not.toContain("[StopReadiness]");
+    expect(handler).not.toContain("getEffectiveState");
+    expect(handler).not.toContain("getActivePlanMarker");
+    expect(handler).not.toContain("activePlanForRecovery");
+    expect(handler).not.toContain("handoff_refresh");
+  });
+
+  test('Antigravity exposes explicit tuples and matches only the agreed guarded tools', () => {
+    expect(routesForHost('antigravity').map(({ event, routeId }) => [event, routeId])).toEqual([
+      ['SessionStart', 'default'], ['PreToolUse', 'edit'], ['PreToolUse', 'bash'], ['Stop', 'default'],
+    ]);
+    expect(antigravityHookMatcher('bash')).toBe('run_command');
+    expect(antigravityHookMatcher('edit')).toBe('write_file|edit_file');
+  });
+
+  test('Antigravity bootstrap retains only the hook environment allowlist', () => {
+    const allowed = {
+      HOME: '/scratch/home', PATH: '/scratch/bin', TMPDIR: '/scratch/tmp', BUN_INSTALL: '/scratch/bun',
+      HOOK_HOST: 'antigravity', REPO_HARNESS_SEAT: 'advisor', REPO_HARNESS_SEAT_REPOSITORY: '1',
+    };
+    expect(antigravityEnvironment({
+      ...allowed, HOOK_REPO_ROOT: '/other', REPO_HARNESS_HOME: '/other', AMBIENT_SECRET: 'fake',
+    })).toEqual(allowed);
+  });
+
+});

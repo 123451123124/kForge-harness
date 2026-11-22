@@ -1,0 +1,6 @@
+schemaVersion: archcontext.relation/v1
+id: relation.publication.contract-assets
+kind: calls
+source: capability.organization.publication
+target: capability.workflow-engine.contract-assets
+intent: "Read integration proof through the packaged worktree merge helper"

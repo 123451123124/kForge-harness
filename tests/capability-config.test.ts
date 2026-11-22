@@ -1,0 +1,184 @@
+import { describe, expect, test } from "bun:test";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { spawnSync } from "child_process";
+
+const ROOT = join(import.meta.dir, "..");
+
+function tmpWorkspace(prefix: string): string {
+  const cwd = mkdtempSync(join(tmpdir(), `${prefix}-`));
+  mkdirSync(join(cwd, "scripts"), { recursive: true });
+  for (const helper of ["capability-config.ts", "capability-resolver.ts"]) {
+    const source = helper === "capability-resolver.ts"
+      ? join(ROOT, "assets/templates/helpers", helper)
+      : join(ROOT, "scripts", helper);
+    copyFileSync(source, join(cwd, "scripts", helper));
+  }
+  return cwd;
+}
+
+function runCapabilityConfig(cwd: string, args: string[]) {
+  return spawnSync("bun", ["scripts/capability-config.ts", ...args], {
+    cwd,
+    encoding: "utf-8",
+  });
+}
+
+describe("capability-config helper", () => {
+  test("adds one explicit capability without automatically authoring local agent contracts", () => {
+    const cwd = tmpWorkspace("capability-config-add");
+    try {
+      mkdirSync(join(cwd, "apps/agent"), { recursive: true });
+
+      const args = ["add", "--prefix", "apps/agent", "--verification-hint", "bun test apps/agent"];
+      const res = spawnSync("bun", [join(ROOT, "src/cli/index.ts"), "capability", "register", ...args], {
+        cwd, encoding: "utf-8",
+      });
+
+      expect(res.status).toBe(0);
+      expect(res.stdout).toContain("[CapabilityConfig] Added apps-agent -> apps/agent");
+      expect(existsSync(join(cwd, "scripts/migrate-project-template.sh"))).toBe(false);
+
+      const registry = JSON.parse(readFileSync(join(cwd, ".ai/context/capabilities.json"), "utf-8"));
+      const directCwd = tmpWorkspace("capability-config-direct");
+      try {
+        mkdirSync(join(directCwd, "apps/agent"), { recursive: true });
+        const direct = runCapabilityConfig(directCwd, args);
+        expect(direct.status, direct.stderr).toBe(res.status);
+        expect(direct.stdout).toBe(res.stdout);
+        expect(direct.stderr).toBe(res.stderr);
+        expect(JSON.parse(readFileSync(join(directCwd, ".ai/context/capabilities.json"), "utf-8"))).toEqual(registry);
+      } finally { rmSync(directCwd, { recursive: true, force: true }); }
+      expect(registry.capabilities).toHaveLength(1);
+      expect(registry.capabilities[0]).toMatchObject({
+        id: "apps-agent",
+        domain: "apps-agent",
+        name: "agent",
+        prefixes: ["apps/agent"],
+        contract_files: {
+          agents: "apps/agent/AGENTS.md",
+          claude: "apps/agent/CLAUDE.md",
+        },
+        architecture_module: "docs/architecture/modules/apps-agent/agent.md",
+        lsp_profile: "typescript-lsp",
+        verification_hints: ["bun test apps/agent"],
+      });
+
+      expect(existsSync(join(cwd, "apps/agent/AGENTS.md"))).toBe(false);
+      expect(existsSync(join(cwd, "apps/agent/CLAUDE.md"))).toBe(false);
+      expect(existsSync(join(cwd, ".ai/context/context-map.json"))).toBe(false);
+
+      const match = spawnSync(
+        "bun",
+        ["scripts/capability-resolver.ts", "match", "--path", "apps/agent/index.ts", "--format", "json"],
+        { cwd, encoding: "utf-8" }
+      );
+      expect(match.status).toBe(0);
+      expect(JSON.parse(match.stdout).capability_id).toBe("apps-agent");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a projection manifest refuses a chosen or created module page (#2707)", () => {
+    const cwd = tmpWorkspace("capability-config-projection");
+    try {
+      mkdirSync(join(cwd, "apps/agent"), { recursive: true });
+      mkdirSync(join(cwd, "docs/architecture"), { recursive: true });
+      writeFileSync(join(cwd, "docs/architecture/.projection-manifest.json"), JSON.stringify({ targets: {} }));
+
+      const res = runCapabilityConfig(cwd, ["add", "--prefix", "apps/agent", "--create-architecture-module"]);
+      expect(res.status).toBe(2);
+      expect(res.stderr).toContain("docs/architecture/.projection-manifest.json owns the module pages");
+      expect(existsSync(join(cwd, ".ai/context/capabilities.json"))).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("refuses to create missing capability prefixes unless explicitly requested", () => {
+    const cwd = tmpWorkspace("capability-config-missing-prefix");
+    try {
+      const res = runCapabilityConfig(cwd, ["add", "--prefix", "apps/missing"]);
+
+      expect(res.status).toBe(1);
+      expect(res.stderr).toContain("use --create-prefix to create it");
+      expect(existsSync(join(cwd, ".ai/context/capabilities.json"))).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("reuses existing registry entries instead of re-deriving custom fields", () => {
+    const cwd = tmpWorkspace("capability-config-existing");
+    try {
+      mkdirSync(join(cwd, "apps/agent"), { recursive: true });
+
+      const first = runCapabilityConfig(cwd, [
+        "add",
+        "--prefix",
+        "apps/agent",
+        "--id",
+        "custom-agent",
+        "--domain",
+        "runtime",
+        "--name",
+        "agent",
+      ]);
+      expect(first.status).toBe(0);
+
+      const second = runCapabilityConfig(cwd, ["add", "--prefix", "apps/agent", "--id", "custom-agent"]);
+      expect(second.status).toBe(0);
+      expect(second.stdout).toContain("[CapabilityConfig] Found existing custom-agent -> apps/agent");
+
+      const registry = JSON.parse(readFileSync(join(cwd, ".ai/context/capabilities.json"), "utf-8"));
+      expect(registry.capabilities).toHaveLength(1);
+      expect(registry.capabilities[0].domain).toBe("runtime");
+
+      expect(existsSync(join(cwd, "apps/agent/AGENTS.md"))).toBe(false);
+      expect(existsSync(join(cwd, "apps/agent/CLAUDE.md"))).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("refuses to write the JSON registry when archcontext owns the capability source", () => {
+    const cwd = tmpWorkspace("capability-config-archcontext");
+    try {
+      mkdirSync(join(cwd, "apps/agent"), { recursive: true });
+      const first = runCapabilityConfig(cwd, ["add", "--prefix", "apps/agent"]);
+      expect(first.status).toBe(0);
+
+      const registryPath = join(cwd, ".ai/context/capabilities.json");
+      const before = readFileSync(registryPath);
+
+      mkdirSync(join(cwd, ".ai/harness"), { recursive: true });
+      writeFileSync(
+        join(cwd, ".ai/harness/policy.json"),
+        `${JSON.stringify({ version: 1, context: { capability_source: "archcontext" } }, null, 2)}\n`,
+      );
+
+      const second = runCapabilityConfig(cwd, ["add", "--prefix", "apps/other", "--create-prefix"]);
+      expect(second.status).toBe(2);
+      expect(second.stderr).toContain('capability source is "archcontext"');
+      expect(second.stderr).toContain(".archcontext/model/nodes");
+      expect(readFileSync(registryPath)).toEqual(before);
+      expect(existsSync(join(cwd, "apps/other"))).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("refuses a Windows drive prefix as the registry reader does", () => {
+    const cwd = tmpWorkspace("capability-config-drive");
+    try {
+      const res = runCapabilityConfig(cwd, ["add", "--prefix", "C:/x", "--create-prefix"]);
+      expect(res.status).not.toBe(0);
+      expect(res.stderr).toContain("absolute path is outside repo");
+      expect(existsSync(join(cwd, ".ai/context/capabilities.json"))).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+});

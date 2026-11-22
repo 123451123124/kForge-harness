@@ -1,0 +1,110 @@
+import { describe, expect, test } from 'bun:test';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { listHelperFiles, resolveHelper } from '../../src/effects/runtime/helper-runner';
+import { renderWorkflowContractMarker } from '../../src/core/adoption/workflow-contract-asset';
+import { collectProjectionFiles, readProjectionFile, writeProjectionFileAtomic } from '../../src/effects/source-projection';
+const ROOT = join(import.meta.dir, '..', '..');
+describe('single executable helper authority', () => {
+  test('every packaged helper resolves the exact canonical script, including protected helpers', () => {
+    const files = listHelperFiles({});
+    expect(files.length).toBeGreaterThan(10);
+    for (const file of files) {
+      const actual = resolveHelper(file, ROOT, {});
+      expect(actual?.source).toBe('package');
+      expect(actual?.path).toBe(join(ROOT, 'scripts', file));
+      expect(lstatSync(actual!.path).isFile()).toBe(true);
+      expect(lstatSync(actual!.path).isSymbolicLink()).toBe(false);
+    }
+  });
+  test('the package defines the runtime location and the repo holds the opt-in marker', () => {
+    const packed = JSON.parse(readFileSync(join(ROOT, 'assets/workflow-contract.v1.json'), 'utf8'));
+    const local = readFileSync(join(ROOT, '.ai/harness/workflow-contract.json'), 'utf8');
+    expect(packed.helpers.runtimeDirectory).toBe('package:scripts');
+    expect(local).toBe(renderWorkflowContractMarker());
+  });
+  test('check rejects byte and mode drift; write repairs only the disposable projection', () => {
+    const root = mkdtempSync(join(tmpdir(), 'helper-projection-'));
+    try {
+      for (const dir of ['scripts', 'src/core/capabilities', 'src/core/architecture', 'src/core/workflow', 'src/effects/architecture', 'src/effects/git', 'src/effects/state', 'assets/templates/helpers']) mkdirSync(join(root, dir), { recursive: true });
+      for (const path of ['scripts/sync-helper-sources.ts', 'scripts/capability-resolver.ts', 'src/effects/source-projection.ts', 'src/core/capabilities/registry.ts', 'src/core/capabilities/resolver.ts', 'src/core/architecture/contracts.ts', 'src/core/workflow/policy-schema.ts', 'src/effects/state/policy-file.ts', 'src/effects/architecture/capability-resolver.ts', 'src/effects/git/runner.ts', 'src/effects/readonly-observation.ts']) {
+        copyFileSync(join(ROOT, path), join(root, path));
+      }
+      const target = join(root, 'assets/templates/helpers/capability-resolver.ts');
+      writeFileSync(target, '#!/usr/bin/env bun\n// stale\n', { mode: 0o755 });
+      const invoke = (mode: string) => spawnSync(process.execPath, [join(root, 'scripts/sync-helper-sources.ts'), mode], {
+        cwd: root, encoding: 'utf8', timeout: 10_000,
+      });
+      const drift = invoke('--check');
+      expect(drift.status, drift.stderr).toBe(1);
+      expect(drift.stderr).toContain('content drift');
+      expect(readFileSync(target, 'utf8')).toContain('stale');
+      expect(invoke('--write').status).toBe(0);
+      expect(invoke('--check').status).toBe(0);
+      chmodSync(target, 0o644);
+      const modeDrift = invoke('--check');
+      expect(modeDrift.status).toBe(1);
+      expect(modeDrift.stderr).toContain('mode drift');
+      expect(invoke('--write').status).toBe(0);
+      expect(invoke('--check').status).toBe(0);
+      writeFileSync(join(root, 'assets/templates/helpers/fixture.sh'), '#!/bin/bash\n', { mode: 0o755 });
+      const unclassified = invoke('--check');
+      expect(unclassified.status).toBe(1);
+      expect(unclassified.stderr).toContain('unclassified package helper: assets/templates/helpers/fixture.sh');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('projection reads reject symlinked roots and ancestor directories', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'source-projection-read-'));
+    const sourceRoot = join(tmp, 'source');
+    const sourceLink = join(tmp, 'source-link');
+    const outside = join(tmp, 'outside');
+    try {
+      mkdirSync(sourceRoot);
+      mkdirSync(outside);
+      writeFileSync(join(sourceRoot, 'local.sh'), '#!/bin/bash\n');
+      writeFileSync(join(outside, 'escaped.sh'), '#!/bin/bash\n');
+      symlinkSync(sourceRoot, sourceLink);
+
+      expect(() => collectProjectionFiles(sourceLink)).toThrow('projection root must not be a symlink');
+
+      symlinkSync(outside, join(sourceRoot, 'nested'));
+      expect(() => readProjectionFile(sourceRoot, 'nested/escaped.sh')).toThrow(
+        'symlink is not allowed in projection path',
+      );
+      expect(() => collectProjectionFiles(sourceRoot)).toThrow('symlink is not allowed in source projection');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+  test('projection writes reject symlinked roots, symlinked parents, and repo escapes', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'source-projection-write-'));
+    const repoRoot = join(tmp, 'repo');
+    const repoLink = join(tmp, 'repo-link');
+    const outside = join(tmp, 'outside');
+    try {
+      mkdirSync(join(repoRoot, '.ai'), { recursive: true });
+      mkdirSync(outside);
+      symlinkSync(repoRoot, repoLink);
+
+      expect(() =>
+        writeProjectionFileAtomic(repoLink, join(repoLink, '.ai', 'hooks', 'test.sh'), 'safe\n', '100644'),
+      ).toThrow('projection root must not be a symlink');
+
+      symlinkSync(outside, join(repoRoot, '.ai', 'hooks'));
+      expect(() =>
+        writeProjectionFileAtomic(repoRoot, join(repoRoot, '.ai', 'hooks', 'test.sh'), 'safe\n', '100644'),
+      ).toThrow('symlink is not allowed in projection parent');
+      expect(existsSync(join(outside, 'test.sh'))).toBe(false);
+
+      expect(() =>
+        writeProjectionFileAtomic(repoRoot, join(repoRoot, '..', 'escaped.sh'), 'safe\n', '100644'),
+      ).toThrow('projection path escapes root');
+      expect(existsSync(join(tmp, 'escaped.sh'))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

@@ -1,0 +1,78 @@
+{
+  "baseline": "82550779cdccf0575d674ae53bbc95ba63e44743",
+  "scenario": "foreign-worktree-owner",
+  "cli_exit": 1,
+  "cli_stderr": "",
+  "field": {
+    "exit": 1,
+    "stdout": "",
+    "stderr": ""
+  },
+  "state": {
+    "protocol": 2,
+    "kind": "repo-harness-effective-state",
+    "task_id": null,
+    "phase": "blocked",
+    "state_version": 1,
+    "state_revision": "sha256:<dynamic:state_revision>",
+    "authority_revision": "sha256:<dynamic:authority_revision>",
+    "subject_revision": "sha256:b120c4bb8e858486b6f5c8893bf3e9da6b9c4efaf8640276457e5891afe91c30",
+    "projection_revision": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "progress_token": "sha256:<dynamic:progress_token>",
+    "workflow_profile": "routine",
+    "requested_workflow_profile": null,
+    "risk_floor": "routine",
+    "profile_reasons": [
+      "risk-floor:routine:local-change",
+      "capability:registry:absent"
+    ],
+    "profile_signals": {
+      "targetPathCount": 1,
+      "capabilityCount": 0,
+      "operationKind": "feature",
+      "strictCategories": [],
+      "mediumScope": false,
+      "crossCapability": false
+    },
+    "capability_ownership": null,
+    "next_action": "resolve blockers",
+    "guidance": "Implement the authorized scope; verify typecheck and affected tests once; record goal/change/verification/risk/rollback in the PR. This is a state snapshot, not a session-wide restriction; re-resolve for the proposed edit and current diff when scope changes. Current edit-time requirements supersede earlier snapshot guidance.",
+    "blockers": [
+      "conflict:worktree_owner"
+    ],
+    "stale_sources": [],
+    "conflicting_sources": [
+      "worktree_owner"
+    ],
+    "source_hashes": {
+      ".ai/context/capabilities.json": "sha256:becde17b6600ee6ea2f65fe3320f11bc1efbb103d81bb7dda3788623ca293441",
+      ".ai/harness/active-worktree": "sha256:<dynamic:.ai/harness/active-worktree>",
+      ".ai/harness/policy.json": "sha256:001e056f4ac35ace2e89e20bef71f492ac9a0ac7373cacaeaf1e0fa36ea130b8",
+      "review_subject": "sha256:b6728423245c1f39a952e3d5e3f39227ce00a658be92d51253eadf167eced6fc",
+      "authority_revision": "sha256:<dynamic:authority_revision>"
+    },
+    "worktree": {
+      "path": ".ai/harness/active-worktree",
+      "freshness": "stale",
+      "current": "<repo>",
+      "owner": "/tmp/foreign-worktree"
+    }
+  },
+  "hook": {
+    "protocol": 1,
+    "kind": "repo-harness-state-snapshot",
+    "states": {
+      "spec": "present",
+      "plan": "none",
+      "pending": "none",
+      "worktree": "foreign_marker",
+      "evidence": "unchecked"
+    },
+    "paths": {
+      "active_plan": null
+    },
+    "marker": {
+      "problem": "foreign_worktree"
+    }
+  }
+}

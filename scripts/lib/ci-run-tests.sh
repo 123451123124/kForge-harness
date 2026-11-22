@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+# Sourceable CI test-loop library. Sourcing must have no side effects so the
+# loop can be exercised directly without running the whole gate.
+
+# Create native paths before Bun caches its startup environment.
+_ci_run_bun_tests_in_temporary_home() {
+  local isolation_module="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-home-isolation.mjs"
+  node -e '
+    const fs = require("node:fs");
+    const { spawnSync } = require("node:child_process");
+    const { createTemporaryTestEnvironment, temporaryPath } = require(process.argv[1]);
+    const { recordSuspect, survivingSuspects, survivorMessage } = require(require("node:path").join(require("node:path").dirname(process.argv[1]), "ci-worktree-suspects.mjs"));
+    const args = process.argv.slice(2);
+    const batch = args.indexOf("--harness-file-list");
+    const divider = args.indexOf("--harness-options");
+    const runs = batch < 0 ? [args] : args.slice(batch + 1, divider).map(file => [...args.slice(0, batch), file, ...args.slice(divider + 1)]);
+    let status = 0;
+    // The caller owns the run directory. A nested gate inside a test inherits a
+    // directory in the disposable root, so it never writes into the checkout.
+    const junitDir = process.env.BUN_TEST_JUNIT_DIR;
+    const testFiles = batch >= 0 ? args.slice(batch + 1, divider) : args.filter(arg => /[.](test|spec)[.][cm]?[jt]sx?$/.test(arg));
+    for (const [index, baseArgs] of runs.entries()) {
+      const { env, home, temp } = createTemporaryTestEnvironment(process.env);
+      env.BUN_TEST_JUNIT_DIR = require("node:path").join(temp, "junit");
+      // The outermost run owns attribution. Nested and pooled runs inherit its directory and file name, record their new paths there and never judge them.
+      const inheritedSuspectDir = process.env.CI_WORKTREE_SUSPECT_DIR;
+      const suspectDir = inheritedSuspectDir || require("node:path").join(temp, "worktree-suspects");
+      if (!inheritedSuspectDir) fs.mkdirSync(suspectDir);
+      // One report per Bun process, named by its test file so a rerun replaces the report. Options go first so the file stays last.
+      const name = (batch >= 0 ? testFiles[index] : testFiles.length === 1 ? testFiles[0] : undefined) ?? "run-" + index;
+      const owner = process.env.CI_WORKTREE_SUSPECT_OWNER || name;
+      env.CI_WORKTREE_SUSPECT_DIR = suspectDir;
+      env.CI_WORKTREE_SUSPECT_OWNER = owner;
+      const runArgs = junitDir
+        ? ["--reporter=junit", "--reporter-outfile=" + require("node:path").join(junitDir, name.replace(/[\\/:]/g, "__") + ".xml"), ...baseArgs]
+        : baseArgs;
+      // The parent runs this check after Bun exits. Bun exit hooks are not reliable.
+      const roots = [...new Set((process.platform === "win32" ? [require("node:os").tmpdir(), "/tmp", "/private/tmp"] : ["/tmp", "/private/tmp"]).filter(p => fs.existsSync(p)).map(p => fs.realpathSync(p)))];
+      const snapshot = () => roots.flatMap(root => fs.readdirSync(root).filter(name => /-wt-/.test(name) && !name.startsWith(".repo-harness-wt-trash-")).map(name => require("node:path").join(root, name)));
+      const pathApi = require("node:path");
+      const runRoots = [home, temp, process.env.HOME, process.env.TMPDIR, process.env.REPO_HARNESS_WORKTREE_ROOT]
+        .filter(Boolean).map(p => temporaryPath(p, true)).filter(Boolean)
+        .filter(p => !roots.includes(p));
+      const insideRun = p => runRoots.some(root => p === root || p.startsWith(root + pathApi.sep));
+      const externalRegistration = checkout => {
+        try {
+          const pointer = pathApi.join(checkout, ".git");
+          const stat = fs.lstatSync(pointer);
+          if (!stat.isFile() || stat.isSymbolicLink()) return false;
+          const text = fs.readFileSync(pointer, "utf8").trim();
+          if (!text.startsWith("gitdir: ")) return false;
+          const admin = fs.realpathSync(pathApi.resolve(checkout, text.slice(8)));
+          return fs.statSync(admin).isDirectory() && !insideRun(admin);
+        } catch { return false; }
+      };
+      const before = new Set(snapshot());
+      const started = Date.now();
+      let fileStatus = 1;
+      try {
+        const result = spawnSync("bun", ["test", ...runArgs], {
+          env,
+          stdio: "inherit",
+        });
+        if (result.error) console.error("[ci] test process failed to start: " + result.error.message);
+        fileStatus = result.status ?? 1;
+        for (const path of snapshot()) {
+          if (before.has(path) || externalRegistration(path)) continue;
+          let stat;
+          try { stat = fs.lstatSync(path); } catch (error) { if (error.code === "ENOENT") continue; throw error; }
+          // Fallback: fixture-created roots are not all known to this runner.
+          // Windows has no uid: stat.uid is 0 and process.getuid is undefined, so the age test alone decides there.
+          if ((process.platform === "win32" || stat.uid === process.getuid()) &&(stat.birthtimeMs || stat.ctimeMs) >= started) {
+            // A concurrent file may own this path and remove it later, so the outermost run judges it when its children have ended.
+            recordSuspect(suspectDir, path, owner);
+          }
+        }
+        if (!inheritedSuspectDir) {
+          for (const survivor of survivingSuspects(suspectDir)) { console.error(survivorMessage(survivor)); fileStatus = 1; }
+        }
+      } finally {
+        const removeDisposableRoot = path => {
+          // A late runtime cache write can race the recursive directory walk.
+          // Retry only ENOTEMPTY, on the same disposable root, with a hard bound.
+          for (let attempt = 0; ; attempt++) {
+            try { fs.rmSync(path, { recursive: true, force: true }); return; }
+            catch (error) {
+              if (error.code !== "ENOTEMPTY" || attempt === 3) throw error;
+              console.error("[ci] retrying disposable root cleanup after ENOTEMPTY (" + (attempt + 1) + "/3): " + path);
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+            }
+          }
+        };
+        removeDisposableRoot(home);
+        removeDisposableRoot(temp);
+      }
+      if (fileStatus !== 0 && status === 0) status = fileStatus;
+    }
+    process.exit(status);
+  ' "$isolation_module" --timeout "${BUN_TEST_TIMEOUT_MS:-60000}" --max-concurrency "${BUN_TEST_MAX_CONCURRENCY:-4}" "$@"
+}
+
+# Bun writes one JUnit report per test process into a run directory under the
+# ignored .ai/harness/runs/. Runs older than a week are removed; CI uploads the
+# directory. Age, not count, decides: concurrent and nested runs keep their own.
+_ci_prepare_junit_dir() {
+  if [[ -n "${BUN_TEST_JUNIT_DIR:-}" ]]; then
+    mkdir -p "$BUN_TEST_JUNIT_DIR"
+    return
+  fi
+  local base
+  base="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.ai/harness/runs/junit"
+  mkdir -p "$base" || return 1
+  find "$base" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + || return 1
+  BUN_TEST_JUNIT_DIR="$base/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  mkdir -p "$BUN_TEST_JUNIT_DIR" || return 1
+  export BUN_TEST_JUNIT_DIR
+}
+
+run_bun_test_file() {
+  local file="$1"
+  echo "[ci] test $file"
+  _ci_run_bun_tests_in_temporary_home "$file"
+}
+
+# Bounded job pool for isolate mode. Only the parent prints, replaying each
+# worker's captured log the moment that worker finishes, so a file's header and
+# its bun output stay contiguous in the merged CI log without any lock.
+# Written for bash 3.2: no `wait -n`, no associative arrays, no GNU-only flags.
+#
+# stdout carries the replayed logs, so the failure list travels back through the
+# caller's `failed_list` variable instead.
+_ci_run_bun_test_pool() {
+  local jobs="$1"
+  shift
+  local files=("$@")
+  local total="${#files[@]}"
+
+  local tmpdir
+  if ! tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/rh-ci-jobs.XXXXXX" 2>/dev/null)"; then
+    echo "[ci] job pool could not create a temporary directory" >&2
+    return 1
+  fi
+  # A sourced library must not steal the caller's EXIT handler, so the previous
+  # one is restored once the pool is done with its scratch directory.
+  local previous_exit_trap
+  previous_exit_trap="$(trap -p EXIT)"
+  trap 'rm -rf "$tmpdir"' EXIT INT TERM
+  if ! : >"$tmpdir/.probe" 2>/dev/null; then
+    echo "[ci] job pool temporary directory is not writable: $tmpdir" >&2
+    rm -rf "$tmpdir"
+    trap - EXIT INT TERM
+    [[ -n "$previous_exit_trap" ]] && eval "$previous_exit_trap"
+    return 1
+  fi
+
+  # Inside a larger run, that run's directory collects the reports and judges them.
+  local suspect_dir="${CI_WORKTREE_SUSPECT_DIR:-}"
+  if [[ -z "$suspect_dir" ]]; then
+    suspect_dir="$tmpdir/suspects"
+    mkdir -p "$suspect_dir"
+  fi
+  local -a slot_pid slot_file slot_log slot_status
+  local slot
+  for ((slot = 0; slot < jobs; slot++)); do
+    slot_pid[$slot]=""
+    slot_file[$slot]=""
+    slot_log[$slot]=""
+    slot_status[$slot]=""
+  done
+
+  local next=0
+  local running=0
+  local unsorted=""
+  local pool_error=0
+  local file log status_file pid status progressed
+
+  while [[ "$next" -lt "$total" || "$running" -gt 0 ]]; do
+    for ((slot = 0; slot < jobs; slot++)); do
+      [[ "$next" -lt "$total" ]] || break
+      [[ -z "${slot_pid[$slot]}" ]] || continue
+      file="${files[$next]}"
+      log="$tmpdir/$next.log"
+      status_file="$tmpdir/$next.status"
+      # The worker records its own exit code through a rename so the parent can
+      # never observe a half-written status, and `set -e` in the caller cannot
+      # abort the worker before that record exists.
+      (
+        status=0
+        CI_WORKTREE_SUSPECT_DIR="$suspect_dir" run_bun_test_file "$file" >"$log" 2>&1 || status=$?
+        printf '%s\n' "$status" >"$status_file.partial"
+        mv "$status_file.partial" "$status_file"
+      ) &
+      pid=$!
+      if [[ -z "$pid" ]]; then
+        echo "[ci] job pool could not spawn a worker for $file" >&2
+        pool_error=1
+        unsorted+="  $file (exit 1)"$'\n'
+        next=$((next + 1))
+        continue
+      fi
+      slot_pid[$slot]="$pid"
+      slot_file[$slot]="$file"
+      slot_log[$slot]="$log"
+      slot_status[$slot]="$status_file"
+      next=$((next + 1))
+      running=$((running + 1))
+    done
+
+    progressed=0
+    for ((slot = 0; slot < jobs; slot++)); do
+      pid="${slot_pid[$slot]}"
+      [[ -n "$pid" ]] || continue
+      status_file="${slot_status[$slot]}"
+      file="${slot_file[$slot]}"
+      log="${slot_log[$slot]}"
+      if [[ -f "$status_file" ]]; then
+        wait "$pid" 2>/dev/null || true
+        status="$(cat "$status_file")"
+      elif kill -0 "$pid" 2>/dev/null; then
+        continue
+      else
+        status=0
+        wait "$pid" 2>/dev/null || status=$?
+        if [[ -f "$status_file" ]]; then
+          status="$(cat "$status_file")"
+        else
+          # The worker died without recording an exit code: the file's result is
+          # unknown, so the pool fails closed instead of counting it as a pass.
+          echo "[ci] job pool lost the worker for $file" >&2
+          pool_error=1
+          [[ "$status" != "0" ]] || status=1
+        fi
+      fi
+      if [[ -f "$log" ]]; then
+        cat "$log"
+      fi
+      if [[ "$status" != "0" ]]; then
+        unsorted+="  $file (exit $status)"$'\n'
+      fi
+      slot_pid[$slot]=""
+      slot_file[$slot]=""
+      slot_log[$slot]=""
+      slot_status[$slot]=""
+      running=$((running - 1))
+      progressed=1
+    done
+
+    if [[ "$progressed" == "0" && "$running" -gt 0 ]]; then
+      sleep 0.05
+    fi
+  done
+
+  # A worktree that one file created and removed is gone now. One that is still
+  # here leaked, so every file that saw it appear fails.
+  if [[ "$suspect_dir" == "$tmpdir/suspects" ]]; then
+    local suspect_module survivors suspect_path suspect_file
+    suspect_module="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ci-worktree-suspects.mjs"
+    # The read must fail closed: an unreadable report is an unknown result, not a pass.
+    if ! survivors="$(node -e 'const { survivingSuspects } = require(process.argv[1]); for (const s of survivingSuspects(process.argv[2])) console.log(s.path + "\t" + s.owner);' "$suspect_module" "$suspect_dir")"; then
+      echo "[ci] job pool could not read the worktree reports" >&2
+      pool_error=1
+    fi
+    while IFS=$'\t' read -r suspect_path suspect_file; do
+      [[ -n "$suspect_path" ]] || continue
+      echo "[ci] surviving new worktree path outside disposable roots (current uid; created during test): $suspect_path ($suspect_file)" >&2
+      case "$unsorted" in *"  $suspect_file (exit "*) ;; *) unsorted+="  $suspect_file (exit 1)"$'\n' ;; esac
+    done <<< "$survivors"
+  fi
+
+  # Completion order is a race, so the summary is sorted by file path to keep
+  # the gate's failure block reproducible across runs.
+  if [[ -n "$unsorted" ]]; then
+    failed_list="$(printf '%s' "$unsorted" | LC_ALL=C sort)"$'\n'
+  fi
+
+  rm -rf "$tmpdir"
+  trap - EXIT INT TERM
+  [[ -n "$previous_exit_trap" ]] && eval "$previous_exit_trap"
+  return "$pool_error"
+}
+
+_ci_build_hook_bundle_if_selected() {
+  grep -qsE 'hook-entry\.js|seedGlobalPackageFixture' -- "$@" || return 0
+  (cd "$(dirname "${BASH_SOURCE[0]}")/../.." && bun run build:hook-bundle) || return $?
+}
+
+# A positional argument with the test file name form must be a file or a directory.
+# Arguments that start with '-' are options; the value after a value-taking option
+# is not positional. The value-taking set is the options that callers pass with a
+# separate value: -t/--test-name-pattern, --timeout, --max-concurrency,
+# --preload/-r, --rerun-each, --coverage-reporter, --coverage-dir.
+_ci_require_test_paths() {
+  local argument skip_value=0
+  for argument in "$@"; do
+    if [[ "$skip_value" == 1 ]]; then
+      skip_value=0
+      continue
+    fi
+    case "$argument" in
+      -t | --test-name-pattern | --timeout | --max-concurrency | --preload | -r | --rerun-each | --coverage-reporter | --coverage-dir)
+        skip_value=1
+        continue
+        ;;
+      -*) continue ;;
+    esac
+    if [[ ! -e "$argument" && "$argument" =~ (^|/)[^/]*([.]test|[.]spec|_test|_spec)[.][cm]?[jt]sx?$ ]]; then
+      echo "[ci] test file does not exist: $argument" >&2
+      return 1
+    fi
+  done
+}
+
+run_bun_tests() {
+  _ci_require_test_paths "$@" || return $?
+  _ci_prepare_junit_dir || return $?
+  if [[ "${BUN_TEST_ISOLATE_FILES:-0}" != "1" ]]; then
+    local argument
+    for argument in "$@"; do
+      if [[ "$argument" == --coverage || "$argument" == --coverage=* ]]; then
+        _ci_build_hook_bundle_if_selected "$@" || return $?
+        _ci_run_bun_tests_in_temporary_home "$@"
+        return
+      fi
+    done
+    local selected=() options=() unique=() selection
+    for argument in "$@"; do
+      if [[ -f "$argument" ]]; then
+        selected[${#selected[@]}]="$argument"
+      elif [[ -d "$argument" ]]; then
+        selection="$(node -e '
+          const fs=require("node:fs"),p=require("node:path");
+          function walk(root){for(const entry of fs.readdirSync(root,{withFileTypes:true})){
+            const path=p.join(root,entry.name);
+            if(entry.isDirectory() && !["node_modules",".git"].includes(entry.name))walk(path);
+            else if(entry.isFile() && /(?:[.]test|[.]spec|_test|_spec)[.][cm]?[jt]sx?$/.test(entry.name))console.log(path);
+          }}walk(process.argv[1]);
+        ' "$argument")" || return $?
+        while IFS= read -r argument; do
+          [[ -n "$argument" ]] && selected[${#selected[@]}]="$argument"
+        done <<< "$selection"
+      else
+        options[${#options[@]}]="$argument"
+      fi
+    done
+    if [[ "${#selected[@]}" -eq 0 ]]; then
+      if [[ "$#" -gt 0 ]]; then
+        _ci_run_bun_tests_in_temporary_home "$@"
+        return
+      fi
+      local selector="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/select-test-suite.ts"
+      selection="$(bun "$selector" "${BUN_TEST_SUITE:-full}")" || return $?
+      local lane
+      while IFS=$'\t' read -r lane argument; do
+        [[ -n "$argument" ]] && selected[${#selected[@]}]="$argument"
+      done <<< "$selection"
+      # Without a file manifest, preserve Bun's native discovery contract.
+      if [[ "${#selected[@]}" -eq 0 ]]; then
+        _ci_run_bun_tests_in_temporary_home "$@"
+        return
+      fi
+    fi
+    local seen=$'\n'
+    for argument in "${selected[@]}"; do
+      case "$seen" in *$'\n'"$argument"$'\n'*) continue ;; esac
+      seen+="$argument"$'\n'
+      unique[${#unique[@]}]="$argument"
+    done
+    _ci_build_hook_bundle_if_selected "${unique[@]}" || return $?
+    _ci_run_bun_tests_in_temporary_home --harness-file-list "${unique[@]}" --harness-options ${options[@]+"${options[@]}"}
+    return
+  fi
+
+  local jobs="${BUN_TEST_JOBS:-1}"
+  case "$jobs" in
+    '' | *[!0-9]* | 0*)
+      echo "[ci] BUN_TEST_JOBS must be a positive integer (got '$jobs')" >&2
+      return 1
+      ;;
+  esac
+
+  local files=()
+  local serial_files=()
+  local file
+  local status
+  local failed_list=""
+  local pool_status=0
+
+  if [[ -n "${BUN_TEST_FILES:-}" ]]; then
+    for file in $BUN_TEST_FILES; do
+      files[${#files[@]}]="$file"
+    done
+    # The list is a second form of the same input, so it takes the same rule as
+    # the positional paths: a name with the test file name form must exist, and a
+    # missing name fails the run before any test starts.
+    _ci_require_test_paths ${files[@]+"${files[@]}"} || return $?
+  fi
+
+  if [[ "${#files[@]}" -eq 0 || "${BUN_TEST_SCHEDULE_FILES:-0}" == 1 ]]; then
+    local selection lane
+    local selector="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/select-test-suite.ts"
+    selection="$(bun "$selector" "${BUN_TEST_SUITE:-full}" ${files[@]+"${files[@]}"})" || return $?
+    files=()
+    while IFS=$'\t' read -r lane file; do
+      [[ -n "$file" ]] || continue
+      case "$lane" in
+        parallel) files[${#files[@]}]="$file" ;;
+        serial) serial_files[${#serial_files[@]}]="$file" ;;
+        *) echo "[ci] invalid test lane: $lane" >&2; return 1 ;;
+      esac
+    done <<< "$selection"
+  fi
+
+  if [[ "${#files[@]}" -eq 0 && "${#serial_files[@]}" -eq 0 ]]; then
+    echo "[ci] no test files matched" >&2
+    return 1
+  fi
+
+  # Isolate mode keeps running every selected file after a failure so one early
+  # red file cannot hide the rest of the suite from the gate's log.
+  _ci_build_hook_bundle_if_selected ${files[@]+"${files[@]}"} ${serial_files[@]+"${serial_files[@]}"} || return $?
+  echo "[ci] parallel files=${#files[@]} jobs=$jobs; serial tail=${#serial_files[@]}"
+  if [[ "$jobs" -eq 1 ]]; then
+    for file in ${files[@]+"${files[@]}"}; do
+      status=0
+      run_bun_test_file "$file" || status=$?
+      if [[ "$status" != "0" ]]; then
+        failed_list+="  $file (exit $status)"$'\n'
+      fi
+    done
+  elif [[ "${#files[@]}" -gt 0 ]]; then
+    _ci_run_bun_test_pool "$jobs" "${files[@]}" || pool_status=$?
+  fi
+
+  for file in ${serial_files[@]+"${serial_files[@]}"}; do
+    status=0
+    run_bun_test_file "$file" || status=$?
+    if [[ "$status" != "0" ]]; then
+      failed_list+="  $file (exit $status)"$'\n'
+    fi
+  done
+
+  local failed_count=0
+  if [[ -n "$failed_list" ]]; then
+    failed_count="$(printf '%s' "$failed_list" | awk 'END { print NR }')"
+  fi
+
+  if [[ "$failed_count" -gt 0 ]]; then
+    echo "[ci] failed test files ($failed_count):" >&2
+    printf '%s' "$failed_list" >&2
+    return 1
+  fi
+
+  if [[ "$pool_status" != "0" ]]; then
+    echo "[ci] job pool failed before every selected file reported" >&2
+    return 1
+  fi
+}
+
+# Direct use runs a complete suite. Sourcing keeps the caller's settings.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -euo pipefail
+  suite_args=("$@")
+  BUN_TEST_SUITE="${1:-full}"
+  if [[ "$#" -gt 0 ]]; then shift; fi
+  if [[ "$#" -eq 2 && "$1" == --timeout && "$2" =~ ^[1-9][0-9]*$ ]]; then
+    BUN_TEST_TIMEOUT_MS="$2"
+    shift 2
+  fi
+  if [[ "$#" -gt 0 || ( "$BUN_TEST_SUITE" != core && "$BUN_TEST_SUITE" != integration && "$BUN_TEST_SUITE" != full ) ]]; then
+    echo "Usage: ci-run-tests.sh [core|integration|full] [--timeout <ms>]" >&2
+    exit 2
+  fi
+  cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+  if ! bun scripts/host-test-queue.ts held; then
+    queue_kind=affected
+    [[ "$BUN_TEST_SUITE" != full ]] || queue_kind=full
+    exec bun scripts/host-test-queue.ts run --kind "$queue_kind" -- "$BASH" scripts/lib/ci-run-tests.sh ${suite_args[@]+"${suite_args[@]}"}
+  fi
+  bun run build:oar-review-host
+  unset BUN_TEST_FILES
+  BUN_TEST_ISOLATE_FILES=1
+  BUN_TEST_SCHEDULE_FILES=1
+  BUN_TEST_JOBS="${BUN_TEST_JOBS:-8}"
+  BUN_TEST_MAX_CONCURRENCY="${BUN_TEST_MAX_CONCURRENCY:-1}"
+  run_bun_tests
+fi

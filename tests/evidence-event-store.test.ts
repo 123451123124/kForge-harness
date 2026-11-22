@@ -1,0 +1,577 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, readFileSync } from "fs";
+import { join } from "path";
+import { initGitRepo, run, withTempRepo } from "./helpers/repo-fixture";
+import { recordDecision } from "../scripts/decision-trail";
+
+import { canonicalize } from "../src/core/evidence/canonical-json";
+import { computeIdempotencyKey } from "../src/core/evidence/idempotency";
+import { redactPayloadStrings } from "../src/core/evidence/redaction";
+import type { SubjectIdentity } from "../src/core/evidence/types";
+import { encodeUlid, generateEventId } from "../src/core/evidence/ulid";
+import {
+  appendEvidenceEvent,
+  appendGenesisRecord,
+  readAcceptedEvents,
+  type EvidenceEventInput,
+} from "../src/effects/evidence/event-log";
+
+function subjectIdentity(overrides: Partial<SubjectIdentity> = {}): SubjectIdentity {
+  return {
+    authority_commit: "5228d4ea0d7987cf6fb73be216d5b9cc638817c3",
+    base_commit: "5228d4ea0d7987cf6fb73be216d5b9cc638817c3",
+    target_commit: "abcdef1234567890abcdef1234567890abcdef12",
+    scope_hash: "sha256:" + "a".repeat(64),
+    subject_hash: "sha256:" + "b".repeat(64),
+    contract_hash: "sha256:" + "c".repeat(64),
+    command_hash: "sha256:" + "d".repeat(64),
+    env_provider_id: "claude-code/1.0.0/home-abc",
+    ...overrides,
+  };
+}
+
+function baseInput(overrides: Partial<EvidenceEventInput> = {}): EvidenceEventInput {
+  return {
+    worktreeId: "epc-01-evidence-event-store",
+    eventType: "verification.command_run",
+    trustClass: "authoritative_machine",
+    producer: "test-harness",
+    correlationRunId: "run-test-0001",
+    subjectIdentity: subjectIdentity(),
+    payload: { kind: "json", value: { note: "hello world" } },
+    ...overrides,
+  };
+}
+
+function freshGenesisRepo(repoRoot: string, ledgerEpochStartSha = "5228d4ea0d7987cf6fb73be216d5b9cc638817c3") {
+  mkdirSync(repoRoot, { recursive: true });
+  appendGenesisRecord(repoRoot, ledgerEpochStartSha, { worktreeId: "epc-01-evidence-event-store" });
+}
+
+describe("decision trail ledger events", () => {
+  test("normalizes cells, reuses genesis and appends a correction without changing old bytes", () => {
+    withTempRepo("decision-event", repoRoot => {
+      initGitRepo(repoRoot);
+      expect(run("git", ["commit", "--allow-empty", "-m", "fixture"], repoRoot).status).toBe(0);
+      freshGenesisRepo(repoRoot);
+      const input = { phase: " build\tstep ", decision: "Use\nledger", why: "One\r\nauthority",
+        evidence: ["src/core/evidence/types.ts:42", "#812"], result: "Implemented", run_id: "session-812" };
+      const first = recordDecision(repoRoot, input);
+      expect(first.event_type).toBe("decision.recorded");
+      expect(first.producer).toBe("decision-trail");
+      expect(first.trust_class).toBe("observed");
+      expect(first.worktree_id).toBe("epc-01-evidence-event-store");
+      expect(first.payload).toEqual({ ...input, phase: "build step", decision: "Use ledger", why: "One authority" });
+      const log = join(repoRoot, ".ai/harness/evidence/events/log.jsonl");
+      const before = readFileSync(log, "utf8");
+      const correction = recordDecision(repoRoot, { ...input, supersedes: first.event_id });
+      expect(correction.event_id).not.toBe(first.event_id);
+      expect(correction.supersedes).toEqual([first.event_id]);
+      expect(readFileSync(log, "utf8").startsWith(before)).toBe(true);
+      expect(readAcceptedEvents(repoRoot).accepted.map(row => row.event_id)).toEqual([correction.event_id]);
+    });
+  });
+
+  test("rejects prose and unsafe evidence before creating a ledger, and cannot replace a verification event", () => {
+    withTempRepo("decision-reject", repoRoot => {
+      initGitRepo(repoRoot);
+      expect(run("git", ["commit", "--allow-empty", "-m", "fixture"], repoRoot).status).toBe(0);
+      const input = { phase: "build", decision: "Use ledger", why: "One authority", evidence: ["#812"], result: "Done" };
+      for (const pointer of ["this is prose", "../private.txt", "/etc/passwd", "C:\\secret.txt", "./result.txt"]) {
+        expect(() => recordDecision(repoRoot, { ...input, evidence: [pointer] })).toThrow("evidence must be");
+      }
+      expect(() => recordDecision(repoRoot, { ...input, decision: "\n\t" })).toThrow("non-empty");
+      expect(existsSync(join(repoRoot, ".ai/harness/evidence/events/log.jsonl"))).toBe(false);
+      freshGenesisRepo(repoRoot);
+      const verification = appendEvidenceEvent(repoRoot, baseInput());
+      expect(() => recordDecision(repoRoot, { ...input, supersedes: verification.event_id })).toThrow("accepted decision-trail");
+      expect(readAcceptedEvents(repoRoot).accepted.map(row => row.event_id)).toEqual([verification.event_id]);
+    });
+  });
+});
+
+describe("evidence event schema and identity", () => {
+  test("event_id is evt-<ULID>, lexicographically sortable and time-embedding", () => {
+    const first = generateEventId();
+    expect(first).toMatch(/^evt-[0-9A-HJKMNP-TV-Z]{26}$/);
+    const earlier = encodeUlid(1_000, new Uint8Array(10));
+    const later = encodeUlid(2_000, new Uint8Array(10));
+    expect(earlier < later).toBe(true);
+    // Same millisecond, different randomness must not collide for reasonable inputs.
+    const a = encodeUlid(5_000, new Uint8Array(10).fill(1));
+    const b = encodeUlid(5_000, new Uint8Array(10).fill(2));
+    expect(a).not.toBe(b);
+    expect(a.slice(0, 10)).toBe(b.slice(0, 10));
+  });
+
+  test("encodeUlid rejects timestamps outside the 48-bit range", () => {
+    expect(() => encodeUlid(-1, new Uint8Array(10))).toThrow();
+    expect(() => encodeUlid(2 ** 48, new Uint8Array(10))).toThrow();
+  });
+
+  test("canonicalize produces identical bytes regardless of key insertion order", () => {
+    const left = canonicalize({ b: 1, a: { d: 2, c: 3 } });
+    const right = canonicalize({ a: { c: 3, d: 2 }, b: 1 });
+    expect(left).toBe(right);
+    expect(left).toBe('{"a":{"c":3,"d":2},"b":1}');
+  });
+
+  test("canonicalize preserves array order (arrays are not sorted)", () => {
+    expect(canonicalize([3, 1, 2])).toBe("[3,1,2]");
+  });
+
+  test("computeIdempotencyKey is deterministic and sensitive to every input field", () => {
+    const base = {
+      subjectIdentity: subjectIdentity(),
+      eventType: "verification.command_run",
+      trustClass: "authoritative_machine" as const,
+      payloadHash: "sha256:" + "e".repeat(64),
+      producer: "test-harness",
+    };
+    const keyA = computeIdempotencyKey(base);
+    const keyB = computeIdempotencyKey(base);
+    expect(keyA).toBe(keyB);
+    expect(keyA).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+    const changedProducer = computeIdempotencyKey({ ...base, producer: "other-producer" });
+    expect(changedProducer).not.toBe(keyA);
+
+    const changedTrust = computeIdempotencyKey({ ...base, trustClass: "observed" });
+    expect(changedTrust).not.toBe(keyA);
+  });
+});
+
+describe("append-only event store", () => {
+  test("genesis-before-append is enforced fail-closed", () => {
+    withTempRepo("evidence-genesis-gate", (repoRoot) => {
+      mkdirSync(repoRoot, { recursive: true });
+      expect(() => appendEvidenceEvent(repoRoot, baseInput())).toThrow(/genesis/i);
+
+      appendGenesisRecord(repoRoot, "5228d4ea0d7987cf6fb73be216d5b9cc638817c3", {
+        worktreeId: "epc-01-evidence-event-store",
+      });
+      const record = appendEvidenceEvent(repoRoot, baseInput());
+      expect(record.event_id).toMatch(/^evt-/);
+    });
+  });
+
+  test("genesis is idempotent for the same epoch sha and fails closed on a conflicting epoch", () => {
+    withTempRepo("evidence-genesis-idempotent", (repoRoot) => {
+      mkdirSync(repoRoot, { recursive: true });
+      const first = appendGenesisRecord(repoRoot, "5228d4ea0d7987cf6fb73be216d5b9cc638817c3", {
+        worktreeId: "epc-01-evidence-event-store",
+      });
+      const second = appendGenesisRecord(repoRoot, "5228d4ea0d7987cf6fb73be216d5b9cc638817c3", {
+        worktreeId: "epc-01-evidence-event-store",
+      });
+      expect(second).toEqual(first);
+
+      expect(() =>
+        appendGenesisRecord(repoRoot, "0000000000000000000000000000000000000000", {
+          worktreeId: "epc-01-evidence-event-store",
+        }),
+      ).toThrow(/epoch/i);
+    });
+  });
+
+  test("many sequential appends land as whole, well-formed JSON lines (append atomicity)", () => {
+    withTempRepo("evidence-append-atomicity", (repoRoot) => {
+      freshGenesisRepo(repoRoot);
+      const total = 50;
+      for (let i = 0; i < total; i++) {
+        appendEvidenceEvent(
+          repoRoot,
+          baseInput({ payload: { kind: "json", value: { i, note: `event-${i}` } } }),
+        );
+      }
+      const logPath = join(repoRoot, ".ai/harness/evidence/events/log.jsonl");
+      const raw = readFileSync(logPath, "utf-8");
+      expect(raw.endsWith("\n")).toBe(true);
+      const lines = raw.split("\n").filter((line) => line.length > 0);
+      // genesis + total events
+      expect(lines.length).toBe(total + 1);
+      for (const line of lines) {
+        expect(() => JSON.parse(line)).not.toThrow();
+      }
+    });
+  });
+
+  test("duplicate-import with an identical idempotency key is a no-op", () => {
+    withTempRepo("evidence-dedup", (repoRoot) => {
+      freshGenesisRepo(repoRoot);
+      const input = baseInput({ correlationRunId: "run-dup-1" });
+      const first = appendEvidenceEvent(repoRoot, input);
+      const second = appendEvidenceEvent(repoRoot, { ...input, correlationRunId: "run-dup-2" });
+      // Same subject/event_type/trust_class/payload/producer -> identical idempotency key.
+      expect(first.idempotency_key).toBe(second.idempotency_key);
+
+      const { accepted } = readAcceptedEvents(repoRoot);
+      expect(accepted.length).toBe(1);
+      expect(accepted[0]!.event_id).toBe(first.event_id);
+    });
+  });
+
+  test("supersedes excludes the superseded event from the accepted set", () => {
+    withTempRepo("evidence-supersedes", (repoRoot) => {
+      freshGenesisRepo(repoRoot);
+      const original = appendEvidenceEvent(
+        repoRoot,
+        baseInput({ payload: { kind: "json", value: { version: 1 } } }),
+      );
+      const replacement = appendEvidenceEvent(
+        repoRoot,
+        baseInput({
+          payload: { kind: "json", value: { version: 2 } },
+          supersedes: [original.event_id],
+        }),
+      );
+
+      const { accepted } = readAcceptedEvents(repoRoot);
+      const ids = accepted.map((event) => event.event_id);
+      expect(ids).not.toContain(original.event_id);
+      expect(ids).toContain(replacement.event_id);
+      expect(accepted.length).toBe(1);
+    });
+  });
+});
+
+describe("D6 construction-invariant safety", () => {
+  const originalEnv = { ...process.env };
+  afterEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  test("known secret env values are never stored raw; replaced with sha256:<hash>", () => {
+    withTempRepo("evidence-redaction-denylist", (repoRoot) => {
+      freshGenesisRepo(repoRoot);
+      const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789AB";
+      process.env.GH_TOKEN = secret;
+      const record = appendEvidenceEvent(
+        repoRoot,
+        baseInput({ payload: { kind: "json", value: { log_excerpt: `token=${secret} end` } } }),
+      );
+
+      const logPath = join(repoRoot, ".ai/harness/evidence/events/log.jsonl");
+      const raw = readFileSync(logPath, "utf-8");
+      expect(raw.includes(secret)).toBe(false);
+      expect(raw).toContain("sha256:");
+      expect(JSON.stringify(record).includes(secret)).toBe(false);
+    });
+  });
+
+  test("high-entropy token runs are redacted even when not on the fixed denylist", () => {
+    withTempRepo("evidence-redaction-entropy", (repoRoot) => {
+      freshGenesisRepo(repoRoot);
+      const token = "Zx9Qk3mP7vRt2Nw8Ly5Ju1Hb6Fg4Ds0Ac";
+      expect(token.length).toBeGreaterThanOrEqual(32);
+      const record = appendEvidenceEvent(
+        repoRoot,
+        baseInput({ payload: { kind: "json", value: { detail: `secret=${token}` } } }),
+      );
+      const logPath = join(repoRoot, ".ai/harness/evidence/events/log.jsonl");
+      const raw = readFileSync(logPath, "utf-8");
+      expect(raw.includes(token)).toBe(false);
+      expect(JSON.stringify(record).includes(token)).toBe(false);
+    });
+  });
+
+  test("absolute paths in payload path fields are rejected fail-closed", () => {
+    withTempRepo("evidence-path-absolute", (repoRoot) => {
+      freshGenesisRepo(repoRoot);
+      expect(() =>
+        appendEvidenceEvent(
+          repoRoot,
+          baseInput({ payload: { kind: "json", value: { file_path: "/etc/passwd" } } }),
+        ),
+      ).toThrow(/absolute|repo-relative/i);
+    });
+  });
+
+  test("path escapes (..) in payload path fields are rejected fail-closed", () => {
+    withTempRepo("evidence-path-escape", (repoRoot) => {
+      freshGenesisRepo(repoRoot);
+      expect(() =>
+        appendEvidenceEvent(
+          repoRoot,
+          baseInput({ payload: { kind: "json", value: { path: "../../etc/passwd" } } }),
+        ),
+      ).toThrow(/traversal|escap/i);
+    });
+  });
+
+  test("repo-relative payload path fields are accepted", () => {
+    withTempRepo("evidence-path-ok", (repoRoot) => {
+      freshGenesisRepo(repoRoot);
+      const record = appendEvidenceEvent(
+        repoRoot,
+        baseInput({ payload: { kind: "json", value: { artifact_path: "tasks/notes/example.md" } } }),
+      );
+      expect(record.payload).toBeDefined();
+    });
+  });
+
+  test("inline payload cap overflows to a content-addressed blob", () => {
+    withTempRepo("evidence-inline-cap", (repoRoot) => {
+      freshGenesisRepo(repoRoot);
+      // Space-separated so no single run reaches the 32-char high-entropy
+      // threshold; this must overflow on size alone, not get redacted first.
+      const big = "word ".repeat(2000);
+      const record = appendEvidenceEvent(
+        repoRoot,
+        baseInput({ payload: { kind: "json", value: { blob_like: big } } }),
+      );
+      expect(record.payload).toBeUndefined();
+      expect(record.blob_sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(record.blob_bytes).toBeGreaterThan(8192 - 1);
+      const blobPath = join(repoRoot, ".ai/harness/evidence/blobs", record.blob_sha256!);
+      expect(existsSync(blobPath)).toBe(true);
+    });
+  });
+
+  test("binary payloads are always offloaded to a blob, never inline", () => {
+    withTempRepo("evidence-binary-blob", (repoRoot) => {
+      freshGenesisRepo(repoRoot);
+      const content = Buffer.from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+      const record = appendEvidenceEvent(
+        repoRoot,
+        baseInput({ payload: { kind: "binary", content, contentType: "application/octet-stream" } }),
+      );
+      expect(record.payload).toBeUndefined();
+      expect(record.blob_sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(record.content_type).toBe("application/octet-stream");
+      const blobPath = join(repoRoot, ".ai/harness/evidence/blobs", record.blob_sha256!);
+      expect(existsSync(blobPath)).toBe(true);
+      expect(readFileSync(blobPath)).toEqual(content);
+    });
+  });
+});
+
+describe("D6 redaction: typed-field exemption (EPC-05 gatekeeper CRITICAL fix)", () => {
+  // Live repro that motivated this fix: evt-01KY4YMNNF0BFAPHV968AX04J6 in the
+  // EPC-05 worktree's own ledger -- a real verify-sprint run against this
+  // package's own realistic-length contract slug mangled review_subject_sha256
+  // (double-prefixed) and every long-slug path in the run_trace.
+  const LONG_SLUG_CONTRACT_PATH = "tasks/contracts/20260722-1929-epc-05-checks-latest-materializer.contract.md";
+  const LONG_SLUG_RUN_FILE = ".ai/harness/runs/run-20260722T210100-99999-20260722-1929-epc-05-checks-latest-materializer.json";
+  const LONG_SLUG_ACTIVE_PLAN = "plans/plan-20260722-1929-epc-05-checks-latest-materializer.md";
+
+  test("a declared hash value (bare 40-char git SHA, bare 64-char hex, or sha256:-prefixed) is exempt from entropy redaction", () => {
+    const bareSha40 = "5228d4ea0d7987cf6fb73be216d5b9cc638817c3";
+    const prefixedSha256 = "sha256:" + "a".repeat(64);
+    const bareSha256 = "b".repeat(64);
+    const result = redactPayloadStrings({ a: bareSha40, b: prefixedSha256, c: bareSha256 }, []) as Record<string, string>;
+    expect(result).toEqual({ a: bareSha40, b: prefixedSha256, c: bareSha256 });
+  });
+
+  test("double-prefix regression: an already sha256:-prefixed hash value is never re-hashed to sha256:sha256:...", () => {
+    const subjectHash = "sha256:" + "d".repeat(64);
+    const result = redactPayloadStrings({ review_subject_sha256: subjectHash }, []) as { review_subject_sha256: string };
+    expect(result.review_subject_sha256).toBe(subjectHash);
+    expect(result.review_subject_sha256).not.toMatch(/^sha256:sha256:/);
+  });
+
+  test("a hash embedded inside a longer free-text string is NOT exempt -- whole-value match only", () => {
+    const embedded = `contract sha256:${"c".repeat(64)} failed`;
+    const result = redactPayloadStrings({ message: embedded }, []) as { message: string };
+    expect(result.message).not.toBe(embedded);
+    expect(result.message.startsWith("contract ")).toBe(true);
+    expect(result.message.endsWith(" failed")).toBe(true);
+  });
+
+  test("a path-key-convention field (path/_path/Path suffix) is exempt from entropy redaction regardless of value shape", () => {
+    const result = redactPayloadStrings(
+      { contract_path: LONG_SLUG_CONTRACT_PATH, filePath: LONG_SLUG_CONTRACT_PATH, path: LONG_SLUG_CONTRACT_PATH },
+      [],
+    ) as Record<string, string>;
+    expect(result.contract_path).toBe(LONG_SLUG_CONTRACT_PATH);
+    expect(result.filePath).toBe(LONG_SLUG_CONTRACT_PATH);
+    expect(result.path).toBe(LONG_SLUG_CONTRACT_PATH);
+  });
+
+  test("a whole-value safe repo-relative path is exempt even when the key does not follow the path-key convention (run_file, lifecycle.snapshot, contract.file, active_plan)", () => {
+    const result = redactPayloadStrings(
+      {
+        run_file: LONG_SLUG_RUN_FILE,
+        lifecycle: { snapshot: LONG_SLUG_RUN_FILE },
+        contract: { file: LONG_SLUG_CONTRACT_PATH },
+        active_plan: LONG_SLUG_ACTIVE_PLAN,
+      },
+      [],
+    ) as { run_file: string; lifecycle: { snapshot: string }; contract: { file: string }; active_plan: string };
+    expect(result.run_file).toBe(LONG_SLUG_RUN_FILE);
+    expect(result.lifecycle.snapshot).toBe(LONG_SLUG_RUN_FILE);
+    expect(result.contract.file).toBe(LONG_SLUG_CONTRACT_PATH);
+    expect(result.active_plan).toBe(LONG_SLUG_ACTIVE_PLAN);
+  });
+
+  test("repo-harness schema and kind discriminants survive while arbitrary long values under those keys remain redacted", () => {
+    const schema = "repo-harness-change-assessment-evidence.v1";
+    const kind = "repo-harness-review-selection-packet";
+    const token = "Zx9Qk3mP7vRt2Nw8Ly5Ju1Hb6Fg4Ds0Ac";
+    const prefixedToken = `repo-harness-${token.toLowerCase()}`;
+    const result = redactPayloadStrings({ schema, kind, nested: { schema: token, kind: prefixedToken } }, []) as {
+      schema: string;
+      kind: string;
+      nested: { schema: string; kind: string };
+    };
+    expect(result.schema).toBe(schema);
+    expect(result.kind).toBe(kind);
+    expect(result.nested.schema).not.toBe(token);
+    expect(result.nested.kind).not.toBe(prefixedToken);
+  });
+
+  test("Change Assessment oracle IDs survive only at the fingerprinted required_oracles path", () => {
+    const oracleId = "published-package-runtime-readback";
+    expect(oracleId.length).toBeGreaterThanOrEqual(32);
+    const result = redactPayloadStrings({
+      change_assessment: {
+        assessment: { required_oracles: [{ id: oracleId }] },
+        selection_packet: { required_oracles: [{ id: oracleId }] },
+      },
+      unrelated: { id: oracleId },
+    }, []) as {
+      change_assessment: {
+        assessment: { required_oracles: Array<{ id: string }> };
+        selection_packet: { required_oracles: Array<{ id: string }> };
+      };
+      unrelated: { id: string };
+    };
+    expect(result.change_assessment.assessment.required_oracles[0]?.id).toBe(oracleId);
+    expect(result.change_assessment.selection_packet.required_oracles[0]?.id).toBe(oracleId);
+    expect(result.unrelated.id).not.toBe(oracleId);
+  });
+
+  test("known-secret matching still redacts a Change Assessment oracle ID", () => {
+    const oracleId = "published-package-runtime-readback";
+    const result = redactPayloadStrings({ required_oracles: [{ id: oracleId }] }, [oracleId]) as {
+      required_oracles: Array<{ id: string }>;
+    };
+    expect(result.required_oracles[0]?.id).not.toContain(oracleId);
+    expect(result.required_oracles[0]?.id).toContain("sha256:");
+  });
+
+  test("native check IDs retain identity while known secrets and unrelated IDs stay redacted", () => {
+    const id = "package-test-packages-client-tests-requires-package-config-test-ts";
+    const payload = { check_id: id, result: { id }, results: [{ id }], evaluation: { unmet_check_ids: [id] } };
+    expect(redactPayloadStrings(payload, [])).toEqual(payload);
+    const secret = redactPayloadStrings(payload, [id]);
+    expect(JSON.stringify(secret)).not.toContain(id);
+    const untyped = { unrelated: { id }, results: { attacker: { id } }, unmet_check_ids: { attacker: id } };
+    const masked = redactPayloadStrings(untyped, []) as typeof untyped;
+    expect(masked.unrelated.id).not.toBe(id);
+    expect(masked.results.attacker.id).not.toBe(id);
+    expect(masked.unmet_check_ids.attacker).not.toBe(id);
+  });
+
+  test("array entries that are whole-value safe repo-relative paths are exempt too (allowed_paths/files_changed)", () => {
+    const result = redactPayloadStrings(
+      { allowed_paths: [LONG_SLUG_CONTRACT_PATH, "scripts/verify-sprint.sh"] },
+      [],
+    ) as { allowed_paths: string[] };
+    expect(result.allowed_paths).toEqual([LONG_SLUG_CONTRACT_PATH, "scripts/verify-sprint.sh"]);
+  });
+
+  test("a path-shaped value with a .. traversal segment is NOT exempt and still gets entropy-redacted", () => {
+    const withTraversal = "../" + "a".repeat(40) + "/nested.txt";
+    const result = redactPayloadStrings({ note: withTraversal }, []) as { note: string };
+    expect(result.note).not.toBe(withTraversal);
+  });
+
+  test("the secret-value denylist still fires inside an exempted (path-shaped) field", () => {
+    const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789AB";
+    const pathWithSecret = `tasks/contracts/${secret}.contract.md`;
+    const result = redactPayloadStrings({ contract_path: pathWithSecret }, [secret]) as { contract_path: string };
+    expect(result.contract_path).not.toContain(secret);
+    expect(result.contract_path).toContain("sha256:");
+  });
+
+  test("the secret-value denylist still fires inside an exempted (declared-hash-shaped) field", () => {
+    const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789AB";
+    // Not hash-shaped once the secret is embedded (fails the whole-value hash
+    // pattern), but proves the denylist pass is unconditional regardless.
+    const result = redactPayloadStrings({ token_ref: secret }, [secret]) as { token_ref: string };
+    expect(result.token_ref).not.toContain(secret);
+    expect(result.token_ref).toContain("sha256:");
+  });
+
+  test("free-text fields keep entropy redaction unchanged (no exemption applies)", () => {
+    const token = "Zx9Qk3mP7vRt2Nw8Ly5Ju1Hb6Fg4Ds0Ac";
+    expect(token.length).toBeGreaterThanOrEqual(32);
+    const result = redactPayloadStrings({ detail: `secret=${token}` }, []) as { detail: string };
+    expect(result.detail).not.toContain(token);
+    expect(result.detail).toContain("sha256:");
+  });
+
+  test("end-to-end: a realistic run_trace payload with a long contract slug survives appendEvidenceEvent byte-intact for its consumer-facing fields", () => {
+    withTempRepo("evidence-redaction-run-trace-e2e", (repoRoot) => {
+      freshGenesisRepo(repoRoot);
+      const runTrace = {
+        schema: "repo-harness-run-trace.v1",
+        status: "pass",
+        review_subject_sha256: "sha256:" + "e".repeat(64),
+        run_file: LONG_SLUG_RUN_FILE,
+        lifecycle: { snapshot: LONG_SLUG_RUN_FILE },
+        contract: { file: LONG_SLUG_CONTRACT_PATH },
+        active_plan: LONG_SLUG_ACTIVE_PLAN,
+      };
+      const record = appendEvidenceEvent(
+        repoRoot,
+        baseInput({ payload: { kind: "json", value: { run_trace: runTrace } } }),
+      );
+      const stored = (record.payload as { run_trace: unknown }).run_trace;
+      expect(stored).toEqual(runTrace);
+    });
+  });
+});
+
+test("declared path arrays preserve extensionless files through ledger redaction", () => {
+  const path = "deploy/workload-container/Dockerfile";
+  const payload = { change_assessment: { assessment: { subject_paths: [path], selected_paths: [path], reasons: [{ paths: [path] }] }, selection_packet: { subject_paths: [path] } } };
+  expect(redactPayloadStrings(payload, [])).toEqual(payload);
+  withTempRepo("evidence-extensionless-path", root => {
+    freshGenesisRepo(root);
+    const record = appendEvidenceEvent(root, baseInput({ payload: { kind: "json", value: payload } }));
+    expect(record.payload).toEqual(payload);
+  });
+});
+test("declared path arrays do not exempt known secrets, traversal or free text", () => {
+  const path = "deploy/workload-container/Dockerfile";
+  expect(redactPayloadStrings({ subject_paths: [path] }, [path])).not.toEqual({ subject_paths: [path] });
+  for (const value of ["../" + path, "/" + path, "token=" + "a".repeat(40)]) {
+    expect(redactPayloadStrings({ subject_paths: [value] }, [])).not.toEqual({ subject_paths: [value] });
+  }
+  expect(redactPayloadStrings({ note: path }, [])).not.toEqual({ note: path });
+});
+
+test("declared extensionless path arrays still redact unknown token segments in the ledger", () => {
+  const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789AB";
+  for (const collection of ["paths", "subject_paths", "selected_paths", "allowed_paths", "files_changed", "reviewed_paths"]) {
+    const payload = { [collection]: ["deploy/" + token] };
+    expect(JSON.stringify(redactPayloadStrings(payload, []))).not.toContain(token);
+    withTempRepo("evidence-path-token", root => {
+      freshGenesisRepo(root);
+      const record = appendEvidenceEvent(root, baseInput({ payload: { kind: "json", value: payload } }));
+      expect(JSON.stringify(record.payload)).not.toContain(token);
+    });
+  }
+});
+
+test('admitted review ledger identity binds grant and plan without borrowing contract identity', async () => {
+  const { parseLogLine } = await import('../src/core/evidence/fold');
+  const { contract_hash: _retired, ...basis } = subjectIdentity() as import('../src/core/evidence/types').ContractSubjectIdentity;
+  const identity: import('../src/core/evidence/types').AdmittedReviewSubjectIdentity = { ...basis,
+    authority_kind: 'review-admission', campaign_sha256: 'sha256:' + '1'.repeat(64),
+    admission_sha256: 'sha256:' + '2'.repeat(64), grant_sha256: 'sha256:' + '3'.repeat(64), plan_hash: 'sha256:' + '4'.repeat(64) };
+  const input = { subjectIdentity: identity, eventType: 'verification_execution.result', trustClass: 'authoritative_machine' as const,
+    payloadHash: 'sha256:' + '5'.repeat(64), producer: 'verification-execution' };
+  const key = computeIdempotencyKey(input);
+  expect(computeIdempotencyKey({ ...input, subjectIdentity: { ...identity, grant_sha256: 'sha256:' + '6'.repeat(64) } })).not.toBe(key);
+  expect(computeIdempotencyKey({ ...input, subjectIdentity: { ...identity, plan_hash: 'sha256:' + '7'.repeat(64) } })).not.toBe(key);
+  const event = { kind: 'evidence_event', schema_version: 1, worktree_id: 'fixture', event_id: 'fixture-event', correlation_run_id: 'fixture-run',
+    event_type: input.eventType, trust_class: input.trustClass, producer: input.producer, subject_identity: identity,
+    idempotency_key: key, payload_hash: input.payloadHash, payload: { protocol: 2 }, created_at: '2026-10-25T00:00:00Z' };
+  expect(parseLogLine(JSON.stringify(event)).ok).toBe(true);
+  expect(parseLogLine(JSON.stringify({ ...event, subject_identity: { ...identity, contract_hash: 'retired' } })).ok).toBe(false);
+  const { grant_sha256: _missing, ...incomplete } = identity;
+  expect(parseLogLine(JSON.stringify({ ...event, subject_identity: incomplete })).ok).toBe(false);
+});

@@ -1,0 +1,162 @@
+#!/usr/bin/env bun
+import { tmpdir } from 'os';
+import { execFileSync } from 'child_process';
+import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmdirSync, writeFileSync } from 'fs';
+import { basename, dirname, join, resolve } from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const packageRoot = basename(scriptDir) === 'helpers' ? resolve(scriptDir, '../../..') : resolve(scriptDir, '..');
+const [action, ...args] = process.argv.slice(2);
+if (action === 'default-template') {
+  const { defaultWorktreeTemplate } = await import(pathToFileURL(join(packageRoot, 'src/core/worktree-location.mjs')).href);
+  console.log(defaultWorktreeTemplate(process.platform, tmpdir()));
+  process.exit(0);
+}
+const { configuredGitBinary } = await import(pathToFileURL(join(packageRoot, 'src/effects/git/common-directory.ts')).href) as typeof import('../src/effects/git/common-directory');
+const value = (key: string) => { const at = args.indexOf(key); if (at < 0 || !args[at + 1]) throw new Error(`runtime requires ${key}`); return args[at + 1]!; };
+function markActiveWorktree(worktree: string): void {
+  const canonical = realpathSync(worktree);
+  let directory = canonical;
+  for (const part of ['.ai', 'harness']) {
+    directory = join(directory, part);
+    try { lstatSync(directory); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; mkdirSync(directory, { mode: 0o700 }); }
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('active-worktree marker directory is unsafe');
+  }
+  const marker = join(directory, 'active-worktree');
+  try {
+    const stat = lstatSync(marker);
+    if (!stat.isFile() || stat.isSymbolicLink() || readFileSync(marker, 'utf8').trim() !== canonical) throw new Error('active-worktree marker has another owner');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    writeFileSync(marker, canonical + '\n', { flag: 'wx', mode: 0o600 });
+  }
+}
+try {
+  if (action === 'issue-fields') {
+    const issue = JSON.parse(value('--json')) as { number?: unknown; title?: unknown; state?: unknown; url?: unknown };
+    if (typeof issue.number !== 'number' || !Number.isInteger(issue.number) || issue.number <= 0
+      || typeof issue.title !== 'string' || typeof issue.state !== 'string' || typeof issue.url !== 'string') {
+      throw new Error('invalid issue JSON');
+    }
+    process.stdout.write([issue.number, issue.title, issue.state, issue.url].join('\0') + '\0');
+  } else if (action === 'assert-unused-path' || action === 'check-start-path') {
+    if (action === 'check-start-path') {
+      // Start is the only creator of managed worktrees, so it also retires
+      // merged ones before it reads the topology. Each destructive step takes
+      // the topology lock. A sweep failure is reported and never blocks start.
+      // An operator command can wait longer than the sweep's hook-era default.
+      const { sweepManagedWorktrees } = await import(pathToFileURL(join(packageRoot, 'src/effects/state/coordination-worktree-topology.ts')).href) as typeof import('../src/effects/state/coordination-worktree-topology');
+      const sweep = sweepManagedWorktrees(value('--repo'), process.cwd(), process.env, { deadlineMs: 30_000 });
+      if (sweep) console.error(sweep);
+    }
+    let stat;
+    try { stat = lstatSync(value('--worktree')); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (stat) {
+      if (action === 'assert-unused-path' || args.includes('--fresh') || !stat.isDirectory() || stat.isSymbolicLink()) throw new Error('target worktree path already exists');
+      const { withWorktreeTopologyLock, assertReusableWorktree } = await import(pathToFileURL(join(packageRoot, 'src/effects/state/coordination-worktree-topology.ts')).href) as typeof import('../src/effects/state/coordination-worktree-topology');
+      withWorktreeTopologyLock(value('--repo'), () => {
+        const canonical = realpathSync(value('--worktree'));
+        assertReusableWorktree(value('--repo'), canonical, value('--branch'));
+        markActiveWorktree(canonical);
+      });
+    }
+  } else if (action === 'sweep') {
+    const { sweepManagedWorktrees } = await import(pathToFileURL(join(packageRoot, 'src/effects/state/coordination-worktree-topology.ts')).href) as typeof import('../src/effects/state/coordination-worktree-topology');
+    console.log(sweepManagedWorktrees(value('--repo'), process.cwd(), process.env, { deadlineMs: 30_000 }) ?? '[WorktreeSweep] no managed worktrees');
+  } else if (action === 'add-worktree') {
+    const { withWorktreeTopologyLock, recordCreatedWorktree } = await import(pathToFileURL(join(packageRoot, 'src/effects/state/coordination-worktree-topology.ts')).href) as typeof import('../src/effects/state/coordination-worktree-topology');
+    withWorktreeTopologyLock(value('--repo'), () => {
+      const worktree = value('--worktree');
+      mkdirSync(dirname(worktree), { recursive: true });
+      // mkdir is the exclusive path claim. It refuses files and all symlinks.
+      mkdirSync(worktree, { mode: 0o700 });
+      const canonical = realpathSync(worktree);
+      const gitArgs = args.includes('--new-branch')
+        ? ['worktree', 'add', '-b', value('--branch'), canonical, value('--base')]
+        : ['worktree', 'add', canonical, value('--branch')];
+      const claim = lstatSync(worktree);
+      try { execFileSync(configuredGitBinary(), gitArgs, { cwd: value('--repo'), stdio: 'inherit' }); }
+      catch (error) {
+        try {
+          const current = lstatSync(worktree);
+          if (current.isDirectory() && !current.isSymbolicLink() && current.dev === claim.dev && current.ino === claim.ino && readdirSync(worktree).length === 0) rmdirSync(worktree);
+        } catch (rollbackError) { if ((rollbackError as NodeJS.ErrnoException).code !== 'ENOENT') console.error('worktree claim rollback incomplete: ' + String(rollbackError)); }
+        throw error;
+      }
+      try { recordCreatedWorktree(value('--repo'), worktree); }
+      catch (error) {
+        throw new Error(`Git created checkout ${canonical} and branch ${value('--branch')}, but start could not save its recovery identity: ${String(error)}. Keep the checkout. Managed cleanup cannot prove ownership without that identity. After merge proof, remove it manually from the main checkout: git worktree remove ${canonical}; git branch -D ${value('--branch')}. Or start with a new --path and --branch.`);
+      }
+      markActiveWorktree(worktree);
+    });
+  } else if (action === 'mark-active') {
+    const { withWorktreeTopologyLock, assertReusableWorktree } = await import(pathToFileURL(join(packageRoot, 'src/effects/state/coordination-worktree-topology.ts')).href) as typeof import('../src/effects/state/coordination-worktree-topology');
+    withWorktreeTopologyLock(value('--repo'), () => {
+      assertReusableWorktree(value('--repo'), realpathSync(value('--worktree')), value('--branch'));
+      markActiveWorktree(value('--worktree'));
+    });
+  } else if (action === 'end-record') {
+    const { readWorktreeRecord, endWorktreeRecord } = await import(pathToFileURL(join(packageRoot, 'src/effects/git/worktree-record.ts')).href) as typeof import('../src/effects/git/worktree-record');
+    const { resolveGitCommonDirectory } = await import(pathToFileURL(join(packageRoot, 'src/effects/git/common-directory.ts')).href) as typeof import('../src/effects/git/common-directory');
+    const common = resolveGitCommonDirectory(value('--repo'));
+    endWorktreeRecord(common, readWorktreeRecord(common, value('--worktree')), 'closed');
+  } else if (action === 'record') {
+    const { recordWorktree } = await import(pathToFileURL(join(packageRoot, 'src/effects/git/worktree-record.ts')).href) as typeof import('../src/effects/git/worktree-record');
+    const creator = value('--creator');
+    if (!['contract', 'portal', 'manual'].includes(creator)) throw new Error('invalid worktree creator');
+    console.log(JSON.stringify(recordWorktree(value('--repo'), value('--worktree'), {
+      creator: creator as 'contract' | 'portal' | 'manual', purpose: value('--purpose'),
+      task_id: args.includes('--task') ? value('--task') : null,
+      pull_request: args.includes('--pr') ? Number(value('--pr')) : null,
+    })));
+  } else if (action === 'register' || action === 'notify-merged' || action === 'cleanup') {
+    const { cleanupTaskWorktree, notifyTaskWorktreeMerged, registerTaskWorktree } = await import(pathToFileURL(join(packageRoot, 'src/effects/terminal/runtime-closeout.ts')).href) as typeof import('../src/effects/terminal/runtime-closeout');
+    const { classicRecordRetired } = await import(pathToFileURL(join(packageRoot, 'src/effects/terminal/task-session-record.ts')).href) as typeof import('../src/effects/terminal/task-session-record');
+    const { readSessionArtifact } = await import(pathToFileURL(join(packageRoot, 'src/effects/terminal/task-session-io.ts')).href) as typeof import('../src/effects/terminal/task-session-io');
+    if (action === 'register') {
+      const input = readSessionArtifact<{ endpoint: import('../src/effects/terminal/task-session-record').HerdrCoreEndpoint }>(value('--endpoint'));
+      // The address file holds the endpoint only; a parent pane or terminal field is a retired shape.
+      if (Object.keys(input).join() !== 'endpoint') classicRecordRetired(value('--endpoint'));
+      console.log(JSON.stringify(await registerTaskWorktree(value('--worktree'), input.endpoint)));
+    } else if (action === 'notify-merged') {
+      const result = await notifyTaskWorktreeMerged(value('--repo'), value('--owner'), {
+        pr: Number(value('--pr')), merge_sha: value('--merge'), worktree: value('--worktree'), branch: value('--branch'),
+      });
+      console.log(JSON.stringify(result));
+      if (result.status === 'retained') process.exitCode = 1;
+    } else if (action === 'cleanup') {
+      const result = await cleanupTaskWorktree(value('--repo'), value('--worktree'), args.includes('--dry-run'));
+      console.log(JSON.stringify(result));
+      if (result.status === 'cleanup_pending') process.exitCode = 1;
+    }
+  } else if (action === 'assert-ignored-cleanup-safe') {
+    const { assertNoIgnoredCloseoutData } = await import(pathToFileURL(join(packageRoot, 'src/effects/state/coordination-worktree-topology.ts')).href) as typeof import('../src/effects/state/coordination-worktree-topology');
+    assertNoIgnoredCloseoutData(value('--worktree'));
+  } else if (action === 'remove-exact') {
+    const { removeExactWorktree } = await import(pathToFileURL(join(packageRoot, 'src/effects/state/coordination-worktree-topology.ts')).href) as typeof import('../src/effects/state/coordination-worktree-topology');
+    removeExactWorktree(value('--repo'), {
+      worktree: value('--worktree') === '(absent)' ? '' : value('--worktree'),
+      branch: value('--branch'), head_sha: value('--head'), target_ref: value('--target'),
+      target_oid: value('--target-oid'), merge_commit_sha: value('--merge'),
+    }, { closeout: true });
+  } else if (action === 'stop-architecture-daemons') {
+    const { checkoutPath } = await import(pathToFileURL(join(packageRoot, 'src/effects/state/coordination-worktree-topology.ts')).href) as typeof import('../src/effects/state/coordination-worktree-topology');
+    const { architecturePort, isArchitectureUnavailable } = await import(pathToFileURL(join(packageRoot, 'src/core/architecture/contracts.ts')).href) as typeof import('../src/core/architecture/contracts');
+    const { readRecordedSelection, registerSelectedArchitecturePorts } = await import(pathToFileURL(join(packageRoot, 'src/cli/installer/architecture-selection.ts')).href) as typeof import('../src/cli/installer/architecture-selection');
+    await registerSelectedArchitecturePorts(readRecordedSelection(), async () => (await import(pathToFileURL(join(packageRoot, 'src/effects/architecture/providers.ts')).href) as typeof import('../src/effects/architecture/providers')).ARCHITECTURE_PROVIDERS);
+    const runtime = architecturePort('runtime');
+    const worktree = checkoutPath(value('--worktree'));
+    // Without the plugin the closeout starts no archctx and stops nothing. A daemon that started while the plugin was selected keeps running after a deselection.
+    if (isArchitectureUnavailable(runtime) && runtime.code === 'ARCHITECTURE_PLUGIN_NOT_SELECTED') {
+      console.log(JSON.stringify({ schemaVersion: 'repo-harness.architecture-daemon-stop/v1', worktree, provider: 'disabled', stopped: [], failures: [] }));
+    } else {
+      if (isArchitectureUnavailable(runtime)) throw new Error(runtime.message);
+      const report = runtime.stopWorkspaceDaemons(value('--repo'), worktree);
+      console.log(JSON.stringify(report));
+      if (report.failures.length > 0) process.exitCode = 1;
+    }
+  } else throw new Error('unknown worktree runtime action');
+} catch (error) { console.error(String(error)); process.exitCode = 1; }

@@ -1,0 +1,52 @@
+import { spawnSync } from 'child_process';
+import type { BoardHostPortsV1 } from '../../core/board/board';
+import { projectBoardParents, type BoardParentsV1 } from '../../core/board/parents';
+import { decodeOpenIssuesRead } from '../../core/board/source';
+
+const GH_TIMEOUT_MS = 60_000;
+
+/** The open issues of the local repository with their sub-issue counts, newest update first; gh follows `endCursor`. */
+export const OPEN_ISSUES_QUERY = `query($owner: String!, $name: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    databaseId nameWithOwner
+    issues(states: OPEN, first: 100, after: $endCursor, orderBy: { field: UPDATED_AT, direction: DESC }) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number title url updatedAt subIssuesSummary { total completed } }
+    }
+  }
+}`;
+
+/** A failed GitHub read refuses the parent facts document. */
+export class BoardParentsError extends Error {
+  constructor(readonly code: 'parents_github_failed', message: string) {
+    super(message);
+    this.name = 'BoardParentsError';
+  }
+}
+
+export interface BoardParentsCollectInput {
+  readonly repo_root: string;
+  /** Kept in the CLI composition input; parent facts do not read hc. */
+  readonly host: BoardHostPortsV1;
+  /** Effect seam for tests: answers the gh argument list. */
+  readonly gh_runner?: (args: readonly string[]) => { readonly status: number; readonly stdout: string; readonly stderr?: string };
+  readonly now?: () => Date;
+}
+
+/** One paginated GitHub read. gh resolves the repository from the checkout. */
+export function collectBoardParents(input: BoardParentsCollectInput): BoardParentsV1 {
+  const observedAt = (input.now?.() ?? new Date()).toISOString();
+  const args = ['api', 'graphql', '--hostname', 'github.com', '--paginate', '--slurp', '-f', `query=${OPEN_ISSUES_QUERY}`, '-F', 'owner={owner}', '-F', 'name={repo}'];
+  const result = input.gh_runner?.(args) ?? spawnSync(process.env.REPO_HARNESS_GH_BIN ?? 'gh', args, {
+    cwd: input.repo_root, env: { ...process.env, GH_HOST: 'github.com' }, encoding: 'utf-8', timeout: GH_TIMEOUT_MS, killSignal: 'SIGKILL',
+  });
+  if (result.status !== 0) throw new BoardParentsError('parents_github_failed', `gh api graphql failed: ${(result.stderr ?? '').trim() || `exit ${result.status}`}`);
+  let pages: unknown;
+  try {
+    pages = JSON.parse(result.stdout);
+  } catch {
+    throw new BoardParentsError('parents_github_failed', 'gh api graphql returned invalid JSON');
+  }
+  const issues = decodeOpenIssuesRead(pages);
+  return projectBoardParents({ observed_at: observedAt, issues });
+}

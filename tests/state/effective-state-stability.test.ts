@@ -1,0 +1,244 @@
+import { describe, expect, test } from 'bun:test';
+import {
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
+import { join } from 'path';
+import { spawn, spawnSync } from 'child_process';
+import {
+  CONTRACT,
+  createEffectiveStateFixture,
+  makeFreshEvidence,
+  writeFixture,
+  writeFixtureStateLock,
+} from './effective-state-fixture';
+import { resolveEffectiveState, resolveEffectiveStateReadOnly } from '../../src/effects/state/resolve-effective-state';
+import { runMutationGuard } from '../../src/cli/hook/mutation-guard';
+import { hookIdentity } from '../helpers/hook-identity';
+import type { EffectiveState } from '../../src/core/state/types';
+
+// hook-guard-stability regression guard (2026-07-23 root-cause-prover
+// diagnosis, .ai/harness/runs/hook-guard-stability/diagnosis-probes/).
+//
+// Root cause: resolveStableEffectiveState's stability contract
+// (src/effects/state/resolve-effective-state.ts) compares the FULL
+// source_hashes map -- including non-authority, high-churn surfaces such as
+// checks/change-assessment.latest.json and the review_subject working-tree
+// diff fingerprint -- between re-reads, and
+// throws `StateResolutionUnstableError` whenever any one of them differs. The
+// hook wrapper
+// (src/cli/hook/runtime.ts) collapses that throw into `null`, which
+// mutation-guard.ts cannot distinguish from a genuine blocker, so it fails
+// closed with the generic "Deterministic workflow profile resolution
+// failed" banner -- blocking innocent edits on ordinary concurrent work
+// (bun test, git commands, evidence-cache writes) rather than on anything
+// wrong with the plan/contract themselves.
+//
+// This guard proves both falsifier directions named in the task contract
+// (tasks/contracts/20260723-0620-hook-guard-stability.contract.md):
+//   (a) churn confined to a non-authority source must not abort resolution
+//       or lose its resolved profile.
+//   (b) a genuine plan-contract conflict remains a state blocker and an edit
+//       observation, without gating ordinary edits.
+//
+// On unfixed code, direction (a) is expected to be RED (the resolution
+// throws under sustained non-authority churn, so `failure` is non-null and
+// the assertions below fail); direction (b) already holds today and stays
+// green across the fix. Only the DESIRED end state is asserted here -- no
+// assertion encodes today's bug as expected behavior.
+
+const CHECKS_RELATIVE_PATH = '.ai/harness/checks/change-assessment.latest.json';
+
+interface ContinuousMutator {
+  readonly startedPath: string;
+  readonly stopPath: string;
+  readonly counterPath: string;
+  readonly done: Promise<void>;
+}
+
+/**
+ * Deterministically churns `relativePath` from a detached shell process for
+ * the whole lifetime of the caller's critical section, with no sleep-based
+ * timing race: mirrors tests/state/state-concurrency.test.ts's "continuous
+ * capability-registry mutation overlaps resolution" barrier technique.
+ *
+ * The mutator first claims the given fake lock-owner file (created via
+ * writeFixtureStateLock with this process's own pid, so it cannot be
+ * reclaimed as stale), mutates the target once, signals "started", THEN
+ * releases the fake lock -- guaranteeing the caller's own
+ * resolveEffectiveState call (which blocks on the same lock) cannot begin
+ * its own reads until at least one mutation has already landed -- and keeps
+ * mutating in a tight loop with no delay until the stop file appears, so
+ * every read taken during the caller's critical section observes fresh
+ * churn regardless of host speed.
+ */
+function spawnContinuousMutator(opts: {
+  readonly cwd: string;
+  readonly relativePath: string;
+  readonly ownerPath: string;
+  readonly lockPath: string;
+}): ContinuousMutator {
+  const stateDir = join(opts.cwd, '.ai/harness/state');
+  mkdirSync(stateDir, { recursive: true });
+  const startedPath = join(stateDir, 'stability-guard-mutator-started');
+  const stopPath = join(stateDir, 'stability-guard-mutator-stop');
+  const counterPath = join(stateDir, 'stability-guard-mutator-count');
+  const targetPath = join(opts.cwd, opts.relativePath);
+  const mutator = spawn('sh', [
+    '-c',
+    [
+      'i=0',
+      'printf " " >> "$1"',
+      'i=$((i + 1))',
+      'printf "%s\\n" "$i" > "$5"',
+      'printf "started\\n" > "$2"',
+      'rm -f "$3"',
+      'rmdir "$4"',
+      'while [ ! -f "$6" ]; do',
+      '  printf " " >> "$1"',
+      '  i=$((i + 1))',
+      'done',
+      'printf "%s\\n" "$i" > "$5"',
+    ].join('\n'),
+    'mutate-effective-state-non-authority-source',
+    targetPath,
+    startedPath,
+    opts.ownerPath,
+    opts.lockPath,
+    counterPath,
+    stopPath,
+  ], { stdio: 'ignore' });
+  const done = new Promise<void>((resolvePromise, rejectPromise) => {
+    mutator.once('exit', (code) => (code === 0
+      ? resolvePromise()
+      : rejectPromise(new Error(`fixture mutator exited ${code}`))));
+    mutator.once('error', rejectPromise);
+  });
+  return { startedPath, stopPath, counterPath, done };
+}
+
+/** Bounded, non-sleep-race busy wait for a barrier file (same idiom as
+ * tests/state/state-concurrency.test.ts): polls for existence, capped at 5s. */
+function waitForBarrier(path: string): void {
+  const barrier = spawnSync('sh', [
+    '-c',
+    'i=0; while [ ! -f "$1" ]; do i=$((i + 1)); [ "$i" -lt 500 ] || exit 1; sleep 0.01; done',
+    'wait-mutator',
+    path,
+  ]);
+  if (barrier.status !== 0) throw new Error(`fixture mutator did not start in time: ${path}`);
+}
+
+describe('Effective State stability contract: authority-only partition (hook-guard-stability)', () => {
+  test('state resolution does not capture retired verification evidence', () => {
+    const fixture = createEffectiveStateFixture();
+    const previousTrace = process.env.GIT_TRACE2_EVENT;
+    try {
+      const nowMs = Date.now();
+      makeFreshEvidence(fixture.cwd, nowMs);
+      const risk = { targetPaths: ['src/feature.ts'], operationKind: 'feature' } as const;
+      const trace = join(fixture.cwd, '.ai/harness/runs/git-trace.jsonl');
+      process.env.GIT_TRACE2_EVENT = trace;
+      const captureCount = () => readFileSync(trace, 'utf8').trim().split('\n')
+        .map(line => JSON.parse(line) as { event: string; argv?: string[] })
+        .filter(event => event.event === 'start' && event.argv?.includes('write-tree')).length;
+
+      writeFileSync(trace, '');
+      const fresh = resolveEffectiveState(fixture.cwd, nowMs, risk);
+      // Each exact capture checks two complete virtual trees. The comparison
+      // and commit confirmation consume only authority hashes.
+      expect(captureCount()).toBe(0);
+
+      writeFileSync(trace, '');
+      resolveEffectiveStateReadOnly(fixture.cwd, nowMs, risk);
+      expect(captureCount()).toBe(0);
+
+      const report = JSON.parse(readFileSync(join(fixture.cwd, '.ai/harness/runs/state-fixture-report.json'), 'utf8'));
+      rmSync(join(fixture.cwd, report.results[0].run_file));
+      const changed = resolveEffectiveState(fixture.cwd, nowMs, risk);
+      expect(changed.authority_revision).toBe(fresh.authority_revision);
+    } finally {
+      if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT;
+      else process.env.GIT_TRACE2_EVENT = previousTrace;
+      fixture.cleanup();
+    }
+  }, 15_000);
+
+  test('sustained churn confined to a non-authority source (checks/change-assessment.latest.json) does not abort resolution', async () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const risk = { targetPaths: ['src/feature.ts'], operationKind: 'feature' } as const;
+      const { ownerPath, lockPath } = writeFixtureStateLock(fixture.cwd, {
+        pid: process.pid,
+        created_at: Date.now(),
+        token: 'stability-guard-non-authority-barrier',
+      });
+      const mutator = spawnContinuousMutator({
+        cwd: fixture.cwd,
+        relativePath: CHECKS_RELATIVE_PATH,
+        ownerPath,
+        lockPath,
+      });
+      waitForBarrier(mutator.startedPath);
+      const beforeCount = Number.parseInt(readFileSync(mutator.counterPath, 'utf-8'), 10);
+
+      let failure: Error | null = null;
+      let resolved: EffectiveState | null = null;
+      try {
+        resolved = resolveEffectiveState(fixture.cwd, Date.now(), risk);
+      } catch (error) {
+        failure = error as Error;
+      } finally {
+        writeFileSync(mutator.stopPath, 'stop\n');
+      }
+      await mutator.done;
+
+      const afterCount = Number.parseInt(readFileSync(mutator.counterPath, 'utf-8'), 10);
+      // Sanity check on the injection itself: the non-authority source
+      // really did churn throughout the call window.
+      expect(afterCount).toBeGreaterThan(beforeCount);
+
+      // Falsifier direction (a): non-authority churn alone must not abort
+      // resolution (no throw) and must not surface as an unresolvable
+      // workflow profile.
+      expect(failure).toBeNull();
+      expect(resolved?.blockers ?? []).toEqual([]);
+      expect(resolved?.workflow_profile === 'routine'
+        || resolved?.workflow_profile === 'high').toBe(true);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 15_000);
+
+  test('a retired plan-contract conflict does not block state or ordinary edits', () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const current = readFileSync(join(fixture.cwd, CONTRACT), 'utf-8');
+      writeFixture(fixture.cwd, CONTRACT, current.replace(
+        /^> \*\*Plan\*\*: .*$/m,
+        '> **Plan**: plans/plan-some-other-conflicting-plan.md',
+      ));
+
+      const directResolution = resolveEffectiveState(fixture.cwd, Date.now(), {
+        targetPaths: ['src/feature.ts'],
+        operationKind: 'edit',
+      });
+      expect(directResolution.blockers).toEqual([]);
+
+      const result = runMutationGuard({
+        repoRoot: fixture.cwd,
+        payload: { tool_input: { file_path: 'src/feature.ts' } },
+        identity: hookIdentity(),
+        env: process.env,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toBe('');
+    } finally {
+      fixture.cleanup();
+    }
+  }, 30_000);
+});

@@ -1,0 +1,112 @@
+{
+  "name": "repo-harness",
+  "version": "0.36.0",
+  "description": "Installs, migrates, audits, and repairs repo-local agentic development harnesses",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aimpact-inc/repo-harness.git"
+  },
+  "type": "module",
+  "pi": {
+    "extensions": ["./src/pi/extension.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.5.2"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true }
+  },
+  "files": [
+    "agents/",
+    "assets/",
+    "dist/hook-entry.js",
+    "dist/oar-review-host.js",
+    "docs/images/",
+    "install.sh",
+    "install.ps1",
+    "interfaces/",
+    "references/handoff.md",
+    "references/bot-control.md",
+    "references/workflow-packaging-rubric.md",
+    "scripts/",
+    "src/",
+    "!src/operator-web/",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "SKILL.md",
+    "README.md",
+    "references/pm-boundary.md"
+  ],
+  "bin": {
+    "rh": "src/cli/index.ts",
+    "repo-harness-hook": "dist/hook-entry.js"
+  },
+  "engines": {
+    "bun": ">=1.4.0",
+    "node": ">=24 <26"
+  },
+  "scripts": {
+    "benchmark:skills": "bun scripts/run-skill-evals.ts",
+    "benchmark:harness": "bun scripts/run-harness-profile-benchmark.ts",
+    "test": "bun scripts/host-test-queue.ts run --kind affected -- bash -c 'source scripts/lib/ci-run-tests.sh; if [[ ${1:-} == -- ]]; then shift; fi; if [[ $# -gt 0 ]]; then BUN_TEST_ISOLATE_FILES=0 run_bun_tests \"$@\"; else bash scripts/lib/ci-run-tests.sh core --timeout 60000; fi' --",
+    "test:files": "bun scripts/host-test-queue.ts run --kind affected -- bash -c 'source scripts/lib/ci-run-tests.sh; BUN_TEST_ISOLATE_FILES=0 run_bun_tests \"$@\"' --",
+    "test:core": "bash scripts/lib/ci-run-tests.sh core",
+    "test:integration": "bash scripts/lib/ci-run-tests.sh integration",
+    "test:full": "bash scripts/lib/ci-run-tests.sh full",
+    "test:coverage": "bun scripts/host-test-queue.ts run --kind affected -- bash -c 'source scripts/lib/ci-run-tests.sh; BUN_TEST_ISOLATE_FILES=0 run_bun_tests --coverage \"$@\"' --",
+    "check:type": "node node_modules/typescript/bin/tsc --noEmit",
+    "check:pi-package": "bun scripts/check-pi-package-smoke.ts",
+    "sync:helpers": "bun scripts/sync-helper-sources.ts --write",
+    "check:helpers": "bun scripts/sync-helper-sources.ts --check",
+    "sync:reference-configs": "bun scripts/sync-reference-configs.ts --write",
+    "check:reference-configs": "bun scripts/sync-reference-configs.ts --check",
+    "project:test-capabilities": "bun scripts/project-test-capabilities.ts --out .ai/harness/runs/test-capability-projection.json",
+    "check:archctx-integration": "bun scripts/axr5-archctx-clean-room.ts",
+    "check:state-boundaries": "bun scripts/check-state-boundaries.ts",
+    "check:context-map": "bun scripts/check-context-map.ts",
+    "check:cli-manifest": "bun scripts/check-cli-manifest.ts",
+    "check:ci": "bash scripts/check-ci.sh",
+    "check:release": "bash scripts/check-npm-release.sh",
+    "check:release-published": "bash scripts/check-release-published.sh",
+    "smoke:tarball-install": "bash scripts/check-tarball-install-smoke.sh",
+    "check:context-files": "rh run check-context-files",
+    "check:deploy-sql": "rh run check-deploy-sql-order",
+    "build:hook-bundle": "bun build src/cli/hook-entry.ts --target=bun --outfile dist/hook-entry.js --define REPO_HARNESS_SINGLE_FILE_BUNDLE=true && head -1 dist/hook-entry.js | grep -q '^#!/usr/bin/env bun' && ! grep -q REPO_HARNESS_SINGLE_FILE_BUNDLE dist/hook-entry.js",
+    "build:operator-web": "vite build --config vite.operator.config.ts",
+    "dev:operator": "vite --config vite.operator.config.ts",
+    "prepack": "bun run build:hook-bundle 1>&2 && bun run build:oar-review-host 1>&2",
+    "prepublishOnly": "bash scripts/check-npm-release.sh --prepublish",
+    "sync:codex-installed": "bash scripts/sync-codex-installed-copies.sh",
+    "build:oar-review-host": "bun build src/effects/review-runner/task-oar-host.ts --target=node --format=esm --packages=external --outfile=dist/oar-review-host.js"
+  },
+  "devDependencies": {
+    "@cloudflare/kumo": "2.18.1",
+    "@colbymchenry/codegraph": "1.6.4",
+    "@dagrejs/dagre": "3.1.3",
+    "@phosphor-icons/react": "^2.1.10",
+    "@tailwindcss/vite": "^4.3.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "@xyflow/react": "12.12.1",
+    "bun-types": "1.4.4",
+    "happy-dom": "^21.0.4",
+    "mermaid": "12.3.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  },
+  "dependencies": {
+    "@botiverse/oar": "0.104.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "archctx": "0.17.1",
+    "archctx-contracts": "0.17.1",
+    "commander": "^15.1.0",
+    "mdast-util-from-markdown": "2.1.0"
+  }
+}

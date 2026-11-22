@@ -1,0 +1,600 @@
+import { describe, expect, test } from 'bun:test';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { dirname, join } from 'path';
+import { runGlobalRuntimeSetup, removeBrainRootConfiguration, updateLeftoverSummary, updateRegisteredUpgradeSummary } from '../../src/cli/commands/global-runtime';
+import { runUserUninstall } from '../../src/cli/installer/uninstall';
+import { formatUpgradeSummaryLine, type UpgradeResult } from '../../src/cli/commands/upgrade';
+import type { LeftoverItem } from '../../src/effects/upgrade/legacy-inventory';
+import type { LegacyWorktreeCandidate } from '../../src/effects/upgrade/legacy-worktree-cleanup';
+import { adoptedRepo, commitAll, git, registeredReposFixture, worktreeSnapshot, writeRegistry, type RegisteredReposFixture } from '../helpers/registered-repos';
+import { renderManagedBlock } from '../../src/core/adoption/managed-block';
+import { runtimeStateIgnoreOperation } from '../../src/effects/adoption/gitignore-plan';
+import { installStateFixturePath } from '../helpers/install-ownership';
+import { version as PACKAGE_VERSION } from '../../package.json';
+import { bunBootstrapRecordPath, importBunBootstrapRecord } from '../../src/effects/host-config/tools';
+import { sha256Prefixed } from '../../src/core/evidence/sha256';
+import { openRepositoryFileGate } from '../../src/effects/host-config/gate';
+import { repositoryConfigPaths, resolveHostConfigRepository } from '../../src/effects/host-config/repository';
+
+describe('operator console setup', () => {
+  test('installs a published source outside the global root from the registry', () => {
+    const root = mkdtempSync(join(tmpdir(), 'published-console-'));
+    const source = join(root, 'bunx-123-repo-harness@9.9.9', 'node_modules', 'repo-harness');
+    const home = join(root, 'home');
+    const bunInstall = join(home, '.bun');
+    const modules = join(bunInstall, 'install', 'global', 'node_modules');
+    const bun = join(root, 'bun');
+    const log = join(root, 'bun.log');
+    try {
+      mkdirSync(source, { recursive: true });
+      mkdirSync(home, { recursive: true });
+      writeFileSync(join(source, 'package.json'), JSON.stringify({ name: 'repo-harness', version: '9.9.9' }));
+      symlinkSync(join(import.meta.dir, '../../assets'), join(source, 'assets'));
+      writeFileSync(bun, `#!/bin/bash\nif [[ "$1" == --version ]]; then echo 1.4.3; exit; fi\nprintf '%s\\n' "$*" >> "${log}"\ncase "$3" in\n  repo-harness@*) name=repo-harness ;;\n  repo-harness-operator-web@*) name=repo-harness-operator-web ;;\n  *) exit 1 ;;\nesac\nversion="\${3#*@}"\nmkdir -p "${modules}/$name"\nprintf '{"name":"%s","version":"%s"}' "$name" "$version" > "${modules}/$name/package.json"\n`);
+      chmodSync(bun, 0o755);
+      const result = runGlobalRuntimeSetup({ sourceRoot: source, cwd: root, plugins: ['operator'], syncSkill: false,
+        hostAdapters: false, externalSkills: false, codegraph: false,
+        env: { ...process.env, HOME: home, BUN_INSTALL: bunInstall, REPO_HARNESS_BUN_EXECUTABLE: bun } });
+      expect(result.steps.find((step) => step.step === 'install repo-harness CLI')).toMatchObject({ status: 'ok' });
+      expect(result.steps.find((step) => step.step === 'ensure operator console')).toMatchObject({ status: 'ok' });
+      expect(readFileSync(log, 'utf8')).toBe('add -g repo-harness@9.9.9 --no-cache\nadd -g repo-harness-operator-web@9.9.9 --no-cache\n');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('installs the local console only when selected and fails updates without a build', () => {
+    const root = mkdtempSync(join(tmpdir(), 'operator-console-'));
+    const source = join(root, 'source');
+    const home = join(root, 'home');
+    const bunInstall = join(root, 'bun');
+    const consoleSource = join(source, 'packages', 'operator-web');
+    const globalModules = join(bunInstall, 'install', 'global', 'node_modules');
+    const installed = join(globalModules, 'repo-harness-operator-web');
+    const sourceConsole = join(source, 'node_modules', 'repo-harness-operator-web');
+    try {
+      mkdirSync(join(consoleSource, 'dist'), { recursive: true });
+      mkdirSync(join(globalModules, 'repo-harness'), { recursive: true });
+      mkdirSync(home, { recursive: true });
+      writeFileSync(join(consoleSource, 'package.json'), JSON.stringify({ name: 'repo-harness-operator-web', version: PACKAGE_VERSION }));
+      writeFileSync(join(consoleSource, 'dist', 'index.html'), '<html></html>');
+      writeFileSync(join(source, 'package.json'), JSON.stringify({ name: 'repo-harness', version: PACKAGE_VERSION }));
+      symlinkSync(join(source, 'package.json'), join(globalModules, 'repo-harness', 'package.json'));
+      symlinkSync(join(import.meta.dir, '../../assets'), join(source, 'assets'));
+      const run = (plugins: ('operator')[], updateMode = false) => runGlobalRuntimeSetup({
+        sourceRoot: source, cwd: root, env: { ...process.env, HOME: home, BUN_INSTALL: bunInstall },
+        plugins, updateMode, installCli: false, syncSkill: false, hostAdapters: false, externalSkills: false, codegraph: false,
+      });
+      expect(run([]).steps.find((step) => step.step === 'ensure operator console')).toMatchObject({ status: 'skipped', detail: 'operator plugin not selected' });
+      expect(existsSync(installed)).toBe(false);
+      expect(run(['operator']).steps.find((step) => step.step === 'ensure operator console')).toMatchObject({ status: 'ok' });
+      expect(realpathSync(sourceConsole)).toBe(realpathSync(consoleSource));
+      expect(JSON.parse(readFileSync(join(sourceConsole, 'package.json'), 'utf8')).version).toBe(PACKAGE_VERSION);
+      expect(run(['operator']).steps.find((step) => step.step === 'ensure operator console')).toMatchObject({ status: 'ok' });
+      rmSync(sourceConsole);
+      mkdirSync(sourceConsole);
+      expect(run(['operator']).steps.find((step) => step.step === 'ensure operator console')).toMatchObject({ status: 'failed', detail: expect.stringContaining('not a symlink') });
+      rmSync(sourceConsole, { recursive: true });
+      rmSync(join(globalModules, 'repo-harness', 'package.json'));
+      writeFileSync(join(globalModules, 'repo-harness', 'package.json'), JSON.stringify({ name: 'repo-harness', version: '9.9.9' }));
+      const fakeBun = join(root, 'bun-executable');
+      const bunLog = join(root, 'bun.log');
+      mkdirSync(installed, { recursive: true });
+      writeFileSync(fakeBun, `#!/bin/bash\nif [[ "$1" == "--version" ]]; then echo 1.4.3; exit; fi\nprintf '%s\\n' "$*" >> "${bunLog}"\nversion="\${3#repo-harness-operator-web@}"\nprintf '{"name":"repo-harness-operator-web","version":"%s"}' "$version" > "${join(installed, 'package.json')}"\n`);
+      chmodSync(fakeBun, 0o755);
+      const registryUpdate = runGlobalRuntimeSetup({ sourceRoot: source, cwd: root, plugins: ['operator'], installCli: false,
+        installSpec: 'repo-harness@9.9.9', syncSkill: false, hostAdapters: false, externalSkills: false, codegraph: false,
+        env: { ...process.env, HOME: home, BUN_INSTALL: bunInstall, REPO_HARNESS_BUN_EXECUTABLE: fakeBun } });
+      expect(registryUpdate.steps.find((step) => step.step === 'ensure operator console')).toMatchObject({ status: 'ok' });
+      expect(readFileSync(bunLog, 'utf8')).toContain('add -g repo-harness-operator-web@9.9.9 --no-cache');
+      expect(JSON.parse(readFileSync(join(installed, 'package.json'), 'utf8')).version).toBe('9.9.9');
+      rmSync(join(consoleSource, 'dist', 'index.html'));
+      const failed = run(['operator'], true);
+      expect(failed.exitCode).toBe(1);
+      expect(failed.stdout).toContain('ensure operator console');
+      expect(failed.stdout).toContain('bun run build:operator-web');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Regression guard for the #169 base-dropping class on the setup-global surface.
+ *
+ * `runGlobalRuntimeSetup` builds its one environment record as
+ * `bindBunRuntimeEnv(commandEnv(sourceRoot, opts.env), bunExecutable)`
+ * (src/cli/commands/global-runtime.ts). With no caller env both helpers used to
+ * base on `{}`, so the composed record held one or two keys and the whole
+ * process environment was discarded.
+ *
+ * Most consumers are masked: `homeDir(env)` resolves
+ * `env?.HOME ?? process.env.HOME ?? homedir()`, so it re-reads process.env and
+ * survives the drop. The one unmasked sink is the very first use of the record,
+ * `requireInstallState(env)` -> `installProfileStatePath(env)`
+ * (src/cli/installer/install-profile.ts), whose chain is
+ * `env.HOME ?? homedir()` with no process.env step. Bun caches `homedir()` at
+ * process start, so on a dropped base that resolves to the operator's real home
+ * and every caller-visible HOME lever is lost.
+ *
+ * Observable: a legacy protocol-1 install-state file seeded under an overridden
+ * HOME must be the file the install state read fails closed on, and the thrown message
+ * carries the resolved path. That read happens before any process spawn or
+ * filesystem write, so this guard has no side effects on either code path.
+ */
+describe('global runtime setup command env base', () => {
+  function runWithSeededHome(sourceRoot: string, home: string): () => unknown {
+    return () => runGlobalRuntimeSetup({
+      sourceRoot,
+      cwd: home,
+      installCli: false,
+      syncSkill: false,
+      hostAdapters: false,
+      externalSkills: false,
+      codegraph: false,
+    });
+  }
+
+  function withOverriddenHome(label: string, body: (tmp: string, home: string, statePath: string) => void): void {
+    const tmp = join(tmpdir(), `repo-harness-global-runtime-env-base-${label}-${Date.now()}`);
+    const home = join(tmp, 'home');
+    const statePath = installStateFixturePath({ HOME: home });
+    const previousHome = process.env.HOME;
+    const previousFlag = process.env.REPO_HARNESS_LINK_INSTALLED_COPIES;
+    try {
+      mkdirSync(join(home, '.repo-harness'), { recursive: true });
+      // Retired protocol-1 state: readInstallState fails closed on it and the
+      // error names the path it resolved, which is exactly the datum under guard.
+      writeFileSync(statePath, JSON.stringify({ protocol: 1, profile: 'full' }));
+      process.env.HOME = home;
+      delete process.env.REPO_HARNESS_LINK_INSTALLED_COPIES;
+      body(tmp, home, statePath);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousFlag === undefined) delete process.env.REPO_HARNESS_LINK_INSTALLED_COPIES;
+      else process.env.REPO_HARNESS_LINK_INSTALLED_COPIES = previousFlag;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  test('npx cache source with no caller env keeps process.env as the constructed env base', () => {
+    withOverriddenHome('npx', (tmp, home, statePath) => {
+      // isNpxCacheSource() matches on the `_npx` path segment, so this drives the
+      // branch that injects REPO_HARNESS_LINK_INSTALLED_COPIES with no caller env.
+      const source = join(tmp, '_npx', 'abc123', 'node_modules', 'repo-harness');
+      mkdirSync(source, { recursive: true });
+      expect(runWithSeededHome(source, home)).toThrow(statePath);
+    });
+  });
+
+  test('non-npx source with no caller env keeps process.env as the constructed env base', () => {
+    withOverriddenHome('plain', (tmp, home, statePath) => {
+      // commandEnv() passes `undefined` straight through here (a well-defined
+      // value downstream); bindBunRuntimeEnv() is the helper that must not
+      // materialize a PATH-only record out of it.
+      const source = join(tmp, 'installed', 'repo-harness');
+      mkdirSync(source, { recursive: true });
+      expect(runWithSeededHome(source, home)).toThrow(statePath);
+    });
+  });
+});
+
+describe('retired brainRoot configuration key', () => {
+  // rh no longer has a vault surface (issue #2937). Update removes the key once and keeps every other byte.
+  test('removes only the brainRoot member and keeps the rest of the document byte-identical', () => {
+    const rows: Array<readonly [string, string, string]> = [
+      ['first member', '{\n    "brainRoot": "/v",\n    "security":   { "mode": "strict" },\n    "custom": [1, 2, 3]\n}\n', '{\n    "security":   { "mode": "strict" },\n    "custom": [1, 2, 3]\n}\n'],
+      ['last member', '{\n  "security": { "mode": "strict" },\n  "brainRoot": "/v"\n}\n', '{\n  "security": { "mode": "strict" }\n}\n'],
+      ['nested unique members', '{"brainRoot":"/v","custom":[{"a":1},{"a":2}],"text":"雪 { \\"a\\": 1 }"}\n', '{"custom":[{"a":1},{"a":2}],"text":"雪 { \\"a\\": 1 }"}\n'],
+      ['only member', '{\n  "brainRoot": "/v"\n}\n', '{}\n'],
+      // A Windows checkout converts LF to CRLF; the renderer keeps its line ending.
+      ['CRLF', '{\r\n  "brainRoot": "/v",\r\n  "a": 1\r\n}\r\n', '{\r\n  "a": 1\r\n}\r\n'],
+    ];
+    for (const [name, original, expected] of rows) {
+      const home = mkdtempSync(join(tmpdir(), 'repo-harness-brainroot-key-'));
+      try {
+        const env = { ...process.env, HOME: home };
+        mkdirSync(join(home, '.repo-harness'), { recursive: true });
+        const path = join(home, '.repo-harness', 'config.json');
+        writeFileSync(path, original);
+        expect(removeBrainRootConfiguration(env), name).toBe(true);
+        expect(readFileSync(path, 'utf8'), name).toBe(expected);
+        // The next run finds no key, so the file stays as it is.
+        expect(removeBrainRootConfiguration(env), name).toBe(false);
+        expect(readFileSync(path, 'utf8'), name).toBe(expected);
+      } finally { rmSync(home, { recursive: true, force: true }); }
+    }
+  });
+
+  test.each([
+    ['duplicate scalar', Buffer.from('{"brainRoot":"/v","custom":1,"custom":2}'), 'duplicate member names'],
+    ['duplicate object', Buffer.from('{"brainRoot":"/v","custom":{"a":1},"custom":{"b":2}}'), 'duplicate member names'],
+    ['duplicate retired key', Buffer.from('{"brainRoot":"/v","brainRoot":"/w"}'), 'duplicate member names'],
+    ['nested duplicate', Buffer.from('{"brainRoot":"/v","custom":{"a":1,"a":2}}'), 'duplicate member names'],
+    ['array-nested escaped duplicate', Buffer.from('{"brainRoot":"/v","custom":[{"a":1,"\\u0061":2}]}'), 'duplicate member names'],
+    ['invalid UTF-8', Buffer.concat([Buffer.from('{"brainRoot":"/v","custom":"'), Buffer.from([0xff]), Buffer.from('"}')]), 'invalid UTF-8'],
+  ])('refuses %s without changing any configuration bytes', (_name, original, reason) => {
+    const home = mkdtempSync(join(tmpdir(), 'repo-harness-brainroot-invalid-'));
+    try {
+      const env = { ...process.env, HOME: home };
+      mkdirSync(join(home, '.repo-harness'), { recursive: true });
+      const path = join(home, '.repo-harness', 'config.json');
+      writeFileSync(path, original);
+      expect(() => removeBrainRootConfiguration(env)).toThrow(reason);
+      expect(readFileSync(path)).toEqual(original);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('leaves a configuration without the key untouched and fails closed on invalid JSON', () => {
+    const home = mkdtempSync(join(tmpdir(), 'repo-harness-brainroot-absent-'));
+    try {
+      const env = { ...process.env, HOME: home };
+      mkdirSync(join(home, '.repo-harness'), { recursive: true });
+      const path = join(home, '.repo-harness', 'config.json');
+      const text = '{ "security": { "mode": "strict" } }\n';
+      writeFileSync(path, text);
+      expect(removeBrainRootConfiguration(env)).toBe(false);
+      expect(readFileSync(path, 'utf8')).toBe(text);
+      writeFileSync(path, '{invalid');
+      expect(() => removeBrainRootConfiguration(env)).toThrow('not a valid JSON object');
+      expect(readFileSync(path, 'utf8')).toBe('{invalid');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+});
+
+describe('update leftover summary', () => {
+  // The fake Bun stands in for the installed package entrypoint and runs a bash script.
+  function withFakeBun(script: (root: string) => string, body: () => void): void {
+    const root = mkdtempSync(join(tmpdir(), 'repo-harness-update-leftovers-'));
+    const previous = process.env.REPO_HARNESS_BUN_EXECUTABLE;
+    try {
+      const bun = join(root, 'bun');
+      writeFileSync(bun, `#!/bin/bash\n${script(root)}`);
+      chmodSync(bun, 0o755);
+      process.env.REPO_HARNESS_BUN_EXECUTABLE = bun;
+      body();
+    } finally {
+      if (previous === undefined) delete process.env.REPO_HARNESS_BUN_EXECUTABLE;
+      else process.env.REPO_HARNESS_BUN_EXECUTABLE = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // The fake package prints a fixed result for any upgrade call.
+  function withFakeUpgrade(stdout: string, stderr: string, body: () => void): void {
+    withFakeBun((root) => {
+      writeFileSync(join(root, 'stdout.json'), stdout);
+      return `cat "${join(root, 'stdout.json')}"\nprintf '%s' '${stderr}' >&2\nexit 1\n`;
+    }, body);
+  }
+
+  test('an updater forwards the summary line of a newer package whose upgrade --json shape changed', () => {
+    withFakeBun(() => [
+      'if [[ " $* " == *" --summary-line "* ]]; then echo \'3 leftovers (1 removable). Run: rh upgrade\'; exit 1; fi',
+      'echo \'{"leftovers":{"count":3}}\'',
+      'exit 1',
+      '',
+    ].join('\n'), () => {
+      expect(updateLeftoverSummary(tmpdir(), false)).toBe('3 leftovers (1 removable). Run: rh upgrade');
+    });
+  });
+
+  test('an updater reports a package that prints no summary line as a failed check', () => {
+    withFakeUpgrade('', 'error: unknown option --summary-line token=hunter2', () => {
+      expect(updateLeftoverSummary(tmpdir(), false))
+        .toBe('Leftover check failed: error: unknown option --summary-line token=[redacted]. Run: rh upgrade');
+    });
+  });
+
+  test('an updater forwards the summary line that the real package entrypoint prints', () => {
+    const root = mkdtempSync(join(tmpdir(), 'repo-harness-update-leftovers-real-'));
+    const keys = ['HOME', 'REPO_HARNESS_HOME', 'REPO_HARNESS_BUN_EXECUTABLE'] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      mkdirSync(join(root, 'home'));
+      mkdirSync(join(root, 'cwd'));
+      process.env.HOME = join(root, 'home');
+      process.env.REPO_HARNESS_HOME = join(root, 'home', '.repo-harness');
+      delete process.env.REPO_HARNESS_BUN_EXECUTABLE;
+      expect(updateLeftoverSummary(join(root, 'cwd'), false)).toBe('0 leftovers (0 removable). Run: rh upgrade');
+    } finally {
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  const checkResult = (overrides: Partial<UpgradeResult>): UpgradeResult => ({
+    items: [], apply: false, exitCode: 1, removedPaths: [], refreshedPaths: [], keptPaths: [], operatorKept: [], ...overrides,
+  });
+
+  test('summary line counts leftovers and keeps secret-like path segments out', () => {
+    const items = Array.from({ length: 400 }, (_, index): LeftoverItem => ({
+      location: 'global',
+      surface: 'skill',
+      path: `/fixture/token=abc/skill-${index}`,
+      retiredBy: 'fixture',
+      ownership: index === 0 ? 'owned-clean' : 'unowned',
+      proof: null,
+      action: index === 0 ? 'remove' : 'report',
+      reason: 'Fixture leftover for the update summary line.',
+    }));
+    expect(formatUpgradeSummaryLine(checkResult({ items }))).toBe('400 leftovers (1 removable). Run: rh upgrade');
+  });
+
+  test('summary line reports a failed check as a warning with redacted error text', () => {
+    expect(formatUpgradeSummaryLine(checkResult({ error: 'catalog failed token=hunter2' })))
+      .toBe('Leftover check failed: catalog failed token=[redacted]. Run: rh upgrade');
+  });
+
+  test('summary line reports a removable legacy sibling worktree as pending, not failed', () => {
+    const candidates: LegacyWorktreeCandidate[] = [
+      { path: '/fixture/repo-old', branch: 'feat/old', head: 'a'.repeat(40), verdict: 'remove', reason: 'merged into origin/main', rebuild: 'git worktree add -b feat/old /fixture/repo-old aaa' },
+      { path: '/fixture/repo-squash', branch: 'feat/squash', head: 'b'.repeat(40), verdict: 'keep', reason: 'merge proof needs the provider; checked only with --apply', rebuild: null },
+    ];
+    expect(formatUpgradeSummaryLine(checkResult({ legacyWorktrees: { candidates } }))).toBe(
+      '0 leftovers (0 removable). Run: rh upgrade; 1 legacy sibling worktree can be removed; run rh upgrade --scope project --apply',
+    );
+  });
+
+  test('summary line counts a deferred legacy sibling worktree as pending and names the provider proof', () => {
+    const candidate = (name: string, verdict: LegacyWorktreeCandidate['verdict']): LegacyWorktreeCandidate => ({ path: `/fixture/${name}`, branch: `feat/${name}`, head: 'c'.repeat(40), verdict, reason: 'fixture', rebuild: null });
+    const hint = (candidates: LegacyWorktreeCandidate[]) => formatUpgradeSummaryLine(checkResult({ legacyWorktrees: { candidates } }));
+    expect(hint([candidate('old', 'remove'), candidate('squash', 'deferred'), candidate('dirty', 'keep')])).toBe(
+      '0 leftovers (0 removable). Run: rh upgrade; 2 legacy sibling worktrees can be removed (1 needs provider proof); run rh upgrade --scope project --apply',
+    );
+    expect(hint([candidate('a', 'deferred'), candidate('b', 'deferred')])).toBe(
+      '0 leftovers (0 removable). Run: rh upgrade; 2 legacy sibling worktrees can be removed (2 need provider proof); run rh upgrade --scope project --apply',
+    );
+  });
+
+  test('registered summary counts pending ready repos and names skipped and failed repos', () => {
+    const repos = [
+      { path: '/fixture/a', status: 'ready', pending: true },
+      { path: '/fixture/b', status: 'ready', pending: false },
+      { path: '/fixture/c', status: 'skipped', reason: 'dirty_worktree' },
+      { path: '/fixture/d', status: 'failed', error: 'init plan failed' },
+    ];
+    withFakeUpgrade(`${JSON.stringify({ revision: `sha256:${'0'.repeat(64)}`, apply: false, exitCode: 1, repos })}\n`, '', () => {
+      expect(updateRegisteredUpgradeSummary(tmpdir(), false)).toBe(
+        `Registered repos: 1 of 4 have pending project upgrade work (/fixture/a); 1 skipped; 1 failed. Preview: rh upgrade --registered. Apply: rh upgrade --registered --apply --expected-revision sha256:${'0'.repeat(64)}`,
+      );
+    });
+  });
+
+  test('registered summary says when the count cannot be computed instead of printing a number', () => {
+    withFakeUpgrade('{"revision":null,"apply":false,"exitCode":2,"repos":[],"error":"registry authority is not valid JSON"}\n', '', () => {
+      expect(updateRegisteredUpgradeSummary(tmpdir(), false)).toBe(
+        'Registered repo upgrade check could not be computed: registry authority is not valid JSON. Preview: rh upgrade --registered',
+      );
+    });
+    withFakeUpgrade('not json\n', '', () => {
+      expect(updateRegisteredUpgradeSummary(tmpdir(), false)).toBe(
+        'Registered repo upgrade check could not be computed: upgrade --registered --json returned no repo list. Preview: rh upgrade --registered',
+      );
+    });
+  });
+});
+
+describe('update registered repo summary', () => {
+  test('runs the real preview and writes nothing in registered repos or the registry', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'repo-harness-update-registered-')));
+    const f = registeredReposFixture(root);
+    const keys = ['HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_NOSYSTEM', 'REPO_HARNESS_HOME', 'REPO_HARNESS_WORKTREE_ROOT', 'REPO_HARNESS_BUN_EXECUTABLE'] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      const current = adoptedRepo(f, 'current');
+      const stale = adoptedRepo(f, 'stale');
+      rmSync(join(stale, 'deploy/README.md'));
+      commitAll(f, stale, 'drop managed file');
+      writeRegistry(f, [current, stale, join(root, 'missing')]);
+      const registryBefore = readFileSync(f.registry, 'utf8');
+      const before = [current, stale].map((repo) => [worktreeSnapshot(repo), git(f, repo, 'status', '--porcelain'), git(f, repo, 'rev-parse', 'HEAD')]);
+      for (const key of keys) {
+        if (f.env[key] === undefined) delete process.env[key];
+        else process.env[key] = f.env[key];
+      }
+      expect(updateRegisteredUpgradeSummary(root, false)).toMatch(new RegExp(
+        `^Registered repos: 1 of 3 have pending project upgrade work \\(${stale}\\); 1 skipped\\. Preview: rh upgrade --registered\\. Apply: rh upgrade --registered --apply --expected-revision sha256:[0-9a-f]{64}$`,
+      ));
+      expect(readFileSync(f.registry, 'utf8')).toBe(registryBefore);
+      expect([current, stale].map((repo) => [worktreeSnapshot(repo), git(f, repo, 'status', '--porcelain'), git(f, repo, 'rev-parse', 'HEAD')])).toEqual(before);
+    } finally {
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+});
+
+describe('runtime ignore rules step', () => {
+  const BEGIN = '# BEGIN: repo-harness runtime-state';
+  const OLD_BLOCK = renderManagedBlock(runtimeStateIgnoreOperation(''));
+  const RETIRE = 'retire user-level runtime ignore block';
+  /** A registry fixture with an update runner, a repository maker and a user-level excludes file that holds the old block. */
+  function withIgnoreFixture(run: (f: RegisteredReposFixture, update: (extra?: NodeJS.ProcessEnv) => ReturnType<typeof runGlobalRuntimeSetup>, repo: (name: string, adopted?: boolean, ...init: string[]) => string, userExcludes: string) => void): void {
+    const f = registeredReposFixture(realpathSync(mkdtempSync(join(tmpdir(), 'runtime-ignore-'))));
+    const env = { ...f.env, BUN_INSTALL: join(f.root, 'bun') };
+    const userExcludes = join(f.env.XDG_CONFIG_HOME!, 'git', 'ignore');
+    mkdirSync(dirname(userExcludes), { recursive: true });
+    writeFileSync(userExcludes, `*.log\n\n${OLD_BLOCK}\n`);
+    const repo = (name: string, adopted = true, ...init: string[]) => {
+      const path = join(f.root, name);
+      mkdirSync(path);
+      git(f, path, 'init', '-q', ...init);
+      if (adopted) { mkdirSync(join(path, '.ai', 'harness'), { recursive: true }); writeFileSync(join(path, '.ai', 'harness', 'workflow-contract.json'), '{}\n'); }
+      return path;
+    };
+    try {
+      run(f, (extra = {}) => runGlobalRuntimeSetup({ cwd: f.root, env: { ...env, ...extra }, plugins: [], updateMode: true, installCli: false, syncSkill: false, hostAdapters: false, externalSkills: false, codegraph: false }), repo, userExcludes);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }
+  const step = (result: ReturnType<typeof runGlobalRuntimeSetup>, name: string) => result.steps.find(entry => entry.step === name);
+  const exclude = (repo: string) => join(repo, '.git', 'info', 'exclude');
+
+  test('update writes the block into each adopted repository through the ledger of its clone and then retires the user-level block; uninstall reverts each repository ledger', () => withIgnoreFixture((f, update, repo, userExcludes) => {
+    const adopted = repo('adopted'), other = repo('not-adopted', false), away = repo('away'), gone = repo('gone'), moved = repo('moved'), fresh = repo('fresh');
+    writeRegistry(f, [adopted, other, away, gone, moved, fresh]);
+    rmSync(exclude(fresh));
+    const template = readFileSync(exclude(adopted), 'utf8');
+    // An escaped trailing space and a trailing blank line: bytes that a trim would change. The block goes before the final line endings.
+    const userBytes = `${template}name\\ \n\n`;
+    writeFileSync(exclude(adopted), userBytes);
+    // An unavailable registered repository keeps the user-level block.
+    renameSync(away, `${away}.moved`);
+    expect(step(update(), RETIRE)).toMatchObject({ status: 'skipped', detail: `${userExcludes}: kept the runtime-state block until every registered repository holds its own proved block` });
+    expect(readFileSync(userExcludes, 'utf8')).toBe(`*.log\n\n${OLD_BLOCK}\n`);
+    renameSync(`${away}.moved`, away);
+    // rh created this file; the user replaces it with blank lines, and the next update puts the block back in.
+    writeFileSync(exclude(fresh), '\n\n');
+    // rh run from a Git hook inherits GIT_DIR; each repository still resolves its own exclude file.
+    const hookEnv = { GIT_DIR: join(adopted, '.git') };
+    const inherited = process.env.GIT_DIR;
+    process.env.GIT_DIR = hookEnv.GIT_DIR;
+    let run: ReturnType<typeof update>;
+    try { run = update(hookEnv); } finally { if (inherited === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = inherited; }
+    expect(step(run, 'write runtime ignore rules')).toMatchObject({ status: 'ok', detail: expect.stringContaining(`${exclude(away)}: written`) });
+    expect(step(run, RETIRE)).toMatchObject({ status: 'ok' });
+    expect(readFileSync(userExcludes, 'utf8')).toBe('*.log\n');
+    for (const path of [adopted, away]) expect(git(f, path, 'check-ignore', '.ai/harness/events.jsonl')).toBe('.ai/harness/events.jsonl');
+    expect(readFileSync(exclude(adopted), 'utf8')).toBe(`${template}name\\ \n\n${OLD_BLOCK}\n\n`);
+    // A repository that is not adopted gets no rule.
+    expect(readFileSync(exclude(other), 'utf8')).toBe(template);
+    for (const path of [adopted, away]) expect(openRepositoryFileGate(f.env, repositoryConfigPaths(f.env, resolveHostConfigRepository(path))).recorded(exclude(path))).toHaveLength(1);
+    expect(existsSync(join(f.env.HOME!, '.repo-harness', 'repository-excludes.json'))).toBe(false);
+    // P2: an edit inside a block keeps it, a line outside a block stays. P1: a deleted file releases its record. P6: a linked info/ keeps its block.
+    writeFileSync(exclude(away), readFileSync(exclude(away), 'utf8').replace(`${BEGIN}\n`, `${BEGIN}\nscratch-*/\n`));
+    writeFileSync(exclude(adopted), `${readFileSync(exclude(adopted), 'utf8')}later/\n`);
+    rmSync(exclude(gone));
+    const info = join(moved, '.git', 'info');
+    renameSync(info, join(f.root, 'moved-info'));
+    symlinkSync(join(f.root, 'moved-info'), info);
+    // Uninstall goes by the repository ledgers, so a repository that left the registry still loses its block.
+    writeRegistry(f, []);
+    const removal = runUserUninstall({ target: 'both', env: { ...f.env, ...hookEnv } });
+    expect(readFileSync(exclude(adopted), 'utf8')).toBe(`${userBytes}later/\n`);
+    expect(removal.items).toContainEqual({ path: exclude(away), action: 'unresolved', reason: expect.stringContaining('changed since rh wrote it; preserved') });
+    expect(readFileSync(exclude(away), 'utf8')).toContain('scratch-*/');
+    expect(removal.items).toContainEqual({ path: exclude(moved), action: 'unresolved', reason: expect.stringContaining(`${info} is a link`) });
+    expect(readFileSync(exclude(moved), 'utf8')).toContain(OLD_BLOCK);
+    // The outside change leaves whole-file ownership unproved: the file and its blank lines stay.
+    expect(readFileSync(exclude(fresh), 'utf8')).toBe('\n\n');
+    // The identical block put back by hand after the release is the user's.
+    writeFileSync(exclude(gone), `${template}\n${OLD_BLOCK}\n`);
+    runUserUninstall({ target: 'both', env: f.env });
+    expect(readFileSync(exclude(gone), 'utf8')).toBe(`${template}\n${OLD_BLOCK}\n`);
+  }));
+
+  test('update imports the blocks that an earlier release listed: only a listed block with shipped text becomes a record', () => withIgnoreFixture((f, update, repo) => {
+    const listed = repo('listed'), edited = repo('edited'), unlisted = repo('unlisted'), annotated = repo('annotated');
+    writeRegistry(f, [listed, edited, unlisted, annotated]);
+    const template = readFileSync(exclude(listed), 'utf8');
+    const editedBlock = OLD_BLOCK.replace(`${BEGIN}\n`, `${BEGIN}\nmine/\n`);
+    for (const [path, block] of [[listed, OLD_BLOCK], [edited, editedBlock], [unlisted, OLD_BLOCK]] as const) writeFileSync(exclude(path), `${template}\n${block}\n`);
+    // A marker must be a whole line: a note after the END line belongs to the user, so the block is unbalanced and stays.
+    const annotatedBytes = `${template}*.log\n\n${OLD_BLOCK} (local note)\nscratch/\n`;
+    writeFileSync(exclude(annotated), annotatedBytes);
+    const list = join(f.env.HOME!, '.repo-harness', 'repository-excludes.json');
+    // An invalid list stops the step and stays.
+    writeFileSync(list, '{"version":1,"entries":[{}]}\n');
+    expect(step(update(), 'write runtime ignore rules')).toMatchObject({ status: 'failed', detail: expect.stringContaining('repository_excludes_ledger_invalid') });
+    expect(existsSync(list)).toBe(true);
+    writeFileSync(list, JSON.stringify({ version: 1, entries: [listed, edited, annotated].map((path) => ({ repo_id: 'id', repo_path: path, exclude_path: exclude(path) })) }));
+    const detail = step(update(), 'write runtime ignore rules')!.detail;
+    expect(detail).toContain(`${exclude(listed)}: imported`);
+    expect(detail).toContain(`${exclude(edited)}: not imported (the block was edited)`);
+    expect(detail).toContain(`${exclude(unlisted)}: kept a block that rh cannot prove it wrote`);
+    expect(detail).toContain(`${exclude(annotated)}: not imported (unbalanced runtime-state markers)`);
+    expect(detail).toContain(`${exclude(annotated)}: unbalanced repo-harness runtime-state markers; preserving the file`);
+    expect(existsSync(list)).toBe(false);
+    // A recorded block that the user deleted comes back at the next update, as before the ledger.
+    writeFileSync(exclude(listed), template);
+    expect(step(update(), 'write runtime ignore rules')!.detail).toContain(`${exclude(listed)}: written`);
+    runUserUninstall({ target: 'both', env: f.env });
+    expect([listed, edited, unlisted, annotated].map((path) => readFileSync(exclude(path), 'utf8'))).toEqual([template, `${template}\n${editedBlock}\n`, `${template}\n${OLD_BLOCK}\n`, annotatedBytes]);
+  }));
+
+  test('update refuses a link below the common dir, a target in the rh home, a non-UTF-8 file and an unproved block, and keeps the user-level block', () => {
+    const link = (path: string, target: string) => { rmSync(path, { force: true }); symlinkSync(target, path); };
+    const rows: { name: string; setup: (repo: string, f: RegisteredReposFixture, userExcludes: string) => string; init?: (f: RegisteredReposFixture) => string[]; reason: (repo: string) => string }[] = [
+      { name: 'linked file', reason: (repo) => `${exclude(repo)} is a link`, setup: (repo, f) => { writeFileSync(join(f.root, 'shared'), '# shared\n'); link(exclude(repo), join(f.root, 'shared')); return join(f.root, 'shared'); } },
+      { name: 'dangling relative link', reason: (repo) => `${exclude(repo)} is a link`, setup: (repo, f) => { link(exclude(repo), '../../../missing-shared'); return join(f.root, 'missing-shared'); } },
+      { name: 'dangling link into the rh home', reason: (repo) => `${exclude(repo)} is a link`, setup: (repo, f) => { link(exclude(repo), join(f.env.HOME!, '.repo-harness', 'stray')); return join(f.env.HOME!, '.repo-harness', 'stray'); } },
+      { name: 'linked info directory', reason: (repo) => `${join(repo, '.git', 'info')} is a link`,
+        setup: (repo, f) => { renameSync(join(repo, '.git', 'info'), join(f.root, 'info')); symlinkSync(join(f.root, 'info'), join(repo, '.git', 'info')); return join(f.root, 'info', 'exclude'); } },
+      { name: 'Git directory in the rh home', reason: () => 'rh does not write host configuration inside', init: f => ['--separate-git-dir', join(f.env.HOME!, '.repo-harness', 'gitdir')],
+        setup: (_repo, f) => join(f.env.HOME!, '.repo-harness', 'gitdir', 'info', 'exclude') },
+      { name: 'edited repository block', reason: () => 'kept a block that rh cannot prove it wrote', setup: (repo) => { writeFileSync(exclude(repo), `${BEGIN}\ncustom-only/\n# END: repo-harness runtime-state\n`); return exclude(repo); } },
+      { name: 'non-UTF-8 file', reason: () => 'not UTF-8 text', setup: (repo) => { writeFileSync(exclude(repo), Buffer.from([0x6e, 0xff, 0x0a])); return exclude(repo); } },
+      { name: 'repository exclude is the user-level file', reason: (repo) => `${exclude(repo)} is a link`, setup: (repo, _f, userExcludes) => { link(exclude(repo), userExcludes); return userExcludes; } },
+    ];
+    for (const row of rows) withIgnoreFixture((f, update, repo, userExcludes) => {
+      const path = repo('repo', true, ...(row.init?.(f) ?? []));
+      writeRegistry(f, [path]);
+      const target = row.setup(path, f, userExcludes);
+      const before = existsSync(target) ? readFileSync(target) : null;
+      const run = update();
+      expect(step(run, 'write runtime ignore rules'), row.name).toMatchObject({ status: 'ok', detail: expect.stringContaining(row.reason(path)) });
+      expect(step(run, RETIRE), row.name).toMatchObject({ status: 'skipped' });
+      expect(readFileSync(userExcludes, 'utf8').includes(OLD_BLOCK), row.name).toBe(true);
+      expect(existsSync(target) ? readFileSync(target) : null, row.name).toEqual(before);
+    });
+  });
+});
+
+// The bootstrap's Bun record (#2853): imported once, and only for the bytes that the bootstrap measured (ownership probe P3).
+describe('Bun bootstrap record import', () => {
+  test.each([
+    { label: 'imports once; a second file of the same record adds nothing and goes', change: 'none' },
+    { label: 'a binary that changed since the bootstrap gets no record, and the claim goes', change: 'binary' },
+    { label: 'a malformed file stops with a named error and stays', change: 'malformed' },
+    { label: 'a recorded Bun that is gone does not block a bootstrap into another BUN_INSTALL', change: 'relocated' },
+  ] as const)('%s', ({ change }) => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), 'bun-bootstrap-')));
+    const env = { HOME: home };
+    const bun = join(home, '.bun', 'bin', 'bun');
+    try {
+      mkdirSync(dirname(bun), { recursive: true });
+      writeFileSync(bun, 'bun 1.4.4\n');
+      const file = bunBootstrapRecordPath(env);
+      const bootstrap = { installed_by: 'rh-bootstrap', version: '1.4.4', path: bun, sha256: sha256Prefixed(Buffer.from('bun 1.4.4\n')), directories: [join(home, '.bun')],
+        profile: { file: join(home, '.zshrc'), inserted: '\n# bun\nexport BUN_INSTALL="$HOME/.bun"\n' } };
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, change === 'malformed' ? JSON.stringify({ ...bootstrap, sha256: 'not a hash' }) : JSON.stringify(bootstrap), { mode: 0o600 });
+      if (change === 'binary') writeFileSync(bun, 'bun 1.5.0\n');
+      const ledgerFile = join(home, '.repo-harness', 'config', 'ledger.json');
+      if (change === 'malformed') {
+        expect(() => importBunBootstrapRecord(env)).toThrow(`the Bun bootstrap record is malformed, so rh does not import it; it stays: ${file}`);
+        expect([existsSync(file), existsSync(ledgerFile)]).toEqual([true, false]);
+        return;
+      }
+      expect(importBunBootstrapRecord(env)).toBe(change === 'binary' ? 'changed' : 'imported');
+      expect(existsSync(file)).toBe(false);
+      if (change === 'binary') { expect(existsSync(ledgerFile)).toBe(false); return; }
+      const { path: _path, sha256, ...rest } = bootstrap;
+      expect(JSON.parse(readFileSync(ledgerFile, 'utf8')).tools).toEqual({ bun: { ...rest, removable: false, paths: { [bun]: { committed: { type: 'file', sha256 } } } } });
+      // A stop after the ledger write left the file: the next run adds nothing and removes it.
+      const ledger = readFileSync(ledgerFile);
+      writeFileSync(file, JSON.stringify(bootstrap), { mode: 0o600 });
+      expect(importBunBootstrapRecord(env)).toBe('already_recorded');
+      expect([existsSync(file), readFileSync(ledgerFile)]).toEqual([false, ledger]);
+      if (change !== 'relocated') return;
+      // The old binary goes; the user bootstraps Bun again into another BUN_INSTALL.
+      rmSync(join(home, '.bun'), { recursive: true });
+      const moved = join(home, '.bun2', 'bin', 'bun');
+      mkdirSync(dirname(moved), { recursive: true });
+      writeFileSync(moved, 'bun 1.4.4\n');
+      writeFileSync(file, JSON.stringify({ ...bootstrap, path: moved, directories: [join(home, '.bun2')] }), { mode: 0o600 });
+      expect(importBunBootstrapRecord(env)).toBe('imported');
+      expect(JSON.parse(readFileSync(ledgerFile, 'utf8')).tools.bun).toEqual({ ...rest, directories: [join(home, '.bun2')], removable: false, paths: { [moved]: { committed: { type: 'file', sha256 } } } });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});

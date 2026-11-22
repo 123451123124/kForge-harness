@@ -1,0 +1,73 @@
+schemaVersion: archcontext.node/v2
+id: capability.verification.evals-checks
+kind: capability
+name: Evals And Checks
+status: active
+layer: scripts
+summary: "Runs repository verification, contract gates, benchmarks, and evaluation suites."
+responsibilities:
+  - "Own machine-verifiable checks, bounded verifier execution, and evaluation evidence."
+  - "Own the test suite, CI coverage selection and the CI report."
+  - "Own the rule registry, TestBudget evaluation and its Actions result annotation and human summary; read rule parameters only from the base policy."
+  - "Run LedgerEnforcement on every PR, including documentation-only changes, and feed its result to Required / CI."
+  - "Project ledger themes and promotion actions, file one promotion issue per candidate and reconcile its route label and parent link; report task progress without changing ledger governance."
+  - "Own the workflow gate scripts that check the contract files, agent tooling and protected paths."
+source:
+  include:
+    - tests/**
+    - evals/**
+    - scripts/run-skill-evals.ts
+    - scripts/run-harness-profile-benchmark.ts
+    - scripts/validate-harness-profile-benchmark.ts
+    - scripts/verify-sprint.sh
+    - scripts/check-agent-tooling.sh
+    - bunfig.toml
+    - .github/**
+    - scripts/verification-plan.ts
+    - scripts/check-ci.sh
+    - scripts/host-test-queue.ts
+    - scripts/check-protected-paths.ts
+    - scripts/select-ci-coverage.ts
+    - scripts/replay-ci-coverage.ts
+    - scripts/report-ci.ts
+    - scripts/check-archimap-links.ts
+    - scripts/check-ledger-enforcement.ts
+    - scripts/select-test-suite.ts
+    - scripts/ci-documentation-consumers.ts
+    - scripts/harness-trace-grade.sh
+    - src/cli/commands/rules.ts
+    - src/cli/commands/verify.ts
+  exclude:
+    - tests/cli/adoption-plan.test.ts
+    - tests/fixtures/adoption/**
+    - tests/architecture-projection-provider.test.ts
+    - tests/cli/global-runtime-init.test.ts
+    - tests/cli/global-runtime.test.ts
+    - tests/cli/mcp-codegraph-contract.test.ts
+    - tests/cli/mcp-policy.test.ts
+    - tests/cli/mcp-reader-tools.test.ts
+    - tests/cli/mcp-tools.test.ts
+    - tests/cli/codegraph-resolver.test.ts
+  entrypoints:
+    - id: entrypoint.evals-checks.primary
+      path: src/effects/evidence/verification-execution.ts
+      symbols:
+        - name: executeAdmittedVerification
+          sinks:
+            - id: sink.evals-checks.prepare
+              path: src/effects/evidence/verification-execution.ts
+              symbol: executePrepared
+        - name: executePrepared
+          sinks:
+            - id: sink.evals-checks.primary
+              path: src/effects/evidence/verification-execution.ts
+              symbol: executeCheck
+extensions:
+  harnessTier: core
+  contractFiles:
+    agents: AGENTS.md
+    claude: CLAUDE.md
+  lspProfile: typescript-lsp
+  verification:
+    - bun run test:core
+    - bun run check:type

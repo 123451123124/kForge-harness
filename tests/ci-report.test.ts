@@ -1,0 +1,734 @@
+import { expect, test } from 'bun:test';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
+import { isCiRepairIssueBody } from '../src/core/ci/test-report';
+import { archimapLinkDrift } from '../scripts/check-archimap-links';
+import { ARCHITECTURE_EVIDENCE, ARCHITECTURE_JOB, CIReportError, architectureActionRow, junitFiles, parseArchitectureSummary, reportCI, renderReport, watchDailyCI, type GitHubAPI } from '../scripts/report-ci';
+
+function fixture(run: (f: { api: GitHubAPI; git: (...args: string[]) => string; before: string; after: string; prCommits: number; root: string; issues: any[]; comments: { issue: number; body: string }[]; calls: { path: string; method: string }[]; setConclusion: (value: string) => void; setRun: (id: number, attempt: number) => void; denyIssues: () => void }) => Promise<void>, candidateCommits = 1) {
+  const root = mkdtempSync(join(tmpdir(), 'ci-report-fixture-'));
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+  return (async () => {
+    try {
+      git('init', '-qb', 'main'); git('config', 'user.name', 'CI report fixture'); git('config', 'user.email', 'ci@example.invalid'); git('config', 'commit.gpgsign', 'false');
+      writeFileSync(join(root, 'feature.txt'), 'before\n'); git('add', '.'); git('commit', '-qm', 'base'); const before = git('rev-parse', 'HEAD');
+      git('checkout', '-qb', 'candidate'); writeFileSync(join(root, 'feature.txt'), 'after\n'); git('add', '.'); git('commit', '-qm', 'candidate');
+      for (let i = 1; i < candidateCommits; i++) {
+        writeFileSync(join(root, `candidate-${i}.txt`), `change ${i}\n`); git('add', '.'); git('commit', '-qm', `candidate change ${i}`);
+      }
+      const prCommits = Number(git('rev-list', '--count', `${before}..candidate`));
+      git('checkout', '-q', 'main'); git('merge', '--squash', 'candidate'); git('commit', '-qm', 'squashed PR'); const after = git('rev-parse', 'HEAD');
+      const now = new Date().toISOString(); const issues: any[] = []; const comments: { issue: number; body: string }[] = []; const calls: { path: string; method: string }[] = []; let conclusion = 'success'; let denied = false; let runId = 12; let runAttempt = 1;
+      const api: GitHubAPI = async (path, method = 'GET', raw) => {
+        calls.push({ path, method });
+        const body = raw as any;
+        if (path === `/repos/test/repo/actions/runs/${runId}`) return { id: runId, path: '.github/workflows/ci.yml', head_branch: 'main', head_sha: git('rev-parse', 'main'),
+          event: 'schedule', status: 'completed', conclusion, run_attempt: runAttempt, html_url: `https://github.com/test/repo/actions/runs/${runId}`, created_at: now };
+        if (/\/attempts\/\d+\/jobs$/.test(new URL(path, 'https://api.github.com').pathname)) return { jobs: [{ id: 44, name: 'Daily test', conclusion, check_run_url: 'https://api.github.com/repos/test/repo/check-runs/55' }] };
+        if (path.endsWith('/check-runs/55')) return { id: 55, html_url: 'https://github.com/test/repo/runs/55' };
+        const commentPath = /\/issues\/(\d+)\/comments(?:\?|$)/.exec(path);
+        if (commentPath && method === 'GET') return comments.filter(comment => comment.issue === Number(commentPath[1]));
+        if (commentPath && method === 'POST') { const comment = { issue: Number(commentPath[1]), body: body.body }; comments.push(comment); return comment; }
+        if (path.includes('/issues?')) return issues;
+        if (path.endsWith('/issues') && method === 'POST') {
+          if (denied) throw new CIReportError(403, 'HTTP 403');
+          const issue = { ...body, state: 'open', number: issues.length + 1, html_url: `https://github.com/test/repo/issues/${issues.length + 1}` };
+          issues.push(issue); writeFileSync(join(root, 'repair-issues.json'), JSON.stringify(issues)); return issue;
+        }
+        if (path.startsWith('/repos/test/repo/pulls?')) return [{ number: 7, merged_at: now, merge_commit_sha: after, base: { ref: 'main' } }];
+        if (path.endsWith('/pulls/7')) return { number: 7, merged: true, merge_commit_sha: after, base: { ref: 'main' }, commits: prCommits };
+        if (path === `/repos/test/repo/commits/${before}/pulls?per_page=100`) return [];
+        if (path.endsWith(`/git/commits/${after}`)) return { sha: after, parents: [{ sha: before }] };
+        if (path.includes('/compare/')) {
+          const [base, head] = path.split('/compare/')[1]!.split('...');
+          return { status: base === head ? 'identical' : spawnSync('git', ['merge-base', '--is-ancestor', base!, head!], { cwd: root }).status === 0 ? 'ahead' : 'diverged' };
+        }
+        throw Error(`Unexpected API operation ${method} ${path}`);
+      };
+      await run({ api, git, root, before, after, prCommits, issues, comments, calls, setConclusion: value => { conclusion = value; }, setRun: (id, attempt) => { runId = id; runAttempt = attempt; }, denyIssues: () => { denied = true; } });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  })();
+}
+
+test('daily report reads exact squash boundaries without ref writes; its SHA revert restores the actual tree', () => fixture(async f => {
+  const refs = f.git('show-ref');
+  const first = await reportCI('test/repo', 12, f.api);
+  expect(first.errors).toEqual([]); expect(first.merges).toEqual([{ pr: 7, before: f.before, after: f.after, rollback: `git revert --no-edit ${f.after}` }]);
+  const second = await reportCI('test/repo', 12, f.api);
+  expect(second).toEqual(first); expect(f.git('show-ref')).toBe(refs);
+  expect(f.calls.some(call => /\/git\/(?:tags|refs?)(?:\/|$)/.test(call.path))).toBe(false);
+  expect(f.calls.some(call => call.method !== 'GET')).toBe(false);
+  expect(renderReport(first)).toContain(`git revert --no-edit ${f.after}`);
+  f.git(...first.merges[0]!.rollback.split(' ').slice(1));
+  expect(f.git('rev-parse', 'HEAD^{tree}')).toBe(f.git('rev-parse', `${f.before}^{tree}`));
+}));
+
+test('multi-commit squash accepts one main boundary and its reported revert restores the pre-merge tree', () => fixture(async f => {
+  const refs = f.git('show-ref');
+  const report = await reportCI('test/repo', 12, f.api);
+  expect(f.prCommits).toBe(2);
+  expect(f.git('rev-list', '--count', `${f.before}..${f.after}`)).toBe('1');
+  expect(report.errors).toEqual([]); expect(report.repairs).toEqual([]);
+  expect(report.merges).toEqual([{ pr: 7, before: f.before, after: f.after, rollback: `git revert --no-edit ${f.after}` }]);
+  expect(f.git('show-ref')).toBe(refs); expect(f.calls.every(call => call.method === 'GET')).toBe(true);
+  f.git(...report.merges[0]!.rollback.split(' ').slice(1));
+  expect(f.git('rev-parse', 'HEAD^{tree}')).toBe(f.git('rev-parse', `${f.before}^{tree}`));
+}, 2));
+
+test.each(['failure', 'cancelled', 'timed_out'])('completed %s run keys one readable repair task by job name across attempts and daily runs', conclusion => fixture(async f => {
+  f.setConclusion(conclusion);
+  const first = await reportCI('test/repo', 12, f.api);
+  expect(first.repairs).toEqual([{ key: 'ci-repair:job:Daily test', issue_url: 'https://github.com/test/repo/issues/1', delivery: 'created' }]);
+  const persisted = JSON.parse(readFileSync(join(f.root, 'repair-issues.json'), 'utf8'));
+  expect(persisted).toHaveLength(1); expect(persisted[0].body).toContain(f.after);
+  // The operator tests route finds open repairs with the same rule the writer keys them by.
+  expect(isCiRepairIssueBody(persisted[0].body)).toBe(true);
+  expect(first.unresolved_repairs?.map(issue => issue.issue_number)).toEqual([1]);
+  const second = await reportCI('test/repo', 12, f.api);
+  expect(second.repairs[0]?.delivery).toBe('reused'); expect(f.issues).toHaveLength(1);
+  // The issue body already holds this attempt's evidence, so a repeated report adds nothing.
+  expect(f.comments).toEqual([]);
+  f.setRun(12, 2);
+  const attempt = await reportCI('test/repo', 12, f.api);
+  expect(attempt.repairs).toEqual([{ key: 'ci-repair:job:Daily test', issue_url: 'https://github.com/test/repo/issues/1', delivery: 'reused' }]);
+  // A reused issue records the current failure once per run attempt.
+  expect(f.comments).toHaveLength(1);
+  expect(f.comments[0]).toMatchObject({ issue: 1 }); expect(f.comments[0]!.body).toContain('Attempt: 2');
+  await reportCI('test/repo', 12, f.api);
+  expect(f.comments).toHaveLength(1);
+  writeFileSync(join(f.root, 'later.txt'), 'later main\n'); f.git('add', '.'); f.git('commit', '-qm', 'later main');
+  f.setRun(13, 1);
+  const daily = await reportCI('test/repo', 13, f.api);
+  expect(daily.repairs).toEqual([{ key: 'ci-repair:job:Daily test', issue_url: 'https://github.com/test/repo/issues/1', delivery: 'reused' }]);
+  expect(f.issues).toHaveLength(1);
+  expect(f.comments).toHaveLength(2);
+  expect(f.comments[1]!.body).toContain('https://github.com/test/repo/actions/runs/13'); expect(f.comments[1]!.body).toContain(f.git('rev-parse', 'main'));
+  f.issues[0].state = 'closed';
+  const reopened = await reportCI('test/repo', 13, f.api);
+  expect(reopened.repairs).toEqual([{ key: 'ci-repair:job:Daily test', issue_url: 'https://github.com/test/repo/issues/2', delivery: 'created' }]);
+}));
+
+function junitFile(file: string, suite: string, cases: { name: string; failed?: boolean }[]): string {
+  const failures = cases.filter(entry => entry.failed).length;
+  const counts = `tests="${cases.length}" assertions="${cases.length}" failures="${failures}" skipped="0"`;
+  const testcases = cases.map(entry => entry.failed
+    ? `      <testcase name="${entry.name}" classname="${suite}" time="0.001" file="${file}" line="2" assertions="1"><failure type="AssertionError" message="boom">boom</failure></testcase>`
+    : `      <testcase name="${entry.name}" classname="${suite}" time="0.001" file="${file}" line="2" assertions="1" />`).join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" ${counts} time="0.2">
+  <testsuite name="${file}" file="${file}" ${counts} time="0.2">
+    <testsuite name="${suite}" file="${file}" line="1" ${counts} time="0.2">
+${testcases}
+    </testsuite>
+  </testsuite>
+</testsuites>`;
+}
+
+/** Answers the failed-run job and JUnit artifact reads; every other provider answer is the shared fixture. */
+function testReportAPI(f: { api: GitHubAPI }, jobs: { id: number; name: string; conclusion: string }[], artifacts: { id: number; name: string }[]): GitHubAPI {
+  return async (path, method, body) => {
+    if (path.includes('/artifacts?')) return { artifacts: artifacts.map(artifact => ({ ...artifact, expired: false, size_in_bytes: 1024 })) };
+    if (path.includes('/attempts/1/jobs')) return { jobs: jobs.map(job => ({ ...job, check_run_url: `https://api.github.com/repos/test/repo/check-runs/${job.id}` })) };
+    const check = /\/check-runs\/(\d+)$/.exec(path);
+    if (check) return { id: Number(check[1]), html_url: `https://github.com/test/repo/runs/${check[1]}` };
+    return f.api(path, method, body);
+  };
+}
+
+test('two failing tests in one job open two repair issues titled by test', () => fixture(async f => {
+  f.setConclusion('failure');
+  const file = 'tests/repair-key.test.ts';
+  const report = junitFile(file, 'repair key', [{ name: 'first test', failed: true }, { name: 'second test', failed: true }]);
+  const api = testReportAPI(f, [{ id: 44, name: 'Daily full tests and package', conclusion: 'failure' }], [{ id: 7, name: 'junit-daily-1' }]);
+  const result = await reportCI('test/repo', 12, api, undefined, async () => [{ path: 'report.xml', text: report }]);
+  expect(result.errors).toEqual([]);
+  expect(result.repairs.map(entry => entry.key).sort()).toEqual([
+    `ci-repair:test:${file} > repair key > first test`,
+    `ci-repair:test:${file} > repair key > second test`,
+  ].sort());
+  expect(f.issues).toHaveLength(2);
+  expect(f.issues.map(issue => issue.title).sort()).toEqual([
+    `[CI repair] repair key > first test @ ${f.after.slice(0, 12)}`,
+    `[CI repair] repair key > second test @ ${f.after.slice(0, 12)}`,
+  ].sort());
+  for (const issue of f.issues) {
+    expect(issue.body).toContain(`File: ${file}`);
+    expect(issue.body).toContain('Failing jobs:\n- Daily full tests and package: failure: https://github.com/test/repo/runs/44');
+  }
+}));
+
+test('one test failing in several jobs opens one repair issue with the job list', () => fixture(async f => {
+  f.setConclusion('failure');
+  const file = 'tests/repair-key.test.ts';
+  const report = junitFile(file, 'repair key', [{ name: 'shared test', failed: true }]);
+  const api = testReportAPI(f, [
+    { id: 44, name: 'Affected tests (shard 0/3)', conclusion: 'failure' },
+    { id: 45, name: 'Daily full tests and package', conclusion: 'failure' },
+  ], [{ id: 7, name: 'junit-affected-shard-0-1' }, { id: 8, name: 'junit-daily-1' }]);
+  const result = await reportCI('test/repo', 12, api, undefined, async () => [{ path: 'report.xml', text: report }]);
+  expect(result.errors).toEqual([]);
+  expect(result.repairs).toEqual([{ key: `ci-repair:test:${file} > repair key > shared test`, issue_url: 'https://github.com/test/repo/issues/1', delivery: 'created' }]);
+  expect(f.issues).toHaveLength(1);
+  const body = f.issues[0].body;
+  expect(body).toContain('Failing jobs:');
+  expect(body).toContain('- Affected tests (shard 0/3): failure: https://github.com/test/repo/runs/44');
+  expect(body).toContain('- Daily full tests and package: failure: https://github.com/test/repo/runs/45');
+  expect(f.issues[0].title).toBe(`[CI repair] repair key > shared test @ ${f.after.slice(0, 12)}`);
+}));
+
+test('a job with no readable test report keeps the job repair key', () => fixture(async f => {
+  f.setConclusion('failure');
+  const api = testReportAPI(f, [{ id: 44, name: 'Daily full tests and package', conclusion: 'failure' }], [{ id: 7, name: 'junit-daily-1' }]);
+  const result = await reportCI('test/repo', 12, api, undefined, async () => null);
+  expect(result.errors).toEqual([]);
+  expect(result.repairs).toEqual([{ key: 'ci-repair:job:Daily full tests and package', issue_url: 'https://github.com/test/repo/issues/1', delivery: 'created' }]);
+  expect(f.issues).toHaveLength(1);
+  expect(f.issues[0].title).toBe(`[CI repair] job:Daily full tests and package @ ${f.after.slice(0, 12)}`);
+}));
+
+test('an unreadable test report keeps the job key and records the degradation', () => fixture(async f => {
+  f.setConclusion('failure');
+  const api = testReportAPI(f, [{ id: 44, name: 'Daily full tests and package', conclusion: 'failure' }], [{ id: 7, name: 'junit-daily-1' }]);
+  const result = await reportCI('test/repo', 12, api, undefined, async () => { throw new Error('gh run download failed'); });
+  expect(result.errors).toEqual([]);
+  expect(result.repairs).toEqual([{ key: 'ci-repair:job:Daily full tests and package', issue_url: 'https://github.com/test/repo/issues/1', delivery: 'created' }]);
+  expect(f.issues[0].body).toContain('The test report could not be read; the job key is used.');
+}));
+
+test('the artifact reader lists only nested XML reports', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ci-report-files-'));
+  try {
+    mkdirSync(join(root, 'nested'));
+    writeFileSync(join(root, 'nested', 'a.xml'), '<a/>');
+    writeFileSync(join(root, 'nested', 'notes.txt'), 'no');
+    writeFileSync(join(root, 'b.xml'), '<b/>');
+    expect(junitFiles(root, []).map(file => basename(file.path)).sort()).toEqual(['a.xml', 'b.xml']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('dispatch permission refusal stays pending and leaves the completed merge unchanged', () => fixture(async f => {
+  f.setConclusion('failure'); f.denyIssues();
+  const report = await reportCI('test/repo', 12, f.api);
+  expect(report.repairs).toHaveLength(1);
+  expect(report.repairs.every(repair => repair.delivery === 'pending' && repair.issue_url === null)).toBe(true);
+  expect(report.errors.join('\n')).toContain('Repair dispatch pending: job:Daily test: HTTP 403');
+  expect(report.merges[0]?.after).toBe(f.after);
+  expect(f.git('rev-parse', 'main')).toBe(f.after);
+}));
+
+test('untrusted PR or wrong workflow runs cannot dispatch privileged effects', async () => {
+  let writes = 0;
+  const api: GitHubAPI = async (_path, method = 'GET') => { if (method === 'POST') writes++; return { id: 12, path: '.github/workflows/untrusted.yml', head_branch: 'main' }; };
+  await expect(reportCI('test/repo', 12, api)).rejects.toThrow('not a completed fixed-main');
+  expect(writes).toBe(0);
+});
+
+test.each([{ runs: [] }, { runs: [{ id: 12, path: '.github/workflows/ci.yml', event: 'schedule', head_branch: 'main', created_at: '2026-10-03T21:00:00Z', status: 'unknown_status' }] }])('daily watchdog creates/reuses one dated repair when no delivered schedule run exists: %j', async ({ runs }) => {
+  const issues: any[] = [];
+  const api: GitHubAPI = async (path, method = 'GET', body) => {
+    if (path.includes('/actions/workflows/ci.yml/runs?')) return { workflow_runs: runs };
+    if (path.includes('/issues?')) return issues;
+    if (path.endsWith('/commits/main')) return { sha: 'a'.repeat(40) };
+    if (path.endsWith('/issues') && method === 'POST') { const issue = { ...(body as any), number: 1, html_url: 'https://github.com/test/repo/issues/1' }; issues.push(issue); return issue; }
+    throw Error(`Unexpected API request ${path}`);
+  };
+  const first = await watchDailyCI('test/repo', new Date('2026-10-03T23:30:00Z'), api, '0 19 * * *');
+  expect(first.delivery).toBe('created'); expect(first.sha).toBe('a'.repeat(40));
+  expect(isCiRepairIssueBody(issues[0].body)).toBe(true);
+  expect(first.observation).toBe('not-started');
+  expect(first.run_ids).toEqual([]);
+  const late = await watchDailyCI('test/repo', new Date('2026-10-04T00:05:00Z'), api, '0 19 * * *');
+  expect(late.delivery).toBe('reused'); expect(late.date).toBe('2026-10-03'); expect(issues).toHaveLength(1);
+});
+
+test.each([
+  { now: '2026-10-03T23:30:00Z', created: '2026-10-03T21:00:00Z', date: '2026-10-03', status: 'completed' },
+  { now: '2026-10-06T03:09:34.720Z', created: '2026-10-06T00:41:50Z', date: '2026-10-05', status: 'completed' },
+  { now: '2026-11-10T02:34:00Z', created: '2026-11-10T02:06:25Z', date: '2026-11-09', status: 'in_progress' },
+])('daily watchdog observes a delivered run across its UTC window: %j', async ({ now, created, date, status }) => {
+  const run = { id: 37395342276, path: '.github/workflows/ci.yml', event: 'schedule', head_branch: 'main', created_at: created, status, conclusion: status === 'completed' ? 'failure' : null };
+  let writes = 0;
+  const api: GitHubAPI = async (path, method = 'GET', body) => {
+    if (path.includes('/actions/workflows/ci.yml/runs?')) {
+      // Match the provider's inclusive calendar-date filter, including one-day queries.
+      const filter = new URL(path, 'https://api.github.com').searchParams.get('created')!;
+      const [from, to = from] = filter.split('..');
+      const day = run.created_at.slice(0, 10);
+      return { workflow_runs: day >= from! && day <= to! ? [run] : [] };
+    }
+    if (path.includes('/issues?')) return [];
+    if (path.endsWith('/commits/main')) return { sha: 'a'.repeat(40) };
+    if (path.endsWith('/issues') && method === 'POST') { writes++; return { ...(body as object), number: 1, html_url: 'https://github.com/test/repo/issues/1' }; }
+    throw Error(`Unexpected API request ${path}`);
+  };
+  const observed = await watchDailyCI('test/repo', new Date(now), api, '0 19 * * *');
+  expect(observed).toEqual({ date, observation: 'run-observed', run_ids: [run.id] });
+  expect(writes).toBe(0);
+});
+
+test.each(['2026-10-05T18:59:59Z', '2026-10-06T03:09:35Z'])('daily watchdog does not count a run outside the exact window: %s', async created => {
+  let writes = 0;
+  const api: GitHubAPI = async (path, method = 'GET', body) => {
+    if (path.includes('/actions/workflows/ci.yml/runs?')) return { workflow_runs: [{ id: 12, path: '.github/workflows/ci.yml', event: 'schedule', head_branch: 'main', created_at: created, status: 'completed' }] };
+    if (path.includes('/issues?')) return [];
+    if (path.endsWith('/commits/main')) return { sha: 'a'.repeat(40) };
+    if (path.endsWith('/issues') && method === 'POST') { writes++; return { ...(body as object), number: 1, html_url: 'https://github.com/test/repo/issues/1' }; }
+    throw Error(`Unexpected API request ${path}`);
+  };
+  const observed = await watchDailyCI('test/repo', new Date('2026-10-06T03:09:34.720Z'), api, '0 19 * * *');
+  expect(observed.observation).toBe('not-started');
+  expect(writes).toBe(1);
+});
+
+test('malformed provider JSON run is rejected before any issue effect', async () => {
+  let writes = 0;
+  const api: GitHubAPI = async (_path, method = 'GET') => { if (method === 'POST') writes++; return ['not a run object']; };
+  await expect(reportCI('test/repo', 12, api)).rejects.toThrow('CI run must be a JSON object');
+  expect(writes).toBe(0);
+});
+
+test.each([
+  { name: 'malformed commit', commit: [] },
+  { name: 'root commit', commit: { parents: [] } },
+  { name: 'multiple parents', commit: { parents: [{ sha: 'a'.repeat(40) }, { sha: 'b'.repeat(40) }] } },
+  { name: 'wrong commit SHA', commit: { sha: 'a'.repeat(40) } },
+  { name: 'zero parent', commit: { parents: [{ sha: '0'.repeat(40) }] } },
+  { name: 'malformed parent', commit: { parents: [null] } },
+  { name: 'incomplete commit', commit: { parents: undefined } },
+  { name: 'same parent', sameParent: true },
+  { name: 'API failure', fail: true },
+  { name: 'incomplete membership', membership: {} },
+])('rollback boundary fails closed for $name', scenario => fixture(async f => {
+  const refs = f.git('show-ref');
+  const api: GitHubAPI = async (path, method, body) => {
+    if (path.endsWith(`/git/commits/${f.after}`)) {
+      if ('fail' in scenario) throw new CIReportError(404, 'HTTP 404');
+      if ('sameParent' in scenario) return { sha: f.after, parents: [{ sha: f.after }] };
+      if ('commit' in scenario) return Array.isArray(scenario.commit) ? scenario.commit : { sha: f.after, parents: [{ sha: f.before }], ...scenario.commit };
+    }
+    if (path.includes('/compare/') && 'membership' in scenario) return scenario.membership;
+    return f.api(path, method, body);
+  };
+  const first = await reportCI('test/repo', 12, api);
+  expect(first.merges).toEqual([]); expect(first.errors).toHaveLength(1);
+  expect(first.repairs).toEqual([{ key: 'ci-repair:merge-pr-7', issue_url: 'https://github.com/test/repo/issues/1', delivery: 'created' }]);
+  const second = await reportCI('test/repo', 12, api);
+  expect(second.repairs[0]?.delivery).toBe('reused'); expect(f.issues).toHaveLength(1);
+  expect(f.git('show-ref')).toBe(refs);
+}));
+
+test('multi-commit rebase fails closed because reverting its last commit leaves the first change', () => fixture(async f => {
+  f.git('checkout', '-qb', 'rebase-pr', f.before);
+  for (const file of ['first.txt', 'second.txt']) {
+    writeFileSync(join(f.root, file), file); f.git('add', '.'); f.git('commit', '-qm', file);
+  }
+  f.git('rebase', 'main'); const after = f.git('rev-parse', 'HEAD');
+  const count = Number(f.git('rev-list', '--count', `${f.after}..${after}`));
+  const parent = f.git('rev-parse', 'HEAD^');
+  f.git('checkout', '-q', 'main'); f.git('merge', '--ff-only', 'rebase-pr');
+  const api: GitHubAPI = async (path, method, body) => {
+    if (path.startsWith('/repos/test/repo/pulls?')) return (await f.api(path) as Record<string, unknown>[]).map(pr => ({ ...pr, merge_commit_sha: after }));
+    if (path.endsWith('/pulls/7')) return { number: 7, merged: true, merge_commit_sha: after, base: { ref: 'main' }, commits: count };
+    if (path.endsWith(`/git/commits/${after}`)) return { sha: after, parents: [{ sha: parent }] };
+    if (path === `/repos/test/repo/commits/${parent}/pulls?per_page=100`) return [{ number: 7 }];
+    return f.api(path, method, body);
+  };
+  const report = await reportCI('test/repo', 12, api);
+  expect(count).toBe(2); expect(report.merges).toEqual([]);
+  expect(report.errors.join('\n')).toContain('Automatic rollback cannot revert only the last commit of multi-commit rebase PR #7');
+  expect(report.repairs[0]).toMatchObject({ key: 'ci-repair:merge-pr-7', delivery: 'created' });
+  expect(f.git('rev-parse', 'main')).toBe(after);
+  f.git('checkout', '-qb', 'incomplete-rollback'); f.git('revert', '--no-edit', after);
+  expect(readFileSync(join(f.root, 'first.txt'), 'utf8')).toBe('first.txt');
+  expect(f.git('rev-parse', 'HEAD^{tree}')).not.toBe(f.git('rev-parse', `${f.after}^{tree}`));
+}));
+
+test.each([
+  { name: 'wrong PR', detail: { number: 8 } },
+  { name: 'wrong merge SHA', detail: { merge_commit_sha: 'a'.repeat(40) } },
+  { name: 'unmerged PR', detail: { merged: false } },
+  { name: 'wrong base', detail: { base: { ref: 'feature' } } },
+  { name: 'malformed detail', detail: null },
+  { name: 'detail API failure', fail: true },
+])('merged PR identity proof fails closed: $name', scenario => fixture(async f => {
+  const report = await reportCI('test/repo', 12, async (path, method, body) => {
+    if (path.endsWith('/pulls/7')) {
+      if ('fail' in scenario) throw new CIReportError(404, 'HTTP 404');
+      return scenario.detail === null ? null : { ...(await f.api(path) as object), ...scenario.detail };
+    }
+    return f.api(path, method, body);
+  });
+  expect(report.merges).toEqual([]); expect(report.errors).toHaveLength(1);
+  expect(report.repairs[0]).toMatchObject({ key: 'ci-repair:merge-pr-7', delivery: 'created' });
+}));
+
+test.each([
+  { name: 'non-array associations', response: {} },
+  { name: 'malformed association', response: [null] },
+  { name: 'missing PR number', response: [{}] },
+  { name: 'unsafe PR number', response: [{ number: Number.MAX_SAFE_INTEGER + 1 }] },
+  { name: 'full association page', response: Array.from({ length: 100 }, () => ({ number: 6 })) },
+  { name: 'parent API failure', fail: true },
+])('rollback parent PR observation fails closed: $name', scenario => fixture(async f => {
+  const report = await reportCI('test/repo', 12, async (path, method, body) => {
+    if (path === `/repos/test/repo/commits/${f.before}/pulls?per_page=100`) {
+      if ('fail' in scenario) throw new CIReportError(404, 'HTTP 404');
+      return scenario.response;
+    }
+    return f.api(path, method, body);
+  });
+  expect(report.merges).toEqual([]); expect(report.errors).toHaveLength(1);
+  expect(report.repairs[0]).toMatchObject({ key: 'ci-repair:merge-pr-7', delivery: 'created' });
+}));
+
+test.each([
+  { name: 'snapshot compare 503', status: 503, read: (path: string) => path.includes('/compare/') },
+  { name: 'parent PR associations 500', status: 500, read: (path: string) => /\/commits\/[0-9a-f]{40}\/pulls\?/.test(path) },
+  { name: 'closed PR list 502', status: 502, read: (path: string) => path.startsWith('/repos/test/repo/pulls?') },
+])('a provider 5xx on a rollback boundary read makes merge reporting unavailable and opens no repair issue: $name', scenario => fixture(async f => {
+  const report = await reportCI('test/repo', 12, async (path, method, body) => {
+    if (scenario.read(path)) throw new CIReportError(scenario.status, `GitHub GET ${path}: HTTP ${scenario.status}`);
+    return f.api(path, method, body);
+  });
+  expect(report.merges).toEqual([]); expect(report.repairs).toEqual([]); expect(f.issues).toEqual([]);
+  expect(report.errors).toEqual([expect.stringMatching(new RegExp(`^Merge reporting unavailable \\(attention_owner: external\\): GitHub GET .*: HTTP ${scenario.status}$`))]);
+}));
+
+test('a provider request timeout on a rollback boundary read makes merge reporting unavailable and opens no repair issue', () => fixture(async f => {
+  const eventPath = join(f.root, 'event.json');
+  writeFileSync(eventPath, JSON.stringify({ workflow_run: { id: 12 } }));
+  // The merge read never answers, so only the request deadline of the api boundary ends it.
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, idleTimeout: 120, async fetch(request) {
+    const url = new URL(request.url);
+    const path = url.pathname + url.search;
+    if (request.method === 'GET' && path === `/repos/test/repo/git/commits/${f.after}`) return new Promise<Response>(() => {});
+    try {
+      const result = await f.api(path, request.method as 'GET' | 'POST', request.method === 'POST' ? await request.json() : undefined);
+      return Response.json(result);
+    } catch (error) { return Response.json({ message: String(error) }, { status: 500 }); }
+  } });
+  try {
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, '../scripts/report-ci.ts')], {
+      cwd: f.root, env: { ...process.env, HOME: f.root, GH_TOKEN: 'fixture-token', GITHUB_REPOSITORY: 'test/repo', GITHUB_API_URL: server.url.origin,
+        GITHUB_EVENT_PATH: eventPath, GITHUB_STEP_SUMMARY: join(f.root, 'summary.md') }, stdout: 'ignore', stderr: 'ignore',
+    });
+    expect(await child.exited).toBe(1);
+    const report = JSON.parse(readFileSync(join(f.root, '.ci-report/report.json'), 'utf8'));
+    expect(report.errors).toEqual([`Merge reporting unavailable (attention_owner: external): GitHub GET /repos/test/repo/git/commits/${f.after}: provider request timeout after 30000 ms`]);
+    expect(report.merges).toEqual([]); expect(report.repairs).toEqual([]); expect(f.issues).toEqual([]);
+  } finally { server.stop(true); }
+}));
+
+test('a provider body stall on a rollback boundary read is the same external outage, not a repair', () => fixture(async f => {
+  const eventPath = join(f.root, 'event.json');
+  writeFileSync(eventPath, JSON.stringify({ workflow_run: { id: 12 } }));
+  // The merge read sends its headers and the first body bytes at once and never finishes the body, so only the request
+  // deadline ends it. An empty stream would hold the headers back, and the deadline would cut off the fetch itself.
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, idleTimeout: 120, async fetch(request) {
+    const url = new URL(request.url);
+    const path = url.pathname + url.search;
+    if (request.method === 'GET' && path === `/repos/test/repo/git/commits/${f.after}`) {
+      const body = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{"sha')); } });
+      return new Response(body, { headers: { 'Content-Type': 'application/json' } });
+    }
+    try {
+      const result = await f.api(path, request.method as 'GET' | 'POST', request.method === 'POST' ? await request.json() : undefined);
+      return Response.json(result);
+    } catch (error) { return Response.json({ message: String(error) }, { status: 500 }); }
+  } });
+  try {
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, '../scripts/report-ci.ts')], {
+      cwd: f.root, env: { ...process.env, HOME: f.root, GH_TOKEN: 'fixture-token', GITHUB_REPOSITORY: 'test/repo', GITHUB_API_URL: server.url.origin,
+        GITHUB_EVENT_PATH: eventPath, GITHUB_STEP_SUMMARY: join(f.root, 'summary.md') }, stdout: 'ignore', stderr: 'ignore',
+    });
+    expect(await child.exited).toBe(1);
+    const report = JSON.parse(readFileSync(join(f.root, '.ci-report/report.json'), 'utf8'));
+    expect(report.errors).toEqual([`Merge reporting unavailable (attention_owner: external): GitHub GET /repos/test/repo/git/commits/${f.after}: provider request timeout after 30000 ms`]);
+    expect(report.merges).toEqual([]); expect(report.repairs).toEqual([]); expect(f.issues).toEqual([]);
+  } finally { server.stop(true); }
+}));
+
+test.each([
+  { name: 'unresolved repair list 503', conclusion: 'success', read: (path: string) => path.includes('/issues?state=open'), error: 'Unresolved repair readback unavailable', repairs: [] },
+  { name: 'failed run jobs 503 keeps the run repair', conclusion: 'failure', read: (path: string) => path.includes('/jobs?'), error: 'Failure observation incomplete', repairs: ['ci-repair:12:1:run-12'] },
+])('a provider 5xx on a non-merge read is an external error: $name', scenario => fixture(async f => {
+  f.setConclusion(scenario.conclusion);
+  const report = await reportCI('test/repo', 12, async (path, method, body) => {
+    if (scenario.read(path)) throw new CIReportError(503, `GitHub GET ${path}: HTTP 503`);
+    return f.api(path, method, body);
+  });
+  expect(report.repairs.map(repair => repair.key)).toEqual([...scenario.repairs]);
+  expect(report.errors).toEqual([expect.stringMatching(new RegExp(`^Provider unavailable \\(attention_owner: external\\): ${scenario.error}: GitHub GET .*: HTTP 503$`))]);
+}));
+
+test('a parent introduced by another PR keeps the squash boundary valid', () => fixture(async f => {
+  const report = await reportCI('test/repo', 12, (path, method, body) =>
+    path === `/repos/test/repo/commits/${f.before}/pulls?per_page=100` ? Promise.resolve([{ number: 6 }]) : f.api(path, method, body));
+  expect(report.errors).toEqual([]);
+  expect(report.merges[0]).toEqual({ pr: 7, before: f.before, after: f.after, rollback: `git revert --no-edit ${f.after}` });
+}));
+
+test.each(['behind', 'diverged'])('merge outside the fixed snapshot is excluded: %s', status => fixture(async f => {
+  const report = await reportCI('test/repo', 12, (path, method, body) => path.includes('/compare/') ? Promise.resolve({ status }) : f.api(path, method, body));
+  expect(report.merges).toEqual([]); expect(report.repairs).toEqual([]); expect(report.errors).toEqual([]);
+}));
+
+test('a later fixed main snapshot retains the provider merge and parent boundary', () => fixture(async f => {
+  writeFileSync(join(f.root, 'feature.txt'), 'later main\n'); f.git('add', '.'); f.git('commit', '-qm', 'later main');
+  const report = await reportCI('test/repo', 12, f.api);
+  expect(report.sha).toBe(f.git('rev-parse', 'main'));
+  expect(report.merges).toEqual([{ pr: 7, before: f.before, after: f.after, rollback: `git revert --no-edit ${f.after}` }]);
+  expect(report.errors).toEqual([]);
+}));
+
+test.each([
+  { name: 'incomplete PR page', response: {} },
+  { name: 'missing merge SHA', response: [{ number: 7, merged_at: new Date().toISOString(), base: { ref: 'main' } }] },
+  { name: 'unsafe PR number', response: [{ number: Number.MAX_SAFE_INTEGER + 1, merged_at: new Date().toISOString(), merge_commit_sha: 'a'.repeat(40), base: { ref: 'main' } }] },
+  { name: 'fractional PR number', response: [{ number: 7.5, merged_at: new Date().toISOString(), merge_commit_sha: 'a'.repeat(40), base: { ref: 'main' } }] },
+  { name: 'zero merge SHA', response: [{ number: 7, merged_at: new Date().toISOString(), merge_commit_sha: '0'.repeat(40), base: { ref: 'main' } }] },
+])('incomplete provider merge observation fails closed: $name', ({ response }) => fixture(async f => {
+  const report = await reportCI('test/repo', 12, (path, method, body) => path.startsWith('/repos/test/repo/pulls?') ? Promise.resolve(response) : f.api(path, method, body));
+  expect(report.merges).toEqual([]); expect(report.errors).toHaveLength(1);
+  expect(report.repairs[0]).toMatchObject({ key: 'ci-repair:12:1:report-12', delivery: 'created' });
+}));
+
+test('merge boundary repair reuses one open PR issue across new main SHAs, run IDs and attempts', () => fixture(async f => {
+  f.issues.push(
+    { number: 1, state: 'open', body: '<!-- ci-repair:91:3:tags-pr-7 -->', html_url: 'https://github.com/test/repo/issues/1' },
+    { number: 2, state: 'open', body: '<!-- ci-repair:tags-pr-7 -->', html_url: 'https://github.com/test/repo/issues/2' },
+    { number: 3, state: 'open', pull_request: {}, body: '<!-- ci-repair:merge-pr-7 -->', html_url: 'https://github.com/test/repo/pull/3' },
+    { number: 4, state: 'closed', body: '<!-- ci-repair:merge-pr-7 -->', html_url: 'https://github.com/test/repo/issues/4' },
+  );
+  const api: GitHubAPI = (path, method, body) => path.includes('/git/commits/') ? Promise.reject(new CIReportError(404, 'HTTP 404')) : f.api(path, method, body);
+  const first = await reportCI('test/repo', 12, api);
+  expect(first.repairs[0]).toMatchObject({ key: 'ci-repair:merge-pr-7', delivery: 'created', issue_url: 'https://github.com/test/repo/issues/5' });
+  expect((await reportCI('test/repo', 12, api)).repairs[0]?.delivery).toBe('reused');
+  f.issues[4].state = 'closed';
+  expect((await reportCI('test/repo', 12, api)).repairs[0]?.delivery).toBe('created');
+  writeFileSync(join(f.root, 'later.txt'), 'later main\n'); f.git('add', '.'); f.git('commit', '-qm', 'later main');
+  f.setRun(13, 2);
+  const next = await reportCI('test/repo', 13, api);
+  expect(next.sha).not.toBe(first.sha);
+  expect(next.run_id).toBe(13); expect(next.run_attempt).toBe(2);
+  expect(next.repairs[0]).toEqual({ key: 'ci-repair:merge-pr-7', delivery: 'reused', issue_url: 'https://github.com/test/repo/issues/6' });
+  expect(f.issues).toHaveLength(6);
+}));
+
+test('concurrent reports for one merged PR elect one open shared repair issue', async () => {
+  const now = new Date().toISOString();
+  const after = 'b'.repeat(40);
+  const issues: any[] = [];
+  const comments: { issue: number; body: string }[] = [];
+  let lists = 0;
+  let releaseSecond = () => {};
+  const bothListed = new Promise<void>(resolve => { releaseSecond = resolve; });
+  const api: GitHubAPI = async (path, method = 'GET', raw) => {
+    const body = raw as any;
+    if (/^\/repos\/test\/repo\/actions\/runs\/\d+$/.test(path)) {
+      const id = Number(path.split('/').pop());
+      return { id, path: '.github/workflows/ci.yml', head_branch: 'main', head_sha: 'a'.repeat(40), event: 'schedule', status: 'completed', conclusion: 'success', run_attempt: 1, html_url: `https://github.com/test/repo/actions/runs/${id}`, created_at: now };
+    }
+    // Deterministic barrier: both reports read the same empty issue snapshot
+    // before either creation becomes visible, then creation runs for real.
+    if (path.startsWith('/repos/test/repo/issues?state=all')) {
+      lists++;
+      if (lists <= 2) { if (lists === 2) releaseSecond(); await bothListed; return []; }
+      return issues;
+    }
+    if (path.startsWith('/repos/test/repo/issues?state=open')) return issues.filter(issue => issue.state === 'open');
+    const commentPath = /\/issues\/(\d+)\/comments(?:\?|$)/.exec(path);
+    if (commentPath && method === 'GET') return comments.filter(comment => comment.issue === Number(commentPath[1]));
+    if (commentPath && method === 'POST') { const comment = { issue: Number(commentPath[1]), body: body.body }; comments.push(comment); return comment; }
+    if (path === '/repos/test/repo/issues' && method === 'POST') {
+      const issue = { ...body, state: 'open', number: issues.length + 1, html_url: `https://github.com/test/repo/issues/${issues.length + 1}` };
+      issues.push(issue);
+      return issue;
+    }
+    if (path.startsWith('/repos/test/repo/issues/') && method === 'PATCH') {
+      const issue = issues.find(candidate => candidate.number === Number(path.split('/').pop()));
+      if (!issue) throw new Error(`Unexpected close of missing issue ${path}`);
+      issue.state = body.state ?? issue.state;
+      return issue;
+    }
+    if (path.startsWith('/repos/test/repo/pulls?')) return [{ number: 7, merged_at: now, merge_commit_sha: after, base: { ref: 'main' } }];
+    if (/^\/repos\/test\/repo\/git\/commits\//.test(path)) throw new CIReportError(404, 'HTTP 404');
+    throw Error(`Unexpected API operation ${method} ${path}`);
+  };
+  const reports = await Promise.all([reportCI('test/repo', 12, api), reportCI('test/repo', 13, api)]);
+  const repairs = reports.map(report => report.repairs[0]!);
+  expect(repairs.map(repair => repair.key)).toEqual(['ci-repair:merge-pr-7', 'ci-repair:merge-pr-7']);
+  expect([...repairs.map(repair => repair.delivery)].sort()).toEqual(['created', 'reused']);
+  const winner = repairs.find(repair => repair.delivery === 'created')!;
+  expect(repairs.find(repair => repair.delivery === 'reused')!.issue_url).toBe(winner.issue_url);
+  expect(issues).toHaveLength(2);
+  expect(issues.every(issue => typeof issue.body === 'string' && issue.body.includes('<!-- ci-repair:merge-pr-7 -->'))).toBe(true);
+  const open = issues.filter(issue => issue.state === 'open');
+  expect(open).toHaveLength(1);
+  expect(open[0]!.html_url).toBe(winner.issue_url);
+  expect(issues.find(issue => issue.state === 'closed')!.number).toBeGreaterThan(open[0]!.number);
+  // The losing report's run evidence lands on the winning issue, not only on its closed duplicate.
+  expect(comments.map(comment => comment.issue)).toEqual([open[0]!.number]);
+  const next = await reportCI('test/repo', 14, api);
+  expect(next.repairs[0]).toMatchObject({ key: 'ci-repair:merge-pr-7', delivery: 'reused', issue_url: winner.issue_url });
+  expect(issues).toHaveLength(2);
+  expect(issues.filter(issue => issue.state === 'open')).toHaveLength(1);
+});
+
+test.each([
+  { response: JSON.stringify({ message: 'Resource not accessible by integration\nfixture-secret-token ghp_othercredential Bearer another-token', token: 'must-not-be-recorded' }), reason: 'Resource not accessible by integration' },
+  { response: 'upstream returned non-JSON fixture-secret-token', reason: '' },
+  { response: JSON.stringify({ message: { token: 'fixture-secret-token' } }), reason: '' },
+])('real CLI keeps HTTP refusal status and only a redacted provider message: %j', ({ response, reason }) => fixture(async f => {
+  const eventPath = join(f.root, 'event.json');
+  writeFileSync(eventPath, JSON.stringify({ workflow_run: { id: 12 } }));
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    const path = new URL(request.url).pathname + new URL(request.url).search;
+    if (request.method === 'GET' && path.endsWith(`/git/commits/${f.after}`)) return new Response(response, { status: 403, headers: { 'Content-Type': 'application/json', 'X-Fake-Secret': 'header-secret' } });
+    try {
+      const result = await f.api(path, request.method as 'GET' | 'POST', request.method === 'POST' ? await request.json() : undefined);
+      return Response.json(result);
+    } catch (error) {
+      if (error instanceof CIReportError && error.status !== null) return Response.json({ message: error.message }, { status: error.status });
+      return Response.json({ message: String(error) }, { status: 500 });
+    }
+  } });
+  try {
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, '../scripts/report-ci.ts')], {
+      cwd: f.root, env: { ...process.env, HOME: f.root, GH_TOKEN: 'fixture-secret-token', GITHUB_REPOSITORY: 'test/repo', GITHUB_API_URL: server.url.origin,
+        GITHUB_EVENT_PATH: eventPath, GITHUB_STEP_SUMMARY: join(f.root, 'summary.md') }, stdout: 'pipe', stderr: 'pipe',
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect({ exitCode, stdout, stderr }).toEqual({ exitCode: 1, stdout: '', stderr: '' });
+    const json = readFileSync(join(f.root, '.ci-report/report.json'), 'utf8');
+    const report = JSON.parse(json);
+    expect(report.errors).toHaveLength(1);
+    expect(report.errors[0]).toContain(`GitHub GET /repos/test/repo/git/commits/${f.after}: HTTP 403`);
+    if (reason) expect(report.errors[0]).toContain(reason);
+    expect(report.merges).toEqual([]); expect(report.repairs[0].delivery).toBe('created');
+    const output = json + readFileSync(join(f.root, '.ci-report/report.md'), 'utf8') + readFileSync(join(f.root, 'summary.md'), 'utf8') + stdout + stderr;
+    for (const secret of ['fixture-secret-token', 'ghp_othercredential', 'another-token', 'must-not-be-recorded', 'header-secret']) expect(output).not.toContain(secret);
+    expect(f.git('rev-parse', 'main')).toBe(f.after);
+    expect(f.git('tag', '--list')).toBe('');
+  } finally { server.stop(true); }
+}));
+
+test('real CLI labels a provider 5xx on the initial run read external and stays pending', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ci-report-initial-run-'));
+  const requests: string[] = [];
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    requests.push(`${request.method} ${new URL(request.url).pathname}`);
+    return Response.json({ message: 'Service Unavailable' }, { status: 503 });
+  } });
+  try {
+    const eventPath = join(root, 'event.json');
+    writeFileSync(eventPath, JSON.stringify({ workflow_run: { id: 12 } }));
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, '../scripts/report-ci.ts')], {
+      cwd: root, env: { ...process.env, HOME: root, GH_TOKEN: 'fixture-token', GITHUB_REPOSITORY: 'test/repo', GITHUB_API_URL: server.url.origin, GITHUB_EVENT_PATH: eventPath },
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await child.exited).not.toBe(0);
+    expect(JSON.parse(readFileSync(join(root, '.ci-report/pending.json'), 'utf8'))).toEqual({ run_id: 12, delivery: 'pending',
+      error: 'Provider unavailable (attention_owner: external): GitHub GET /repos/test/repo/actions/runs/12: HTTP 503: Service Unavailable' });
+    expect(requests).toEqual(['GET /repos/test/repo/actions/runs/12']);
+  } finally { server.stop(true); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('report and watchdog uploads include the real hidden report directory', () => {
+  const workflow = Bun.YAML.parse(readFileSync(join(import.meta.dir, '../.github/workflows/ci-report.yml'), 'utf8')) as any;
+  for (const name of ['report', 'watchdog']) {
+    const uploads = workflow.jobs[name].steps.filter((step: any) => step.uses === 'actions/upload-artifact@v4');
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0].if).toBe('always()');
+    expect(uploads[0].with.path).toBe('.ci-report/');
+    expect(uploads[0].with['include-hidden-files']).toBe(true);
+    expect(uploads[0].with['if-no-files-found']).toBe('error');
+  }
+});
+
+const architectureEvidence = readFileSync(join(import.meta.dir, '..', ARCHITECTURE_EVIDENCE), 'utf8');
+const architectureSummary = { status: 'planned', renderEquivalent: false, differingPaths: ['docs/architecture/a.md'], humanActions: [], freshness: 'stale', unpublishedSince: '2026-11-12T01:01:09.000Z', archimapLinks: { dead: [], missing: [] } };
+// The fixture job is the daily architecture job; every other provider answer is the shared fixture.
+const architectureAPI = (f: { api: GitHubAPI }): GitHubAPI => async (path, method, body) => path.includes('/attempts/1/jobs')
+  ? { jobs: [{ id: 44, name: ARCHITECTURE_JOB, conclusion: 'failure', check_run_url: 'https://api.github.com/repos/test/repo/check-runs/55' }] }
+  : f.api(path, method, body);
+
+test('a daily architecture failure opens a named repair issue with the summary, render differences and writer action row', () => fixture(async f => {
+  f.setConclusion('failure');
+  const input = { summaryText: JSON.stringify(architectureSummary), evidence: architectureEvidence };
+  const first = await reportCI('test/repo', 12, architectureAPI(f), input);
+  expect(first.errors).toEqual([]);
+  expect(first.repairs).toEqual([{ key: `ci-repair:job:${ARCHITECTURE_JOB}`, issue_url: 'https://github.com/test/repo/issues/1', delivery: 'created' }]);
+  const issue = f.issues[0];
+  expect(issue.title).toBe(`[CI repair] architecture stale (planned) @ ${f.after.slice(0, 12)}`);
+  expect(issue.body).toStartWith(`<!-- ci-repair:job:${ARCHITECTURE_JOB} -->`);
+  expect(issue.body).toContain(`\`\`\`json\n${JSON.stringify(architectureSummary, null, 2)}\n\`\`\``);
+  expect(issue.body).toContain('Render differences: docs/architecture/a.md');
+  expect(issue.body).toContain('Freshness: stale; oldest unpublished main commit: 2026-11-12T01:01:09.000Z');
+  expect(issue.body).toContain('Archimap module links: dead none; missing none');
+  expect(issue.body).not.toContain('Archimap action');
+  expect(issue.body).toContain(architectureActionRow(parseArchitectureSummary(input.summaryText), architectureEvidence));
+  expect(issue.body).toContain('| `renderEquivalent: false` |');
+  expect(issue.body).not.toContain('run typecheck + affected tests');
+  expect((await reportCI('test/repo', 12, architectureAPI(f), input)).repairs[0]?.delivery).toBe('reused');
+  expect(f.issues).toHaveLength(1);
+}));
+
+test('a dead or missing archimap module link names the links and the refresh action in the repair issue', () => fixture(async f => {
+  f.setConclusion('failure');
+  const summary = { ...architectureSummary, renderEquivalent: true, differingPaths: [], freshness: 'fresh',
+    archimapLinks: { dead: ['docs/architecture/modules/a/gone.md'], missing: ['docs/architecture/modules/b/new.md'] } };
+  const report = await reportCI('test/repo', 12, architectureAPI(f), { summaryText: JSON.stringify(summary), evidence: architectureEvidence });
+  expect(report.errors).toEqual([]);
+  const issue = f.issues[0];
+  expect(issue.title).toBe(`[CI repair] architecture fresh (planned), archimap links @ ${f.after.slice(0, 12)}`);
+  expect(issue.body).toContain('Archimap module links: dead docs/architecture/modules/a/gone.md; missing docs/architecture/modules/b/new.md');
+  expect(issue.body).toContain('Archimap action: refresh `docs/architecture/archimap.html`');
+}));
+
+test('the archimap link check reads module document links of the map against modules[].docs', () => {
+  const html = '<a href="history.md"></a><a href="https://example.invalid/modules/x.md"></a><a href="#modules"></a>'
+    + '<a href="modules/a/kept.md"></a><a class="node" href="modules/a/kept.md"></a><a href="modules/a/gone.md#top"></a>'
+    // Single quotes, spaces around = and upper case are the same link to the parser.
+    + "<a href='modules/c/quoted.md'></a><a href='modules/c/gone-quoted.md'></a><a href = \"modules/d/spaced.md\"></a><A HREF = 'modules/d/gone-spaced.md'></A>";
+  const docs = ['docs/architecture/modules/a/kept.md', 'docs/architecture/modules/b/new.md', 'docs/architecture/modules/c/quoted.md', 'docs/architecture/modules/d/spaced.md'];
+  const present = new Set(docs);
+  expect(archimapLinkDrift(html, docs, path => present.has(path))).toEqual({
+    dead: ['docs/architecture/modules/a/gone.md', 'docs/architecture/modules/c/gone-quoted.md', 'docs/architecture/modules/d/gone-spaced.md'],
+    missing: ['docs/architecture/modules/b/new.md'] });
+});
+
+test('a daily architecture failure without a summary says so and routes to the command-error row', () => fixture(async f => {
+  f.setConclusion('failure');
+  const report = await reportCI('test/repo', 12, architectureAPI(f), { summaryText: null, evidence: architectureEvidence });
+  expect(report.errors).toEqual([]);
+  const issue = f.issues[0];
+  expect(issue.title).toBe(`[CI repair] architecture without summary @ ${f.after.slice(0, 12)}`);
+  expect(issue.body).toContain('The job uploaded no architecture summary: the check or the oldest unpublished commit read gave no result.');
+  expect(issue.body).toContain('| Command error, `blocked` or a failure status |');
+}));
+
+test('an invalid architecture summary or a missing action row is reported, and the issue is still opened', () => fixture(async f => {
+  f.setConclusion('failure');
+  const report = await reportCI('test/repo', 12, architectureAPI(f), { summaryText: '{"status":"planned","renderEquivalent":false,"differingPaths":[1],"humanActions":[],"freshness":"stale","unpublishedSince":"2026-11-12T01:01:09.000Z"}', evidence: '' });
+  expect(report.errors).toEqual([
+    'Architecture summary invalid: Architecture summary differingPaths must be a string array',
+    `Architecture action unavailable: No action row starts with Command error, \`blocked\` or a failure status in ${ARCHITECTURE_EVIDENCE}`,
+  ]);
+  expect(report.repairs[0]).toMatchObject({ key: `ci-repair:job:${ARCHITECTURE_JOB}`, delivery: 'created' });
+  expect(f.issues[0].body).toContain('The architecture summary is not valid');
+}));
+
+test.each([
+  [{ status: 'planned', renderEquivalent: true, differingPaths: [], humanActions: [] }, '| `renderEquivalent: true` |'],
+  [{ status: 'planned', renderEquivalent: false, differingPaths: ['docs/architecture/a.md'], humanActions: [] }, '| `renderEquivalent: false` |'],
+  [{ status: 'human-action-required', renderEquivalent: null, differingPaths: [], humanActions: [{ reasonCode: 'unresolved-major-change' }] }, '| `human-action-required` with `unresolved-major-change` |'],
+  [{ status: 'human-action-required', renderEquivalent: null, differingPaths: [], humanActions: [{ reasonCode: 'ownership-conflict' }] }, '| Other `humanActions` reason codes, or `adoption-required` |'],
+  [{ status: 'adoption-required', renderEquivalent: null, differingPaths: [], humanActions: [] }, '| Other `humanActions` reason codes, or `adoption-required` |'],
+  [{ status: 'planned-partial', renderEquivalent: null, differingPaths: [], humanActions: [] }, '| Command error, `blocked` or a failure status |'],
+  [{ status: 'blocked', renderEquivalent: null, differingPaths: [], humanActions: [] }, '| Command error, `blocked` or a failure status |'],
+])('each architecture result maps to one row of the real evidence table: %j', (summary, row) => {
+  expect(architectureActionRow(summary, architectureEvidence)).toStartWith(row);
+});

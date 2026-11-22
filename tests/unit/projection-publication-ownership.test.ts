@@ -1,0 +1,19 @@
+import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+const ROOT = join(import.meta.dir, "../..");
+const read = (path: string) => readFileSync(join(ROOT, path), "utf8");
+
+test("explicit verification never authors automatic architecture or approval projections", () => {
+  const helper = read("scripts/verify-sprint.sh");
+  expect(helper).not.toContain("materialize_automatic_architecture_projection");
+  expect(helper).not.toContain("review_subject_sha256");
+  expect(helper).not.toContain("prepare-acceptance");
+  expect(helper).toContain('"$BUN_BIN" run check:type');
+  expect(helper).toContain('"$BUN_BIN" "$SCRIPT_DIR/merge-gate.ts" run --base "$base"');
+});
+test("closeout has no contract scope exemption because it has no scope check", () => {
+  const helper = read("scripts/contract-worktree.sh");
+  expect(helper).not.toContain("is_workflow_owned_projection_output");
+  expect(helper).not.toContain("check_scope_against_contract");
+});

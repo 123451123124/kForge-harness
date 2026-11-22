@@ -1,0 +1,78 @@
+import type { CapabilityRegistryDiagnostic, CapabilitySourceMode } from './registry';
+
+/**
+ * Two blocker keys keep two different repairs apart. `capability_registry:invalid`
+ * means the capability authority (JSON registry or ArchContext model) or one
+ * path's ownership answer is wrong, so the model needs an edit.
+ * `capability_ownership:unavailable` means ownership was not computed at all:
+ * the archctx process, its version or its runtime failed, or a read-only
+ * observation does not start it. The model can be correct in that case.
+ */
+export type CapabilityOwnershipBlockerKey = 'capability_registry:invalid' | 'capability_ownership:unavailable';
+
+export interface CapabilityOwnershipBlocker {
+  readonly key: CapabilityOwnershipBlockerKey;
+  /** The first diagnostic code; it goes into `profile_reasons`. */
+  readonly code: string;
+  /** The first diagnostic message on one line; corrupt resolve JSON keeps its bounded evidence. */
+  readonly message: string;
+  /** One command that shows or repairs the cause. */
+  readonly fix: string;
+}
+
+const MESSAGE_LIMIT = 240;
+
+const UNAVAILABLE_CODES: ReadonlySet<string> = new Set([
+  'ARCHCONTEXT_RESOLVE_FAILED',
+  'ARCHCONTEXT_RESOLVE_TIMEOUT',
+  'ARCHCONTEXT_RESOLVE_UNAVAILABLE',
+]);
+
+// Only a package-local archctx that is missing or has the wrong version is repaired by an update.
+const PACKAGE_ERROR_CODES: ReadonlySet<string> = new Set([
+  'RH_ARCHCTX_PACKAGE_MISMATCH',
+  'RH_ARCHCTX_PACKAGE_MISSING',
+]);
+
+function oneLine(message: string, limit = MESSAGE_LIMIT): string {
+  const flat = message.replace(/\s+/g, ' ').trim();
+  return flat.length > limit ? `${flat.slice(0, limit - 3)}...` : flat;
+}
+
+function fixFor(diagnostic: CapabilityRegistryDiagnostic, mode: CapabilitySourceMode): string {
+  switch (diagnostic.code) {
+    case 'ARCHCONTEXT_RESOLVE_FAILED':
+      if (diagnostic.archctxErrorCode === 'RH_ARCHCTX_RESOLVE_CORRUPT_JSON') return 'rh state resolve --json';
+      return PACKAGE_ERROR_CODES.has(diagnostic.archctxErrorCode ?? '') ? 'rh update' : 'rh doctor --json';
+    case 'ARCHCONTEXT_RESOLVE_TIMEOUT':
+    case 'ARCHCONTEXT_RESOLVE_UNAVAILABLE':
+      return 'rh state resolve --json';
+    case 'ARCHCONTEXT_MODEL_REJECTED':
+      return 'edit .archcontext/model/nodes, then run rh capability resolve match --path <path>';
+    case 'AMBIGUOUS_MATCH':
+    case 'ARCHCONTEXT_OWNER_UNKNOWN':
+      return mode === 'archcontext'
+        ? `rh capability resolve match --path ${diagnostic.path}`
+        : 'rh capability resolve validate';
+    default:
+      return 'rh capability resolve validate';
+  }
+}
+
+/** Projects the first ownership diagnostic onto its blocker key, short message and fix command. */
+export function capabilityOwnershipBlocker(
+  diagnostic: CapabilityRegistryDiagnostic,
+  mode: CapabilitySourceMode,
+): CapabilityOwnershipBlocker {
+  return Object.freeze({
+    key: UNAVAILABLE_CODES.has(diagnostic.code) ? 'capability_ownership:unavailable' : 'capability_registry:invalid',
+    code: diagnostic.code,
+    message: oneLine(diagnostic.message, diagnostic.archctxErrorCode === 'RH_ARCHCTX_RESOLVE_CORRUPT_JSON' ? 4096 : MESSAGE_LIMIT),
+    fix: fixFor(diagnostic, mode),
+  });
+}
+
+/** The `next_action` text that carries the cause and the fix to every state reader and hook. */
+export function capabilityOwnershipNextAction(blocker: CapabilityOwnershipBlocker): string {
+  return `resolve blockers: ${blocker.key} ${blocker.code}: ${blocker.message}; fix: ${blocker.fix}`;
+}

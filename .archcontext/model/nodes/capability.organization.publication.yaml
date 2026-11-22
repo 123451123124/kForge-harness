@@ -1,0 +1,40 @@
+schemaVersion: "archcontext.node/v2"
+id: "capability.organization.publication"
+kind: "capability"
+name: "Publication Observations"
+status: "active"
+layer: "effects"
+summary: "Observes explicit canonical provider PR readiness and integration evidence, shares canonical publication digest helpers and stores provider feedback facts and delivery receipts."
+responsibilities:
+  - "Provide the canonical publication JSON and SHA-256 helpers that integration evidence digests use; no publication receipt or lifecycle store reader or writer remains."
+  - "Derive PullRequestReadinessV2 from explicit canonical REST repository identity, PR number and exact expected head/base through provider identity, facts and reobservation."
+  - "Bind registry-scoped readiness to the local GitHub origin before provider reads; preserve the standalone explicit PR CLI capability."
+  - "Read the stored TestBudget result from the current Actions check attempt; compare head, merge-base, effective base policy, rule version and parsed exception with live inputs."
+  - "Block readiness on missing, stale, error or violation results; recheck the accepted TestBudget inputs before the merge request (ADR-0004)."
+  - "Store immutable provider feedback facts and separate delivery receipts; Task Fleet owns admitted feedback intake."
+  - "Provide live provider merge commit/tree evidence for exact integration candidates and guarded worktree cleanup without changing GitHub issue or PR authority."
+  - "Own the GitHub writes that plugins use: push one commit to a new remote ref, find or create a Draft PR for one exact head, and set the GitHub App hook config. A lost or invalid response after a write stays unknown."
+source:
+  include:
+    - "src/core/publication/**"
+    - "src/effects/publication/**"
+    - "src/cli/commands/publication.ts"
+    - "scripts/release-owner-steps.sh"
+  entrypoints:
+    - id: "entrypoint.publication.command"
+      path: "src/cli/commands/publication.ts"
+      symbols:
+        - name: "buildPublicationCommand"
+          sinks:
+            - id: "sink.publication.readiness"
+              path: "src/effects/publication/merge-readiness.ts"
+              symbol: "collectPullRequestMergeReadiness"
+extensions:
+  harnessTier: "core"
+  contractFiles:
+    agents: "AGENTS.md"
+    claude: "CLAUDE.md"
+  lspProfile: "typescript-lsp"
+  verification:
+    - "bun run test:files tests/unit/merge-readiness-v1.test.ts tests/unit/publication-feedback-effect.test.ts tests/publication-feedback-concurrency.test.ts tests/cli/fleet-feedback.test.ts --timeout 60000 --max-concurrency 1"
+    - "bun run check:type"

@@ -1,0 +1,38 @@
+---
+name: repo-harness
+description: Route explicit repo-harness commands and active harness work. Exclude ordinary questions, quoted reports, and general product work.
+when_to_use: "repo-harness"
+---
+
+# repo-harness
+
+Bot entrypoint. Resolve scope, worker ownership and the authorized outcome.
+When acting as a PM Bot, use [the shared PM boundary](references/pm-boundary.md).
+The PM coordinates work. Coding agents own source edits, tests and repairs.
+GrokBot init: [bot onboarding](docs/bot-onboarding.md).
+This role applies to Grok, Hermes, Dot and other Bot hosts. It does not restrict
+an explicitly assigned coding worker or a direct development session.
+Use `rh state resolve --json` when active harness state is needed.
+Treat the returned state as authority; load only the files it names.
+Load the required `herdr` skill before controlling Herdr panes or agents.
+Discover panes by task path, then use explicit targets.
+
+1. **setup** — bind the mode and target repo, then assign `repo-harness-setup`.
+2. **plan** — use `repo-harness-check` for scoped design or plan review.
+   PRD or Goal: `repo-harness-product`. Issues: `repo-harness-issue-flow`.
+3. **execute** — assign a [worker brief](assets/reference-configs/herdr-notify.md#worker-briefs). Load worker techniques
+   from `repo-harness-test` or
+   [`repo-harness-architecture`](assets/skill-commands/repo-harness-architecture/SKILL.md)
+   only when needed.
+   Use `repo-harness-ship` for explicitly authorized publication.
+4. **verify** — use `repo-harness-check` to assess recorded checks and risk.
+   When a worker reports `done` with source changes, read the cheap diff-scoped architecture signals. The repository-wide refactor scan runs once per merge, not at `done`.
+5. **handoff** — read `references/handoff.md` only when work must resume later.
+
+For a lost worker response or Bot control integration, read
+`references/bot-control.md`. Inspect the peer pane. Do not resend the request.
+
+Keep main publication, deletion, credentials/permissions and release/production
+within their separate authorization boundaries. Ordinary work needs scoped
+changes, verification and a PR description. Load architecture or command details
+only when the task needs them.

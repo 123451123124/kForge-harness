@@ -1,0 +1,444 @@
+import { existsSync, readdirSync, readFileSync, statSync } from "fs";
+import { relative, resolve } from "path";
+import { gitSpawnSync } from "../git/runner";
+import { POLICY_ABSENT, isPolicyObject, policyValue, type DecodedWorkflowPolicy } from "../../core/workflow/policy-schema";
+import { readWorkflowPolicyFile } from "../state/policy-file";
+import {
+  archcontextNodeId,
+  PROJECTION_MANIFEST_PATH,
+  normalizeCapabilityPath,
+  parseCapabilityRegistry,
+  parseProjectedModulePages,
+  withProjectedModulePages,
+  type ArchcontextCapabilityOwners,
+  type ArchcontextCapabilityResolution,
+  type Capability,
+  type CapabilityRegistry,
+  type CapabilityRegistryDiagnostic,
+  type CapabilityRegistryResolution,
+  type CapabilitySourceMode,
+  type ProjectedModulePages,
+} from "../../core/capabilities/registry";
+import {
+  CapabilitySourceError,
+  HARNESS_POLICY,
+  capabilitySourceModeFromValue,
+  findMatch,
+  matchRecord,
+  toArchContextNodeV2,
+  type ArchContextNodeV2,
+  type MatchAuthority,
+} from "../../core/capabilities/resolver";
+import { architecturePort, isArchitectureUnavailable, type ArchitectureOwnershipPort } from "../../core/architecture/contracts";
+
+export { CapabilitySourceError, findMatch } from "../../core/capabilities/resolver";
+export type { ArchContextNodeV2, MatchAuthority } from "../../core/capabilities/resolver";
+
+export type { Capability, CapabilityRegistry, ContractFiles } from "../../core/capabilities/registry";
+
+
+type Format = "json" | "text" | "prefixes" | "archcontext-nodes-v2";
+
+type Args = {
+  command: string;
+  repo: string;
+  path: string;
+  pathsFrom: string;
+  format: Format;
+};
+
+const DEFAULT_REGISTRY = ".ai/context/capabilities.json";
+const ARCHCONTEXT_NODES_DIR = ".archcontext/model/nodes";
+
+
+
+export function capabilitySourceMode(repo: string): CapabilitySourceMode {
+  let policy: DecodedWorkflowPolicy;
+  try {
+    policy = readWorkflowPolicyFile(repo);
+  } catch (error) {
+    // A file ancestor reads as an absent policy: this reader selected the
+    // registry by an existence probe. Other policy-file readers keep the throw.
+    if ((error as NodeJS.ErrnoException).code === "ENOTDIR") return "registry";
+    const cause = error instanceof Error && error.cause instanceof SyntaxError ? error.cause : error;
+    throw new CapabilitySourceError(
+      `malformed harness policy: ${HARNESS_POLICY}: ${(cause as Error).message}`
+    );
+  }
+  return capabilitySourceModeOf(policy);
+}
+
+/** A non-object root or `context` section leaves the key absent. */
+export function capabilitySourceModeOf(policy: DecodedWorkflowPolicy): CapabilitySourceMode {
+  const context = policy.rootIsObject ? policyValue(policy, "context") : POLICY_ABSENT;
+  const value = isPolicyObject(context) ? policyValue(policy, "context.capability_source") : POLICY_ABSENT;
+  return capabilitySourceModeFromValue(value === POLICY_ABSENT ? undefined : value);
+}
+
+function usage(): never {
+  console.error(
+    [
+      "Usage:",
+      "  scripts/capability-resolver.ts list [--repo <repo>] [--format json|text|prefixes]",
+      "  scripts/capability-resolver.ts match --path <repo-relative-path> [--repo <repo>] [--format json|text]",
+      "  scripts/capability-resolver.ts match --paths-from <file|-> [--repo <repo>] [--format json|text]",
+      "  scripts/capability-resolver.ts validate [--repo <repo>] [--format json|text]",
+      "  scripts/capability-resolver.ts export --format archcontext-nodes-v2 [--repo <repo>]",
+    ].join("\n")
+  );
+  process.exit(2);
+}
+
+function parseArgs(argv: string[]): Args {
+  const args: Args = {
+    command: argv[0] || "",
+    repo: ".",
+    path: "",
+    pathsFrom: "",
+    format: "text",
+  };
+
+  for (let index = 1; index < argv.length; index += 1) {
+    const arg = argv[index];
+    switch (arg) {
+      case "--repo":
+        args.repo = argv[++index] || usage();
+        break;
+      case "--path":
+        args.path = argv[++index] || usage();
+        break;
+      case "--paths-from":
+        args.pathsFrom = argv[++index] || usage();
+        break;
+      case "--format": {
+        const value = argv[++index] as Format;
+        if (!["json", "text", "prefixes", "archcontext-nodes-v2"].includes(value)) usage();
+        args.format = value;
+        break;
+      }
+      case "--help":
+      case "-h":
+        usage();
+        break;
+      default:
+        console.error(`Unknown argument: ${arg}`);
+        usage();
+    }
+  }
+
+  if (!["list", "match", "validate", "export"].includes(args.command)) usage();
+  if (args.command === "match" && !args.path && !args.pathsFrom) usage();
+  if (args.command === "match" && args.path && args.pathsFrom) usage();
+  if (args.command === "match" && args.format === "prefixes") usage();
+  if (args.command === "export" && args.format !== "archcontext-nodes-v2") usage();
+  if (args.command !== "export" && args.format === "archcontext-nodes-v2") usage();
+  return args;
+}
+
+function repoRoot(input: string): string {
+  const cwd = resolve(input);
+  const result = gitSpawnSync(["rev-parse", "--show-toplevel"], {
+    cwd,
+    encoding: "utf-8",
+  });
+  if (result.status === 0 && result.stdout.trim()) {
+    return resolve(result.stdout.trim());
+  }
+  return cwd;
+}
+
+function missingRegistryError(): Error {
+  return new Error(
+    `missing capability registry: ${DEFAULT_REGISTRY}; create it with ` +
+      "rh capability register add --prefix <existing-path>"
+  );
+}
+
+function capabilityAuthorityPath(mode: CapabilitySourceMode): string {
+  return mode === "archcontext" ? ARCHCONTEXT_NODES_DIR : DEFAULT_REGISTRY;
+}
+
+// One authority per mode: archcontext never falls back to the JSON registry and
+// the JSON registry never falls back to archcontext nodes.
+function loadRegistry(repo: string, mode: CapabilitySourceMode): CapabilityRegistryResolution | ArchcontextCapabilityResolution {
+  if (mode === "archcontext") {
+    const native = archcontextOwnership();
+    try {
+      const resolution = native.readAuthority(repo);
+      if (resolution.status === "invalid") {
+        throw new CapabilitySourceError(resolution.diagnostics.map((item) => item.message).join("; "));
+      }
+      return resolution;
+    } catch (error) {
+      if (error instanceof CapabilitySourceError) throw error;
+      throw new CapabilitySourceError(native.formatError(error));
+    }
+  }
+  const registryPath = resolve(repo, DEFAULT_REGISTRY);
+  if (!existsSync(registryPath)) {
+    return parseCapabilityRegistry(null, { declared: false, repoRoot: repo });
+  }
+  return parseCapabilityRegistry(readFileSync(registryPath, "utf-8"), { declared: true, repoRoot: repo });
+}
+
+function readProjectionManifest(repo: string): string | null {
+  const manifestPath = resolve(repo, PROJECTION_MANIFEST_PATH);
+  return existsSync(manifestPath) ? readFileSync(manifestPath, "utf-8") : null;
+}
+
+/** The module pages of the projection manifest; null without one. An invalid manifest throws. */
+export function readProjectedModulePages(repo: string): ProjectedModulePages | null {
+  const manifest = readProjectionManifest(repo);
+  if (manifest === null) return null;
+  const pages = parseProjectedModulePages(manifest);
+  if ("code" in pages) throw new Error(pages.message);
+  return pages;
+}
+
+/**
+ * Registry mode reads module pages from the projection manifest when one
+ * exists; `projectedPages` is then every path the manifest projects.
+ */
+function loadEffectiveRegistry(repo: string, mode: CapabilitySourceMode): {
+  readonly resolution: CapabilityRegistryResolution | ArchcontextCapabilityResolution;
+  readonly projectedPages: ReadonlySet<string> | null;
+} {
+  const resolution = loadRegistry(repo, mode);
+  if ("owners" in resolution || resolution.status !== "valid") return { resolution, projectedPages: null };
+  return withProjectedModulePages(resolution, readProjectionManifest(repo));
+}
+
+function malformedRegistryError(
+  diagnostics: readonly CapabilityRegistryDiagnostic[],
+  authority: string,
+): Error {
+  return new Error(
+    `malformed capability registry: ${authority}: ${diagnostics.map((item) => item.message).join("; ")}`
+  );
+}
+
+export function readRegistry(repo: string): CapabilityRegistry {
+  const mode = capabilitySourceMode(repo);
+  const resolution = loadRegistry(repo, mode);
+  if (resolution.status === "absent") throw missingRegistryError();
+  if (resolution.status === "invalid") {
+    throw malformedRegistryError(resolution.diagnostics, capabilityAuthorityPath(mode));
+  }
+  return resolution.registry;
+}
+
+// Anchors must exist only for listed (active) capabilities. Every capability
+// node, whatever its status, still owns its architecture module. Under a
+// projection manifest, a page is an orphan when the manifest does not project it.
+function validateRegistryEffects(
+  registry: CapabilityRegistry,
+  repo: string,
+  allCapabilities: readonly Capability[] = registry.capabilities,
+  projectedPages: ReadonlySet<string> | null = null,
+): string[] {
+  const errors: string[] = [];
+  const architectureModules = new Set<string>();
+
+  for (const capability of registry.capabilities) {
+    for (const prefix of capability.prefixes) {
+      const normalized = normalizeCapabilityPath(prefix, repo);
+      if (!existsSync(resolve(repo, normalized))) {
+        errors.push(`${capability.id}: prefix does not exist: ${normalized}`);
+      }
+    }
+  }
+  if (projectedPages) {
+    for (const path of projectedPages) architectureModules.add(path);
+  } else {
+    for (const capability of allCapabilities) {
+      architectureModules.add(normalizeCapabilityPath(capability.architecture_module!, repo));
+    }
+  }
+
+  const modulesRoot = resolve(repo, "docs/architecture/modules");
+  if (existsSync(modulesRoot)) {
+    const stack = [modulesRoot];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        const absPath = resolve(current, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(absPath);
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          const relPath = relative(repo, absPath).replaceAll("\\", "/");
+          if (!architectureModules.has(relPath)) {
+            errors.push(`orphan architecture module: ${relPath}`);
+          }
+        }
+      }
+    }
+  }
+
+  return errors;
+}
+
+
+// The standalone projection of this helper registers no provider, so archcontext
+// mode fails closed there instead of guessing.
+function archcontextOwnership(): ArchitectureOwnershipPort {
+  const port = architecturePort("ownership");
+  if (isArchitectureUnavailable(port)) {
+    throw new CapabilitySourceError(
+      'capability_source "archcontext" needs the packaged resolver; run rh capability resolve'
+    );
+  }
+  return port;
+}
+
+
+/**
+ * One match per input path. Under `archcontext`, one archctx call resolves the
+ * whole batch, joined against every capability node whatever its status.
+ */
+export async function findMatches(authority: MatchAuthority, repo: string, paths: readonly string[]) {
+  if (authority.mode === "registry") return paths.map((path) => findMatch(authority.registry, repo, path));
+  const resolution = archcontextOwnership().resolvePaths(repo, authority.owners, paths);
+  if (resolution.status !== "valid") {
+    throw new Error(resolution.diagnostics.map((item) => item.message).join("; "));
+  }
+  const byPath = new Map(resolution.matches.map((match) => [match.filePath, match]));
+  return paths.map((path) => {
+    const filePath = normalizeCapabilityPath(path, repo);
+    return matchRecord(filePath, byPath.get(filePath) ?? null);
+  });
+}
+
+function printJson(value: unknown): void {
+  console.log(JSON.stringify(value, null, 2));
+}
+
+
+export function buildArchContextNodesV2(
+  registry: CapabilityRegistry,
+  options: { repoRoot?: string; isExistingDirectory?: (path: string) => boolean } = {},
+): ArchContextNodeV2[] {
+  const repoRoot = options.repoRoot ?? process.cwd();
+  const isExistingDirectory = options.isExistingDirectory ?? ((path: string) => {
+    try { return statSync(resolve(repoRoot, path)).isDirectory(); } catch { return false; }
+  });
+  return registry.capabilities
+    .map((capability) => toArchContextNodeV2(capability, isExistingDirectory))
+    .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+}
+
+function allCapabilities(
+  resolution: { readonly registry: CapabilityRegistry; readonly owners?: ArchcontextCapabilityOwners },
+): readonly Capability[] {
+  return resolution.owners ? [...resolution.owners.values()] : resolution.registry.capabilities;
+}
+
+async function readPathLines(input: string): Promise<string[]> {
+  const text = input === "-" ? await Bun.stdin.text() : readFileSync(input, "utf-8");
+  return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+export async function runCapabilityResolverCli(argv: string[]): Promise<void> {
+  const args = parseArgs(argv);
+  const repo = repoRoot(args.repo);
+  const mode = capabilitySourceMode(repo);
+  const authority = capabilityAuthorityPath(mode);
+  const { resolution, projectedPages } = loadEffectiveRegistry(repo, mode);
+  if (resolution.status === "absent") throw missingRegistryError();
+
+  if (args.command === "validate") {
+    if (resolution.status === "invalid") {
+      const structuralCodes = new Set([
+        "INVALID_JSON",
+        "REGISTRY_NOT_OBJECT",
+        "UNSUPPORTED_VERSION",
+        "CAPABILITIES_NOT_ARRAY",
+        "CAPABILITY_NOT_OBJECT",
+      ]);
+      if (resolution.diagnostics.some((item) => structuralCodes.has(item.code))) {
+        throw malformedRegistryError(resolution.diagnostics, authority);
+      }
+    }
+    const errors = resolution.status === "invalid"
+      ? resolution.diagnostics.map((item) => item.message)
+      : validateRegistryEffects(resolution.registry, repo, allCapabilities(resolution), projectedPages);
+    if (args.format === "json") {
+      printJson({ ok: errors.length === 0, errors });
+    } else if (errors.length === 0) {
+      console.log("[CapabilityResolver] OK");
+    } else {
+      for (const error of errors) console.log(`[CapabilityResolver] ${error}`);
+    }
+    process.exit(errors.length === 0 ? 0 : 1);
+  }
+
+  if (resolution.status === "invalid") throw malformedRegistryError(resolution.diagnostics, authority);
+  const registry = resolution.registry;
+  const matchAuthority: MatchAuthority = "owners" in resolution
+    ? { mode: "archcontext", owners: resolution.owners }
+    : { mode: "registry", registry };
+
+  if (args.command === "list") {
+    if (args.format === "json") {
+      printJson(registry.capabilities);
+    } else if (args.format === "prefixes") {
+      for (const capability of registry.capabilities) {
+        for (const prefix of capability.prefixes) {
+          console.log(normalizeCapabilityPath(prefix, repo));
+        }
+      }
+    } else {
+      // An anchorless ArchContext capability owns paths only through globs; show its node id.
+      for (const capability of registry.capabilities) {
+        console.log(`${capability.id}\t${capability.prefixes.join(",") || archcontextNodeId(capability)}`);
+      }
+    }
+    return;
+  }
+
+  if (args.command === "export") {
+    const exportErrors = validateRegistryEffects(registry, repo, registry.capabilities, projectedPages);
+    if (exportErrors.length > 0) {
+      throw new Error(`capability registry is invalid:\n${exportErrors.join("\n")}`);
+    }
+    printJson(buildArchContextNodesV2(registry, { repoRoot: repo }));
+    return;
+  }
+
+  const errors = validateRegistryEffects(registry, repo, allCapabilities(resolution), projectedPages);
+  if (errors.length > 0) {
+    throw new Error(`capability registry is invalid:\n${errors.join("\n")}`);
+  }
+  if (args.pathsFrom) {
+    const matches = await findMatches(matchAuthority, repo, [...new Set(await readPathLines(args.pathsFrom))]);
+    if (args.format === "json") {
+      printJson(matches);
+    } else {
+      for (const match of matches) {
+        console.log(`${match.file_path}: ${match.capability_id} (${match.matched_prefix})`);
+      }
+    }
+    return;
+  }
+
+  const [match] = await findMatches(matchAuthority, repo, [args.path]);
+  if (args.format === "json") {
+    printJson(match);
+  } else {
+    for (const [key, value] of Object.entries(match)) {
+      if (Array.isArray(value)) {
+        console.log(`${key}: ${value.join(", ")}`);
+      } else {
+        console.log(`${key}: ${value}`);
+      }
+    }
+  }
+}
+
+if (import.meta.main) {
+  try {
+    await runCapabilityResolverCli(process.argv.slice(2));
+  } catch (error) {
+    console.error(`[CapabilityResolver] ${(error as Error).message}`);
+    process.exit((error as { exitCode?: number }).exitCode ?? 1);
+  }
+}

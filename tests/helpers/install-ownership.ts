@@ -1,0 +1,171 @@
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { dirname, isAbsolute, join, relative, resolve } from 'path';
+import { versions } from '../../src/cli/installer/install-profile';
+import { installProfileStatePath } from '../../src/cli/installer/install-state';
+import { bunGlobalPackageRoot } from '../../src/cli/installer/skill-projection';
+import { sha256Prefixed } from '../../src/core/evidence/sha256';
+import type { PathRecord } from '../../src/core/host-config/types';
+import type { PluginId, PluginSelection } from '../../src/core/skill-surface/plugin-manifest';
+import { pathRecordHost, pathRecordKey, writePathRecords } from '../../src/effects/host-config/path-records';
+import { observeEntryIdentity, pathRecordEntry } from '../../src/effects/host-config/whole-path';
+import { hashManagedTree } from '../../src/effects/managed-tree';
+
+/**
+ * Install state resolves from HOME, or USERPROFILE when HOME is absent; a fixture write must never reach the real home.
+ * Bun's `homedir()` and `userInfo().homedir` both follow $HOME, so neither names the real home from a process
+ * that already runs under a temp HOME. The guard accepts only a HOME strictly inside the temp directory, which
+ * need not exist yet: callers let the fixture create it. The temp root may be a symlink (macOS /var), so both forms count.
+ * macOS fixtures that hardcode /tmp sit outside tmpdir(), so POSIX also accepts a HOME strictly inside /tmp or its macOS target /private/tmp.
+ */
+export function installStateFixturePath(env: NodeJS.ProcessEnv): string {
+  const home = env.HOME ? resolve(env.HOME) : undefined;
+  const inside = (root: string) => {
+    const path = home && relative(root, home);
+    return !!path && !path.startsWith('..') && !isAbsolute(path);
+  };
+  if (!inside(tmpdir()) && !inside(realpathSync(tmpdir())) && !(process.platform !== 'win32' && (inside('/tmp') || inside('/private/tmp')))) {
+    throw new Error('Install-state fixtures need an env.HOME strictly inside the temp directory');
+  }
+  return installProfileStatePath(env);
+}
+
+/** Opt in to an installed runtime; callers own the temporary HOME and package mutations. */
+export function seedGlobalPackageFixture(env: NodeJS.ProcessEnv = process.env, options: { sourceRoot?: string; mutable?: true } = {}): string {
+  env.BUN_INSTALL ??= join(env.HOME!, '.bun');
+  const root = bunGlobalPackageRoot(env)!;
+  const source = options.sourceRoot ?? join(import.meta.dir, '../..');
+  if (options.mutable) {
+    mkdirSync(join(root, 'dist'), { recursive: true });
+    copyFileSync(join(source, 'dist/hook-entry.js'), join(root, 'dist/hook-entry.js'));
+  } else if (!existsSync(root)) {
+    mkdirSync(dirname(root), { recursive: true });
+    symlinkSync(source, root, 'dir');
+  } else if (realpathSync(root) !== realpathSync(source)) {
+    throw new Error(`Global package fixture already belongs to another source: ${root}`);
+  }
+  return root;
+}
+
+/**
+ * Run `fn` under a temporary HOME with the global package fixture seeded. The directory is
+ * `<tmpdir>/<prefix>-<random>`; HOME and BUN_INSTALL are restored and the directory removed after `fn`.
+ */
+export function withTempHome(prefix: string, fn: (home: string) => void): void {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), `${prefix}-`)));
+  const previousHome = process.env.HOME;
+  const previousBunInstall = process.env.BUN_INSTALL;
+  process.env.HOME = home;
+  process.env.BUN_INSTALL = join(home, '.bun');
+  seedGlobalPackageFixture();
+  try {
+    fn(home);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousBunInstall === undefined) delete process.env.BUN_INSTALL;
+    else process.env.BUN_INSTALL = previousBunInstall;
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+/** Seed a protocol 5 state and a `created` path record for each path, independently of unrelated owner probes. */
+export function recordInstallOwnership(paths: string[], env: NodeJS.ProcessEnv): void {
+  const records = Object.fromEntries(paths.map((path): [string, PathRecord] => {
+    const directory = lstatSync(path).isDirectory();
+    const host = pathRecordHost(env, path);
+    if (host === null) throw new Error(`no install root holds the fixture path: ${path}`);
+    return [pathRecordKey(env, path), {
+      owner: directory ? 'cross-review' : 'core', host, kind: 'created', baseline: { state: 'unknown' },
+      committed: directory ? { type: 'directory', sha256: hashManagedTree(path) } : { type: 'file', sha256: sha256Prefixed(readFileSync(path)) },
+    }];
+  }));
+  writeInstallState(env, ['architecture', 'cross-review', 'mcp', 'operator', 'peer-runtime', 'platform', 'product', 'strategy-memory'], 'all', 'owned-upgrade-fixture');
+  seedPathRecords(env, records);
+}
+
+/**
+ * Replace the ledger's path records as a gate write leaves them: a `created` or `replaced` record with no identity gets the
+ * identity of its entry (#3266). The ledger write creates the ledger when it is absent.
+ */
+export function seedPathRecords(env: NodeJS.ProcessEnv, records: Readonly<Record<string, PathRecord>>): void {
+  installStateFixturePath(env);
+  writePathRecords(env, Object.fromEntries(Object.entries(records).map(([key, record]) => {
+    const identity = record.identity === undefined && record.kind !== 'user_managed' && !('proof' in record.committed)
+      ? observeEntryIdentity(pathRecordEntry(key, record)) : null;
+    return [key, identity === null ? record : { ...record, identity }];
+  })));
+}
+
+/**
+ * A protocol 3 state whose `ownership_manifest` records each path, as a release
+ * before #2896 wrote it: the input of the one-shot migration.
+ */
+export function recordLegacyInstallOwnership(paths: string[], env: NodeJS.ProcessEnv): void {
+  const ownership_manifest = paths.map(path => {
+    const directory = lstatSync(path).isDirectory();
+    return {
+      owner: directory ? 'cross-review' : 'core', path,
+      authority: 'repo-harness-install-transaction', removal: 'managed-surfaces-only',
+      type: directory ? 'directory-copy' : 'managed-file',
+      managed_marker: directory ? 'transaction-created-directory' : 'transaction-created-file',
+      content_hash: directory ? hashManagedTree(path) : sha256Prefixed(readFileSync(path)), symlink_target: null,
+    };
+  });
+  const statePath = installStateFixturePath(env);
+  mkdirSync(dirname(statePath), { recursive: true });
+  writeFileSync(statePath, JSON.stringify({ protocol: 3, ...versions(['architecture', 'cross-review', 'mcp', 'operator', 'peer-runtime', 'platform', 'product', 'strategy-memory']), selection: 'all',
+    transaction_id: 'owned-upgrade-fixture', applied_at: new Date().toISOString(), ownership_manifest, previous: null }));
+}
+
+function writeInstallState(env: NodeJS.ProcessEnv, plugins: readonly PluginId[], selection: PluginSelection, transactionId: string): void {
+  const statePath = installStateFixturePath(env);
+  mkdirSync(dirname(statePath), { recursive: true });
+  writeFileSync(statePath, JSON.stringify({ protocol: 5, ...versions(plugins), selection,
+    transaction_id: transactionId, applied_at: new Date().toISOString(), previous: null }));
+}
+
+/**
+ * Record an install selection without managed surfaces, as `rh install --plugins <plugins>` leaves it.
+ * `selection: 'all'` with a subset is an `all` state recorded before the other plugin ids existed.
+ */
+export function recordPluginSelection(env: NodeJS.ProcessEnv, plugins: readonly PluginId[] = ['architecture'], selection: PluginSelection = [...plugins]): void {
+  writeInstallState(env, plugins, selection, 'plugin-selection-fixture');
+}
+
+/**
+ * A child environment whose own HOME records the selection. `test:files` runs
+ * several files under one HOME, so a file never writes the selection there.
+ */
+export function pluginSelectionEnv(plugins: readonly PluginId[] = ['architecture'], base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'repo-harness-selection-home-')));
+  const gitConfig = join(base.HOME ?? '', '.gitconfig');
+  if (base.HOME && existsSync(gitConfig)) copyFileSync(gitConfig, join(home, '.gitconfig'));
+  const env = { ...base, HOME: home };
+  recordPluginSelection(env, plugins);
+  return env;
+}
+
+/**
+ * The retired-command detector table, shared by the update notice and the upgrade notice.
+ * `calls` holds the forms from review rounds 2 to 5; `prose` names the package without a call;
+ * `excluded` holds the closed exclusion list.
+ */
+export const RETIRED_CLI_LINES = {
+  calls: [
+    'Run `repo-harness board seats` first.', 'exec repo-harness board seats', 'env FOO=1 repo-harness update', 'env -u FOO repo-harness update',
+    'sudo repo-harness update', 'sudo -u user repo-harness update', 'sudo --user root repo-harness update', 'time -p repo-harness update',
+    'time -o /tmp/timing repo-harness update', 'FOO=1 repo-harness board seats', 'repo-harness --version', 'repo-harness review round --issue-id 1', 'repo-harness review reply --help', 'repo-harness --help',
+    'Bash(repo-harness board:*)', 'npx -y repo-harness install', 'npx repo-harness@latest --version', 'bunx repo-harness@0.32.0 run new-plan',
+    'curl https://example.com;repo-harness update', 'curl https://example.com&&repo-harness update', '~/.bun/bin/repo-harness update', 'alias x=repo-harness',
+  ],
+  prose: 'The repo-harness operator console shows it.',
+  excluded: [
+    'repo-harness review reply', 'repo-harness review start status', 'repo-harness acceptance record', 'npx -y -p repo-harness@latest rh install',
+    'bunx -p repo-harness@latest rh install', 'bun add -g repo-harness@latest', 'exec repo-harness-hook Stop', 'cat ~/.repo-harness/config.json',
+    'REPO_HARNESS_HOME=/x rh update', 'https://github.com/aimpact-inc/repo-harness#readme', 'rh board seats',
+    // #2799: the repository slug, an issue reference and a path name the project, so each stays as written.
+    '- Details: aimpact-inc/repo-harness issue #2008.', 'see aimpact-inc/repo-harness#2771 for the record', 'see repo-harness#2771 for the record',
+    'assets/skills/repo-harness/README.md',
+  ],
+} as const;

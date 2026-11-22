@@ -1,0 +1,999 @@
+/**
+ * `rh setup check` -- read-only Agent bootstrap checklist.
+ *
+ * This command intentionally does not install hooks, write user-owned markdown,
+ * or mutate repo-local runtime files. It gathers the existing readiness probes
+ * and turns actionable gaps into an Agent-facing checklist with verification
+ * commands and risk notes.
+ */
+
+import { FileSyntaxError, parseJsonText } from '../../core/evidence/file-syntax';
+import { spawnSync } from 'child_process';
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'fs';
+import * as os from 'os';
+import { basename, dirname, join, resolve } from 'path';
+import { fileURLToPath } from 'url';
+import { Command } from 'commander';
+import { shellQuote } from '../../core/shell-quote';
+import { runDoctor, type CheckStatus, type DoctorPorts, type DoctorReport, type DoctorTarget } from './doctor';
+import {
+  formatManagedHookProjectionMismatch,
+  runStatus,
+  type StatusReport,
+} from './status';
+import type { InstallTargetSpec } from './install';
+import { readUpgradeDecisions, type UpgradeDecision } from '../../effects/upgrade/operator-decisions';
+import { installOwnershipReader, planUpgrade } from './upgrade';
+import { stripRepoHarnessManagedHooks } from '../../core/adoption/managed-hook-config';
+import { planAdoption } from '../../effects/adoption/plan';
+import { ReviewBaseUnresolvedError } from '../../effects/adoption/standard-plan';
+import type { AdoptionPlan } from '../../core/adoption/operations';
+import { isRepoHarnessSourceCheckout } from '../../effects/source-checkout';
+import { resolveRepoRoot } from '../hook/runtime';
+import {
+  GLOBAL_RULES_EDITED,
+  GLOBAL_RULES_UNBALANCED,
+  globalContextPath,
+  inspectGlobalContext,
+  type GlobalContextInspection,
+} from '../installer/global-context';
+
+export type InitHookTarget = InstallTargetSpec;
+export type InitHookStatus = 'ok' | 'attention' | 'blocked';
+export type InitHookCheckStatus = CheckStatus | 'needs_agent';
+export type InitHookCheckSource =
+  | 'status'
+  | 'doctor'
+  | 'security'
+  | 'tooling'
+  | 'global-rules'
+  | 'legacy';
+
+export interface InitHookCheck {
+  id: string;
+  title: string;
+  status: InitHookCheckStatus;
+  detail: string;
+  source: InitHookCheckSource;
+}
+
+export interface InitHookAction {
+  id: string;
+  status: 'needs_agent';
+  reason: string;
+  requires_agent: true;
+  risk: string;
+  command?: string;
+  targets?: string[];
+  verification: string;
+}
+
+export interface InitHookReport {
+  version: 1;
+  status: InitHookStatus;
+  target: InitHookTarget;
+  checkUpdates: boolean;
+  summary: { ok: number; warn: number; fail: number; na: number; needs_agent: number };
+  checks: InitHookCheck[];
+  agent_actions: InitHookAction[];
+  leftovers?: { total: number; removable: number };
+}
+
+export interface ToolingReport {
+  generated_at?: string;
+  repo_root?: string;
+  hosts?: string[];
+  check_updates?: boolean;
+  runtime_capabilities?: Record<string, RuntimeCapability>;
+  tools?: Record<string, ToolingTool>;
+}
+
+export interface RuntimeCapability {
+  name?: string;
+  status?: string;
+  path?: string | null;
+  owner?: string;
+  required?: boolean;
+  required_for?: string;
+  reason?: string;
+  command?: string;
+}
+
+export interface ToolingTool {
+  path_copy?: { relation: 'managed' | 'unrelated'; fix_command: string | null; fix_note: string | null } | null;
+  name?: string;
+  required?: boolean;
+  status?: string;
+  reason?: string;
+  update_status?: string | null;
+  update_reason?: string;
+  install_command?: string;
+  upgrade_command?: string;
+  sync_command?: string;
+  ensure_command?: string | null;
+  mcp_install_command?: string;
+  init_command?: string;
+}
+
+export interface InitHookOptions {
+  cwd?: string;
+  sourceRoot?: string;
+  env?: NodeJS.ProcessEnv;
+  target?: InitHookTarget;
+  checkUpdates?: boolean;
+  statusReport?: StatusReport;
+  doctorReport?: DoctorReport;
+  toolingReport?: ToolingReport;
+}
+
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(SCRIPT_DIR, '..', '..', '..');
+const UPDATE_CHECK_ENV = 'REPO_HARNESS_CHECK_UPDATES';
+const VALID_TARGETS: readonly InitHookTarget[] = ['codex', 'claude', 'both'];
+
+function withProcessEnv<T>(env: NodeJS.ProcessEnv | undefined, fn: () => T): T {
+  if (!env) return fn();
+  const previous = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(env)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+function selectedTargets(target: InitHookTarget): Array<'codex' | 'claude'> {
+  if (target === 'both') return ['codex', 'claude'];
+  return [target];
+}
+
+function targetLabel(target: 'codex' | 'claude'): string {
+  return target === 'codex' ? 'Codex' : 'Claude Code';
+}
+
+function homeDir(env?: NodeJS.ProcessEnv): string {
+  return env?.HOME ?? process.env.HOME ?? os.homedir();
+}
+
+const LEGACY_ADAPTER_CANDIDATES = ['.codex/hooks.json', '.claude/settings.json'] as const;
+
+/** Only these errors mean that the path, or a directory on it, does not exist. */
+const MISSING_PATH_CODES = new Set(['ENOENT', 'ENOTDIR']);
+
+/** The real path, or null when the path does not exist. Every other error (EACCES, ELOOP, ...) throws. */
+function realPathOrMissing(filePath: string): string | null {
+  try {
+    return realpathSync(filePath);
+  } catch (error) {
+    if (MISSING_PATH_CODES.has((error as NodeJS.ErrnoException).code ?? '')) return null;
+    throw error;
+  }
+}
+
+/**
+ * The real identity of a file: its full real path (a final symlink is
+ * followed), else its name under the real parent directory, else null when
+ * the parent does not exist either, so no file is there to read.
+ */
+function fileIdentity(filePath: string): string | null {
+  const real = realPathOrMissing(filePath);
+  if (real !== null) return real;
+  const directory = realPathOrMissing(dirname(filePath));
+  return directory === null ? null : join(directory, basename(filePath));
+}
+
+/**
+ * True when the file is a user-level adapter (<home>/.claude/settings.json or
+ * <home>/.codex/hooks.json) by real identity: a repository rooted at $HOME, or
+ * a dotfiles repository whose file a home adapter links to. A path that
+ * cannot be resolved throws, so callers fail closed.
+ */
+function isUserLevelAdapter(filePath: string, home: string): boolean {
+  const identity = fileIdentity(filePath);
+  return identity !== null && LEGACY_ADAPTER_CANDIDATES.some((rel) => fileIdentity(join(home, rel)) === identity);
+}
+
+function verificationCommand(target: InitHookTarget, checkUpdates: boolean): string {
+  return `rh setup check --target ${target}${checkUpdates ? ' --check-updates' : ''} --json`;
+}
+
+/** Agent actions in creation order, plus the action each check produced. */
+interface ActionLedger {
+  readonly list: InitHookAction[];
+  /** Check id -> id of the first action generated for that check. */
+  readonly byCheck: Map<string, string>;
+}
+
+function addAction(actions: ActionLedger, action: InitHookAction, checkIds: readonly string[]): void {
+  if (!actions.list.some((entry) => entry.id === action.id)) actions.list.push(action);
+  for (const checkId of checkIds) linkCheck(actions, checkId, action.id);
+}
+
+function linkCheck(actions: ActionLedger, checkId: string, actionId: string): void {
+  if (!actions.byCheck.has(checkId)) actions.byCheck.set(checkId, actionId);
+}
+
+function statusChecks(
+  report: StatusReport,
+  target: InitHookTarget,
+  checkUpdates: boolean,
+  actions: ActionLedger,
+): InitHookCheck[] {
+  const checks: InitHookCheck[] = [];
+  const invalidState = report.installState.recorded === 'invalid'
+    ? report.installState
+    : null;
+  let stateActionId: string | null = null;
+  if (invalidState) {
+    stateActionId = 'install-state.repair';
+    addAction(actions, {
+      id: stateActionId,
+      status: 'needs_agent',
+      reason: `Install state cannot be read (${invalidState.code}): ${invalidState.error}`,
+      requires_agent: true,
+      risk: 'Requires operator inspection of the user-level state authority; do not overwrite or delete it until the intended plugin selection and ownership manifest are established.',
+      targets: [invalidState.path],
+      verification: verificationCommand(target, checkUpdates),
+    }, []);
+  }
+  for (const id of selectedTargets(target)) {
+    const entry = report.targets.find((candidate) => candidate.id === id);
+    if (!entry) {
+      checks.push({
+        id: `status.adapter.${id}`,
+        title: `${targetLabel(id)} global hook adapter`,
+        status: 'fail',
+        source: 'status',
+        detail: 'target is not registered in the installer registry',
+      });
+      continue;
+    }
+
+    if (!entry.installed) {
+      checks.push({
+        id: `status.adapter.${id}`,
+        title: `${targetLabel(id)} global hook adapter`,
+        status: 'warn',
+        source: 'status',
+        detail: `${targetLabel(id)} host not detected; no adapter install action was generated`,
+      });
+      continue;
+    }
+
+    const countConfigured = entry.managedEntryCount === entry.expectedEntryCount;
+    const projectionConfigured = entry.projection === undefined
+      ? countConfigured
+      : entry.projection.status === 'consistent' && entry.projection.error === undefined;
+    const configured = invalidState === null
+      && entry.alreadyConfigured
+      && countConfigured
+      && projectionConfigured;
+    const projectionDetail = entry.projection?.error
+      ? `; projection check failed: ${entry.projection.error}`
+      : entry.alreadyConfigured
+      && entry.projection?.status === 'drift'
+      && entry.projection.mismatches.length > 0
+      ? `; projection drift: ${entry.projection.mismatches.map(formatManagedHookProjectionMismatch).join('; ')}`
+      : '';
+    checks.push({
+      id: `status.adapter.${id}`,
+      title: `${targetLabel(id)} global hook adapter`,
+      status: configured ? 'ok' : 'needs_agent',
+      source: 'status',
+      detail: invalidState
+        ? `install state cannot be read: ${invalidState.error}`
+        : configured
+        ? `${entry.managedEntryCount}/${entry.expectedEntryCount} managed entries at ${entry.configPath}`
+        : `${entry.managedEntryCount}/${entry.expectedEntryCount} managed entries at ${entry.configPath ?? '(unknown config path)'}${projectionDetail}`,
+    });
+    if (stateActionId !== null) linkCheck(actions, `status.adapter.${id}`, stateActionId);
+
+    if (!configured && invalidState === null) {
+      addAction(actions, {
+        id: `adapter.${id}.install`,
+        status: 'needs_agent',
+        reason: `${targetLabel(id)} user-level adapter is missing or does not match the route registry.`,
+        requires_agent: true,
+        risk: 'Writes user-level host hook config; preserve unmanaged user entries and re-check managed count.',
+        command: `rh install --target ${id} --location global`,
+        targets: entry.configPath ? [entry.configPath] : undefined,
+        verification: verificationCommand(target, checkUpdates),
+      }, [`status.adapter.${id}`]);
+    }
+  }
+  return checks;
+}
+
+function adoptionRefreshCheck(
+  report: StatusReport,
+  target: InitHookTarget,
+  checkUpdates: boolean,
+  actions: ActionLedger,
+): InitHookCheck {
+  const id = 'repo.init-refresh';
+  const title = 'Repo-local adoption refresh';
+  if (!checkUpdates) {
+    return {
+      id,
+      title,
+      status: 'na',
+      source: 'status',
+      detail: 'disabled; run setup check with --check-updates to evaluate repo-local init refresh',
+    };
+  }
+
+  if (!report.repo.inGitRepo || !report.repo.repoRoot) {
+    return {
+      id,
+      title,
+      status: 'na',
+      source: 'status',
+      detail: 'current directory is not inside a git repo',
+    };
+  }
+
+  if (!report.repo.optIn) {
+    return {
+      id,
+      title,
+      status: 'na',
+      source: 'status',
+      detail: `repo is not repo-harness adopted (${report.repo.optInMarker} missing)`,
+    };
+  }
+
+  if (isRepoHarnessSourceCheckout(report.repo.repoRoot)) {
+    return {
+      id,
+      title,
+      status: 'na',
+      source: 'status',
+      detail: 'self-host source checkout owns its workflow surfaces; downstream init refresh is not applicable',
+    };
+  }
+
+  let plan: AdoptionPlan;
+  try {
+    plan = planAdoption({ repoRoot: report.repo.repoRoot, mode: 'standard', apply: false });
+  } catch (error) {
+    if (!(error instanceof ReviewBaseUnresolvedError)) throw error;
+    addAction(actions, {
+      id: 'repo.init-refresh',
+      status: 'needs_agent',
+      reason: error.message,
+      requires_agent: true,
+      risk: 'init refuses until the repository names a default branch; repair the git refs first.',
+      targets: [report.repo.repoRoot],
+      verification: verificationCommand(target, checkUpdates),
+    }, [id]);
+    return { id, title, status: 'needs_agent', source: 'status', detail: error.message };
+  }
+  if (plan.summary.plannedTotal === 0) {
+    return {
+      id,
+      title,
+      status: 'ok',
+      source: 'status',
+      detail: `up-to-date; ${plan.summary.total} operations skipped`,
+    };
+  }
+
+  const command = `rh init --repo ${shellQuote(report.repo.repoRoot)}`;
+  addAction(actions, {
+    id: 'repo.init-refresh',
+    status: 'needs_agent',
+    reason: 'The current adopted repo has pending repo-harness adoption plan operations.',
+    requires_agent: true,
+    risk: 'Updates repo-local workflow files; review the init dry-run first and preserve user-owned content.',
+    command,
+    targets: [report.repo.repoRoot],
+    verification: verificationCommand(target, checkUpdates),
+  }, [id]);
+  return {
+    id,
+    title,
+    status: 'needs_agent',
+    source: 'status',
+    detail: `planned=${plan.summary.plannedTotal}; skipped=${plan.summary.skippedTotal}; user_owned=${plan.summary.userOwnedFilesTouched}; command=${command}`,
+  };
+}
+
+function parseActionCommand(detail: string): string | undefined {
+  const direct = detail.match(/agent_action=([^;]+)/);
+  if (direct) return direct[1].trim();
+  const remediation = detail.match(/remediation=([^;]+)/);
+  if (remediation) return remediation[1].trim();
+  const run = detail.match(/\(run:\s*([^)]+)\)/);
+  return run?.[1]?.trim();
+}
+
+function doctorChecks(
+  report: DoctorReport,
+  target: InitHookTarget,
+  checkUpdates: boolean,
+  actions: ActionLedger,
+): InitHookCheck[] {
+  const checks: InitHookCheck[] = [];
+  for (const entry of report.checks) {
+    if (target === 'claude' && entry.id === 'codex-cli-version') continue;
+    if (entry.id === 'pi-package' && entry.status === 'warn') {
+      addAction(actions, {
+        id: 'pi.package.install', status: 'needs_agent', reason: entry.detail,
+        requires_agent: true, risk: 'Registers the installed package through Pi; preserves other package entries.',
+        command: 'rh install --target both', verification: verificationCommand(target, checkUpdates),
+      }, ['doctor.pi-package']);
+    }
+    const source: InitHookCheckSource = entry.id === 'security-config' ? 'security' : 'doctor';
+    let checkStatus: InitHookCheckStatus = entry.status;
+
+    if (entry.id === 'cli-update' && entry.status === 'warn') {
+      const command = parseActionCommand(entry.detail);
+      if (command) {
+        checkStatus = 'needs_agent';
+        addAction(actions, {
+          id: 'cli.update',
+          status: 'needs_agent',
+          reason: 'The installed repo-harness CLI is older than the latest package version.',
+          requires_agent: true,
+          risk: 'Updates global CLI/runtime; Agent should verify adapters and current repo status after install.',
+          command,
+          verification: verificationCommand(target, checkUpdates),
+        }, [`doctor.${entry.id}`]);
+      }
+    } else if (entry.id === 'security-config' && (entry.status === 'warn' || entry.status === 'fail')) {
+      if (entry.status === 'warn') checkStatus = 'needs_agent';
+      addAction(actions, {
+        id: 'security.review-local-config',
+        status: 'needs_agent',
+        reason: 'Security scan found unmanaged or risky local automation surfaces.',
+        requires_agent: true,
+        risk: 'Do not blindly delete user-owned config; inspect the reported file and preserve intentional entries.',
+        command: 'rh security scan --json',
+        verification: 'rh security scan --json',
+      }, [`doctor.${entry.id}`]);
+    } else if (
+      (entry.id === 'repo-hook-scripts' || entry.id.startsWith('codegraph-')) &&
+      (entry.status === 'warn' || entry.status === 'fail')
+    ) {
+      const command = parseActionCommand(entry.detail);
+      if (command) {
+        if (entry.status === 'warn') checkStatus = 'needs_agent';
+        addAction(actions, {
+          id: `doctor.${entry.id}.repair`,
+          status: 'needs_agent',
+          reason: `${entry.describe} is not ready.`,
+          requires_agent: true,
+          risk: 'Repair command may touch repo-local workflow or user-level tool configuration; run from the intended repo root.',
+          command,
+          verification: verificationCommand(target, checkUpdates),
+        }, [`doctor.${entry.id}`]);
+      }
+    }
+
+    checks.push({
+      id: `doctor.${entry.id}`,
+      title: entry.describe,
+      status: checkStatus,
+      source,
+      detail: entry.detail,
+    });
+  }
+  return checks;
+}
+
+function globalRulesChecks(
+  target: InitHookTarget,
+  env: NodeJS.ProcessEnv | undefined,
+  sourceRoot: string,
+  checkUpdates: boolean,
+  actions: ActionLedger,
+): InitHookCheck[] {
+  const home = homeDir(env);
+  const checks: InitHookCheck[] = [];
+  const missing: string[] = [];
+  const missingChecks: string[] = [];
+  for (const host of selectedTargets(target)) {
+    const id = `global-rules.${host}`;
+    const filePath = globalContextPath(home, host);
+    const exists = existsSync(filePath);
+    const check = (status: InitHookCheckStatus, detail: string): void => {
+      checks.push({
+        id,
+        title: `${targetLabel(host)} user-level Global Working Rules`,
+        status,
+        source: 'global-rules',
+        detail,
+      });
+    };
+    let content: string | null = null;
+    if (exists) {
+      try {
+        // A FIFO or special file would block or fail the read; never open it. User links are followed.
+        if (!statSync(filePath).isFile()) throw new Error('not a regular file');
+        content = readFileSync(filePath, 'utf-8');
+      } catch (error) {
+        check('needs_agent', `unreadable (${(error as Error).message}): ${filePath}`);
+        missing.push(filePath);
+        missingChecks.push(id);
+        continue;
+      }
+    }
+    let inspection: GlobalContextInspection;
+    try {
+      inspection = inspectGlobalContext(content, sourceRoot);
+    } catch (error) {
+      check('fail', `cannot render the current Global Working Rules template from ${sourceRoot} (${(error as Error).message}): ${filePath}`);
+      continue;
+    }
+    const flagCommand = '`rh update --report-language <follow|zh-CN|en>`';
+    switch (inspection.state) {
+      case 'managed-current':
+        check('ok', `managed block matches the current template at ${filePath}`);
+        break;
+      case 'managed-stale':
+        check('warn', inspection.synced?.status === 'kept-edited'
+          ? `${GLOBAL_RULES_EDITED}: ${filePath}`
+          : inspection.legacySpan
+            ? `legacy repo-harness sections outside the markers at ${filePath}; run \`rh update\``
+            : `managed block is stale at ${filePath}; run \`rh update\``);
+        break;
+      case 'managed-unrecorded':
+        check('warn', `managed block has no recorded reporting language at ${filePath}; run ${flagCommand}`);
+        break;
+      case 'legacy-unmanaged':
+        check('warn', `legacy repo-harness rules without markers at ${filePath}; run ${flagCommand}`);
+        break;
+      case 'unbalanced':
+        check('fail', `${GLOBAL_RULES_UNBALANCED}: ${filePath}`);
+        break;
+      case 'no-rules':
+      case 'missing-file':
+        check('needs_agent', `${exists ? 'not found in existing file' : 'file missing'}: ${filePath}`);
+        missing.push(filePath);
+        missingChecks.push(id);
+        break;
+    }
+  }
+
+  if (missing.length > 0) {
+    addAction(actions, {
+      id: 'global-rules.insert',
+      status: 'needs_agent',
+      reason: 'One or more user-level instruction files do not contain Global Working Rules.',
+      requires_agent: true,
+      risk: 'User-owned markdown; Agent must inspect first and insert only if absent, preserving existing content.',
+      targets: missing,
+      verification: verificationCommand(target, checkUpdates),
+    }, missingChecks);
+  }
+
+  return checks;
+}
+
+function normalizeToolCommand(command: string | undefined, target: InitHookTarget): string | undefined {
+  return command?.replace('<codex|claude|both>', target).trim() || undefined;
+}
+
+function toolCheckStatus(toolName: string, status: string | undefined, target: InitHookTarget): InitHookCheckStatus {
+  if (toolName === 'codex_automation_profile' && target === 'claude') return 'na';
+  if (status === 'not-selected') return 'na';
+  const normalized = (status ?? 'unknown').toLowerCase();
+  if (['present', 'ok', 'configured', 'ready', 'synced'].includes(normalized)) return 'ok';
+  if (['missing', 'not-detected', 'unavailable', 'failed', 'fail', 'missing-local', 'partial', 'mismatch', 'invalid'].includes(normalized)) {
+    return 'needs_agent';
+  }
+  if (['warning', 'warn', 'deferred', 'unknown', 'drift', 'stale'].includes(normalized)) return 'warn';
+  return 'warn';
+}
+
+function updateNeedsAgent(updateStatus: string | null | undefined): boolean {
+  const normalized = (updateStatus ?? '').toLowerCase();
+  return ['update-available', 'outdated', 'stale'].includes(normalized);
+}
+
+function runtimeCapabilityStatus(capability: RuntimeCapability): InitHookCheckStatus {
+  const normalized = (capability.status ?? 'unknown').toLowerCase();
+  if (['present', 'available', 'supported', 'ok', 'ready'].includes(normalized)) return 'ok';
+  if (['missing', 'unavailable', 'unsupported', 'failed', 'fail', 'timed-out'].includes(normalized)) {
+    return capability.required ? 'needs_agent' : 'warn';
+  }
+  // `not-probed` is an opt-in capability that was deliberately not measured
+  // (scripts/check-agent-tooling.sh --probe-skills-cli), not a failure: it must
+  // never escalate to needs_agent, the way an unmeasured update check does not.
+  if (['not-probed', 'not-checked'].includes(normalized)) return 'warn';
+  return capability.required ? 'needs_agent' : 'warn';
+}
+
+function runtimeCapabilityChecks(
+  report: ToolingReport | undefined,
+  target: InitHookTarget,
+  checkUpdates: boolean,
+  actions: ActionLedger,
+): InitHookCheck[] {
+  const checks: InitHookCheck[] = [];
+  for (const [capabilityName, capability] of Object.entries(report?.runtime_capabilities ?? {})) {
+    const status = runtimeCapabilityStatus(capability);
+    const owner = capability.owner ? `owner=${capability.owner}` : 'owner=unknown';
+    const required = capability.required ? 'required' : 'optional';
+    const path = capability.path ? `; path=${capability.path}` : '';
+    const requiredFor = capability.required_for ? `; required_for=${capability.required_for}` : '';
+    const reason = capability.reason ? `; reason=${capability.reason}` : '';
+    checks.push({
+      id: `runtime.${capabilityName}`,
+      title: `Runtime capability: ${capability.name ?? capabilityName}`,
+      status,
+      source: 'tooling',
+      detail: `${capability.status ?? 'unknown'} (${required}); ${owner}${path}${requiredFor}${reason}`,
+    });
+
+    if (status === 'needs_agent') {
+      addAction(actions, {
+        id: `runtime.${capabilityName}.repair`,
+        status: 'needs_agent',
+        reason: `${capability.name ?? capabilityName} runtime capability is ${capability.status ?? 'unknown'}.`,
+        requires_agent: true,
+        risk: 'May change host-level runtime tooling; verify setup check after repair.',
+        command: normalizeToolCommand(capability.command, target),
+        verification: verificationCommand(target, checkUpdates),
+      }, [`runtime.${capabilityName}`]);
+    }
+  }
+  return checks;
+}
+
+function commandForToolGap(tool: ToolingTool, target: InitHookTarget): string | undefined {
+  const status = (tool.status ?? '').toLowerCase();
+  if (status === 'missing') {
+    return normalizeToolCommand(tool.install_command, target);
+  }
+  return normalizeToolCommand(
+    tool.sync_command ?? tool.ensure_command ?? tool.mcp_install_command ?? tool.install_command ?? tool.upgrade_command,
+    target,
+  );
+}
+
+function collectToolingReport(sourceRoot: string, cwd: string, target: InitHookTarget, checkUpdates: boolean, env?: NodeJS.ProcessEnv): {
+  report?: ToolingReport;
+  error?: string;
+  command: string[];
+} {
+  const script = join(sourceRoot, 'scripts', 'check-agent-tooling.sh');
+  const args = [script, '--json', '--host', target];
+  if (checkUpdates) args.push('--check-updates');
+  if (!existsSync(script)) return { command: ['bash', ...args], error: `script not found: ${script}` };
+
+  const result = spawnSync('bash', args, {
+    cwd,
+    encoding: 'utf-8',
+    env: { ...process.env, ...(env ?? {}) },
+    timeout: 30000,
+  });
+  if (result.stdout?.trim()) {
+    try {
+      return { command: ['bash', ...args], report: JSON.parse(result.stdout) as ToolingReport };
+    } catch (error) {
+      return { command: ['bash', ...args], error: `could not parse tooling JSON: ${(error as Error).message}` };
+    }
+  }
+  return {
+    command: ['bash', ...args],
+    error: result.stderr || result.error?.message || `tooling check exited ${result.status ?? 'without status'}`,
+  };
+}
+
+function toolingChecks(
+  report: ToolingReport | undefined,
+  target: InitHookTarget,
+  checkUpdates: boolean,
+  actions: ActionLedger,
+  probeError?: string,
+): InitHookCheck[] {
+  if (!report) {
+    return [{
+      id: 'tooling.report',
+      title: 'External tooling readiness',
+      status: 'warn',
+      source: 'tooling',
+      detail: probeError ?? 'tooling report unavailable',
+    }];
+  }
+
+  const checks: InitHookCheck[] = [];
+  for (const [toolName, tool] of Object.entries(report.tools ?? {})) {
+    const required = tool.required !== false;
+    const foreignCopy = tool.path_copy?.relation === 'unrelated';
+    const readinessStatus = foreignCopy ? 'fail' : required ? toolCheckStatus(toolName, tool.status, target) : 'ok';
+    const hasUpdateAction = required && checkUpdates && updateNeedsAgent(tool.update_status);
+    const status: InitHookCheckStatus = hasUpdateAction && readinessStatus === 'ok'
+      ? 'needs_agent'
+      : readinessStatus;
+    const update = tool.update_status && tool.update_status !== 'not-checked'
+      ? `; update=${tool.update_status}`
+      : '';
+    const requirement = required ? '' : 'optional; ';
+    checks.push({
+      id: `tooling.${toolName}`,
+      title: `External tooling: ${tool.name ?? toolName}`,
+      status,
+      source: 'tooling',
+      detail: status === 'na'
+        ? tool.status === 'not-selected' ? `not-selected; ${tool.reason ?? 'no detail'}` : `skipped for target=${target}`
+        : `${tool.status ?? 'unknown'}${update}; ${requirement}${tool.reason ?? 'no detail'}`,
+    });
+
+    if (foreignCopy && tool.path_copy) {
+      addAction(actions, {
+        id: `tooling.${toolName}.path-copy`, status: 'needs_agent',
+        reason: `The PATH copy is unrelated to the managed runtime.${tool.path_copy.fix_note ? ` ${tool.path_copy.fix_note}` : ''}`, requires_agent: true,
+        risk: 'The owner must remove the unrelated copy.', ...(tool.path_copy.fix_command ? { command: tool.path_copy.fix_command } : {}),
+        verification: verificationCommand(target, checkUpdates),
+      }, [`tooling.${toolName}`]);
+    }
+    if (required && readinessStatus === 'needs_agent') {
+      const command = commandForToolGap(tool, target);
+      addAction(actions, {
+        id: `tooling.${toolName}.repair`,
+        status: 'needs_agent',
+        reason: `${tool.name ?? toolName} readiness is ${tool.status ?? 'unknown'}.`,
+        requires_agent: true,
+        risk: 'May install or reconfigure external developer tooling; preserve host-specific paths and verify after the command.',
+        command,
+        verification: verificationCommand(target, checkUpdates),
+      }, [`tooling.${toolName}`]);
+    }
+
+    if (hasUpdateAction) {
+      const command = normalizeToolCommand(tool.upgrade_command, target);
+      addAction(actions, {
+        id: `tooling.${toolName}.update`,
+        status: 'needs_agent',
+        reason: `${tool.name ?? toolName} reports ${tool.update_status}.`,
+        requires_agent: true,
+        risk: 'Updates external developer tooling; run the tool-specific verification afterward.',
+        command,
+        verification: verificationCommand(target, checkUpdates),
+      }, [`tooling.${toolName}`]);
+    }
+  }
+  return checks;
+}
+
+/**
+ * A project host config is a retired adapter only when it still holds a
+ * repo-harness command. A config that cannot be read is not proven clean.
+ */
+function legacyAdapterDetail(filePath: string): { readonly legacy: boolean; readonly text: string } {
+  if (!existsSync(filePath)) return { legacy: false, text: `not present: ${filePath}` };
+  let removed: number;
+  try {
+    const data = parseJsonText(readFileSync(filePath, 'utf8'), filePath) as { hooks?: unknown };
+    removed = stripRepoHarnessManagedHooks(data.hooks).removed.length;
+  } catch (error) {
+    return { legacy: true, text: `cannot inspect ${filePath}: ${error instanceof FileSyntaxError ? error.detail : (error as Error).message}` };
+  }
+  return removed > 0
+    ? { legacy: true, text: `legacy adapter config at ${filePath} holds ${removed} repo-harness hook command(s)` }
+    : { legacy: false, text: `no repo-harness hook command in ${filePath}` };
+}
+
+function legacyChecks(cwd: string, home: string, target: InitHookTarget, checkUpdates: boolean, actions: ActionLedger): InitHookCheck[] {
+  const ids = ['legacy.project-claude-settings', 'legacy.project-codex-hooks'] as const;
+  const repoRoot = resolveRepoRoot(cwd);
+  // Outside a repository, <cwd>/.claude and <cwd>/.codex can be the user-level adapters (cwd = $HOME).
+  if (repoRoot === null) {
+    return ids.map((id) => ({
+      id,
+      title: 'Retired repo-local host adapter config',
+      status: 'na',
+      source: 'legacy',
+      detail: `cwd is not in a git repository: ${cwd}`,
+    }));
+  }
+  const files = [
+    { id: ids[0], filePath: join(repoRoot, '.claude', 'settings.json') },
+    { id: ids[1], filePath: join(repoRoot, '.codex', 'hooks.json') },
+  ];
+  const title = 'Retired repo-local host adapter config';
+  const checks: InitHookCheck[] = [];
+  const present: string[] = [];
+  const presentChecks: string[] = [];
+  // A candidate that a user-level adapter owns, or that cannot be resolved apart from one, is not a project adapter.
+  let userLevelAdapter = false;
+  for (const entry of files) {
+    let userLevel: boolean;
+    try {
+      userLevel = isUserLevelAdapter(entry.filePath, home);
+    } catch (error) {
+      userLevelAdapter = true;
+      checks.push({ id: entry.id, title, status: 'needs_agent', source: 'legacy', detail: `cannot resolve ${entry.filePath}: ${(error as Error).message}` });
+      present.push(entry.filePath);
+      presentChecks.push(entry.id);
+      continue;
+    }
+    // A repository rooted at $HOME, or a dotfiles file behind a home adapter link, is the user-level adapter.
+    if (userLevel) {
+      userLevelAdapter = true;
+      checks.push({ id: entry.id, title, status: 'na', source: 'legacy', detail: `user-level adapter, not a project adapter: ${entry.filePath}` });
+      continue;
+    }
+    const detail = legacyAdapterDetail(entry.filePath);
+    checks.push({
+      id: entry.id,
+      title,
+      status: detail.legacy ? 'needs_agent' : 'ok',
+      source: 'legacy',
+      detail: detail.text,
+    });
+    if (detail.legacy) {
+      present.push(entry.filePath);
+      presentChecks.push(entry.id);
+    }
+  }
+
+  if (present.length > 0) {
+    addAction(actions, {
+      id: 'legacy.project-adapters.review',
+      status: 'needs_agent',
+      reason: userLevelAdapter
+        ? 'Repo-local host adapter configs are retired. A candidate is, or cannot be resolved apart from, a user-level adapter; review the targets manually.'
+        : 'Repo-local host adapter configs are retired; user-level adapters should own runtime routing. Review each target, then run rh init to remove its repo-harness hook commands.',
+      command: userLevelAdapter ? undefined : 'rh init',
+      requires_agent: true,
+      risk: 'These files may contain user-owned historical config; review the targets before cleanup. rh init also refreshes the repo-local harness.',
+      targets: present,
+      verification: verificationCommand(target, checkUpdates),
+    }, presentChecks);
+  }
+  return checks;
+}
+
+function summarize(checks: InitHookCheck[]): InitHookReport['summary'] {
+  const summary = { ok: 0, warn: 0, fail: 0, na: 0, needs_agent: 0 };
+  for (const check of checks) summary[check.status] += 1;
+  return summary;
+}
+
+function overallStatus(summary: InitHookReport['summary']): InitHookStatus {
+  if (summary.fail > 0) return 'blocked';
+  if (summary.warn > 0 || summary.needs_agent > 0) return 'attention';
+  return 'ok';
+}
+
+/** The setup check report plus the typed inputs it was built from. */
+export interface SetupCheckBuild {
+  readonly report: InitHookReport;
+  readonly status: StatusReport;
+  readonly doctor: DoctorReport;
+  readonly tooling: ToolingReport | undefined;
+  /** Check id -> the agent action the builder generated for that check. */
+  readonly check_actions: ReadonlyMap<string, InitHookAction>;
+}
+
+/** The one `setup check` builder. `runInitHook` returns its report. */
+export function buildSetupCheck(ports: DoctorPorts, opts: InitHookOptions = {}): SetupCheckBuild {
+  const cwd = resolve(opts.cwd ?? process.cwd());
+  const sourceRoot = resolve(opts.sourceRoot ?? REPO_ROOT);
+  const target = opts.target ?? 'both';
+  const checkUpdates = opts.checkUpdates === true;
+  const actions: ActionLedger = { list: [], byCheck: new Map() };
+
+  const statusReport = opts.statusReport ?? withProcessEnv(opts.env, () => runStatus(cwd));
+  const doctorEnv = { ...(opts.env ?? {}), [UPDATE_CHECK_ENV]: checkUpdates ? '1' : undefined };
+  const doctorReport = opts.doctorReport ?? withProcessEnv(doctorEnv, () => runDoctor(ports, cwd, target as DoctorTarget));
+  const toolingProbe = opts.toolingReport
+    ? { report: opts.toolingReport, error: undefined }
+    : collectToolingReport(sourceRoot, cwd, target, checkUpdates, opts.env);
+
+  const checks: InitHookCheck[] = [
+    ...statusChecks(statusReport, target, checkUpdates, actions),
+    adoptionRefreshCheck(statusReport, target, checkUpdates, actions),
+    ...doctorChecks(doctorReport, target, checkUpdates, actions),
+    ...globalRulesChecks(target, opts.env, sourceRoot, checkUpdates, actions),
+    ...runtimeCapabilityChecks(toolingProbe.report, target, checkUpdates, actions),
+    ...toolingChecks(toolingProbe.report, target, checkUpdates, actions, toolingProbe.error),
+    ...legacyChecks(cwd, homeDir(opts.env), target, checkUpdates, actions),
+  ];
+
+  // Same planner as `upgrade`: items a current operator keep decision covers are not leftovers.
+  let decisions: UpgradeDecision[] = [];
+  try { decisions = readUpgradeDecisions(cwd); } catch (error) {
+    checks.push({
+      id: 'legacy.upgrade-decisions',
+      title: 'Operator upgrade decisions',
+      status: 'warn',
+      source: 'legacy',
+      detail: `${error instanceof Error ? error.message : String(error)}. Decisions are ignored until the file is fixed.`,
+    });
+  }
+  const home = opts.env?.HOME ?? process.env.HOME ?? os.homedir();
+  // The install-state action above already reports an unreadable ledger; leftovers need it to classify ownership.
+  const legacyItems = statusReport.installState.recorded === 'invalid'
+    ? []
+    : planUpgrade({ scope: 'all', cwd, home, packageRoot: REPO_ROOT, installOwnership: installOwnershipReader({ ...process.env, ...opts.env, HOME: home }) }, decisions).items;
+  const summary = summarize(checks);
+  const report: InitHookReport = {
+    version: 1,
+    status: overallStatus(summary),
+    target,
+    checkUpdates,
+    summary,
+    checks,
+    agent_actions: actions.list,
+    leftovers: { total: legacyItems.length, removable: legacyItems.filter((item) => item.action !== 'report').length },
+  };
+  const byId = new Map(actions.list.map((action) => [action.id, action]));
+  const checkActions = new Map<string, InitHookAction>();
+  for (const [checkId, actionId] of actions.byCheck) checkActions.set(checkId, byId.get(actionId)!);
+  return { report, status: statusReport, doctor: doctorReport, tooling: toolingProbe.report, check_actions: checkActions };
+}
+
+export function runInitHook(ports: DoctorPorts, opts: InitHookOptions = {}): InitHookReport {
+  return buildSetupCheck(ports, opts).report;
+}
+
+export function formatInitHook(report: InitHookReport, asJson = false): string {
+  if (asJson) return JSON.stringify(report, null, 2);
+  const lines: string[] = [];
+  lines.push(`rh setup check: ${report.status}`);
+  lines.push(`target=${report.target}; check-updates=${report.checkUpdates ? 'on' : 'off'}`);
+  lines.push(
+    `summary: ${report.summary.ok} ok, ${report.summary.warn} warn, ${report.summary.fail} fail, ${report.summary.na} n/a, ${report.summary.needs_agent} needs-agent`,
+  );
+  if (report.leftovers) {
+    lines.push(`${report.leftovers.total} leftovers (${report.leftovers.removable} removable). Run: rh upgrade`);
+  }
+  lines.push('');
+  lines.push('Checks:');
+  for (const check of report.checks) {
+    lines.push(`  [${check.status}] ${check.id}: ${check.detail}`);
+  }
+  lines.push('');
+  lines.push('Agent actions:');
+  if (report.agent_actions.length === 0) {
+    lines.push('  none');
+  } else {
+    for (const action of report.agent_actions) {
+      lines.push(`  - ${action.id}: ${action.reason}`);
+      if (action.command) lines.push(`    command: ${action.command}`);
+      if (action.targets?.length) lines.push(`    targets: ${action.targets.join(', ')}`);
+      lines.push(`    risk: ${action.risk}`);
+      lines.push(`    verification: ${action.verification}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+export function buildSetupCommand(ports: DoctorPorts): Command {
+  const command = new Command('setup');
+  command.description('User-level rh setup utilities');
+
+  command
+    .command('check')
+    .description('Run a read-only Agent bootstrap checklist for user-level repo-harness readiness')
+    .option('--target <target>', `Host target to inspect: ${VALID_TARGETS.join('|')}`, 'both')
+    .option('--check-updates', 'Include network-backed version update advisories')
+    .option('--json', 'Output JSON instead of human-readable text')
+    .action((rawOpts: { target: string; checkUpdates?: boolean; json?: boolean }) => {
+      if (!VALID_TARGETS.includes(rawOpts.target as InitHookTarget)) {
+        console.error(
+          `rh setup check: invalid --target "${rawOpts.target}" (expected: ${VALID_TARGETS.join(', ')})`,
+        );
+        process.exit(2);
+      }
+      const report = runInitHook(ports, {
+        target: rawOpts.target as InitHookTarget,
+        checkUpdates: rawOpts.checkUpdates === true,
+      });
+      console.log(formatInitHook(report, rawOpts.json === true));
+      process.exit(report.status === 'blocked' ? 1 : 0);
+    });
+
+  return command;
+}

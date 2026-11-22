@@ -1,0 +1,257 @@
+import { describe, expect, test } from "bun:test";
+import { existsSync, readFileSync, readdirSync, statSync } from "fs";
+import { join, relative, sep } from "path";
+
+// SSD-06 (C8): live-reference scan for the 19 retired Skill package names.
+// It scans a fixed surface list and fails on any hit, with a per-name/per-file
+// allowlist for the legitimate contexts the plan itself names: migration
+// metadata (the manifest's own retiredPackages array), changelog/history,
+// archived artifacts, the R1 provenance-enum vocabulary (acceptance-receipt
+// source values and plan-capture --source values, both permanent
+// data-schema vocabulary unrelated to Skill routing), and the R2 generated
+// bridge projection identity.
+
+const ROOT = join(import.meta.dir, "..", "..");
+
+const MANIFEST = JSON.parse(
+  readFileSync(join(ROOT, "assets/skill-commands/manifest.json"), "utf-8"),
+) as {
+  packages: Array<{ name: string }>;
+  retiredPackages: Array<{ name: string; replacement: string | null; note: string }>;
+};
+
+// R2: `repo-harness-chatgpt-bridge` is a retiredPackages[] entry but is NOT a
+// scannable retired name: `mcp doctor` (src/cli/mcp/doctor.ts) names the
+// leftover `.agents/skills/repo-harness-chatgpt-bridge/` directory that the
+// removed `mcp install-skill` wrote (#1354), so the user can delete it.
+const SCAN_EXEMPT_RETIRED_NAMES = new Set(["repo-harness-chatgpt-bridge"]);
+
+// Derived from the manifest rather than hand-listed: retiredPackages[] is
+// already the migration record of record, so a second hardcoded copy here
+// would be a competing authority that silently goes stale when a package
+// retires.
+const RETIRED_NAMES = MANIFEST.retiredPackages
+  .map((entry) => entry.name)
+  .filter((name) => !SCAN_EXEMPT_RETIRED_NAMES.has(name));
+
+// Plan C8: "src/, scripts/, assets/, .agents/, SKILL.md, README*,
+// docs/reference-configs/, docs/architecture/, evals/".
+const SCAN_SURFACES = [
+  "src",
+  "scripts",
+  "assets",
+  ".agents",
+  "SKILL.md",
+  "README.md",
+  "README.zh-CN.md",
+  "README.ja.md",
+  "README.fr.md",
+  "README.es.md",
+  "docs/reference-configs",
+  "docs/architecture",
+  "evals",
+];
+
+// Whole-file exemptions, each with its own justification. Every entry here
+// was found by an exploratory sweep during SSD-06 and individually
+// classified before being allowlisted -- none is a blanket "quiet the scan"
+// exemption.
+const FILE_ALLOWLIST: Record<string, string> = {
+  // Migration diagnostics: the manifest's own retiredPackages[] array names
+  // every retired package and its replacement (plan-required content).
+  "assets/skill-commands/manifest.json":
+    "retiredPackages[] migration-diagnostics array (plan-required)",
+  // R5: untouchable historical pre-cutover evidence.
+  "evals/skill-routing/discovery-baseline.json":
+    "frozen pre-cutover discovery baseline (plan Ruling R5)",
+  // This module doc's own migration-metadata paragraph, documenting the
+  // retiredPackages[] mapping for human readers (same justification as the
+  // manifest entry above).
+  "docs/architecture/modules/public-surface/action-commands.md":
+    "documents the retiredPackages[] mapping as migration metadata",
+};
+
+// R1: "Do NOT touch scripts/acceptance-receipt.ts,
+// scripts/harness-trace-grade.sh, scripts/lib/project-init-lib.sh enum usages"
+// -- permanent provenance-enum vocabulary (generic-review is the current
+// Receipt source; retired provider sources are rejected). Contract seeds and
+// evidence materialization also carry the same frozen source vocabulary rather
+// than a runnable Skill reference.
+const R1_PROVENANCE_ENUM_FILES = [
+  "scripts/acceptance-receipt.ts",
+  "scripts/harness-trace-grade.sh",
+  "scripts/lib/project-init-lib.sh",
+];
+
+// Discovered during the SSD-06 sweep, originally outside this contract's
+// allowed_paths (assets/templates/, scripts/ensure-task-workflow.sh, and
+// evals/fixtures/ were not listed in
+// tasks/contracts/20260715-1140-skill-surface-discovery-convergence.contract.md's
+// allowed_paths). The contract was amended to bring those five files into
+// scope and the acceptance-gate follow-up fixed all five (prior-art trigger
+// text reworded to name repo-harness-product's prd mode; both fixture
+// READMEs reworded to the same canonical names), so no residual remains.
+// Kept as an empty record rather than deleted: the tightened stale-allowlist
+// test below still iterates its keys, and a future genuine out-of-scope
+// residual is recorded the same way.
+const OUT_OF_SCOPE_RESIDUALS: Record<string, string> = {};
+
+function allFiles(root: string): string[] {
+  const stats = statSync(root);
+  if (stats.isFile()) return [root];
+  const out: string[] = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const child = join(root, entry.name);
+    if (entry.isDirectory()) out.push(...allFiles(child));
+    else if (entry.isFile()) out.push(child);
+  }
+  return out;
+}
+
+const RETIREMENT_DIAGNOSTICS: Record<string, string[]> = {
+  "claude-review": ["src/cli/index.ts", "src/effects/review/generic-review.ts"],
+};
+
+// #1227 removed the six duplicated flow documents. Their names must not
+// return as live references in the reference-config mirrors or in the Skills
+// that describe testing and delegation.
+const RETIRED_REFERENCE_CONFIG_NAMES = [
+  "handoff-protocol",
+  "workflow-orchestration",
+  "development-protocol",
+  "sprint-contracts",
+  "contract-brief-example",
+  "contract-brief-example-bugfix",
+];
+
+const RETIRED_REFERENCE_CONFIG_SURFACES = [
+  "assets/reference-configs",
+  "docs/reference-configs",
+  "assets/skills",
+];
+
+/** Word-boundary-aware match: a retired name is a hit only when not glued
+ * to more identifier/hyphen characters on either side (rejects homonyms
+ * like `.repo-harness-migrate-backup` or `repo-harness-deploy-sql`, which a
+ * plain substring scan would false-positive on). */
+function hasLiveHit(content: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const pattern = new RegExp(`(?<![A-Za-z0-9_-])${escaped}(?![A-Za-z0-9_-])`, "u");
+  return pattern.test(content);
+}
+
+describe("retired Skill package names: live-reference scan", () => {
+  // .agents/ is a plan-listed scan surface but, post-cutover, may be
+  // entirely absent (git does not track empty directories; this repo's
+  // .agents/skills/ contained only the two now-deleted static ChatGPT skill
+  // dirs). An absent surface has nothing to scan, not an error.
+  // A plain loop keeps each surface a named read for CI selection
+  // (scripts/ci-documentation-consumers.ts), so a docs-only diff runs this scan.
+  const files: string[] = [];
+  for (const surface of SCAN_SURFACES) {
+    if (existsSync(join(ROOT, surface))) files.push(...allFiles(join(ROOT, surface)));
+  }
+
+  test("scan surface is non-trivial (sanity check against a vacuous pass)", () => {
+    expect(files.length).toBeGreaterThan(100);
+  });
+
+  test("every retired name has zero live hits outside the checked-in allowlist", () => {
+    const violations: string[] = [];
+
+    for (const absolute of files) {
+      const rel = relative(ROOT, absolute).split(sep).join("/");
+      if (FILE_ALLOWLIST[rel] || OUT_OF_SCOPE_RESIDUALS[rel] || R1_PROVENANCE_ENUM_FILES.includes(rel)) continue;
+
+      let content: string;
+      try {
+        const bytes = readFileSync(absolute);
+        // Probe for a NUL byte before decoding. readFileSync(_, "utf-8") never
+        // throws on binary input -- it produces replacement characters -- so the
+        // catch below never fired for the checked-in PNGs and every one of them
+        // was fully UTF-8 decoded on each run. A retired name cannot live in a
+        // NUL-bearing file as a text reference, so skipping is not a coverage loss.
+        if (bytes.subarray(0, 8192).includes(0)) continue;
+        content = bytes.toString("utf-8");
+      } catch {
+        continue; // unreadable; not a text reference by construction
+      }
+
+      for (const name of RETIRED_NAMES) {
+        // Only explicit upgrade refusal and legacy drain path detection; no runnable alias/reader.
+        if (RETIREMENT_DIAGNOSTICS[name]?.includes(rel)) continue;
+        if (hasLiveHit(content, name)) {
+          violations.push(`${rel}: ${name}`);
+        }
+      }
+    }
+
+    expect(violations).toEqual([]);
+  }, 10_000);
+
+  test("every allowlisted file still exists (no stale allowlist entries)", () => {
+    const allEntries = [
+      ...Object.keys(FILE_ALLOWLIST),
+      ...Object.keys(OUT_OF_SCOPE_RESIDUALS),
+      ...R1_PROVENANCE_ENUM_FILES,
+    ];
+    for (const rel of allEntries) {
+      const absolute = join(ROOT, rel);
+      expect(() => statSync(absolute)).not.toThrow();
+    }
+
+    // Existing is not enough: a since-fixed file still passes the
+    // exists-check above forever, leaving a silent permanent exemption.
+    // Every FILE_ALLOWLIST/OUT_OF_SCOPE_RESIDUALS entry must still contain
+    // at least one live retired-name hit -- fixing the file's stale
+    // reference forces removing its entry here, or this test fails.
+    // (SSD-07 phase A/D2 R2: the three homonym-justified entries this loop
+    // used to skip were removed entirely from both allowlists instead --
+    // hasLiveHit's word-boundary regex never matched them in the first
+    // place, so there was no hit to exempt and no residual to track.)
+    const hitCheckEntries: Record<string, string> = { ...FILE_ALLOWLIST, ...OUT_OF_SCOPE_RESIDUALS };
+    for (const rel of Object.keys(hitCheckEntries)) {
+      const absolute = join(ROOT, rel);
+      const content = readFileSync(absolute, "utf-8");
+      const stillHasRetiredName = RETIRED_NAMES.some((name) => hasLiveHit(content, name));
+      expect(stillHasRetiredName).toBe(true);
+    }
+  });
+
+  test("retiredPackages[] records every retired name with a live-or-null replacement", () => {
+    const liveNames = new Set(MANIFEST.packages.map((p) => p.name));
+    const recordedNames = new Set(MANIFEST.retiredPackages.map((r) => r.name));
+
+    // Sanity check against a vacuous scan: RETIRED_NAMES is derived from the
+    // manifest, so an emptied retiredPackages[] would make the scan above pass
+    // trivially. The exact count is deliberately not pinned here — the manifest
+    // is the single authority for it.
+    expect(RETIRED_NAMES.length).toBeGreaterThan(0);
+    for (const name of SCAN_EXEMPT_RETIRED_NAMES) {
+      expect(recordedNames.has(name)).toBe(true);
+    }
+    for (const entry of MANIFEST.retiredPackages) {
+      if (entry.replacement !== null) expect(liveNames.has(entry.replacement)).toBe(true);
+    }
+  });
+});
+
+describe("retired reference-config names: live-reference scan", () => {
+  test("every retired flow doc has zero live hits in the mirrors and Skills", () => {
+    const violations: string[] = [];
+
+    for (const surface of RETIRED_REFERENCE_CONFIG_SURFACES) {
+      const absolute = join(ROOT, surface);
+      if (!existsSync(absolute)) continue;
+      for (const file of allFiles(absolute)) {
+        const rel = relative(ROOT, file).split(sep).join("/");
+        const content = readFileSync(file, "utf-8");
+        for (const name of RETIRED_REFERENCE_CONFIG_NAMES) {
+          if (hasLiveHit(content, name)) violations.push(`${rel}: ${name}`);
+        }
+      }
+    }
+
+    expect(violations).toEqual([]);
+  });
+});

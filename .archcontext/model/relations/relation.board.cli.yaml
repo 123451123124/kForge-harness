@@ -1,0 +1,6 @@
+schemaVersion: archcontext.relation/v1
+id: relation.board.cli
+kind: calls
+source: capability.organization.board
+target: component.board.cli
+intent: "Expose board, attention, seats and quota commands, and validate and post typed protocol comments through board post"

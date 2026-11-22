@@ -1,0 +1,922 @@
+import { osAccountHome } from '../runtime/os-account-home';
+import { observeActiveReviewAdmission } from '../admission/issue-goal';
+import { bindReviewAdmission, reviewAdmissionAllowsPath } from '../../core/review/authority-context';
+import { readReviewAdmissionSource, type ReviewAdmissionSource } from '../admission/admission-source';
+import { gitSpawnSync } from '../git/runner';
+import { currentReadonlyObservation, rejectObservation, observationReadFileSync as readFileSync } from '../readonly-observation';
+import { existsSync, lstatSync, realpathSync, unlinkSync, writeFileSync } from 'fs';
+import { join, relative, resolve } from 'path';
+import {
+  PACKAGE_ROOT,
+  readRegular,
+  repositoryRoot,
+  requireFromHelper,
+  unsafeRepoRelativePath,
+  verificationReportFile,
+} from './acceptance-receipt-runtime';
+import {
+  acceptanceReceiptPath,
+  readAcceptanceVerificationObservation,
+  readReceipt,
+  readUserWaiverGrant,
+  reviewResultPath,
+  userWaiverGrantPath,
+  writeAcceptanceWithObservation,
+  writeUserWaiverGrant,
+} from './acceptance-receipt-store';
+import {
+  acceptanceReviewContextDigest,
+  assertReviewFields,
+  assertUserWaiverGrant,
+  authorityFingerprint,
+  fail,
+  modelRelation,
+  renderAcceptanceProjection,
+  stableJson,
+  validateDisposition,
+  validateDomainReview,
+  validateFindings,
+  validateUserWaiverAuthorization,
+  waiverGrantFingerprint,
+  type AcceptanceAuthor,
+  type AcceptanceDisposition,
+  type AcceptanceEvidence,
+  type AcceptanceFinding,
+  type AcceptancePolicy,
+  type AcceptanceReceipt,
+  type AcceptanceReceiptPolicyInput,
+  type AcceptanceReceiptPolicyVerdict,
+  type AcceptanceReviewResult,
+  type AcceptanceValidatorRuleId,
+  type ReviewSubject,
+  type UserWaiverGrant,
+} from '../../core/review/acceptance-receipt';
+import { isRecord } from '../../core/evidence/is-record';
+import { parseJsonText } from '../../core/evidence/file-syntax';
+import { SHA256_PREFIXED_PATTERN } from '../../core/evidence/sha256-pattern';
+import { sha256Prefixed } from '../../core/evidence/sha256';
+import {
+  validateRequiredCheckFailureEvidenceList,
+  type RequiredCheckFailureEvidenceV1,
+} from '../../core/evidence/required-check-evidence';
+import {
+  validateRequiredCheckCoverageEvidenceOrNull,
+  type RequiredCheckCoverageEvidenceV1,
+} from '../../core/publication/required-check-coverage';
+import { PUBLICATION_POLICY_PATH, requiredCheckCoveragePolicyAtRef, type RequiredCheckCoveragePolicyAtRef } from '../../core/publication/acceptance-merge-policy';
+import { collectPullRequestMergeReadiness, validatePullRequestSelection } from '../publication/merge-readiness';
+
+export { resolveProtectedGitRuntime } from './acceptance-receipt-runtime';
+export {
+  acceptanceReceiptPath,
+  acceptanceReceiptRecordPath,
+  acceptanceVerificationObservationPath,
+  readAcceptanceReceiptRecord,
+  readAcceptanceVerificationObservation,
+  readUserWaiverGrantFile,
+  userWaiverGrantPath,
+  writeAcceptanceVerificationObservation,
+} from './acceptance-receipt-store';
+
+/** The explicit PR identity an active coverage policy needs. The record path reads the evidence itself. */
+export interface AcceptancePullRequestSelection {
+  readonly repository: string;
+  readonly provider_repository_id: string;
+  readonly pr_number: number;
+  readonly expected_base_sha: string;
+}
+
+export {
+  ACCEPTANCE_VALIDATOR_RULE_IDS,
+  ACCEPTANCE_VERIFICATION_OBSERVATION_KIND,
+  ACCEPTANCE_VERIFICATION_OBSERVATION_PROTOCOL,
+  CONSUMED_RECEIPT_KEYS,
+  GENERIC_REVIEW_ROLE,
+  acceptancePolicySource,
+  acceptanceReviewContextDigest,
+  acceptanceVerificationObservationSubjectKey,
+  authorityFingerprint,
+  contractCarriesArchiveProjection,
+  renderAcceptanceProjection,
+} from '../../core/review/acceptance-receipt';
+
+export type {
+  AcceptanceAuthor,
+  AcceptanceDisposition,
+  AcceptanceEvidence,
+  AcceptanceFinding,
+  AcceptancePolicy,
+  AcceptancePolicyV1,
+  AcceptancePolicyV2,
+  AcceptanceReceipt,
+  AcceptanceReceiptPolicyInput,
+  AcceptanceReceiptPolicyVerdict,
+  AcceptanceReviewResult,
+  AcceptanceValidatorRuleId,
+  AcceptanceVerificationObservationV1,
+  ModelRelation,
+  ReviewSubject,
+  UserWaiverGrant,
+} from '../../core/review/acceptance-receipt';
+export type { RequiredCheckCoverageEvidenceV1 } from '../../core/publication/required-check-coverage';
+
+
+
+function verifyReviewResult(root: string, authorityHome: string, receipt: AcceptanceReceipt, contextDigest: string): void {
+  if (receipt.result_sha256 === null) return;
+  const path = reviewResultPath(root, authorityHome, receipt.result_sha256);
+  if (!existsSync(path)) fail('generic-review result record is missing. Record a fresh acceptance.');
+  if (!lstatSync(path).isFile()) fail('generic-review result authority is unsafe');
+  const bytes = readFileSync(path);
+  if (receipt.result_sha256 !== sha256Prefixed(bytes)) fail('AcceptanceReceipt generic-review result_sha256 mismatch');
+  const review = validateDomainReview(parseJsonText(bytes.toString('utf-8'), path));
+  for (const field of ['request_id','context_sha256','actual_harness','actual_role','actual_model'] as const) {
+    if (receipt[field] !== review[field]) fail(`AcceptanceReceipt generic-review ${field} mismatch`);
+  }
+  if (receipt.context_sha256 !== contextDigest || review.subject_sha256 !== receipt.subject_sha256) fail('AcceptanceReceipt generic-review context/subject mismatch');
+  if (review.verdict !== (receipt.disposition === 'external_pass' ? 'PASS' : 'FAIL')
+    || review.summary !== receipt.summary || stableJson(review.findings) !== stableJson(receipt.findings)) fail('AcceptanceReceipt generic-review verdict/findings mismatch');
+}
+
+
+type Options = {
+  admissionSource?: (root: string, values: Readonly<Record<string, string | undefined>>) => ReviewAdmissionSource;
+  authorityHome?: string;
+  now?: () => Date;
+};
+
+type ProfileBenchmarkValidator = {
+  validateHarnessBenchmarkReport(reportPath: string, requireAuthoritative?: boolean): { authoritative: boolean };
+  reportByteBindingPath(reportPath: string): string;
+};
+
+function currentSubject(root: string, targetRef?: string, targetRevision?: string): ReviewSubject {
+  const module = requireFromHelper(join(PACKAGE_ROOT, 'src/effects/review/diff-fingerprint.ts')) as typeof import('./diff-fingerprint');
+  const reviewBase = module.resolvePolicyReviewBase(root);
+  if (!reviewBase.ok) fail('policy review base is unavailable: ' + reviewBase.reason);
+  if (targetRef !== undefined && targetRef !== reviewBase.targetRef) fail('AcceptanceReceipt target ref is stale against workflow policy');
+  const subject = module.buildReviewSubject(root, { targetRef: targetRef ?? reviewBase.targetRef, targetRevision });
+  if (subject.status !== 'ok' || !SHA256_PREFIXED_PATTERN.test(subject.review_subject_sha256)) fail('current normalized review subject is unavailable');
+  return subject;
+}
+
+
+/** Validate a materialized report, without another tree capture. Raw evaluator
+ * results must cross the materialization boundary exactly once at the caller. */
+export function inspectAcceptanceEvidence(args: {
+  root: string;
+  authority: ReviewAdmissionSource;
+  report: unknown;
+  subject: ReviewSubject;
+  env?: NodeJS.ProcessEnv;
+  current?: boolean;
+}): AcceptanceEvidence {
+  const root = realpathSync(args.root);
+  const active = currentAdmission(root, args.authority);
+  const admission = active.admission;
+  if (isRecord(args.report) && args.report.kind === 'verification_unavailable') fail('verification evidence is unavailable: ' + args.report.reason);
+  const execution = requireFromHelper(join(PACKAGE_ROOT, 'src/effects/evidence/verification-execution.ts')) as typeof import('../evidence/verification-execution');
+  let report: import('../evidence/verification-execution').VerificationExecutionReport;
+  try {
+    report = execution.validateMaterializedVerificationExecutionReport({ repoRoot: root, authority: args.authority,
+      report: args.report,
+      env: args.env, current: args.current }).report;
+  } catch (error) { fail('verification execution evidence is invalid: ' + (error as Error).message); }
+  const subject = args.subject;
+  const allowed = admission.allowed_paths;
+  if (subject.status !== 'ok') fail('current normalized review subject is unavailable');
+  for (const path of subject.paths) if (!reviewAdmissionAllowsPath(allowed, path)) fail('admission Allowed Paths refuse reviewed path: ' + path);
+  if (currentReadonlyObservation()) rejectObservation('Bounded acceptance assessment and benchmark adapters are not available');
+  const records = requireFromHelper(join(PACKAGE_ROOT, 'src/core/review/check-records.ts')) as typeof import('../../core/review/check-records');
+  const core = requireFromHelper(join(PACKAGE_ROOT, 'src/core/review/change-assessment.ts')) as typeof import('../../core/review/change-assessment');
+  const effects = requireFromHelper(join(PACKAGE_ROOT, 'src/effects/review/change-assessment.ts')) as typeof import('./change-assessment');
+  const assessmentFile = effects.readChangeAssessmentRecord(root, records.CHECK_RECORD_MAX_BYTES);
+  if (assessmentFile.state === 'absent') fail(`Change Assessment is missing: ${records.CHANGE_ASSESSMENT_EVIDENCE_PATH}`);
+  if (assessmentFile.state === 'unreadable') fail(`verification evidence change assessment ${assessmentFile.message}`);
+  let evidence: import('../../core/review/check-records').ChangeAssessmentEvidence;
+  try { evidence = records.decodeChangeAssessmentEvidence(assessmentFile.content); } catch (error) { fail('verification evidence change assessment is invalid: ' + (error as Error).message); }
+  if (evidence.status !== 'pass') fail('verification evidence change assessment is not passing');
+  const assessmentBasis = { schema: records.CHANGE_ASSESSMENT_EVIDENCE_SCHEMA, status: evidence.status, assessment: evidence.assessment, selection_packet: evidence.selection_packet };
+  let packet: ReturnType<typeof core.validateReviewSelectionPacketAgainstAssessment>;
+  try {
+    const declared = evidence.assessment;
+    const selfBoundPacket = evidence.selection_packet;
+    if (selfBoundPacket.review_subject_sha256 !== subject.review_subject_sha256 || selfBoundPacket.target_ref !== subject.target_ref
+      || selfBoundPacket.target_revision !== subject.target_rev) fail('verification evidence change assessment packet is stale for the current subject');
+    const recomputed = effects.prepareChangeAssessment({ repoRoot: root, authority: args.authority, targetRevision: subject.target_rev });
+    if (recomputed.assessment.status === 'degraded') fail('verification evidence Change Assessment base is unavailable');
+    if (declared.assessment_sha256 !== recomputed.assessment.assessment_sha256) fail('verification evidence Change Assessment does not match current base assessment');
+    packet = core.validateReviewSelectionPacketAgainstAssessment(evidence.selection_packet, recomputed.assessment);
+  } catch (error) { fail('verification evidence change assessment is invalid: ' + (error as Error).message); }
+  if (packet.status !== 'ready') fail('verification evidence change assessment packet is blocked');
+  let benchmark = 'not-applicable';
+  if (admission.benchmark === 'required') {
+    const validator = requireFromHelper(join(PACKAGE_ROOT, 'scripts/run-harness-profile-benchmark.ts')) as ProfileBenchmarkValidator;
+    const reportPath = readRegular(root, 'evals/harness/reports/profile-comparison.json', 'required benchmark report').path;
+    const validated = validator.validateHarnessBenchmarkReport(join(root, reportPath), true);
+    const binding = readRegular(root, relative(root, validator.reportByteBindingPath(join(root, reportPath))), 'benchmark byte binding');
+    benchmark = sha256Prefixed(binding.content);
+    if (!validated.authoritative) fail('required benchmark report is not authoritative');
+  }
+  const results = report.results.map(result => ({ ...result, execution: result.execution === 'reused' ? 'executed' : result.execution }));
+  const target = { campaign_sha256: report.target.campaign_sha256, admission_sha256: report.target.admission_sha256, grant_sha256: report.target.grant_sha256, plan_hash: report.target.plan_hash, snapshot_hash: report.target.snapshot_hash, tree_hash: report.target.tree_hash };
+  return { fingerprint: sha256Prefixed(stableJson({ execution: { ...report, target, results }, change_assessment: assessmentBasis, benchmark })), benchmark };
+}
+
+function normalizedVerificationEvidence(verification: { path: string; content: string }, subject: ReviewSubject, root: string,
+  authority: ReviewAdmissionSource): AcceptanceEvidence {
+  let report: unknown;
+  try { report = parseJsonText(verification.content, verification.path); } catch (error) { fail('verification evidence is invalid JSON: ' + (error as Error).message); }
+  const execution = requireFromHelper(join(PACKAGE_ROOT, 'src/effects/evidence/verification-execution.ts')) as typeof import('../evidence/verification-execution');
+  const current = execution.evaluateAdmittedVerification({ repoRoot: root, authority });
+  if (!current.passed) fail('verification evidence is stale: current passing evaluation is unavailable');
+  if (!isRecord(report) || !isRecord(report.target) || report.target.snapshot_hash !== current.target.snapshot_hash
+    || report.target.plan_hash !== current.target.plan_hash) fail('verification evidence is stale for the current source snapshot');
+  return inspectAcceptanceEvidence({ root, authority, report, subject, current: true });
+}
+
+const GIT_OID_FIELD = /^[0-9a-f]{40,64}$/;
+
+/**
+ * The single synchronous acceptance rule set, composed by `verifyAcceptance`
+ * with the live subject and verification-evidence reads. It is the acceptance
+ * gate's own rule set and has exactly one caller: readers outside this module
+ * do not run it, they read the record-time
+ * `AcceptanceVerificationObservationV1` this authority publishes instead.
+ */
+export function validateAcceptanceReceiptAgainstPolicy(
+  input: AcceptanceReceiptPolicyInput,
+): AcceptanceReceiptPolicyVerdict {
+  const no = (rule: AcceptanceValidatorRuleId, reason: string): AcceptanceReceiptPolicyVerdict => ({ ok: false, rule, reason });
+  const receipt = input.receipt;
+  try {
+    if (receipt.protocol !== 4 || receipt.kind !== 'repo-harness-acceptance-receipt') {
+      return no('receipt_protocol_kind', 'AcceptanceReceipt kind/protocol is invalid');
+    }
+    try {
+      validateRequiredCheckFailureEvidenceList(receipt.failures);
+    } catch (error) {
+      return no('check_failure_evidence', `AcceptanceReceipt failures are invalid: ${(error as Error).message}`);
+    }
+    try {
+      validateRequiredCheckCoverageEvidenceOrNull(receipt.required_check_coverage);
+    } catch (error) {
+      return no('required_check_coverage_evidence', `AcceptanceReceipt required_check_coverage is invalid: ${(error as Error).message}`);
+    }
+    if (receipt.repository_root !== input.repositoryRoot) return no('repository_root', 'AcceptanceReceipt repository root is stale');
+    if (receipt.campaign_sha256 !== input.admission.campaign_sha256) return no('campaign_identity', 'AcceptanceReceipt campaign is stale');
+    if (receipt.admission_sha256 !== input.admission.admission_sha256 || receipt.grant_sha256 !== input.grantSha256) return no('admission_binding', 'AcceptanceReceipt admission is stale');
+    if (!SHA256_PREFIXED_PATTERN.test(receipt.grant_sha256)) return no('grant_digest_shape', 'AcceptanceReceipt grant digest is invalid');
+    const policy: AcceptancePolicy = { protocol: 1, ...input.admission.policy };
+    if (policy.reviewer !== receipt.expected_reviewer) return no('reviewer_policy', 'AcceptanceReceipt reviewer policy is stale');
+    if (input.admission.goal.revision !== receipt.goal_sha256) return no('goal_fingerprint', 'AcceptanceReceipt goal is stale');
+    if (unsafeRepoRelativePath(receipt.verification_file)) return no('verification_file_shape', 'AcceptanceReceipt verification_file is unsafe');
+    if (!SHA256_PREFIXED_PATTERN.test(receipt.verification_evidence_sha256)) return no('verification_evidence_shape', 'AcceptanceReceipt verification_evidence_sha256 is invalid');
+    if (receipt.benchmark_evidence_sha256.trim() === '') return no('benchmark_evidence_present', 'AcceptanceReceipt benchmark_evidence_sha256 is required');
+    if (!SHA256_PREFIXED_PATTERN.test(receipt.subject_sha256)) return no('subject_sha256_shape', 'AcceptanceReceipt subject_sha256 is invalid');
+    if (receipt.subject_scope !== 'normalized-final-content') return no('subject_scope', 'AcceptanceReceipt subject scope is invalid');
+    if (receipt.target_ref.trim() === '') return no('target_ref_present', 'AcceptanceReceipt target_ref is required');
+    if (!GIT_OID_FIELD.test(receipt.target_revision)) return no('target_revision_shape', 'AcceptanceReceipt target_revision is invalid');
+    if (receipt.required_check_coverage !== null && receipt.required_check_coverage.base_sha !== receipt.target_revision) {
+      return no('required_check_coverage_evidence', 'AcceptanceReceipt required_check_coverage does not bind the target revision');
+    }
+    // Emptiness is legal: a subject can review zero paths. Shape is not.
+    if (receipt.reviewed_paths.some(unsafeRepoRelativePath)) return no('reviewed_paths_shape', 'AcceptanceReceipt reviewed_paths are invalid');
+    if (receipt.summary.trim() === '') return no('summary_present', 'AcceptanceReceipt summary is required');
+    if (receipt.issued_at.trim() === '' || Number.isNaN(Date.parse(receipt.issued_at))) {
+      return no('issued_at_shape', 'AcceptanceReceipt issued_at is invalid');
+    }
+    const owner = input.admission.actor_id;
+    if (receipt.disposition === 'user_waiver') {
+      const grant = input.waiverGrant;
+      if (grant === null) return no('waiver_grant_present', 'AcceptanceReceipt user_waiver requires a UserWaiverGrant');
+      assertUserWaiverGrant(grant);
+      if (policy.user_waiver !== 'allowed') return no('waiver_policy_allowed', 'admission forbids user waiver');
+      if (grant.repository_root !== input.repositoryRoot) return no('waiver_grant_repository', 'UserWaiverGrant repository root is stale');
+      if (grant.campaign_sha256 !== receipt.campaign_sha256 || grant.admission_sha256 !== receipt.admission_sha256) {
+        return no('waiver_grant_admission', 'UserWaiverGrant admission authority is stale');
+      }
+      if (grant.grant_sha256 !== receipt.grant_sha256 || grant.goal_sha256 !== receipt.goal_sha256) {
+        return no('waiver_grant_goal', 'UserWaiverGrant goal authority is stale');
+      }
+      if (grant.actor !== owner) return no('waiver_grant_owner', 'UserWaiverGrant owner is stale');
+      if (waiverGrantFingerprint(grant) !== receipt.waiver_grant_sha256) return no('waiver_grant_fingerprint', 'AcceptanceReceipt waiver grant is stale');
+      validateUserWaiverAuthorization(grant.authorization, waiverAuthorizationSubject(input.repositoryRoot, input.admission, input.grantSha256, grant.summary), Date.now());
+    } else if (receipt.waiver_grant_sha256 !== null || input.waiverGrant !== null) {
+      return no('waiver_binding_symmetry', 'AcceptanceReceipt waiver grant binding does not match disposition');
+    }
+    try {
+      assertReviewFields(receipt);
+      validateDisposition(policy, owner, receipt.disposition, receipt.reviewer, receipt.source, receipt.actor, receipt.findings);
+    } catch (error) {
+      return no('disposition_policy', (error as Error).message);
+    }
+    if (receipt.disposition === 'reject') return no('disposition_not_reject', 'AcceptanceReceipt disposition is reject');
+    return { ok: true };
+  } catch (error) {
+    // A rule that threw rather than returned: the contract policy block is
+    // unparseable, or an input the caller supplied is malformed.
+    return { ok: false, rule: 'validator_threw', reason: (error as Error).message };
+  }
+}
+
+function currentAdmission(root: string, authority: ReviewAdmissionSource) {
+  if (currentReadonlyObservation()) rejectObservation('Live issue admission requires an external observation');
+  if (realpathSync(authority.repoRoot) !== root) fail('review admission repository mismatch');
+  return observeActiveReviewAdmission(authority);
+}
+
+function waiverAuthorizationSubject(root: string, admission: ReturnType<typeof currentAdmission>['admission'], grant: string, summary: string) {
+  return { repository_root: root, repository_id: admission.repository_id, issue_id: admission.issue_id, campaign_id: admission.campaign_id,
+    campaign_sha256: admission.campaign_sha256, admission_sha256: admission.admission_sha256,
+    grant_sha256: grant, goal_sha256: admission.goal.revision, actor: admission.actor_id, summary };
+}
+
+/** Trusted Bot entrypoint. The caller must obtain separate human waiver approval
+ * upstream. Policy eligibility and an execution actor name are not that action.
+ */
+export function recordUserWaiverGrant(args: {
+  root: string; authorityHome: string; authority: ReviewAdmissionSource; actor: string; summary: string; authorization?: unknown; now?: () => Date;
+}): UserWaiverGrant {
+  if (!args.summary.trim()) fail('waiver grant summary is required');
+  const root = realpathSync(args.root), active = currentAdmission(root, args.authority), admission = active.admission;
+  if (admission.policy.user_waiver !== 'allowed') fail('admission forbids user waiver');
+  if (args.actor !== admission.actor_id) fail('UserWaiverGrant actor must equal the approved actor');
+  const now = (args.now ?? (() => new Date()))();
+  const authorization = validateUserWaiverAuthorization(args.authorization,
+    waiverAuthorizationSubject(root, admission, active.grant_sha256, args.summary), now.getTime());
+  const grant: UserWaiverGrant = {
+    protocol: 3, kind: 'repo-harness-user-waiver-grant', repository_root: root,
+    campaign_sha256: admission.campaign_sha256, admission_sha256: admission.admission_sha256,
+    grant_sha256: active.grant_sha256, goal_sha256: admission.goal.revision,
+    actor: args.actor, scope: 'admission-authority', summary: args.summary,
+    issued_at: now.toISOString(), authorization,
+  };
+  writeUserWaiverGrant(userWaiverGrantPath(root, args.authorityHome, true), grant);
+  return grant;
+}
+
+export function verifyUserWaiverGrant(args: {
+  root: string; authorityHome: string; authority: ReviewAdmissionSource; now?: () => Date;
+}): UserWaiverGrant {
+  const root = realpathSync(args.root), active = currentAdmission(root, args.authority), admission = active.admission;
+  const grant = readUserWaiverGrant(userWaiverGrantPath(root, args.authorityHome));
+  if (grant.repository_root !== root || grant.campaign_sha256 !== admission.campaign_sha256
+    || grant.admission_sha256 !== admission.admission_sha256 || grant.grant_sha256 !== active.grant_sha256
+    || grant.goal_sha256 !== admission.goal.revision || grant.actor !== admission.actor_id) fail('UserWaiverGrant authority is stale');
+  if (admission.policy.user_waiver !== 'allowed') fail('admission forbids user waiver');
+  validateUserWaiverAuthorization(grant.authorization, waiverAuthorizationSubject(root, admission, active.grant_sha256, grant.summary),
+    (args.now ?? (() => new Date()))().getTime());
+  return grant;
+}
+
+export function revokeUserWaiverGrant(args: { root: string; authorityHome: string }): void {
+  if (currentReadonlyObservation()) rejectObservation('Observation cannot revoke a waiver');
+  const path = userWaiverGrantPath(realpathSync(args.root), args.authorityHome);
+  if (existsSync(path)) unlinkSync(path);
+}
+
+export async function acceptanceContext(args: {
+  root: string; authority: ReviewAdmissionSource; verification: string; authorityHome?: string; targetRef?: string; targetRevision?: string;
+}) {
+  const root = realpathSync(args.root), active = currentAdmission(root, args.authority), admission = active.admission;
+  const verification = verificationReportFile(root, args.verification);
+  const subject = currentSubject(root, args.targetRef, args.targetRevision);
+  const evidence = normalizedVerificationEvidence(verification, subject, root, args.authority);
+  const report = parseJsonText(verification.content, verification.path) as { target: { plan_hash: string; snapshot_hash: string } };
+  const authorityContext = bindReviewAdmission(admission, {
+    subject: { status: 'ok', scope: subject.scope, target_ref: subject.target_ref, target_rev: subject.target_rev,
+      head_rev: subject.head_rev, review_subject_sha256: subject.review_subject_sha256 },
+    verification: { plan_sha256: report.target.plan_hash, source_sha256: report.target.snapshot_hash,
+      // The validated snapshot SHA256 binds the Git tree OID; the OID itself may be SHA1.
+      tree_sha256: report.target.snapshot_hash, evidence_sha256: evidence.fingerprint },
+  }, active.grant_sha256);
+  if (currentAdmission(root, args.authority).revision !== active.revision) fail('review admission changed during evidence observation');
+  const policy: AcceptancePolicy = { protocol: 1, ...admission.policy };
+  return { root, authority: args.authority, admission, authorityContext, policy, owner: admission.actor_id,
+    goal: admission.goal, verification, subject, evidence };
+}
+
+function buildReceipt(
+  context: Awaited<ReturnType<typeof acceptanceContext>>,
+  disposition: AcceptanceDisposition,
+  reviewer: AcceptanceReceipt['reviewer'],
+  source: AcceptanceReceipt['source'],
+  actor: string | null,
+  summary: string,
+  findings: AcceptanceFinding[],
+  failures: RequiredCheckFailureEvidenceV1[],
+  coverage: RequiredCheckCoverageEvidenceV1 | null,
+  waiverGrantSha256: string | null,
+  now: () => Date,
+): AcceptanceReceipt {
+  return {
+    protocol: 4,
+    kind: 'repo-harness-acceptance-receipt',
+    repository_root: context.root,
+    campaign_sha256: context.admission.campaign_sha256,
+    admission_sha256: context.admission.admission_sha256,
+    grant_sha256: context.authorityContext.authorization.grant_sha256,
+    goal_sha256: context.goal.revision,
+    verification_file: context.verification.path,
+    verification_evidence_sha256: context.evidence.fingerprint,
+    benchmark_evidence_sha256: context.evidence.benchmark,
+    subject_sha256: context.subject.review_subject_sha256,
+    subject_scope: context.subject.scope,
+    target_ref: context.subject.target_ref,
+    target_revision: context.subject.target_rev,
+    reviewed_paths: [...context.subject.paths],
+    disposition,
+    expected_reviewer: context.policy.reviewer,
+    reviewer,
+    source,
+    request_id: null, context_sha256: null, result_sha256: null,
+    actual_harness: null, actual_role: null, actual_model: null,
+    author_session_binding_sha256: null, author_actual_models: null, model_relation: null,
+    actor,
+    summary,
+    findings,
+    failures,
+    required_check_coverage: coverage,
+    waiver_grant_sha256: waiverGrantSha256,
+    issued_at: now().toISOString(),
+  };
+}
+
+/**
+ * Both record paths run the gate's full synchronous rule set before the
+ * receipt — and therefore the verification observation — is written, so every
+ * `record_time` coverage claim on the observation path is literally true.
+ *
+ * `disposition_not_reject` is the one rule deliberately skipped here: a
+ * rejection is a legitimate thing to record. It stays a reader-side rule, and
+ * every shape rule above it still runs for a rejection.
+ */
+function assertRecordedReceiptPolicy(
+  context: Awaited<ReturnType<typeof acceptanceContext>>,
+  receipt: AcceptanceReceipt,
+  waiverGrant: UserWaiverGrant | null,
+): void {
+  const verdict = validateAcceptanceReceiptAgainstPolicy({
+    receipt,
+    repositoryRoot: context.root,
+    admission: context.admission,
+    grantSha256: context.authorityContext.authorization.grant_sha256,
+    waiverGrant,
+  });
+  if (verdict.ok || verdict.rule === 'disposition_not_reject') return;
+  fail(`${verdict.reason} (${verdict.rule})`);
+}
+
+/**
+ * The explicit PR identity options. All four or none: a partial selection
+ * cannot bind the coverage read.
+ */
+function pullRequestSelectionOption(argv: string[]): AcceptancePullRequestSelection | undefined {
+  const repository = option(argv, '--repository', false);
+  const repositoryId = option(argv, '--repository-id', false);
+  const pr = option(argv, '--pr', false);
+  const base = option(argv, '--base', false);
+  const given = [repository, repositoryId, pr, base].filter((value) => value !== undefined).length;
+  if (given === 0) return undefined;
+  if (given !== 4) fail('--repository, --repository-id, --pr and --base must be given together');
+  return { repository: repository!, provider_repository_id: repositoryId!, pr_number: Number(pr), expected_base_sha: base! };
+}
+
+/**
+ * The coverage policy at one commit of the local repository. The receipt binds
+ * a revision, so the block is read at that revision and not from the working
+ * tree. A missing file is `absent`; a malformed one fails the record.
+ */
+function coveragePolicyAtRevision(root: string, revision: string): RequiredCheckCoveragePolicyAtRef {
+  const listing = gitSpawnSync(['ls-tree', revision, '--', PUBLICATION_POLICY_PATH], { cwd: root, encoding: 'utf8', timeout: 10_000 });
+  if (listing.status !== 0) fail(`cannot read ${PUBLICATION_POLICY_PATH} at ${revision}`);
+  if (listing.stdout.trim() === '') return { status: 'absent' };
+  const shown = gitSpawnSync(['show', `${revision}:${PUBLICATION_POLICY_PATH}`], { cwd: root, encoding: 'utf8', timeout: 10_000, maxBuffer: 1_048_576 });
+  if (shown.status !== 0) fail(`cannot read ${PUBLICATION_POLICY_PATH} at ${revision}`);
+  return requiredCheckCoveragePolicyAtRef({ status: 'present', text: shown.stdout });
+}
+
+/**
+ * The coverage evidence the record stores. It is not caller-supplied: when the
+ * reviewed target carries an active block, the record path reads the PR
+ * readiness itself, bound to the reviewed head and the reviewed target (the PR
+ * base), and fails closed when that observation is missing or bound elsewhere.
+ */
+function recordedCoverage(args: {
+  readonly root: string;
+  /** The reviewed target (the PR base) and the reviewed head. */
+  readonly targetRevision: string;
+  readonly headRevision: string;
+  readonly pullRequest?: AcceptancePullRequestSelection;
+}): RequiredCheckCoverageEvidenceV1 | null {
+  const policy = coveragePolicyAtRevision(args.root, args.targetRevision);
+  if (policy.status === 'invalid') fail(`required-check coverage policy at ${args.targetRevision} is invalid: ${policy.message}`);
+  if (policy.status === 'absent') return null;
+  if (args.pullRequest === undefined) {
+    fail('an active required-check coverage policy requires an explicit pull request selection');
+  }
+  const selection = validatePullRequestSelection({ ...args.pullRequest, expected_head_sha: args.headRevision });
+  if (selection.expected_base_sha !== args.targetRevision) {
+    fail('the pull request base is not the reviewed target revision');
+  }
+  const readiness = collectPullRequestMergeReadiness({ repo_root: args.root, ...selection });
+  const coverage = readiness.required_check_coverage;
+  if (coverage === null) {
+    fail(`the pull request readiness read did not observe required-check coverage: ${readiness.blockers.map((blocker) => blocker.code).join(', ') || 'no evidence'}`);
+  }
+  if (coverage.head_sha !== args.headRevision) fail('required-check coverage does not bind the reviewed head');
+  if (coverage.base_sha !== args.targetRevision) fail('required-check coverage does not bind the reviewed target');
+  return coverage;
+}
+
+export async function recordAcceptance(args: {
+  reviewResult?: AcceptanceReviewResult;
+  /** Null when no bound author task session exists for this review. */
+  author: AcceptanceAuthor | null;
+  root: string;
+  authorityHome: string;
+  authority: ReviewAdmissionSource;
+  verification: string;
+  disposition: AcceptanceDisposition;
+  reviewer: string;
+  source: string;
+  actor: string | null;
+  summary: string;
+  findings: AcceptanceFinding[];
+  /** Observed required-check failure evidence; a rerun pass never becomes a proven flake. */
+  failures?: readonly RequiredCheckFailureEvidenceV1[];
+  /** Explicit PR identity. Required when the reviewed revision carries an active coverage block. */
+  pull_request?: AcceptancePullRequestSelection;
+  /** A provider must bind its opinion to the context it actually reviewed. */
+  expectedContext?: {
+    admission_sha256: string;
+    goal_sha256: string;
+    subject_sha256: string;
+    verification_evidence_sha256: string;
+    target_revision: string;
+  };
+  now?: () => Date;
+}): Promise<AcceptanceReceipt> {
+  if (args.summary.trim() === '') fail('acceptance summary is required');
+  if (args.disposition === 'user_waiver') {
+    fail('user_waiver must be materialized from a valid UserWaiverGrant');
+  }
+  const context = await acceptanceContext(args);
+  if (args.expectedContext) {
+    const actual = {
+      admission_sha256: context.admission.admission_sha256,
+      goal_sha256: context.goal.revision,
+      subject_sha256: context.subject.review_subject_sha256,
+      verification_evidence_sha256: context.evidence.fingerprint,
+      target_revision: context.subject.target_rev,
+    };
+    for (const field of Object.keys(actual) as (keyof typeof actual)[]) {
+      if (args.expectedContext[field] !== actual[field]) fail(`reviewed acceptance context is stale: ${field}`);
+    }
+  }
+  validateDisposition(context.policy, context.owner, args.disposition, args.reviewer, args.source, args.actor, args.findings);
+  const receipt = buildReceipt(
+    context,
+    args.disposition,
+    args.reviewer as AcceptanceReceipt['reviewer'],
+    args.source as AcceptanceReceipt['source'],
+    args.actor,
+    args.summary,
+    args.findings,
+    validateRequiredCheckFailureEvidenceList(args.failures ?? []),
+    recordedCoverage({ root: context.root, targetRevision: context.subject.target_rev,
+      headRevision: context.subject.head_rev, pullRequest: args.pull_request }),
+    null,
+    args.now ?? (() => new Date()),
+  );
+  const review = validateDomainReview(args.reviewResult);
+  if (review.context_sha256 !== acceptanceReviewContextDigest(context) || review.subject_sha256 !== receipt.subject_sha256) fail('generic-review result context/subject is stale');
+  const reviewResult = stableJson(review);
+  Object.assign(receipt, { request_id: review.request_id, context_sha256: review.context_sha256,
+    result_sha256: sha256Prefixed(reviewResult), actual_harness: review.actual_harness,
+    actual_role: review.actual_role, actual_model: review.actual_model,
+    author_session_binding_sha256: args.author?.binding_sha256 ?? null, author_actual_models: args.author?.models ?? null,
+    model_relation: modelRelation(args.author?.models ?? null, review.actual_model) });
+  if (review.verdict !== (args.disposition === 'external_pass' ? 'PASS' : 'FAIL') || review.summary !== args.summary
+    || stableJson(review.findings) !== stableJson(args.findings)) fail('generic-review result verdict/findings mismatch');
+  assertRecordedReceiptPolicy(context, receipt, null);
+  writeAcceptanceWithObservation(context.root, args.authorityHome, receipt, reviewResult);
+  return receipt;
+}
+
+export async function recordUserWaiverAcceptance(args: {
+  root: string;
+  authorityHome: string;
+  authority: ReviewAdmissionSource;
+  verification: string;
+  /** Explicit PR identity. Required when the reviewed revision carries an active coverage block. */
+  pull_request?: AcceptancePullRequestSelection;
+  now?: () => Date;
+}): Promise<AcceptanceReceipt> {
+  const context = await acceptanceContext(args);
+  const grant = verifyUserWaiverGrant({
+    root: context.root,
+    authorityHome: args.authorityHome,
+    authority: args.authority,
+    now: args.now,
+  });
+  const findings: AcceptanceFinding[] = [];
+  validateDisposition(context.policy, context.owner, 'user_waiver', 'User', 'user-waiver', grant.actor, findings);
+  const receipt = buildReceipt(
+    context,
+    'user_waiver',
+    'User',
+    'user-waiver',
+    grant.actor,
+    grant.summary,
+    findings,
+    [],
+    recordedCoverage({ root: context.root, targetRevision: context.subject.target_rev,
+      headRevision: context.subject.head_rev, pullRequest: args.pull_request }),
+    waiverGrantFingerprint(grant),
+    args.now ?? (() => new Date()),
+  );
+  assertRecordedReceiptPolicy(context, receipt, grant);
+  writeAcceptanceWithObservation(context.root, args.authorityHome, receipt);
+  return receipt;
+}
+
+export async function verifyAcceptance(args: {
+  root: string; authorityHome: string; authority: ReviewAdmissionSource; verification?: string;
+}): Promise<AcceptanceReceipt> {
+  const root = realpathSync(args.root);
+  const current = readReceipt(acceptanceReceiptPath(root, args.authorityHome));
+  const { receipt } = current;
+  const subject = currentSubject(root, receipt.target_ref, receipt.target_revision);
+  if (subject.review_subject_sha256 !== receipt.subject_sha256) fail('AcceptanceReceipt semantic subject is stale');
+  const context = await acceptanceContext({ ...args, root, verification: args.verification ?? receipt.verification_file,
+    targetRef: receipt.target_ref, targetRevision: receipt.target_revision });
+  return inspectAcceptanceBinding({ root, authorityHome: args.authorityHome, authority: args.authority,
+    subject: context.subject, evidence: context.evidence }, current);
+}
+
+type AcceptanceBindingInput = {
+  root: string; authorityHome: string; authority: ReviewAdmissionSource; subject: ReviewSubject; evidence: AcceptanceEvidence;
+};
+
+/** Reobserve admission even when the evaluator supplies current subject evidence. */
+export function inspectAcceptanceCurrentBinding(args: AcceptanceBindingInput): AcceptanceReceipt {
+  const root = realpathSync(args.root);
+  return inspectAcceptanceBinding({ ...args, root }, readReceipt(acceptanceReceiptPath(root, args.authorityHome)));
+}
+
+function inspectAcceptanceBinding(args: AcceptanceBindingInput, current: ReturnType<typeof readReceipt>): AcceptanceReceipt {
+  const { root, subject } = args;
+  const { receipt, sha256 } = current;
+  const active = currentAdmission(root, args.authority);
+  if (subject.review_subject_sha256 !== receipt.subject_sha256 || subject.target_ref !== receipt.target_ref
+    || subject.target_rev !== receipt.target_revision || stableJson(subject.paths) !== stableJson(receipt.reviewed_paths)) fail('AcceptanceReceipt semantic subject is stale');
+  const diff = requireFromHelper(join(PACKAGE_ROOT, 'src/effects/review/diff-fingerprint.ts')) as typeof import('./diff-fingerprint');
+  const base = diff.resolvePolicyReviewBase(root);
+  if (!base.ok || base.targetRef !== receipt.target_ref) fail('AcceptanceReceipt target ref is stale against workflow policy');
+  if (args.evidence.fingerprint !== receipt.verification_evidence_sha256 || args.evidence.benchmark !== receipt.benchmark_evidence_sha256) fail('AcceptanceReceipt verification evidence is stale');
+  const verification = verificationReportFile(root, receipt.verification_file);
+  const report = parseJsonText(verification.content, verification.path) as { target: { plan_hash: string; snapshot_hash: string } };
+  const context = bindReviewAdmission(active.admission, {
+    subject: { status: 'ok', scope: subject.scope, target_ref: subject.target_ref, target_rev: subject.target_rev, head_rev: subject.head_rev, review_subject_sha256: subject.review_subject_sha256 },
+    verification: { plan_sha256: report.target.plan_hash, source_sha256: report.target.snapshot_hash, // The validated snapshot SHA256 binds the Git tree OID; the OID itself may be SHA1.
+      tree_sha256: report.target.snapshot_hash, evidence_sha256: args.evidence.fingerprint },
+  }, active.grant_sha256);
+  verifyReviewResult(root, args.authorityHome, receipt, context.context_sha256);
+  const verdict = validateAcceptanceReceiptAgainstPolicy({ receipt, repositoryRoot: root, admission: active.admission, grantSha256: active.grant_sha256,
+    waiverGrant: receipt.disposition === 'user_waiver' ? verifyUserWaiverGrant(args) : null });
+  if (!verdict.ok) fail(verdict.reason);
+  const observation = readAcceptanceVerificationObservation(root, args.authorityHome, receipt.campaign_sha256, receipt.admission_sha256, sha256);
+  if (!observation || observation.grant_sha256 !== receipt.grant_sha256 || observation.goal_sha256 !== receipt.goal_sha256
+    || observation.target_ref !== receipt.target_ref || observation.target_revision !== receipt.target_revision
+    || observation.subject_sha256 !== receipt.subject_sha256 || observation.verification_evidence_sha256 !== receipt.verification_evidence_sha256
+    || observation.disposition !== receipt.disposition) fail('AcceptanceVerificationObservation is missing or stale');
+  return receipt;
+}
+
+
+/**
+ * The review file header carries the same four review-binding fields the
+ * receipt already owns (`Status`, `Recommendation`, `Reviewed Subject
+ * SHA256`, `Reviewed Target Revision`). The receipt is their single
+ * authority, so each one is projected from it unconditionally: an authored
+ * value that disagrees is stale, not a second opinion to preserve.
+ */
+function syncReviewHeader(source: string, receipt: AcceptanceReceipt): string {
+  const boundary = source.search(/^##[ \t]/m);
+  let header = boundary === -1 ? source : source.slice(0, boundary);
+  const rest = boundary === -1 ? '' : source.slice(boundary);
+  const accepted = receipt.disposition !== 'reject';
+  const syncField = (field: string, value: string): void => {
+    header = header.replace(
+      new RegExp(`^(> \\*\\*${field}\\*\\*:[ \\t]*).+$`, 'm'),
+      (_whole, prefix: string) => `${prefix}${value}`,
+    );
+  };
+  syncField('Reviewed Subject SHA256', receipt.subject_sha256);
+  syncField('Reviewed Target Revision', receipt.target_revision);
+  syncField('Recommendation', accepted ? 'pass' : 'fail');
+  syncField('Status', accepted ? 'Accepted' : 'Pending');
+  return `${header}${rest}`;
+}
+
+export function projectAcceptance(reviewPath: string, receipt: AcceptanceReceipt): void {
+  if (currentReadonlyObservation()) rejectObservation('Observation cannot write an acceptance projection');
+  const source = readFileSync(reviewPath, 'utf-8');
+  const projection = renderAcceptanceProjection(receipt);
+  const pattern = /^## Acceptance Receipt Projection[ \t]*(?:\r?\n|$)[\s\S]*?(?=^##[ \t]+|(?![\s\S]))/m;
+  const next = pattern.test(source)
+    ? source.replace(pattern, `${projection}\n\n`)
+    : `${source.trimEnd()}\n\n${projection}\n`;
+  writeFileSync(reviewPath, syncReviewHeader(next, receipt), 'utf-8');
+}
+
+/**
+ * EPC-04: at the end of a successful `record` (CLI level only -- this is
+ * never invoked from the exported `recordAcceptance`/`recordUserWaiverAcceptance`
+ * functions themselves, so direct library callers, including
+ * tests/acceptance-receipt.test.ts, are unaffected), import the
+ * just-recorded receipt into the EPC-01 ledger as one attested EvidenceEvent
+ * (D4). `reject` has no attested trust mapping (D4's closed table has only
+ * two entries) and is not itself a claim of acceptance, so it is skipped
+ * here rather than routed into `importAttestedEvidence` only to fail closed
+ * on `unsupported_disposition` -- that would turn an intentional, already
+ * exit-code-1 rejection into a hard crash of the record command, which is
+ * not this package's scope.
+ *
+ * A missing attested-import module skips the ledger import and leaves the
+ * recorded receipt in place.
+ * Any OTHER failure (the module resolves but the import itself reports a
+ * real fail-closed reason) still fails the record command: an acceptance
+ * that cannot enter the evidence authority must not report success.
+ */
+async function importAttestedReceiptIfApplicable(
+  root: string,
+  receipt: AcceptanceReceipt,
+  authority: ReviewAdmissionSource,
+): Promise<void> {
+  if (receipt.disposition !== 'external_pass' && receipt.disposition !== 'user_waiver') return;
+
+  type AttestedImportModule = {
+    importAttestedEvidence: (input: { repoRoot: string; authority: ReviewAdmissionSource; receipt: AcceptanceReceipt }) => { ok: boolean; reason?: string; message?: string };
+  };
+  let attestedImport: AttestedImportModule;
+  try {
+    attestedImport = (await import('../evidence/attested-import.ts')) as AttestedImportModule;
+  } catch (error) {
+    if (isModuleUnresolvedError(error)) {
+      console.error('acceptance-receipt: attested-import module unavailable in this deployed-helper context; skipping ledger import (record unaffected)');
+      return;
+    }
+    throw error;
+  }
+
+  const result = attestedImport.importAttestedEvidence({ repoRoot: root, authority, receipt });
+  if (!result.ok) {
+    fail(`AcceptanceReceipt recorded but ledger import failed closed: ${result.message ?? result.reason}`);
+  }
+}
+
+function projectRecordedAcceptance(args: {
+  root: string;
+  review: string | undefined;
+  receipt: AcceptanceReceipt;
+}): void {
+  if (args.review) projectAcceptance(resolve(args.root, args.review), args.receipt);
+}
+
+function isModuleUnresolvedError(error: unknown): boolean {
+  return (error as { code?: string } | null | undefined)?.code === 'ERR_MODULE_NOT_FOUND';
+}
+
+function option(argv: string[], name: string, required = true): string | undefined {
+  const index = argv.indexOf(name);
+  const value = index >= 0 ? argv[index + 1] : undefined;
+  if (required && (!value || value.startsWith('--'))) fail(`${name} is required`, 2);
+  return value;
+}
+
+export async function runAcceptanceReceiptCli(argv: string[], opts: Options = {}): Promise<number> {
+  const command = argv[0];
+  const root = repositoryRoot();
+  const authorityHome = opts.authorityHome ?? osAccountHome();
+  if (command === 'path') { console.log(acceptanceReceiptPath(root, authorityHome)); return 0; }
+  if (command === 'revoke-waiver') { revokeUserWaiverGrant({ root, authorityHome }); return 0; }
+  const authority = (opts.admissionSource ?? readReviewAdmissionSource)(root, {
+    'repository-id': option(argv, '--repository-id', false), 'issue-id': option(argv, '--issue-id', false),
+    'campaign-id': option(argv, '--campaign-id', false), 'grant-sha256': option(argv, '--grant-sha256', false),
+    'policy-sha256': option(argv, '--policy-sha256', false), actor: option(argv, '--actor', false),
+  });
+  if (command === 'evidence-requirement') {
+    process.stdout.write(currentAdmission(root, authority).admission.benchmark); return 0;
+  }
+  if (command === 'inspect-current') {
+    const execution = requireFromHelper(join(PACKAGE_ROOT, 'src/effects/evidence/verification-execution.ts')) as typeof import('../evidence/verification-execution');
+    const report = execution.evaluateAdmittedVerification({ repoRoot: root, authority });
+    const subject = currentSubject(root);
+    const evidence = inspectAcceptanceEvidence({ root, authority,
+      report: execution.materializeVerificationExecutionReport(report), subject, current: true });
+    console.log(JSON.stringify(inspectAcceptanceCurrentBinding({ root, authorityHome, authority, subject, evidence })));
+    return 0;
+  }
+  if (command === 'policy') {
+    console.log(JSON.stringify(currentAdmission(root, authority).admission.policy));
+    return 0;
+  }
+  if (command === 'grant-waiver') {
+    const grant = recordUserWaiverGrant({
+      root,
+      authorityHome,
+      authority,
+      actor: option(argv, '--actor')!,
+      summary: option(argv, '--summary')!,
+      authorization: parseJsonText(readFileSync(resolve(root, option(argv, '--authorization')!), 'utf8'), option(argv, '--authorization')!),
+      now: opts.now,
+    });
+    console.log(JSON.stringify(grant));
+    return 0;
+  }
+  if (command === 'verify-waiver-grant') {
+    console.log(JSON.stringify(verifyUserWaiverGrant({
+      root,
+      authorityHome,
+      authority,
+      now: opts.now,
+    })));
+    return 0;
+  }
+  if (command === 'record') {
+    const disposition = option(argv, '--disposition') as AcceptanceDisposition;
+    if (!['external_pass', 'user_waiver', 'reject'].includes(disposition)) fail('--disposition is invalid', 2);
+    const review = option(argv, '--review', false);
+    if (disposition === 'user_waiver') {
+      const receipt = await recordUserWaiverAcceptance({
+        root,
+        authorityHome,
+        authority,
+        verification: option(argv, '--verification')!,
+        pull_request: pullRequestSelectionOption(argv),
+        now: opts.now,
+      });
+      projectRecordedAcceptance({ root, review, receipt });
+      await importAttestedReceiptIfApplicable(root, receipt, authority);
+      console.log(JSON.stringify(receipt));
+      return 0;
+    }
+    const findingsRaw = option(argv, '--findings-json', false) ?? '[]';
+    const failuresRaw = option(argv, '--failures-json', false) ?? '[]';
+    const failures = validateRequiredCheckFailureEvidenceList(JSON.parse(failuresRaw));
+    const pullRequest = pullRequestSelectionOption(argv);
+    const reviewResultFile = option(argv, '--review-result')!;
+    if (!lstatSync(reviewResultFile).isFile() || lstatSync(reviewResultFile).isSymbolicLink()) fail('--review-result must be a regular file');
+    const receipt = await recordAcceptance({
+      reviewResult: validateDomainReview(parseJsonText(readFileSync(reviewResultFile,'utf8'), reviewResultFile)),
+      root,
+      authorityHome,
+      authority,
+      verification: option(argv, '--verification')!,
+      disposition,
+      reviewer: option(argv, '--reviewer')!,
+      source: option(argv, '--source')!,
+      actor: null,
+      // A supplied Result has no bound author task session.
+      author: null,
+      summary: option(argv, '--summary')!,
+      findings: validateFindings(JSON.parse(findingsRaw)),
+      failures,
+      pull_request: pullRequest,
+      now: opts.now,
+    });
+    projectRecordedAcceptance({ root, review, receipt });
+    await importAttestedReceiptIfApplicable(root, receipt, authority);
+    console.log(JSON.stringify(receipt));
+    return disposition === 'reject' ? 1 : 0;
+  }
+  if (command === 'verify') {
+    const receipt = await verifyAcceptance({
+      root,
+      authorityHome,
+      authority,
+      verification: option(argv, '--verification', false),
+    });
+    const format = option(argv, '--format', false) ?? 'json';
+    if (format === 'row') {
+      console.log(`pass\t${receipt.reviewer}\t${receipt.source}\t${receipt.disposition}\tAcceptanceReceipt ${receipt.disposition} is valid.`);
+    } else {
+      console.log(JSON.stringify(receipt));
+    }
+    return 0;
+  }
+  if (command === 'project') {
+    const receipt = await verifyAcceptance({
+      root,
+      authorityHome,
+      authority,
+      verification: option(argv, '--verification', false),
+    });
+    projectAcceptance(resolve(root, option(argv, '--review')!), receipt);
+    return 0;
+  }
+  fail('usage: acceptance-receipt.ts <policy|grant-waiver|verify-waiver-grant|revoke-waiver|record|verify|project|path> ...', 2);
+}

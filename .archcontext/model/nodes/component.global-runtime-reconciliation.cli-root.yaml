@@ -1,0 +1,41 @@
+schemaVersion: archcontext.node/v2
+id: component.global-runtime-reconciliation.cli-root
+kind: component
+name: CLI Composition Root
+status: active
+parent: capability.runtime-harness.global-runtime-reconciliation
+layer: cli
+summary: Builds the repo-harness command tree from the core and plugin command modules and runs the update transactions.
+responsibilities:
+  - Register every top-level command module in one commander program.
+  - Parse the mcp commands, load the mcp serve and doctor actions by dynamic import and set repository access grants for mcp access set.
+  - Parse operator and catch-up commands and load their actions by dynamic import after the plugin guard.
+  - Expose the core worktree lifecycle through internal helpers; guard only worktrees list, clean and path with the operator selection.
+  - Publish the registered command manifest through rh commands and check documented command paths against that tree.
+  - Compose projection, debt, module, refactor and codegraph under the architecture-selected rh arch command.
+  - Guard review round, status, close and cancel, herdr, events and the Operator cleanup investigation child with peer-runtime before loading their runtime bodies.
+  - Run the plugin selection projection and runtime refresh inside one host transaction with configuration restores.
+extensions:
+  harnessTier: "composition"
+source:
+  include:
+    - "src/cli/index.ts"
+    - "src/cli/runtime-transaction.ts"
+    - "src/cli/candidate-runtime-reconciliation.ts"
+    - "src/cli/commands/mcp.ts"
+    - "src/cli/commands/operator.ts"
+    - "src/cli/commands/herdr.ts"
+    - "src/cli/commands/events.ts"
+    - "src/cli/commands/worktrees.ts"
+    - "src/cli/commands/catch-up.ts"
+    - "src/cli/commands/commands.ts"
+    - "scripts/check-cli-manifest.ts"
+  entrypoints:
+    - id: entrypoint.global-runtime-reconciliation.cli-root
+      path: "src/cli/candidate-runtime-reconciliation.ts"
+      symbols:
+        - name: "runCandidateRuntimeReconciliation"
+          sinks:
+            - id: sink.global-runtime-reconciliation.setup
+              path: "src/cli/commands/global-runtime.ts"
+              symbol: "runGlobalRuntimeSetup"

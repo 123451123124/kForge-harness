@@ -1,0 +1,77 @@
+import { existsSync, realpathSync, statSync, type Stats } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
+
+export type NodeSelection =
+  | { readonly status: 'selected'; readonly path: string }
+  | { readonly status: 'explicit-rejected'; readonly reason: 'not-absolute' | 'not-executable' | 'version' }
+  | { readonly status: 'not-found' };
+
+export interface NodeSelectionInput {
+  /** The semver range that a selected Node version must satisfy. */
+  readonly range: string;
+  /** `REPO_HARNESS_NODE_BIN` when the caller honors it. Omit to skip that tier. */
+  readonly explicit?: string;
+  /** Search PATH only when this is set. An empty string searches nothing. */
+  readonly pathValue?: string;
+  readonly pathExt?: string;
+  readonly candidates: readonly string[] | (() => readonly string[]);
+  /** Run `--version` under the caller's process authority. Return the version without a leading `v`, or null. */
+  readonly versionOf: (executable: string) => string | null;
+  readonly platform?: NodeJS.Platform;
+}
+
+function satisfies(version: string | null, range: string): boolean {
+  return version !== null && Bun.semver.satisfies(version, range);
+}
+
+/**
+ * One executable test for the explicit pin and the trusted candidates.
+ * Windows has no execute bit: libuv reports a regular file as `0666`, or `0444`
+ * when read-only (`src/win/fs.c`, `fs__stat_assign_statbuf`), so a real
+ * `node.exe` would fail a POSIX bit test.
+ */
+function isExecutableRuntime(stat: Stats, platform: NodeJS.Platform): boolean {
+  return stat.isFile() && (platform === 'win32' || (stat.mode & 0o111) !== 0);
+}
+
+/**
+ * One Node selection order: explicit pin, then PATH, then trusted candidates.
+ * Callers still start the version process, because the protected helper and
+ * the architecture provider do not share a process environment.
+ */
+export function selectCompatibleNode(input: NodeSelectionInput): NodeSelection {
+  const platform = input.platform ?? process.platform;
+  const explicit = input.explicit?.trim();
+  if (explicit) {
+    if (!isAbsolute(explicit)) return { status: 'explicit-rejected', reason: 'not-absolute' };
+    const actual = realpathSync(explicit);
+    const stat = statSync(actual);
+    if (!isExecutableRuntime(stat, platform)) return { status: 'explicit-rejected', reason: 'not-executable' };
+    if (!satisfies(input.versionOf(actual), input.range)) return { status: 'explicit-rejected', reason: 'version' };
+    return { status: 'selected', path: actual };
+  }
+  if (input.pathValue !== undefined) {
+    const extensions = platform === 'win32'
+      ? (input.pathExt ?? '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean)
+      : [''];
+    for (const directory of input.pathValue.split(platform === 'win32' ? ';' : ':')) {
+      if (!directory) continue;
+      for (const extension of extensions) {
+        const candidate = join(directory, `node${extension}`);
+        if (!existsSync(candidate)) continue;
+        if (!satisfies(input.versionOf(candidate), input.range)) continue;
+        return { status: 'selected', path: realpathSync(candidate) };
+      }
+    }
+  }
+  const candidates = typeof input.candidates === 'function' ? input.candidates() : input.candidates;
+  for (const candidate of candidates) {
+    if (!isAbsolute(candidate) || !existsSync(candidate)) continue;
+    const actual = realpathSync(candidate);
+    const stat = statSync(actual);
+    if (!isExecutableRuntime(stat, platform)) continue;
+    if (!satisfies(input.versionOf(actual), input.range)) continue;
+    return { status: 'selected', path: actual };
+  }
+  return { status: 'not-found' };
+}

@@ -1,0 +1,464 @@
+import { parseJsonText } from '../../core/evidence/file-syntax';
+import { TaskMessageError } from '../../core/messages/task-message-error';
+import { readReviewAdmissionSource } from '../../effects/admission/admission-source';
+import { Command } from 'commander';
+import { migrateTaskInboxLayout, TaskInboxMigrationError } from '../../effects/fleet/task-inbox-layout-migration';
+import { TaskInboxLayoutError } from '../../effects/fleet/task-inbox-layout';
+import { backfillRepoHarnessRegistry, pruneRepoHarnessRegistry } from '../../effects/repo-registry';
+import { BotRegistryError, readBotRegistry, type BotRecordV1 } from '../../effects/bot-registry';
+import { randomUUID } from 'crypto';
+import { readFileSync } from 'fs';
+
+import { MergeReadinessError } from '../../effects/publication/merge-readiness';
+import { observeTaskInboxContext, type TaskInboxSessionSource, ackTaskInbox, deliverTaskInbox, listTaskInbox, sendTaskMessage, TaskInboxError } from '../../effects/fleet/task-inbox';
+import { buildTaskMessageEvent, type TaskMessageEventInput, type TaskMessageRecipient } from '../../core/fleet/admitted-task-message';
+import { prepareFeedbackSubject, FeedbackError, intakeGitHubFeedback, projectPendingFeedbackOffer, showGitHubFeedback, transitionFeedbackDelivery } from '../../effects/fleet/provider-feedback';
+import { FeedbackStoreError, readFeedbackDeliveryReceipt } from '../../effects/publication/feedback-store';
+
+function outputError(error: unknown): void {
+  const code = error instanceof MergeReadinessError
+    || error instanceof FeedbackError
+    || error instanceof FeedbackStoreError
+    || error instanceof TaskInboxError
+    || error instanceof TaskMessageError
+    ? error.code
+    : 'provider_unavailable';
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`${JSON.stringify({ ok: false, error: code, message })}\n`);
+  process.exitCode = 1;
+}
+
+function outputFeedbackValidation(error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`${JSON.stringify({ ok: false, error: 'invalid_argument', message })}\n`);
+  process.exitCode = 2;
+}
+
+function requireJson(json: boolean | undefined): void {
+  if (json !== true) throw new Error('--json is required');
+}
+
+function requiredStringOption(value: string | undefined, name: string): string {
+  const result = optionalStringOption(value, name);
+  if (result === undefined) throw new Error(`--${name} is required`);
+  return result;
+}
+
+function feedbackEnvironment() {
+  return {
+    repo_root: process.cwd(),
+    gh_bin: process.env.REPO_HARNESS_GH_BIN,
+    git_bin: process.env.REPO_HARNESS_GIT_BIN,
+  } as const;
+}
+
+function outputTaskInboxError(error: unknown): void {
+  const code = error instanceof TaskInboxError || error instanceof TaskMessageError || error instanceof TaskInboxMigrationError || error instanceof TaskInboxLayoutError || error instanceof BotRegistryError
+    ? error.code
+    : 'invalid_argument';
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`${JSON.stringify({ ok: false, error: code, message })}\n`);
+  process.exitCode = 1;
+}
+
+type TaskMessageScope = 'task' | 'claim';
+type TaskMessageAudience = 'owner' | 'orchestrator' | 'user';
+
+function admittedInboxContext(repoRoot: string, taskId: string, contextFile: string) {
+  return parseAdmittedInboxContext(repoRoot, taskId, parseJsonText(readFileSync(contextFile, 'utf8'), contextFile));
+}
+function parseAdmittedInboxContext(repoRoot: string, taskId: string, value: any) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(['admission', 'claim', 'session'])) throw new Error('inbox context fields are invalid');
+  const selector = value.admission;
+  if (!selector || typeof selector !== 'object' || Array.isArray(selector)
+    || JSON.stringify(Object.keys(selector).sort()) !== JSON.stringify(['actor_id', 'campaign_id', 'grant_sha256', 'issue_id', 'policy_sha256', 'repository_id'])) throw new Error('inbox admission selector fields are invalid');
+  if (!value.session || typeof value.session !== 'object' || Array.isArray(value.session)
+    || JSON.stringify(Object.keys(value.session).sort()) !== JSON.stringify(['role', 'task'])
+    || typeof value.session.task !== 'string' || typeof value.session.role !== 'string') throw new Error('inbox session fields are invalid');
+  const source: TaskInboxSessionSource = { session: value.session, authority: { claim: value.claim,
+    source: readReviewAdmissionSource(repoRoot, { 'repository-id': selector.repository_id, 'issue-id': selector.issue_id,
+      'campaign-id': selector.campaign_id, 'grant-sha256': selector.grant_sha256, 'policy-sha256': selector.policy_sha256, actor: selector.actor_id }) } };
+  const admission = observeTaskInboxContext({ repo_root: repoRoot, source, task_id: taskId });
+  return { source, taskId, admission };
+}
+
+function readMessageBody(bodyFile: string): string {
+  return readFileSync(bodyFile).toString('utf8');
+}
+
+/**
+ * The sender of a `fleet message send` event. A registered Bot is attributed,
+ * not trusted more: it keeps local operator trust, so its steer is delivered
+ * like the user's. An id that names no registered Bot is refused.
+ */
+export function taskMessageSender(botId: string | null, bots: readonly BotRecordV1[]): Pick<TaskMessageEventInput, 'sender_kind' | 'sender_id' | 'sender_trust'> {
+  if (botId === null) return { sender_kind: 'user', sender_id: null, sender_trust: 'local_operator' };
+  if (!bots.some(bot => bot.bot_id === botId)) throw new Error(`--bot ${botId} is not a registered Bot`);
+  return { sender_kind: 'operator', sender_id: botId, sender_trust: 'local_operator' };
+}
+
+function messageInput(
+  options: {
+    readonly taskId: string;
+    readonly scope: TaskMessageScope;
+    readonly audience: TaskMessageAudience;
+    readonly body: string;
+    readonly messageId?: string;
+    readonly inReplyTo?: string;
+    readonly sender: Pick<TaskMessageEventInput, 'sender_kind' | 'sender_id' | 'sender_trust'>;
+  },
+  context: ReturnType<typeof admittedInboxContext>,
+): TaskMessageEventInput {
+  return {
+    message_id: options.messageId ?? randomUUID(),
+    task_id: context.taskId,
+    admission_sha256: context.admission.approval.admission_sha256,
+    task_identity: { repository_id: context.admission.identity.repository_id, issue_id: context.admission.identity.issue_id, campaign_id: context.admission.identity.campaign_id },
+    scope: options.scope,
+    target_claim: options.scope === 'claim' ? context.admission.identity.claim : null,
+    ...options.sender,
+    audience: options.audience,
+    body: options.body,
+    created_at: new Date().toISOString(),
+    in_reply_to: options.inReplyTo ?? null,
+  };
+}
+
+function optionalStringOption(value: string | undefined, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) throw new Error(`--${name} must be a non-empty string`);
+  return trimmed;
+}
+
+
+function feedbackContext(contextFile: string, publicationId?: string) {
+  const value = parseJsonText(readFileSync(contextFile, 'utf8'), contextFile) as any;
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join(',') !== 'admission,claim,selection,session') throw new Error('feedback context fields are invalid');
+  const context = parseAdmittedInboxContext(process.cwd(), value.session?.task,
+    { admission: value.admission, claim: value.claim, session: value.session });
+  const input = { ...feedbackEnvironment(), source: context.source, selection: value.selection };
+  const subject = prepareFeedbackSubject(input);
+  if (publicationId !== undefined && subject.publication_id !== publicationId) throw new Error('publication-id differs from explicit feedback context');
+  return { ...input, publication_id: subject.publication_id };
+}
+
+export function buildFleetCommand(): Command {
+  const fleet = new Command('fleet').description('Project fleet workflow views and task acquisition');
+  fleet.command('register')
+    .description('Register explicit adopted primary checkouts with source manual; never scans directories')
+    .argument('<paths...>', 'Repository roots to register; each is checked and reported on its own')
+    .action((paths: string[]) => {
+      try {
+        const result = backfillRepoHarnessRegistry(paths);
+        const ok = result.rejected.length === 0;
+        process.stdout.write(`${JSON.stringify({ ok, ...result }, null, 2)}\n`);
+        if (!ok) process.exitCode = 1;
+      } catch (error) { outputFeedbackValidation(error); }
+    });
+  fleet.command('prune')
+    .description('Preview missing and linked-worktree repository registrations; --apply removes registry rows only, without backup')
+    .option('--apply', 'Remove confirmed absent paths and linked-worktree rows under the registry mutation lock')
+    .option('--expected-revision <digest>', 'Exact registry_revision from the preview; required with --apply')
+    .option('--repo-id <id...>', 'Limit inspection/removal to these registered repository IDs')
+    .action(options => {
+      try {
+        const result = pruneRepoHarnessRegistry({ apply: options.apply,
+          expectedRevision: options.expectedRevision, repoIds: options.repoId });
+        process.stdout.write(`${JSON.stringify({ ok: true, ...result }, null, 2)}\n`);
+      } catch (error) { outputFeedbackValidation(error); }
+    });
+  fleet.command('remove')
+    .description('Preview the registry rows of the named repository IDs, also when their paths are present; --apply removes those rows only, without backup')
+    .argument('<repo-ids...>', 'Registered repository IDs to remove; an unknown ID refuses the whole command')
+    .option('--apply', 'Remove the named rows under the registry mutation lock; never touches the directories')
+    .option('--expected-revision <digest>', 'Exact registry_revision from the preview; required with --apply')
+    .action((repoIds: string[], options) => {
+      try {
+        const result = pruneRepoHarnessRegistry({ apply: options.apply,
+          expectedRevision: options.expectedRevision, repoIds, named: true });
+        process.stdout.write(`${JSON.stringify({ ok: true, ...result }, null, 2)}\n`);
+      } catch (error) { outputFeedbackValidation(error); }
+    });
+
+  const feedback = fleet
+    .command('feedback')
+    .description('Observe and acknowledge immutable provider feedback for a publication');
+
+  feedback
+    .command('intake')
+    .description('Observe GitHub checks and review threads and persist immutable feedback events')
+    .option('--json', 'Output JSON')
+    .requiredOption('--context <file>', 'JSON {admission,claim,session,selection}; explicit provider and admitted session context')
+    .option('--publication-id <publicationId>', 'Publication identity to observe')
+    .action((options: { readonly context: string; readonly json?: boolean; readonly publicationId?: string }) => {
+      let publicationId: string | undefined;
+      try {
+        requireJson(options.json);
+      } catch (error) {
+        outputFeedbackValidation(error);
+        return;
+      }
+      try {
+        publicationId = options.publicationId === undefined ? undefined : requiredStringOption(options.publicationId, 'publication-id');
+        const result = intakeGitHubFeedback({
+          ...feedbackContext(options.context, publicationId),
+        });
+        process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
+      } catch (error) {
+        outputError(error);
+      }
+    });
+
+  feedback
+    .command('offers')
+    .description('Project the pending provider feedback repair offer')
+    .option('--json', 'Output JSON')
+    .requiredOption('--context <file>', 'JSON {admission,claim,session,selection}; explicit provider and admitted session context')
+    .option('--publication-id <publicationId>', 'Publication identity to inspect')
+    .action((options: { readonly context: string; readonly json?: boolean; readonly publicationId?: string }) => {
+      let publicationId: string;
+      try {
+        requireJson(options.json);
+        publicationId = requiredStringOption(options.publicationId, 'publication-id');
+      } catch (error) {
+        outputFeedbackValidation(error);
+        return;
+      }
+      try {
+        const result = projectPendingFeedbackOffer({
+          ...feedbackContext(options.context, publicationId),
+        });
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+      } catch (error) {
+        outputError(error);
+      }
+    });
+
+  feedback
+    .command('ack')
+    .description('Acknowledge one durable provider feedback delivery receipt')
+    .option('--json', 'Output JSON')
+    .requiredOption('--context <file>', 'JSON {admission,claim,session,selection}; explicit provider and admitted session context')
+    .option('--publication-id <publicationId>', 'Publication identity to acknowledge')
+    .option('--provider-event-id <providerEventId>', 'Opaque provider event identity')
+    .action((options: {
+      readonly context: string; readonly json?: boolean;
+      readonly publicationId?: string;
+      readonly providerEventId?: string;
+    }) => {
+      let publicationId: string;
+      let providerEventId: string;
+      try {
+        requireJson(options.json);
+        publicationId = requiredStringOption(options.publicationId, 'publication-id');
+        providerEventId = requiredStringOption(options.providerEventId, 'provider-event-id');
+      } catch (error) {
+        outputFeedbackValidation(error);
+        return;
+      }
+      try {
+        const gitBin = process.env.REPO_HARNESS_GIT_BIN;
+        const current = readFeedbackDeliveryReceipt(process.cwd(), publicationId, providerEventId, gitBin);
+        const receipt = transitionFeedbackDelivery({
+          ...feedbackContext(options.context, publicationId),
+          provider_event_id: providerEventId,
+          git_bin: gitBin,
+          transition: {
+            delivery_state: 'acknowledged',
+            ...(current === null || current.delivery_state === 'pending' ? { delivery_channel: 'manual' as const } : {}),
+            transitioned_at: new Date().toISOString(),
+          },
+        });
+        process.stdout.write(`${JSON.stringify({ ok: true, receipt })}\n`);
+      } catch (error) {
+        outputError(error);
+      }
+    });
+
+  feedback
+    .command('show')
+    .description('Display one provider feedback body as untrusted text')
+    .option('--json', 'Output JSON')
+    .requiredOption('--context <file>', 'JSON {admission,claim,session,selection}; explicit provider and admitted session context')
+    .option('--publication-id <publicationId>', 'Publication identity to inspect')
+    .option('--provider-event-id <providerEventId>', 'Opaque provider event identity')
+    .action((options: {
+      readonly context: string; readonly json?: boolean;
+      readonly publicationId?: string;
+      readonly providerEventId?: string;
+    }) => {
+      let publicationId: string;
+      let providerEventId: string;
+      try {
+        requireJson(options.json);
+        publicationId = requiredStringOption(options.publicationId, 'publication-id');
+        providerEventId = requiredStringOption(options.providerEventId, 'provider-event-id');
+      } catch (error) {
+        outputFeedbackValidation(error);
+        return;
+      }
+      try {
+        const result = showGitHubFeedback({
+          ...feedbackContext(options.context, publicationId),
+          provider_event_id: providerEventId,
+        });
+        process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
+      } catch (error) {
+        outputError(error);
+      }
+    });
+
+  const message = fleet
+    .command('message')
+    .description('Send one bounded task-addressed message');
+  message
+    .command('send')
+    .description('Create one immutable task message event')
+    .requiredOption('--json', 'Output the task message result as JSON')
+    .requiredOption('--task-id <taskId>', 'Existing admitted session task id')
+    .requiredOption('--context <file>', 'JSON {admission, claim, session}; explicit current admission and immutable claim reference')
+    .requiredOption('--scope <scope>', 'Message scope: task or claim')
+    .requiredOption('--audience <audience>', 'Message audience: owner, orchestrator, or user')
+    .requiredOption('--body-file <path>', 'UTF-8 file containing the untrusted message body')
+    .option('--message-id <messageId>', 'Stable UUID for an idempotent retry')
+    .option('--in-reply-to <messageId>', 'Prior message UUID')
+    .option('--bot <bot-id>', 'Registered Bot that sends this message (see `rh bots register`)')
+    .action((options: {
+      readonly taskId: string;
+      readonly context: string;
+      readonly scope: string;
+      readonly audience: string;
+      readonly bodyFile: string;
+      readonly messageId?: string;
+      readonly inReplyTo?: string;
+      readonly bot?: string;
+    }) => {
+      try {
+        if (options.scope !== 'task' && options.scope !== 'claim') throw new Error('--scope must be task or claim');
+        if (options.audience !== 'owner' && options.audience !== 'orchestrator' && options.audience !== 'user') {
+          throw new Error('--audience must be owner, orchestrator, or user');
+        }
+        const taskId = optionalStringOption(options.taskId, 'task-id');
+        const bodyFile = optionalStringOption(options.bodyFile, 'body-file');
+        if (!taskId || !bodyFile) throw new Error('--task-id and --body-file must be non-empty strings');
+        const botId = optionalStringOption(options.bot, 'bot') ?? null;
+        const sender = taskMessageSender(botId, botId === null ? [] : readBotRegistry());
+        const context = admittedInboxContext(process.cwd(), taskId, options.context);
+        const event = buildTaskMessageEvent(messageInput({
+          taskId,
+          scope: options.scope,
+          audience: options.audience,
+          body: readMessageBody(bodyFile),
+          messageId: optionalStringOption(options.messageId, 'message-id'),
+          inReplyTo: optionalStringOption(options.inReplyTo, 'in-reply-to'),
+          sender,
+        }, context));
+        const result = sendTaskMessage({
+          repo_root: process.cwd(),
+          source: context.source,
+          event,
+        });
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+      } catch (error) {
+        outputTaskInboxError(error);
+      }
+    });
+
+  const inbox = fleet
+    .command('inbox')
+    .description('Inspect and acknowledge task-message delivery receipts');
+
+  inbox.command('migrate-layout')
+    .description('Inspect or explicitly migrate the offline Task Inbox storage layout')
+    .requiredOption('--json', 'Output migration inventory and digests as JSON')
+    .option('--apply', 'Apply a dry-run-bound migration')
+    .option('--resume', 'Resume the exact interrupted migration')
+    .option('--rollback', 'Restore v1 only before any subsequent v2 writes')
+    .option('--expected-source-sha256 <digest>', 'Exact source digest returned by dry-run')
+    .option('--receipt-sha256 <digest>', 'Exact migration receipt digest for rollback')
+    .option('--confirm-quiescent', 'Confirm all repository clients and hooks are stopped')
+    .action((options: { apply?: boolean; resume?: boolean; rollback?: boolean; expectedSourceSha256?: string; receiptSha256?: string; confirmQuiescent?: boolean }) => {
+      try {
+        if ([options.apply, options.resume, options.rollback].filter(Boolean).length > 1) throw new Error('--apply, --resume and --rollback are mutually exclusive');
+        const mode = options.apply ? 'apply' : options.resume ? 'resume' : options.rollback ? 'rollback' : 'dry-run';
+        const result = migrateTaskInboxLayout({ repo_root: process.cwd(), mode,
+          expected_source_sha256: options.expectedSourceSha256, receipt_sha256: options.receiptSha256,
+          confirm_quiescent: options.confirmQuiescent });
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+      } catch (error) { outputTaskInboxError(error); }
+    });
+
+  inbox
+    .command('list')
+    .description('Deliver and list messages for the current bound owner')
+    .requiredOption('--json', 'Output inbox state as JSON')
+    .requiredOption('--task-id <taskId>', 'Existing admitted session task id')
+    .requiredOption('--context <file>', 'JSON {admission, claim, session}; explicit current admission and immutable claim reference')
+    .action((options: {
+      readonly taskId: string;
+      readonly context: string;
+    }) => {
+      try {
+        const taskId = optionalStringOption(options.taskId, 'task-id');
+        if (!taskId) throw new Error('--task-id must be a non-empty string');
+        const context = admittedInboxContext(process.cwd(), taskId, options.context);
+        const recipient: TaskMessageRecipient = { kind: 'claim', claim: context.admission.identity.claim };
+        deliverTaskInbox({
+          repo_root: process.cwd(),
+          task_id: taskId,
+          source: context.source,
+          recipient,
+          execution_worktree: process.cwd(),
+          delivery_channel: 'manual',
+          delivered_at: new Date().toISOString(),
+        });
+        const result = listTaskInbox({
+          repo_root: process.cwd(),
+          task_id: taskId,
+          source: context.source,
+          recipient,
+          execution_worktree: process.cwd(),
+        });
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+      } catch (error) {
+        outputTaskInboxError(error);
+      }
+    });
+
+  inbox
+    .command('ack')
+    .description('Acknowledge one message for the current bound owner')
+    .requiredOption('--json', 'Output the acknowledgement result as JSON')
+    .requiredOption('--task-id <taskId>', 'Existing admitted session task id')
+    .requiredOption('--context <file>', 'JSON {admission, claim, session}; explicit current admission and immutable claim reference')
+    .requiredOption('--message-id <messageId>', 'Message UUID to acknowledge')
+    .action((options: {
+      readonly taskId: string;
+      readonly context: string;
+      readonly messageId: string;
+    }) => {
+      try {
+        const taskId = optionalStringOption(options.taskId, 'task-id');
+        const messageId = optionalStringOption(options.messageId, 'message-id');
+        if (!taskId || !messageId) throw new Error('--task-id and --message-id must be non-empty strings');
+        const context = admittedInboxContext(process.cwd(), taskId, options.context);
+        const recipient: TaskMessageRecipient = { kind: 'claim', claim: context.admission.identity.claim };
+        const result = ackTaskInbox({
+          repo_root: process.cwd(),
+          task_id: taskId,
+          source: context.source,
+          message_id: messageId,
+          recipient,
+          execution_worktree: process.cwd(),
+          acknowledged_at: new Date().toISOString(),
+        });
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+      } catch (error) {
+        outputTaskInboxError(error);
+      }
+    });
+  return fleet;
+}

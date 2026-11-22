@@ -1,0 +1,41 @@
+codeFacts:
+  mode: "embedded"
+  provider: "codegraph"
+  required: true
+content:
+  decisions: "docs/adr"
+  generated: ".archcontext/generated"
+  policies: ".archcontext/policies"
+  projections: ".archcontext/projections"
+generated:
+  commitToGit: true
+  formats:
+    - "markdown"
+    - "mermaid"
+model:
+  layout: "split"
+  root: ".archcontext/model"
+  layers:
+    - tests
+    - scripts
+    - cli
+    - effects
+    - web
+    - core
+    - assets
+    - external
+privacy:
+  cloudContentUpload: "deny"
+  localTunnel:
+    includeSourceByDefault: false
+    maxResultBytes: 8192
+product:
+  governanceLevel: "auto"
+  id: "product.repo-harness"
+  name: "repo-harness"
+runtime:
+  checkpoint:
+    changedFileThreshold: 20
+    requiredBeforeComplete: true
+  contextBudgetBytes: 12288
+schemaVersion: "archcontext.manifest/v1"

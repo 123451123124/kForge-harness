@@ -1,0 +1,6 @@
+schemaVersion: archcontext.relation/v1
+id: relation.hook-adapters.route-runtime.edit-guards
+kind: calls
+source: component.hook-adapters.primary
+target: component.hook-adapters.edit-guards
+intent: "Bind PreToolUse.edit and the Claude or Pi PreToolUse.bash route to the typed path guards"

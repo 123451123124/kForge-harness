@@ -1,0 +1,1004 @@
+import { describe, expect, test } from "bun:test";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { dirname, join } from "path";
+import { spawnSync } from "child_process";
+
+import { MANAGED_AGENTS, WRITABLE_AGENTS } from '../src/effects/terminal/task-role-profiles';
+import { installProfileHostMutationPaths } from "../src/cli/installer/install-profile";
+
+import { recordInstallOwnership } from "./helpers/install-ownership";
+import { pathRecordKey, readPathRecords } from "../src/effects/host-config/path-records";
+import { openHostConfigGate } from "../src/effects/host-config/gate";
+import { hostConfigPaths, putVault } from "../src/effects/host-config/store";
+import { observeEntryIdentity } from "../src/effects/host-config/whole-path";
+import { sha256Prefixed } from "../src/core/evidence/sha256";
+
+/** The ledger's `user_managed` path records under `home`: the fleet files that the user keeps. */
+function userManagedRecords(home: string) {
+  return Object.fromEntries(Object.entries(readPathRecords({ HOME: home })).filter(([, record]) => record.kind === "user_managed"));
+}
+import { writeBunWrapper } from "./helpers/repo-fixture";
+
+const ROOT = join(import.meta.dir, "..");
+const SCRIPT = join(ROOT, "scripts/install-agent-fleet.sh");
+const FLEET_SOURCE_DIR = join(ROOT, "agents/fleet");
+const GOLDEN_CODEX_DIR = join(ROOT, ".codex/agents");
+const AGENTS = ["explorer", "deep-reasoner", "harness-evaluator"];
+const CODEX_EXPECTATIONS: Record<
+  string,
+  { model: string; effort: string; descriptionLabel: string; sourceDescription: string; sandboxMode: string }
+> = {
+  explorer: {
+    model: "gpt-6-luna",
+    effort: "high",
+    descriptionLabel: "GPT-6 Luna at high reasoning",
+    sourceDescription: "Haiku at high effort",
+    sandboxMode: "read-only",
+  },
+  "deep-reasoner": {
+    model: "gpt-6.2-sol",
+    effort: "high",
+    descriptionLabel: "GPT-6.2 Sol at high reasoning",
+    sourceDescription: "Opus at xhigh effort",
+    sandboxMode: "read-only",
+  },
+  "harness-evaluator": {
+    model: "gpt-6.2-sol",
+    effort: "medium",
+    descriptionLabel: "GPT-6.2 Sol at medium reasoning",
+    sourceDescription: "Opus at high effort",
+    sandboxMode: "workspace-write",
+  },
+};
+
+// Canonical anti-extras clause (scripts/contract-run.ts EXECUTION_BOUNDARY, joined with
+// "\n"). Hardcoded here the same way tests/workflow-contract.test.ts hardcodes the
+// canonical first sentence: this is the literal text the installer must NOT embed into
+// a generated persona. The clause has exactly one owner on the Codex native-child path,
+// the SubagentStart task packet, which alone knows whether the child is contract-bound
+// and writable.
+const CANONICAL_BOUNDARY_TEXT = [
+  "Execution boundary: implement exactly the Goal, In scope items, Allowed Paths, and Exit Criteria in this brief. Treat absent requirements as forbidden design space, not as permission to improve.",
+  "",
+  "Do not add optional features, alternate UX, extra integrations, migration paths, compatibility behavior, fallback behavior, telemetry, broad cleanup, refactors, new abstractions, extra docs, or polish unless that work is explicitly listed under In scope or required by Exit Criteria.",
+  "",
+  "If you discover useful additional work, record it under Out of scope / Future work in the notes or review artifact. Do not implement it. Do not end with unsolicited offers to do more work.",
+  "",
+  "If the requested outcome cannot be completed without expanding scope, fail closed: stop, name the missing decision, and cite the exact file/section that blocks execution.",
+].join("\n");
+
+function setupFakeHome(prefix: string) {
+  const root = mkdtempSync(join(tmpdir(), `${prefix}-`));
+  const home = join(root, "home");
+  mkdirSync(home, { recursive: true });
+  return { root, home };
+}
+
+let runtimeSequence = 0;
+
+function prepareInstallerRuntime(home: string, sourceDir: string) {
+  const packageRoot = join(dirname(home), `package-runtime-${runtimeSequence++}`);
+  const runtimeScript = join(packageRoot, "scripts/install-agent-fleet.sh");
+  mkdirSync(join(packageRoot, "scripts"), { recursive: true });
+  mkdirSync(join(packageRoot, "agents"), { recursive: true });
+  cpSync(SCRIPT, runtimeScript);
+  symlinkSync(join(ROOT, "src"), join(packageRoot, "src"), "dir");
+  chmodSync(runtimeScript, 0o755);
+  cpSync(sourceDir, join(packageRoot, "agents/fleet"), { recursive: true });
+  return { packageRoot, runtimeScript };
+}
+
+function runInstaller(
+  home: string,
+  sourceDir: string,
+  args: string[] = [],
+  extraEnv: Record<string, string> = {},
+) {
+  const runtime = prepareInstallerRuntime(home, sourceDir);
+  return spawnSync("bash", [runtime.runtimeScript, ...args], {
+    cwd: ROOT,
+    encoding: "utf-8",
+    env: {
+      ...process.env,
+      HOME: home,
+      ...extraEnv,
+    },
+  });
+}
+
+describe("install-agent-fleet", () => {
+  test("upgrades receipt-owned fleet files and preserves subsequent user edits", () => {
+    const { root, home } = setupFakeHome("fleet-owned-upgrade");
+    const env = { ...process.env, HOME: home };
+    try {
+      expect(runInstaller(home, FLEET_SOURCE_DIR).status).toBe(0);
+      const paths = AGENTS.flatMap(agent => [join(home, ".claude/agents", `${agent}.md`), join(home, ".codex/agents", `${agent}.toml`)]);
+      recordInstallOwnership(paths, env);
+      for (const path of paths) expect(installProfileHostMutationPaths(env)).toContain(path);
+      const next = join(root, "next");
+      cpSync(FLEET_SOURCE_DIR, next, { recursive: true });
+      for (const agent of AGENTS) {
+        const file = join(next, `${agent}.md`);
+        writeFileSync(file, readFileSync(file, "utf8") + "\nUpdated role instruction.\n");
+      }
+      const result = runInstaller(home, next);
+      expect(result.status).toBe(0);
+      recordInstallOwnership(paths, env);
+      for (const host of [".claude", ".codex"]) {
+        const file = join(home, host, "agents", `harness-evaluator.${host === ".claude" ? "md" : "toml"}`);
+        expect(readFileSync(file, "utf8")).toContain("Updated role instruction.");
+        writeFileSync(file, readFileSync(file, "utf8") + "\n# User edit\n");
+      }
+      const blocked = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(blocked.status).toBe(1);
+      expect(blocked.stdout).toContain("harness-evaluator.md: drift");
+      expect(blocked.stdout).toContain("harness-evaluator.toml: drift");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test("fresh install writes claude .md byte-identical to source and codex .toml byte-identical to golden", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-fresh");
+    try {
+      const res = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(res.status).toBe(0);
+
+      for (const agent of AGENTS) {
+        expect(res.stdout).toContain(`[fleet] claude/${agent}.md: installed`);
+        expect(res.stdout).toContain(`[fleet] codex/${agent}.toml: installed`);
+
+        const installedClaude = readFileSync(join(home, ".claude/agents", `${agent}.md`), "utf-8");
+        const sourceClaude = readFileSync(join(FLEET_SOURCE_DIR, `${agent}.md`), "utf-8");
+        expect(installedClaude).toBe(sourceClaude);
+
+        const installedCodex = readFileSync(join(home, ".codex/agents", `${agent}.toml`), "utf-8");
+        const golden = readFileSync(join(GOLDEN_CODEX_DIR, `${agent}.toml`), "utf-8");
+        const expected = CODEX_EXPECTATIONS[agent];
+        expect(installedCodex).toBe(golden);
+        expect(installedCodex).toContain(`model = "${expected.model}"`);
+        expect(installedCodex).toContain(`model_reasoning_effort = "${expected.effort}"`);
+        expect(installedCodex).toContain(expected.descriptionLabel);
+        expect(installedCodex).toContain(`sandbox_mode = "${expected.sandboxMode}"`);
+        expect(installedCodex).not.toContain(expected.sourceDescription);
+        expect(installedCodex).not.toMatch(/\b(?:fable|opus|sonnet|haiku)\b/i);
+      }
+
+      expect(readdirSync(join(home, ".claude/agents")).sort()).toEqual(AGENTS.map(agent => `${agent}.md`).sort());
+      expect(readdirSync(join(home, ".codex/agents")).sort()).toEqual(AGENTS.map(agent => `${agent}.toml`).sort());
+      // The orchestrator is a seat (`rh seats argv orchestrator`), not a fleet role.
+      expect(res.stdout).not.toContain("orchestrator");
+      expect(existsSync(join(home, ".claude/agents/orchestrator.md"))).toBe(false);
+      expect(existsSync(join(home, ".codex/agents/orchestrator.toml"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("idempotent re-run reports up-to-date for all six files", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-idempotent");
+    try {
+      expect(runInstaller(home, FLEET_SOURCE_DIR).status).toBe(0);
+      const second = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(second.status).toBe(0);
+      for (const agent of AGENTS) {
+        expect(second.stdout).toContain(`[fleet] claude/${agent}.md: up-to-date`);
+        expect(second.stdout).toContain(`[fleet] codex/${agent}.toml: up-to-date`);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("local modification to an installed target is preserved and reported as drift", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-drift");
+    try {
+      expect(runInstaller(home, FLEET_SOURCE_DIR).status).toBe(0);
+      const target = join(home, ".codex/agents/deep-reasoner.toml");
+      const locallyEdited = [
+        'developer_instructions = """escaped delimiter: \\"""',
+        'name = "harness-evaluator"',
+        'still part of developer instructions"""',
+        'name = "deep-reasoner # local"',
+        'description = "identity-correct local drift"',
+        'model = "gpt-5.6-sol"',
+        'model_reasoning_effort = "xhigh"',
+        'sandbox_mode = "read-only"',
+        "",
+      ].join("\n");
+      writeFileSync(target, locallyEdited);
+
+      const second = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(second.status).not.toBe(0);
+      expect(second.stdout).toContain("[fleet] codex/deep-reasoner.toml: drift");
+      expect(readFileSync(target, "utf-8")).toBe(locallyEdited);
+
+      const claudeTarget = join(home, ".claude/agents/deep-reasoner.md");
+      const quotedIdentityEdit = `${readFileSync(claudeTarget, "utf-8")
+        .replace("name: deep-reasoner", 'name: "deep-reasoner" # local style')
+        .replace("\n---\n", "\nmetadata:\n  name: harness-evaluator\n---\n")}\n# preserve-me\n`;
+      writeFileSync(claudeTarget, quotedIdentityEdit);
+      const third = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(third.status).not.toBe(0);
+      expect(third.stdout).toContain("[fleet] claude/deep-reasoner.md: drift");
+      expect(readFileSync(claudeTarget, "utf-8")).toBe(quotedIdentityEdit);
+
+      const ambiguousYamlIdentityEdit = quotedIdentityEdit.replace('name: "deep-reasoner" # local style', "name: null");
+      writeFileSync(claudeTarget, ambiguousYamlIdentityEdit);
+      const fourth = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(fourth.status).not.toBe(0);
+      expect(fourth.stdout).toContain("[fleet] claude/deep-reasoner.md: drift");
+      expect(readFileSync(claudeTarget, "utf-8")).toBe(ambiguousYamlIdentityEdit);
+
+      const duplicateYamlIdentityEdit = quotedIdentityEdit.replace(
+        'name: "deep-reasoner" # local style',
+        "name: deep-reasoner\nname: harness-evaluator",
+      );
+      writeFileSync(claudeTarget, duplicateYamlIdentityEdit);
+      const fifth = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(fifth.status).not.toBe(0);
+      expect(fifth.stdout).toContain("[fleet] claude/deep-reasoner.md: drift");
+      expect(readFileSync(claudeTarget, "utf-8")).toBe(duplicateYamlIdentityEdit);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an explicitly accepted user-managed fleet remains idempotent until an accepted file changes", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-user-managed");
+    try {
+      expect(runInstaller(home, FLEET_SOURCE_DIR).status).toBe(0);
+      const claudeTarget = join(home, ".claude/agents/deep-reasoner.md");
+      const codexTarget = join(home, ".codex/agents/explorer.toml");
+      const customClaude = readFileSync(claudeTarget, "utf-8")
+        .replaceAll("Opus at xhigh effort", "Opus at max effort")
+        .replace("effort: xhigh", "effort: max");
+      const customCodex = readFileSync(codexTarget, "utf-8")
+        .replace('model = "gpt-6-luna"', 'model = "gpt-6.1-sol"');
+      writeFileSync(claudeTarget, customClaude);
+      writeFileSync(codexTarget, customCodex);
+
+      const accepted = runInstaller(home, FLEET_SOURCE_DIR, ["--accept-user-managed"]);
+      expect(accepted.status).toBe(0);
+      expect(accepted.stdout).toContain("[fleet] user-managed records: accepted 2 files");
+      expect(readFileSync(claudeTarget, "utf-8")).toBe(customClaude);
+      expect(readFileSync(codexTarget, "utf-8")).toBe(customCodex);
+
+      const acceptedRecords = userManagedRecords(home);
+      expect(Object.keys(acceptedRecords).sort()).toEqual([claudeTarget, codexTarget].map((path) => pathRecordKey({ HOME: home }, path)).sort());
+      expect(Object.values(acceptedRecords).every((record) => record.owner === "core" && record.committed.type === "file"
+        && /^sha256:[a-f0-9]{64}$/.test(record.committed.sha256))).toBe(true);
+
+      const repeated = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(repeated.status).toBe(0);
+      expect(repeated.stdout).toContain("[fleet] claude/deep-reasoner.md: user-managed");
+      expect(repeated.stdout).toContain("[fleet] codex/explorer.toml: user-managed");
+      expect(readFileSync(claudeTarget, "utf-8")).toBe(customClaude);
+      expect(readFileSync(codexTarget, "utf-8")).toBe(customCodex);
+
+      const changedAfterAcceptance = `${customCodex}# changed after acceptance\n`;
+      writeFileSync(codexTarget, changedAfterAcceptance);
+      const staleReceipt = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(staleReceipt.status).not.toBe(0);
+      expect(staleReceipt.stdout).toContain("[fleet] codex/explorer.toml: drift");
+      expect(readFileSync(codexTarget, "utf-8")).toBe(changedAfterAcceptance);
+
+      const forced = runInstaller(home, FLEET_SOURCE_DIR, ["--force"]);
+      expect(forced.status).toBe(0);
+      expect(userManagedRecords(home)).toEqual({});
+      expect(readFileSync(codexTarget, "utf-8")).toBe(
+        readFileSync(join(GOLDEN_CODEX_DIR, "explorer.toml"), "utf-8"),
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("--accept-user-managed rejects malformed or role-mismatched files without writing a record", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-user-managed-invalid");
+    try {
+      expect(runInstaller(home, FLEET_SOURCE_DIR).status).toBe(0);
+      const target = join(home, ".claude/agents/deep-reasoner.md");
+      writeFileSync(
+        target,
+        readFileSync(target, "utf-8").replace("name: deep-reasoner", "name: harness-evaluator"),
+      );
+
+      const accepted = runInstaller(home, FLEET_SOURCE_DIR, ["--accept-user-managed"]);
+      expect(accepted.status).not.toBe(0);
+      expect(accepted.stdout).toContain("[fleet] claude/deep-reasoner.md: user-managed-invalid");
+      expect(userManagedRecords(home)).toEqual({});
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test.each([
+    ["claude", "md", "none"], ["codex", "toml", "none"],
+    ["claude", "md", "stale"], ["codex", "toml", "stale"],
+  ] as const)("--force keeps %s/%s user bytes and mode in the vault (prior ownership: %s), prints a working restore command, and a revert keeps a later user edit", (host, ext, owned) => {
+    const { root, home } = setupFakeHome("install-agent-fleet-user's home");
+    try {
+      expect(runInstaller(home, FLEET_SOURCE_DIR).status).toBe(0);
+      const file = `deep-reasoner.${ext}`;
+      const target = join(home, `.${host}/agents`, file);
+      if (owned === "stale") recordInstallOwnership([target], { ...process.env, HOME: home });
+      const original = Buffer.from([0x75, 0x73, 0x65, 0x72, 0x00, 0xff, 0x0a]);
+      writeFileSync(target, original);
+      chmodSync(target, 0o640);
+
+      const forced = runInstaller(home, FLEET_SOURCE_DIR, ["--force"]);
+      expect(forced.status).toBe(0);
+      const line = forced.stdout.split("\n").find(line => line.startsWith(`[fleet] ${host}/${file}:`));
+      const replacement = /: replaced \(backup: (.*); restore: (.*)\)$/.exec(line ?? "");
+      expect(replacement).not.toBeNull();
+      const [, backup, restore] = replacement!;
+      expect(dirname(backup)).toBe(join(home, ".repo-harness/config/vault"));
+      expect(statSync(dirname(backup)).mode & 0o777).toBe(0o700);
+      expect(readFileSync(backup)).toEqual(original);
+      expect(existsSync(join(home, ".repo-harness/replaced-agents"))).toBe(false);
+      const generated = join(host === "claude" ? FLEET_SOURCE_DIR : GOLDEN_CODEX_DIR, file);
+      expect(readFileSync(target)).toEqual(readFileSync(generated));
+      expect(spawnSync("sh", ["-c", restore], { cwd: root, env: { ...process.env, HOME: home } }).status).toBe(0);
+      expect(readFileSync(target)).toEqual(original);
+      expect(statSync(target).mode & 0o777).toBe(0o640);
+      // The record is `replaced`: the gate revert gives the user file back while the file holds rh's bytes.
+      expect(runInstaller(home, FLEET_SOURCE_DIR, ["--force"]).status).toBe(0);
+      expect(readPathRecords({ HOME: home })[pathRecordKey({ HOME: home }, target)]?.kind).toBe("replaced");
+      const gate = openHostConfigGate({ env: { HOME: home } });
+      expect(gate.revertPaths([target]).map((entry) => entry.action)).toEqual(["restored"]);
+      expect(readFileSync(target)).toEqual(original);
+      expect(runInstaller(home, FLEET_SOURCE_DIR, ["--force"]).status).toBe(0);
+      writeFileSync(target, "user edit after --force\n");
+      expect(gate.revertPaths([target]).map((entry) => entry.action)).toEqual(["kept_edited"]);
+      expect(readFileSync(target, "utf8")).toBe("user edit after --force\n");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test.each([
+    ["read-only state directory", "both"], ["unreadable sources", "both"],
+    ["mixed replacements", "claude"], ["mixed replacements", "codex"],
+  ])("--force keeps the user-managed records of the files it cannot replace with %s (failed host: %s)", (failure, failedHost) => {
+    const { root, home } = setupFakeHome("install-agent-fleet-backup-failure");
+    const stateDir = join(home, ".repo-harness");
+    // The gate keeps its vault and ledger here.
+    const configDir = join(stateDir, "config");
+    try {
+      expect(runInstaller(home, FLEET_SOURCE_DIR).status).toBe(0);
+      const targets = [["claude", "md"], ["codex", "toml"]].map(([host, ext]) => {
+        const file = `explorer.${ext}`;
+        const path = join(home, `.${host}/agents`, file);
+        const generated = readFileSync(path, "utf8");
+        const custom = `${generated}\n# user agent\n`;
+        writeFileSync(path, custom);
+        return { host, file, path, generated, custom, blocked: failedHost === "both" || failedHost === host };
+      });
+      expect(runInstaller(home, FLEET_SOURCE_DIR, ["--accept-user-managed"]).status).toBe(0);
+      const receipt = userManagedRecords(home);
+      expect(Object.keys(receipt)).toHaveLength(2);
+      if (failure === "read-only state directory") chmodSync(configDir, 0o500);
+      else for (const target of targets) if (target.blocked) chmodSync(target.path, 0o200);
+
+      const failed = runInstaller(home, FLEET_SOURCE_DIR, ["--force"]);
+      expect(failed.status).toBe(1);
+      for (const target of targets) {
+        expect(failed.stdout).toContain(`[fleet] ${target.host}/${target.file}: ${target.blocked ? "backup-failed" : "replaced (backup:"}`);
+        if (target.blocked && failure !== "read-only state directory") chmodSync(target.path, 0o600);
+        expect(readFileSync(target.path, "utf8")).toBe(target.blocked ? target.custom : target.generated);
+      }
+      // A replaced file's record is `replaced` now: it holds the vault reference of the user file.
+      const kept = Object.fromEntries(Object.entries(receipt).filter(([key]) => targets.some((target) => target.blocked && pathRecordKey({ HOME: home }, target.path) === key)));
+      expect(userManagedRecords(home)).toEqual(kept);
+      const vault = join(stateDir, "config", "vault");
+      // The vault's storage guard (#2854) is not a copy.
+      expect(existsSync(vault) ? readdirSync(vault).filter((name) => name !== ".gitignore") : []).toHaveLength(failedHost === "both" ? 0 : 1);
+
+      chmodSync(configDir, 0o700);
+      const normal = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(normal.status).toBe(0);
+      for (const target of targets) {
+        expect(normal.stdout).toContain(`[fleet] ${target.host}/${target.file}: ${target.blocked ? "user-managed" : "up-to-date"}`);
+      }
+      expect(userManagedRecords(home)).toEqual(kept);
+      expect(runInstaller(home, FLEET_SOURCE_DIR, ["--force"]).status).toBe(0);
+      expect(userManagedRecords(home)).toEqual({});
+    } finally {
+      chmodSync(configDir, 0o700);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("the replaced-agents copies of an older --force move to the vault once, also across a fleet change; a file that --force did not write stops the migration", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-replaced-agents");
+    try {
+      // An older fleet version wrote the file; this run imports the copy and then refreshes the file.
+      const older = join(root, "older");
+      cpSync(FLEET_SOURCE_DIR, older, { recursive: true });
+      writeFileSync(join(older, "explorer.md"), `${readFileSync(join(older, "explorer.md"), "utf8")}\nOlder role instruction.\n`);
+      expect(runInstaller(home, older).status).toBe(0);
+      const dir = join(home, ".repo-harness/replaced-agents");
+      const target = join(home, ".claude/agents/explorer.md");
+      const earliest = join(dir, "claude-explorer.md.2026-01-01T00-00-00-000Z-1.bak");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "claude-explorer.md.2026-01-02T00-00-00-000Z-2.bak"), "later\n");
+      writeFileSync(earliest, "original\n");
+      const migrated = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(migrated.status).toBe(0);
+      expect(migrated.stdout).toContain(`[fleet] ${target}: the user file in ${earliest} is now in the rh vault`);
+      expect(migrated.stdout).toContain("[fleet] claude/explorer.md: installed");
+      expect(readPathRecords({ HOME: home })[pathRecordKey({ HOME: home }, target)]?.kind).toBe("replaced");
+      expect(runInstaller(home, FLEET_SOURCE_DIR).stdout).not.toContain("is now in the rh vault");
+      expect(openHostConfigGate({ env: { HOME: home } }).revertPaths([target]).map((entry) => entry.action)).toEqual(["restored"]);
+      expect(readFileSync(target, "utf8")).toBe("original\n");
+      writeFileSync(join(dir, "notes.txt"), "mine\n");
+      const stray = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(stray.status).not.toBe(0);
+      expect(stray.stderr).toContain(`${join(dir, "notes.txt")} is not a fleet copy that rh wrote`);
+      expect(readFileSync(target, "utf8")).toBe("original\n");
+
+      // The revert released the record and the copies stay. A generated copy that the user puts back has no record:
+      // its import proves nothing, so the uninstall keeps the user's file and names the vault copy.
+      rmSync(join(dir, "notes.txt"));
+      const generated = readFileSync(join(FLEET_SOURCE_DIR, "explorer.md"), "utf8");
+      writeFileSync(target, generated);
+      const reinstalled = runInstaller(home, FLEET_SOURCE_DIR);
+      expect([reinstalled.status, reinstalled.stdout]).toEqual([0, expect.stringContaining(`[fleet] ${target}: the user file in ${earliest} is now in the rh vault; no record proves that rh wrote the file there now, so rh uninstall keeps it and names the vault copy`)]);
+      const [kept] = openHostConfigGate({ env: { HOME: home } }).revertPaths([target]);
+      expect({ action: kept?.action, code: kept?.code, file: readFileSync(target, "utf8") })
+        .toEqual({ action: "kept_edited", code: "host_config_identity_missing", file: generated });
+      expect(readFileSync(kept!.vault!, "utf8")).toBe("original\n");
+
+      const forced = runInstaller(home, FLEET_SOURCE_DIR, ["--force"]);
+      expect(forced.status, forced.stdout + forced.stderr).toBe(0);
+      expect(forced.stdout).toContain("[fleet] claude/explorer.md: replaced (backup:");
+      const [restored] = openHostConfigGate({ env: { HOME: home } }).revertPaths([target]);
+      expect([restored?.action, readFileSync(target, "utf8")]).toEqual(["restored", generated]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("--force does not write through an agent link: a link to a user file and a dangling link are refused per file; a record of an earlier release keeps its link", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-linked");
+    try {
+      const [existing, dangling] = [join(home, "dotfiles/explorer.md"), join(home, "dotfiles/deep-reasoner.md")];
+      const [linked, unborn] = [join(home, ".claude/agents/explorer.md"), join(home, ".claude/agents/deep-reasoner.md")];
+      mkdirSync(join(home, "dotfiles"), { recursive: true });
+      mkdirSync(join(home, ".claude/agents"), { recursive: true });
+      writeFileSync(existing, "mine\n");
+      symlinkSync(existing, linked);
+      symlinkSync(dangling, unborn);
+      const forced = runInstaller(home, FLEET_SOURCE_DIR, ["--force"]);
+      expect(forced.status, forced.stdout + forced.stderr).toBe(1);
+      expect(forced.stdout).toContain(`[fleet] claude/explorer.md: refused (this path is a link to ${existing}, and the user's word to replace a file does not reach through a link`);
+      expect(forced.stdout).toContain(`[fleet] claude/deep-reasoner.md: refused (this path is a link to the missing ${dangling}, so rh creates nothing through it`);
+      expect(forced.stdout).toContain("[fleet] claude/harness-evaluator.md: installed");
+      const records = readPathRecords({ HOME: home });
+      expect({ existing: readFileSync(existing, "utf8"), dangling: existsSync(dangling), recorded: [linked, unborn].map((path) => pathRecordKey({ HOME: home }, path) in records) })
+        .toEqual({ existing: "mine\n", dangling: false, recorded: [false, false] });
+
+      // A replaced record that an earlier release wrote through the link stays with the file that it replaced.
+      const ledgerPath = join(home, ".repo-harness/config/ledger.json");
+      const fleet = readFileSync(join(FLEET_SOURCE_DIR, "explorer.md"));
+      writeFileSync(existing, fleet);
+      const backup = putVault(hostConfigPaths({ HOME: home }), Buffer.from("mine\n"));
+      const ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      ledger.paths[pathRecordKey({ HOME: home }, linked)] = { owner: "core", host: "claude", kind: "replaced", baseline: { state: "known", existed: true, sha256: sha256Prefixed(Buffer.from("mine\n")) },
+        committed: { type: "file", sha256: sha256Prefixed(fleet) }, backup, link_target: existing, identity: observeEntryIdentity(existing) };
+      writeFileSync(ledgerPath, JSON.stringify(ledger));
+      const moved = join(home, "dotfiles/moved.md");
+      rmSync(linked);
+      symlinkSync(moved, linked);
+      const refused = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(refused.status).toBe(1);
+      expect(refused.stdout).toContain(`[fleet] claude/explorer.md: refused (rh replaced the user file ${existing} and keeps it in the vault, but this path now reaches ${moved}`);
+      expect(openHostConfigGate({ env: { HOME: home } }).revertPaths([linked]).map((entry) => entry.action)).toEqual(["kept_edited"]);
+      expect({ moved: existsSync(moved), record: readPathRecords({ HOME: home })[pathRecordKey({ HOME: home }, linked)] }).toMatchObject({ moved: false, record: { kind: "replaced", link_target: existing } });
+      rmSync(linked);
+      symlinkSync(existing, linked);
+      expect(openHostConfigGate({ env: { HOME: home } }).revertPaths([linked]).map((entry) => entry.action)).toEqual(["restored"]);
+      expect({ existing: readFileSync(existing, "utf8"), link: lstatSync(linked).isSymbolicLink() }).toEqual({ existing: "mine\n", link: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("--force makes no vault copies for absent or current rh-owned targets", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-force-no-backup");
+    const backupDir = join(home, ".repo-harness/config/vault");
+    try {
+      expect(runInstaller(home, FLEET_SOURCE_DIR, ["--force"]).status).toBe(0);
+      expect(existsSync(backupDir)).toBe(false);
+      expect(runInstaller(home, FLEET_SOURCE_DIR, ["--force"]).stdout).toContain("explorer.md: up-to-date");
+      expect(existsSync(backupDir)).toBe(false);
+      const targets = [join(home, ".claude/agents/explorer.md"), join(home, ".codex/agents/explorer.toml")];
+      const next = join(root, "next");
+      cpSync(FLEET_SOURCE_DIR, next, { recursive: true });
+      const source = join(next, "explorer.md");
+      writeFileSync(source, readFileSync(source, "utf8") + "\nUpdated role instruction.\n");
+      const upgraded = runInstaller(home, next, ["--force"]);
+      expect(upgraded.status).toBe(0);
+      expect(upgraded.stdout).toContain("[fleet] claude/explorer.md: installed");
+      expect(upgraded.stdout).toContain("[fleet] codex/explorer.toml: installed");
+      for (const target of targets) expect(readFileSync(target, "utf8")).toContain("Updated role instruction.");
+      expect(existsSync(backupDir)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("invalid frontmatter fails the whole source preflight before any target mutation", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-invalid");
+    const badSourceDir = join(root, "bad-source");
+    try {
+      mkdirSync(badSourceDir, { recursive: true });
+      for (const agent of AGENTS) {
+        cpSync(join(FLEET_SOURCE_DIR, `${agent}.md`), join(badSourceDir, `${agent}.md`));
+      }
+      const corrupted = readFileSync(join(badSourceDir, "harness-evaluator.md"), "utf-8").replace("effort: high", "effort: min");
+      writeFileSync(join(badSourceDir, "harness-evaluator.md"), corrupted);
+
+      const res = runInstaller(home, badSourceDir);
+      expect(res.status).not.toBe(0);
+      expect(res.stdout).toContain("[fleet] claude/harness-evaluator.md: source-invalid");
+      expect(res.stdout).toContain("[fleet] codex/harness-evaluator.toml: source-invalid");
+      expect(existsSync(join(home, ".claude/agents/harness-evaluator.md"))).toBe(false);
+      expect(existsSync(join(home, ".codex/agents/harness-evaluator.toml"))).toBe(false);
+      expect(existsSync(join(home, ".claude/agents/deep-reasoner.md"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a missing or unparseable source role identity fails the installer", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-missing-role-identity");
+    const badSourceDir = join(root, "bad-source");
+    try {
+      mkdirSync(badSourceDir, { recursive: true });
+      for (const agent of AGENTS) {
+        cpSync(join(FLEET_SOURCE_DIR, `${agent}.md`), join(badSourceDir, `${agent}.md`));
+      }
+      writeFileSync(
+        join(badSourceDir, "harness-evaluator.md"),
+        [
+          "---",
+          "- metadata:",
+          "    name: harness-evaluator",
+          "    description: nested identity is not root role metadata",
+          "    model: opus",
+          "    effort: max",
+          "---",
+          "nested role fixture",
+          "",
+        ].join("\n"),
+      );
+
+      const res = runInstaller(home, badSourceDir);
+      expect(res.status).not.toBe(0);
+      expect(res.stdout).toContain("[fleet] claude/harness-evaluator.md: source-invalid");
+      expect(res.stdout).toContain("[fleet] codex/harness-evaluator.toml: source-invalid");
+      expect(existsSync(join(home, ".codex/agents/harness-evaluator.toml"))).toBe(false);
+      expect(existsSync(join(home, ".codex/agents/deep-reasoner.toml"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a frontmatter name that does not match its source role fails closed", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-role-name-mismatch");
+    const badSourceDir = join(root, "bad-source");
+    try {
+      mkdirSync(badSourceDir, { recursive: true });
+      for (const agent of AGENTS) {
+        cpSync(join(FLEET_SOURCE_DIR, `${agent}.md`), join(badSourceDir, `${agent}.md`));
+      }
+      const corrupted = readFileSync(join(badSourceDir, "deep-reasoner.md"), "utf-8")
+        .replace("name: deep-reasoner", "name: harness-evaluator")
+        .replace("description:", "removed_description:");
+      writeFileSync(join(badSourceDir, "deep-reasoner.md"), corrupted);
+      const installedClaudeDir = join(home, ".claude/agents");
+      const installedCodexDir = join(home, ".codex/agents");
+      mkdirSync(installedClaudeDir, { recursive: true });
+      mkdirSync(installedCodexDir, { recursive: true });
+      writeFileSync(join(installedClaudeDir, "deep-reasoner.md"), corrupted);
+      writeFileSync(
+        join(installedCodexDir, "deep-reasoner.toml"),
+        '"name" = "harness-evaluator"\nsandbox_mode = "workspace-write"\n',
+      );
+
+      const res = runInstaller(home, badSourceDir);
+      expect(res.status).not.toBe(0);
+      expect(res.stdout).toContain("[fleet] claude/deep-reasoner.md: source-invalid");
+      expect(res.stdout).toContain("[fleet] codex/deep-reasoner.toml: source-invalid");
+      expect(readFileSync(join(home, ".claude/agents/deep-reasoner.md"), "utf-8")).toBe(corrupted);
+      expect(readFileSync(join(home, ".codex/agents/deep-reasoner.toml"), "utf-8")).toContain('"name" = "harness-evaluator"');
+      expect(existsSync(join(home, ".codex/agents/harness-evaluator.toml"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a corrected source refuses stale installed targets with mismatched role identities", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-stale-role-identity");
+    try {
+      const installedClaudeDir = join(home, ".claude/agents");
+      const installedCodexDir = join(home, ".codex/agents");
+      mkdirSync(installedClaudeDir, { recursive: true });
+      mkdirSync(installedCodexDir, { recursive: true });
+      const mismatchedClaude = readFileSync(join(FLEET_SOURCE_DIR, "deep-reasoner.md"), "utf-8")
+        .replace(/^---\n([\s\S]*?)\n---/, (_match, frontmatter) => {
+          const indented = String(frontmatter)
+            .split("\n")
+            .map((line) => `  ${line}`)
+            .join("\n");
+          return `---\n${indented}\n---`;
+        })
+        .replace("  name: deep-reasoner", "  name: harness-evaluator");
+      writeFileSync(join(installedClaudeDir, "deep-reasoner.md"), mismatchedClaude);
+      writeFileSync(
+        join(installedCodexDir, "deep-reasoner.toml"),
+        "  'name' = \"harness-evaluator\"\nsandbox_mode = \"workspace-write\"\n",
+      );
+
+      const res = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(res.status).not.toBe(0);
+      expect(res.stdout).toContain("[fleet] claude/deep-reasoner.md: drift");
+      expect(res.stdout).toContain("[fleet] codex/deep-reasoner.toml: drift");
+      expect(readFileSync(join(installedClaudeDir, "deep-reasoner.md"), "utf-8")).toBe(mismatchedClaude);
+      expect(readFileSync(join(installedCodexDir, "deep-reasoner.toml"), "utf-8")).toContain('"harness-evaluator"');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an invalid source leaves a stale installed target untouched", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-stale-role-invalid-source");
+    const badSourceDir = join(root, "bad-source");
+    try {
+      mkdirSync(badSourceDir, { recursive: true });
+      for (const agent of AGENTS) {
+        cpSync(join(FLEET_SOURCE_DIR, `${agent}.md`), join(badSourceDir, `${agent}.md`));
+      }
+      writeFileSync(
+        join(badSourceDir, "deep-reasoner.md"),
+        readFileSync(join(badSourceDir, "deep-reasoner.md"), "utf-8").replace("effort: xhigh", "effort: min"),
+      );
+      const installedCodexDir = join(home, ".codex/agents");
+      mkdirSync(installedCodexDir, { recursive: true });
+      writeFileSync(
+        join(installedCodexDir, "deep-reasoner.toml"),
+        'name = "harness-evaluator"\nsandbox_mode = "workspace-write"\n',
+      );
+
+      const res = runInstaller(home, badSourceDir);
+      expect(res.status).not.toBe(0);
+      expect(res.stdout).toContain("[fleet] codex/deep-reasoner.toml: source-invalid");
+      expect(readFileSync(join(installedCodexDir, "deep-reasoner.toml"), "utf-8")).toContain('name = "harness-evaluator"');
+      expect(existsSync(join(home, ".codex/agents/harness-evaluator.toml"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a provider-specific description that disagrees with the model mapping fails closed", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-description-mismatch");
+    const badSourceDir = join(root, "bad-source");
+    try {
+      mkdirSync(badSourceDir, { recursive: true });
+      for (const agent of AGENTS) {
+        cpSync(join(FLEET_SOURCE_DIR, `${agent}.md`), join(badSourceDir, `${agent}.md`));
+      }
+      const mismatched = readFileSync(join(badSourceDir, "harness-evaluator.md"), "utf-8").replace(
+        "Opus at high effort",
+        "an unspecified model",
+      );
+      writeFileSync(join(badSourceDir, "harness-evaluator.md"), mismatched);
+
+      const res = runInstaller(home, badSourceDir);
+      expect(res.status).not.toBe(0);
+      expect(res.stdout).toContain("[fleet] claude/harness-evaluator.md: source-invalid");
+      expect(res.stdout).toContain("[fleet] codex/harness-evaluator.toml: source-invalid");
+      expect(existsSync(join(home, ".codex/agents/harness-evaluator.toml"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("every managed role projects to both hosts", () => {
+    expect(MANAGED_AGENTS).toEqual(AGENTS);
+  });
+
+  test("a missing packaged source fails the whole preflight before any target mutation", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-partial-source");
+    const partialSourceDir = join(root, "partial-source");
+    try {
+      mkdirSync(partialSourceDir, { recursive: true });
+      cpSync(join(FLEET_SOURCE_DIR, "explorer.md"), join(partialSourceDir, "explorer.md"));
+      cpSync(join(FLEET_SOURCE_DIR, "deep-reasoner.md"), join(partialSourceDir, "deep-reasoner.md"));
+      // harness-evaluator.md deliberately absent from partialSourceDir.
+
+      const res = runInstaller(home, partialSourceDir);
+      expect(res.status).not.toBe(0);
+      expect(res.stdout).toContain("[fleet] claude/harness-evaluator.md: source-missing");
+      expect(res.stdout).toContain("[fleet] codex/harness-evaluator.toml: source-missing");
+      expect(existsSync(join(home, ".claude/agents/harness-evaluator.md"))).toBe(false);
+      expect(existsSync(join(home, ".claude/agents/deep-reasoner.md"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a decoy REPO_HARNESS_HELPER_SOURCE_PATH pointing at a different real helper still fails closed on a bad packaged fixture", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-decoy-helper-source-path");
+    const partialSourceDir = join(root, "partial-source");
+    try {
+      mkdirSync(partialSourceDir, { recursive: true });
+      cpSync(join(FLEET_SOURCE_DIR, "explorer.md"), join(partialSourceDir, "explorer.md"));
+      cpSync(join(FLEET_SOURCE_DIR, "deep-reasoner.md"), join(partialSourceDir, "deep-reasoner.md"));
+      // harness-evaluator.md deliberately absent from partialSourceDir, matching the
+      // "missing packaged source" fixture shape above.
+
+      // Simulates the real leak: rh verify exports its own
+      // resolved helper path (a different, real, unrelated packaged helper) into
+      // the environment; a nested bun test child then inherits it verbatim. The
+      // installer must reject this decoy (its basename does not match the
+      // runtime script's own $0) and keep resolving package_root from $0.
+      const decoyHelperSourcePath = join(ROOT, "scripts/verify-sprint.sh");
+      expect(existsSync(decoyHelperSourcePath)).toBe(true);
+
+      const res = runInstaller(home, partialSourceDir, [], {
+        REPO_HARNESS_HELPER_SOURCE_PATH: decoyHelperSourcePath,
+      });
+      expect(res.status).not.toBe(0);
+      expect(res.stdout).toContain("[fleet] claude/harness-evaluator.md: source-missing");
+      expect(res.stdout).toContain("[fleet] codex/harness-evaluator.toml: source-missing");
+      expect(existsSync(join(home, ".claude/agents/harness-evaluator.md"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("total failure (no source, no pre-existing targets) exits non-zero", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-total-failure");
+    const emptySourceDir = join(root, "empty-source");
+    try {
+      mkdirSync(emptySourceDir, { recursive: true });
+      const res = runInstaller(home, emptySourceDir);
+      expect(res.status).not.toBe(0);
+      for (const agent of AGENTS) {
+        expect(res.stdout).toContain(`[fleet] claude/${agent}.md: source-missing`);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("missing packaged source leaves existing targets untouched across retries", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-persistent-remediation-failure");
+    const partialSourceDir = join(root, "partial-source");
+    try {
+      mkdirSync(partialSourceDir, { recursive: true });
+      cpSync(join(FLEET_SOURCE_DIR, "explorer.md"), join(partialSourceDir, "explorer.md"));
+      cpSync(join(FLEET_SOURCE_DIR, "deep-reasoner.md"), join(partialSourceDir, "deep-reasoner.md"));
+
+      const installedCodexDir = join(home, ".codex/agents");
+      mkdirSync(installedCodexDir, { recursive: true });
+      writeFileSync(
+        join(installedCodexDir, "harness-evaluator.toml"),
+        'name = "explorer"\nsandbox_mode = "workspace-write"\n',
+      );
+
+      const first = runInstaller(home, partialSourceDir);
+      expect(first.status).not.toBe(0);
+      expect(first.stdout).toContain("[fleet] codex/harness-evaluator.toml: source-missing");
+      expect(readFileSync(join(installedCodexDir, "harness-evaluator.toml"), "utf-8")).toContain('name = "explorer"');
+
+      const second = runInstaller(home, partialSourceDir);
+      expect(second.status).not.toBe(0);
+      expect(second.stdout).toContain("[fleet] codex/harness-evaluator.toml: source-missing");
+      expect(readFileSync(join(installedCodexDir, "harness-evaluator.toml"), "utf-8")).toContain('name = "explorer"');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("--help exits zero and does not create any HOME state", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-help");
+    try {
+      const res = runInstaller(home, FLEET_SOURCE_DIR, ["--help"]);
+      expect(res.status).toBe(0);
+      expect(res.stdout).toContain("Usage:");
+      expect(existsSync(join(home, ".claude"))).toBe(false);
+      expect(existsSync(join(home, ".codex"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("the installer declares Bun as its only semantic parser runtime", () => {
+    const source = readFileSync(SCRIPT, "utf-8");
+    expect(source).toContain("install-agent-fleet.sh requires bun");
+    expect(source).toContain('MIN_BUN_VERSION="1.4.0"');
+    expect(source).toContain("Bun.TOML.parse(");
+    expect(source).not.toContain("install-agent-fleet.sh requires node or bun");
+    expect(source).toContain('AGENT_FLEET_SOURCE_DIR="$package_root/agents/fleet"');
+    expect(source).not.toContain("REPO_HARNESS_FLEET_SOURCE_DIR");
+    expect(source).not.toContain('spawnSync("curl"');
+    expect(source).toContain('src/effects/terminal/task-role-profiles.ts');
+    expect([...WRITABLE_AGENTS]).toEqual(['harness-evaluator']);
+    expect(source).toContain("if (WRITABLE_AGENTS.has(agent))");
+  }, 30_000);
+
+  test("an unsupported Bun version fails before creating HOME state", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-old-bun");
+    const fakeBin = join(root, "bin");
+    const fakeBun = join(fakeBin, "bun");
+    try {
+      mkdirSync(fakeBin, { recursive: true });
+      writeFileSync(
+        fakeBun,
+        ['#!/bin/sh', 'if [ "$1" = "--version" ]; then', "  echo 1.3.14", "  exit 0", "fi", "exit 99", ""].join("\n"),
+      );
+      chmodSync(fakeBun, 0o755);
+      const res = spawnSync("bash", [SCRIPT], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+          REPO_HARNESS_BUN_BIN: "",
+        },
+      });
+      expect(res.status).not.toBe(0);
+      expect(res.stderr).toContain("requires Bun >= 1.4.0 (found: 1.3.14)");
+      expect(existsSync(join(home, ".claude"))).toBe(false);
+      expect(existsSync(join(home, ".codex"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an invalid explicit Bun fails closed despite a supported PATH Bun", () => {
+    const { root, home } = setupFakeHome("fleet-explicit-bun-invalid");
+    try {
+      const supportedBin = join(root, "supported-bin");
+      mkdirSync(supportedBin);
+      writeBunWrapper(root, join(supportedBin, "bun"));
+      const result = runInstaller(home, FLEET_SOURCE_DIR, [], {
+        REPO_HARNESS_BUN_BIN: join(root, "missing-runtime"),
+        PATH: `${supportedBin}:${process.env.PATH}`,
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("requires bun");
+      expect(existsSync(join(home, ".claude"))).toBe(false);
+      expect(existsSync(join(home, ".codex"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a supported HOME Bun wins when PATH resolves an unsupported Bun", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-home-bun-fallback");
+    const fakeBin = join(root, "bin");
+    const oldBun = join(fakeBin, "bun");
+    const homeBun = join(home, ".bun/bin/bun");
+    try {
+      mkdirSync(fakeBin, { recursive: true });
+      mkdirSync(join(home, ".bun/bin"), { recursive: true });
+      writeFileSync(
+        oldBun,
+        ['#!/bin/sh', 'if [ "$1" = "--version" ]; then', "  echo 1.3.14", "  exit 0", "fi", "exit 99", ""].join("\n"),
+      );
+      writeFileSync(
+        homeBun,
+        [
+          "#!/bin/sh",
+          'if [ "$1" = "--version" ]; then',
+          "  echo 1.4.0",
+          "  exit 0",
+          "fi",
+          `exec ${JSON.stringify(process.execPath)} "$@"`,
+          "",
+        ].join("\n"),
+      );
+      chmodSync(oldBun, 0o755);
+      chmodSync(homeBun, 0o755);
+      const res = spawnSync("bash", [SCRIPT], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+          REPO_HARNESS_BUN_BIN: "",
+        },
+      });
+      expect(res.status).toBe(0);
+      expect(res.stdout).toContain("[fleet] codex/harness-evaluator.toml: installed");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a handed-off Bun below the version floor fails closed instead of falling back to PATH discovery", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-handoff-below-floor");
+    const fakeBin = join(root, "bin");
+    const handoffBun = join(root, "handoff", "bun");
+    const homeBun = join(home, ".bun/bin/bun");
+    try {
+      mkdirSync(fakeBin, { recursive: true });
+      mkdirSync(dirname(handoffBun), { recursive: true });
+      mkdirSync(join(home, ".bun/bin"), { recursive: true });
+      // The handed-off Bun (what a caller like `global-runtime.ts` already
+      // validated) is below the version floor.
+      writeFileSync(
+        handoffBun,
+        ['#!/bin/sh', 'if [ "$1" = "--version" ]; then', "  echo 1.3.14", "  exit 0", "fi", "exit 99", ""].join("\n"),
+      );
+      // A supported Bun sits at the HOME fallback location the pre-fix
+      // discovery loop would have found. The fail-closed handoff must never
+      // reach it: a caller that already validated a Bun gets that Bun
+      // exclusively, not a silent substitute.
+      writeFileSync(
+        homeBun,
+        [
+          "#!/bin/sh",
+          'if [ "$1" = "--version" ]; then',
+          "  echo 1.4.0",
+          "  exit 0",
+          "fi",
+          `exec ${JSON.stringify(process.execPath)} "$@"`,
+          "",
+        ].join("\n"),
+      );
+      chmodSync(handoffBun, 0o755);
+      chmodSync(homeBun, 0o755);
+      const res = spawnSync("bash", [SCRIPT], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+          REPO_HARNESS_BUN_BIN: handoffBun,
+        },
+      });
+      expect(res.status).not.toBe(0);
+      expect(res.stderr).toContain("requires Bun >= 1.4.0 (found: 1.3.14)");
+      expect(existsSync(join(home, ".claude"))).toBe(false);
+      expect(existsSync(join(home, ".codex"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("generated developer_instructions carries the role body only, never the EXECUTION_BOUNDARY clause", () => {
+    const { root, home } = setupFakeHome("install-agent-fleet-boundary");
+    try {
+      // The installer no longer owns the clause at all: neither its source nor any
+      // generated persona may carry a paragraph of it.
+      const installerSource = readFileSync(SCRIPT, "utf-8");
+      for (const paragraph of CANONICAL_BOUNDARY_TEXT.split("\n\n")) {
+        expect(installerSource).not.toContain(paragraph);
+      }
+
+      const res = runInstaller(home, FLEET_SOURCE_DIR);
+      expect(res.status).toBe(0);
+      for (const agent of AGENTS) {
+        const toml = readFileSync(join(home, ".codex/agents", `${agent}.toml`), "utf-8");
+        for (const paragraph of CANONICAL_BOUNDARY_TEXT.split("\n\n")) {
+          expect(toml).not.toContain(paragraph);
+        }
+        // The persona body itself is still projected: developer_instructions ends
+        // with the source body's final line, not with an appended boundary block.
+        const sourceBody = readFileSync(join(FLEET_SOURCE_DIR, `${agent}.md`), "utf-8").trimEnd();
+        const lastBodyLine = sourceBody.slice(sourceBody.lastIndexOf("\n") + 1);
+        expect(toml).toContain(`${lastBodyLine}'''`);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+});

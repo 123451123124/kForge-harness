@@ -1,0 +1,121 @@
+# Operator Console Design Material
+
+Design material for the operator console redesign. The design brief is
+[`../../prds/DESIGN-operator-console-uiux.md`](../../prds/DESIGN-operator-console-uiux.md) and
+the PRD is the snapshot
+[`docs/prds/20261026-2310-operator-console-uiux.prd.md`](../../prds/20261026-2310-operator-console-uiux.prd.md)
+(rev 269). Where this file and the design brief disagree, the brief wins.
+
+| Material | Where |
+| --- | --- |
+| Design canvas (21 artboards, light/dark) | Claude design artifact: https://claude.ai/artifact/JVJiUztNTXwx1wvmFwdcyw (private until shared). Read for the brief at version `1793028533-d1e8` (`project/canvas.json` sha256 `61876184…4e6a7a`) |
+| Design system (live) | Claude design-system artifact: https://claude.ai/artifact/JyoYEw29VBRwmBRnnKf3TT (private until shared). Read at version `1793028749-cefd` |
+| Design system (repo copy) | [`design-system/`](design-system/README.md): README, `tokens.json`, component guidelines, logos and mascots |
+| Architecture History view (#1300) | [`mockups/1300-architecture-history.html`](mockups/1300-architecture-history.html): self-contained HTML. Timeline, milestone map, delta styles for added, removed and renamed nodes and changed relations, and six states. Data is the repo-harness model at 28 real milestones, aggregated per capability in the `archctx history` v1 shape |
+| Board pixel office | [`mockups/board-pixel-office.html`](mockups/board-pixel-office.html): self-contained HTML export of the Claude design artifact https://claude.ai/artifact/VqtiVnoZtx8iSwZMMAHV5x at version `1793824409-e933` (private until shared; S0 art direction, #1790). Three views: all-offices overview with room popups, one room per repo, and states with agent heads, Claude Code outfits and actions, desk states, the boss sprite sheet and the palette. Every scene is one 16 px pixel grid drawn at 3x (2x below 1100 px and in popups) from one 32-colour palette with a day and a night set (`--px-*` tokens). The room is a 3/4 top-down office: back wall with window, clock, plan whiteboard and MAIN door; a stage for the orchestrator and the advisor; worker desks up to the seat limit, and roped, covered desks above it; a CI tower beside each desk in CI; the acceptance queue on yellow floor tape; the batch cart of 6. Claude agents are the official Claude Code pixel mascot; Codex agents are a blue pixel owl; other and unknown agents are people in grey and white caps. A Claude agent wears one of 8 outfits (cap, beanie, crown, scarf, headset, glasses, bow tie or none); the outfit identifies the seat, not a state. Its action follows the seat state and the boss command: typing, sipping coffee while CI runs, hands up when CI fails, slumped when stalled, waving in the queue, thinking as a busy advisor, cheering for 萝卜. The export has no network requests: the three console fonts are embedded as data URIs. Idle loops (typing, blinking, monitor flicker, coffee steam) stop under `prefers-reduced-motion`; a boss command then shows one fixed pose and its status at the acting spot, with the same cooldown and completion timing. Four boss commands go only to the advisor: 大棒, 萝卜, 排雷 and 收放. Each opens a confirmation, has a cooldown, and locks the other three until the advisor finishes. repo-harness shows the #1309 board of 2026-11-01; aiphabee and AstroZi are sample states; the 场景 option 空闲 shows the empty state. Reference screenshots (1920 and 390 px, light and dark) are in [`mockups/board-pixel-office/`](mockups/board-pixel-office/) |
+
+## Page inventory
+
+UI copy in the designs is Simplified Chinese; the Chinese page names are the
+sidebar labels.
+
+| Group | Page (sidebar label) | Artboard | Writes |
+| --- | --- | --- | --- |
+| — | Home (首页) | `Home` | none (includes the today summary) |
+| Work | Board (看板) | `Main` | none |
+| Work | Task drawer | `Task` | none (follow-up is copyable commands; inbox is read-only) |
+| Work | Repositories (仓库) | `Repositories` | none |
+| Work | Worktrees (Worktree) | `Worktrees` | cleans green (reclaimable) worktrees after a server-side recheck |
+| Work | Worktree cleanup session | `WorktreeCleanup` | none by the agent; the user ticks items and the server deletes them |
+| Work | Docs (文档) | `Docs` | starts a docs session |
+| Work | Docs session | `DocsSession` | `docs/` files, branch, Draft PR |
+| Setup | Agents | `Agents` | none (commands only) |
+| Setup | Skills | `Skills` | none |
+| Setup | Hooks | `Hooks` | none |
+| Setup | CLI | `CLI` | none (machine-wide inventory; uninstall is a copyable command) |
+| Setup | Bots | `Bots` | none (MCP, Slack and herdr status; access changes are commands) |
+| Observe | Architecture: modules (default), layers, sequence, topology (架构) | `ArchModules`, `ArchLayers`, `ArchSequence`, `ArchTopology` | none |
+| Observe | Tests (测试) | `Tests` | none |
+| Observe | System (系统) | `System` | none |
+| Observe | Tools (工具) | `Tools` | none |
+| — | Settings · Agent setup (设置) | `Settings` | `~/.repo-harness/config.json` |
+
+The "Task · agent session" artboard was dropped: the console does not message
+or stop coding sessions.
+
+## Worktree page
+
+A disk chart splits every worktree on the machine into three classes:
+reclaimable (merged, clean, not in use; green), needs your decision (yellow)
+and keep (open PR, running process, unpushed or uncommitted source; red). Age
+is never a reason to delete. Each row states the reason and what a delete
+loses. Only green rows can be ticked for one-click cleanup. "Let the agent
+clean up" opens a `worktree_cleanup` session: the agent investigates the
+yellow rows read-only and returns a plan with evidence; the user ticks items;
+the server rechecks each item under the topology lock, deletes it and writes
+an audit entry. Leftover directories that git no longer registers are listed
+by directory name only. PRD gaps G23–G26.
+
+## Home today summary
+
+The home page has a "Today" (今天) list below "Waiting for you". It has five
+rows: PRs merged since 00:00, the three items that waited longest, failed
+checks, open `[CI repair]` issues, and the reclaimable worktree space. Each row
+links to the page that owns the data.
+
+## Architecture module map
+
+The sidebar "Architecture" entry opens the module map. It shows the 28
+capabilities in their groups, with external systems around them. Edge width is
+the import count; a red dashed edge is an undeclared dependency. Five layers
+switch on top of the base map: today's changes, violations and drift, the
+impact of one PR, test coverage, and decisions. The decision layer stays
+disabled until archctx exports ADR `appliesTo` (#407). A side panel shows the
+selected module and a copyable fix command. PRD gaps G11, G22 and G27.
+
+## Collapsible sidebar
+
+A toggle next to the logo collapses the sidebar to a 64px icon rail. The rail
+keeps the nav icons with their names as tooltips, the repository tile and the
+search icon. It hides group labels, counts and the recent docs sessions. The
+architecture pages open collapsed to give the canvas the width; all other
+pages open expanded.
+
+## Repository switcher
+
+Every page has the switcher directly under the logo: a bordered block with a
+32px tile, a small label ("current repository" or "scope"), the repository
+name and `owner · branch · short SHA`, and an up/down chevron. Pages that span
+repositories show "all repositories"; single-repository pages (task drawer,
+docs, architecture, tests) show the current one. Page headers have no second
+switcher. Full spec: [`design-system/components/NavRail.md`](design-system/components/NavRail.md).
+
+## Pixel mascots
+
+17 SVGs in [`design-system/assets/mascots/`](design-system/assets/mascots/),
+scaled by whole multiples with `image-rendering: pixelated`, `alt=""`, at most
+one per screen. Exception: the Board office view (#1790) draws each scene as one
+SVG pixel framebuffer, with one path per palette colour and
+`image-rendering: pixelated`. The scene carries its own sprites (agents and the
+carrot boss), so it shows many characters on one screen. These sprites are not
+files in this folder, and the scene has a text label instead of `alt=""`.
+
+| Mascot | File | Used on |
+| --- | --- | --- |
+| Carrot buddy | `buddy.svg` | general empty state |
+| Carrot buddy, happy | `buddy-happy.svg` | home greeting |
+| Carrot buddy, asleep | `buddy-sleep.svg` | stale registry entries, test maintenance notes |
+| Carrot buddy, alert | `buddy-alert.svg` | Hooks drift banner |
+| Carrot buddy, reading | `buddy-reading.svg` | Docs "new session" |
+| Carrot buddy, party | `buddy-party.svg` | home stats line |
+| Carrot buddy, searching | `buddy-search.svg` | no search results (not used yet) |
+| Carrot buddy, wrench | `buddy-wrench.svg` | Agents drift banner |
+| Donkey | `donkey.svg` | reserve |
+| Donkey, happy | `donkey-happy.svg` | reserve |
+| Donkey with saddlebags | `donkey-bags.svg` | Agents header, Tools banner, Settings (blue bag Codex, orange bag Claude) |
+| Hook | `hook.svg` | reserve |
+| Hook with cap | `hook-cap.svg` | Hooks header |
+| Carrot on a line | `hook-carrot.svg` | Tools banner |
+| Terminal | `terminal.svg` | CLI header |
+| Bug | `bug.svg` | Tests failure stat |
+| Cloud off | `cloud-off.svg` | System "partially available" banner |

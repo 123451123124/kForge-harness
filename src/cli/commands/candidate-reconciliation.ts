@@ -1,0 +1,545 @@
+import { CLI_NAME } from '../../core/skill-surface/cli-name';
+import { createHash, randomUUID } from 'crypto';
+import { sha256Prefixed } from '../../core/evidence/sha256';
+import { parseJsonText } from '../../core/evidence/file-syntax';
+import { isPathInside } from '../../effects/path-containment';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
+import { homedir } from 'os';
+import { isAbsolute, join, relative, resolve, sep } from 'path';
+
+import type { InstallTargetSpec } from './install';
+import { REPORT_LANGUAGE_FLAG_VALUES, type ReportLanguageFlag } from '../installer/global-context';
+import type { OverrideSelection } from '../../core/host-config/override';
+import {
+  buildManagedHooks,
+  canonicalManagedHookProjection,
+  type HookHost,
+  type HooksByEvent,
+} from '../installer/managed-entries';
+import { ROUTES } from '../hook/route-registry';
+import { readExclusiveDirectoryLockOwner } from '../../effects/locking/exclusive-directory-lock';
+import {
+  runtimeTransactionLockRelativePath,
+  runtimeTransactionRoot,
+  type RuntimeTransactionScope,
+} from '../../effects/locking/runtime-transaction-lock';
+
+/** Protocol 2 drops the request profile: the candidate reads the recorded plugin selection from the install state. */
+export const CANDIDATE_RECONCILIATION_PROTOCOL = 3;
+export const CANDIDATE_RECONCILIATION_CAPABILITY_PROTOCOL = 1;
+const CANDIDATE_CAPABILITY_NAME = '.candidate-runtime-reconciliation-capability.v1.json';
+
+interface FileIdentity {
+  readonly dev: number;
+  readonly ino: number;
+}
+
+export interface CandidateReconciliationCapability {
+  readonly protocol: typeof CANDIDATE_RECONCILIATION_CAPABILITY_PROTOCOL;
+  readonly transaction_id: string;
+  readonly parent_token: string;
+  readonly parent_pid: number;
+  readonly lock_path: string;
+  readonly lock_owner_token: string;
+  readonly created_at: string;
+}
+
+export interface CandidateReconciliationCapabilityInput {
+  readonly transactionId: string;
+  readonly transactionBackupRoot: string;
+  readonly parentToken: string;
+  readonly parentPid: number;
+  readonly lockPath: string;
+  readonly lockOwnerToken: string;
+}
+
+export interface CandidatePackageIdentity {
+  readonly root: string;
+  readonly version: string;
+  readonly package_digest: string;
+}
+
+export interface CandidateReconciliationReceipt {
+  readonly protocol: typeof CANDIDATE_RECONCILIATION_PROTOCOL;
+  readonly transaction_id: string;
+  readonly candidate_package_root: string;
+  readonly candidate_version: string;
+  readonly candidate_package_digest: string;
+  readonly route_registry_digest: string;
+  readonly selected_target: InstallTargetSpec;
+  readonly adapter_projection_digests: Readonly<Partial<Record<HookHost, string>>>;
+  readonly ownership_manifest_digest: string | null;
+  readonly reconciliation_scope: 'complete' | 'partial';
+  readonly verified_at: string;
+  /** The `--override` selection that the candidate applied; absent when the request had none. A released candidate never writes it. */
+  readonly overrides?: OverrideSelection;
+}
+
+export interface CandidateReconciliationRequest {
+  readonly protocol: typeof CANDIDATE_RECONCILIATION_PROTOCOL;
+  readonly transaction_id: string;
+  readonly transaction_backup_root: string;
+  readonly parent_token: string;
+  readonly candidate: CandidatePackageIdentity;
+  readonly cwd: string;
+  readonly target: InstallTargetSpec;
+  readonly sync_skill: boolean;
+  readonly host_adapters: boolean;
+  readonly external_skills: boolean;
+  readonly obsidian_skills: boolean;
+  readonly codegraph: boolean;
+  readonly report_language?: ReportLanguageFlag;
+  /** The user's `--override` selection, paths resolved by the parent; the candidate checks it against its own requests. */
+  readonly overrides?: OverrideSelection;
+}
+
+export interface CandidateReceiptExpectation {
+  readonly transaction_id: string;
+  readonly candidate: CandidatePackageIdentity;
+  readonly target: InstallTargetSpec;
+  readonly require_complete: boolean;
+  readonly require_adapter_projection?: boolean;
+}
+
+function fileIdentity(stat: { readonly dev: number; readonly ino: number }): FileIdentity {
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function canonicalDirectory(path: string, label: string): string {
+  const resolved = resolve(path);
+  const stat = lstatSync(resolved);
+  if (!stat.isDirectory()) throw new Error(`${label} is not a directory: ${resolved}`);
+  return realpathSync(resolved);
+}
+
+function candidateCapabilityPath(transactionBackupRoot: string): string {
+  return join(transactionBackupRoot, CANDIDATE_CAPABILITY_NAME);
+}
+
+function parseCapability(raw: string): CandidateReconciliationCapability {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('candidate reconciliation capability is not valid JSON');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('candidate reconciliation capability is not an object');
+  }
+  const value = parsed as Record<string, unknown>;
+  if (
+    value.protocol !== CANDIDATE_RECONCILIATION_CAPABILITY_PROTOCOL
+    || typeof value.transaction_id !== 'string' || !value.transaction_id.startsWith('sha256:')
+    || typeof value.parent_token !== 'string' || !/^[a-f0-9]{64}$/i.test(value.parent_token)
+    || !Number.isSafeInteger(value.parent_pid) || (value.parent_pid as number) < 1
+    || typeof value.lock_path !== 'string' || !isAbsolute(value.lock_path)
+    || typeof value.lock_owner_token !== 'string' || !/^[1-9]\d*-\d+-[0-9a-f-]{36}$/i.test(value.lock_owner_token)
+    || typeof value.created_at !== 'string'
+  ) {
+    throw new Error('candidate reconciliation capability has invalid shape');
+  }
+  return value as unknown as CandidateReconciliationCapability;
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+/**
+ * Publish the one-shot capability only while the predecessor owns the global
+ * runtime lock. A hard-link publication avoids replacing a concurrently
+ * created capability file.
+ */
+export function publishCandidateReconciliationCapability(
+  input: CandidateReconciliationCapabilityInput,
+): CandidateReconciliationCapability {
+  const backupRoot = canonicalDirectory(input.transactionBackupRoot, 'candidate reconciliation transaction backup');
+  const record: CandidateReconciliationCapability = {
+    protocol: CANDIDATE_RECONCILIATION_CAPABILITY_PROTOCOL,
+    transaction_id: input.transactionId,
+    parent_token: input.parentToken,
+    parent_pid: input.parentPid,
+    lock_path: input.lockPath,
+    lock_owner_token: input.lockOwnerToken,
+    created_at: new Date().toISOString(),
+  };
+  parseCapability(JSON.stringify(record));
+  const path = candidateCapabilityPath(backupRoot);
+  const temporary = join(backupRoot, `.${CANDIDATE_CAPABILITY_NAME}.${randomUUID()}.tmp`);
+  let fd: number | null = null;
+  try {
+    fd = openSync(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    writeFileSync(fd, `${JSON.stringify(record)}\n`);
+    fsyncSync(fd);
+    const temporaryIdentity = fileIdentity(fstatSync(fd));
+    closeSync(fd);
+    fd = null;
+    // link(2) is an atomic no-replace publication fence in this directory.
+    linkSync(temporary, path);
+    const published = lstatSync(path);
+    if (!published.isFile() || !sameFileIdentity(fileIdentity(published), temporaryIdentity)) {
+      throw new Error('candidate reconciliation capability publication lost ownership');
+    }
+    unlinkSync(temporary);
+    return record;
+  } catch (error) {
+    if (fd !== null) closeSync(fd);
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // The transaction rollback owns cleanup after a failed publication.
+    }
+    throw error;
+  }
+}
+
+/**
+ * Consume a parent-published capability before candidate code mutates any
+ * managed surface. The parent PID, one-shot token, and live global lock must
+ * all agree; argv/env values alone are never authority.
+ */
+export function consumeCandidateReconciliationCapability(
+  request: CandidateReconciliationRequest,
+  scope: RuntimeTransactionScope,
+): CandidateReconciliationCapability {
+  if (request.transaction_id !== sha256Prefixed(request.transaction_backup_root)) {
+    throw new Error('candidate reconciliation transaction identifier is not bound to its backup root');
+  }
+  if (scope.kind !== 'global') throw new Error('candidate reconciliation requires the global runtime scope');
+  const canonicalHome = canonicalDirectory(realpathSync(scope.root), 'candidate reconciliation home');
+  const canonicalScope: RuntimeTransactionScope = { kind: scope.kind, root: canonicalHome };
+  const lockRelativePath = runtimeTransactionLockRelativePath(canonicalScope);
+  const transactionRoot = canonicalDirectory(runtimeTransactionRoot(canonicalScope), 'candidate reconciliation transaction root');
+  const backupRoot = canonicalDirectory(request.transaction_backup_root, 'candidate reconciliation transaction backup');
+  if (!isPathInside(transactionRoot, backupRoot) || backupRoot === transactionRoot) {
+    throw new Error(`candidate reconciliation transaction backup is outside the active transaction root: ${backupRoot}`);
+  }
+  const path = candidateCapabilityPath(backupRoot);
+  const observed = lstatSync(path);
+  if (!observed.isFile()) throw new Error('candidate reconciliation capability is not a regular file');
+  const observedIdentity = fileIdentity(observed);
+  const capability = parseCapability(readFileSync(path, 'utf-8'));
+  if (
+    capability.transaction_id !== request.transaction_id
+    || capability.parent_token !== request.parent_token
+  ) {
+    throw new Error('candidate reconciliation capability binding mismatch');
+  }
+  if (capability.parent_pid !== process.ppid || !processIsAlive(capability.parent_pid)) {
+    throw new Error('candidate reconciliation parent process is not the live transaction owner');
+  }
+  const expectedLockPath = join(canonicalHome, lockRelativePath);
+  if (capability.lock_path !== expectedLockPath) {
+    throw new Error('candidate reconciliation capability lock path mismatch');
+  }
+  const lockOwner = readExclusiveDirectoryLockOwner(canonicalHome, lockRelativePath);
+  if (
+    lockOwner === null
+    || lockOwner.lockPath !== capability.lock_path
+    || lockOwner.pid !== capability.parent_pid
+    || lockOwner.token !== capability.lock_owner_token
+  ) {
+    throw new Error('candidate reconciliation parent does not own the active global runtime lock');
+  }
+  const consumed = join(backupRoot, `.${CANDIDATE_CAPABILITY_NAME}.consumed-${randomUUID()}`);
+  renameSync(path, consumed);
+  const claimed = lstatSync(consumed);
+  if (!claimed.isFile() || !sameFileIdentity(fileIdentity(claimed), observedIdentity)) {
+    throw new Error('candidate reconciliation capability changed before consumption');
+  }
+  return capability;
+}
+
+function packageTreeDigest(root: string): string {
+  const hash = createHash('sha256');
+  const excludedDirectories = new Set(['.ai', '.codegraph', '.git', 'node_modules', '_ops']);
+  const visit = (directory: string, prefix: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+      if (entry.isDirectory() && excludedDirectories.has(entry.name)) continue;
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        hash.update(`D\0${relative}\0`);
+        visit(path, relative);
+      } else if (entry.isSymbolicLink()) {
+        hash.update(`L\0${relative}\0${readlinkSync(path)}\0`);
+      } else if (entry.isFile()) {
+        hash.update(`F\0${relative}\0`);
+        hash.update(readFileSync(path));
+        hash.update('\0');
+      }
+    }
+  };
+  visit(root, '');
+  return `sha256:${hash.digest('hex')}`;
+}
+
+function readPackageIdentity(root: string): CandidatePackageIdentity {
+  const packagePath = join(root, 'package.json');
+  const raw = readFileSync(packagePath);
+  const manifest = parseJsonText(raw.toString('utf-8'), packagePath) as { name?: unknown; version?: unknown };
+  if (manifest.name !== 'repo-harness' || typeof manifest.version !== 'string' || manifest.version.length === 0) {
+    throw new Error(`candidate package identity is invalid: ${packagePath}`);
+  }
+  return {
+    root,
+    version: manifest.version,
+    package_digest: packageTreeDigest(root),
+  };
+}
+
+export function candidatePackageIdentity(packageRoot: string): CandidatePackageIdentity {
+  const resolved = resolve(packageRoot);
+  if (!existsSync(join(resolved, 'package.json'))) {
+    throw new Error(`candidate package is missing package.json: ${resolved}`);
+  }
+  return readPackageIdentity(realpathSync(resolved));
+}
+
+export function routeRegistryDigest(): string {
+  return sha256Prefixed(JSON.stringify(ROUTES));
+}
+
+export function managedProjectionDigest(hooks: HooksByEvent | unknown): string {
+  return sha256Prefixed(JSON.stringify(canonicalManagedHookProjection(hooks)));
+}
+
+export function hostsForTarget(target: InstallTargetSpec): readonly HookHost[] {
+  return target === 'both' ? ['claude', 'codex'] : [target];
+}
+
+export function expectedAdapterProjectionDigests(
+  target: InstallTargetSpec,
+  env: NodeJS.ProcessEnv = process.env,
+): Readonly<Record<HookHost, string>> {
+  return Object.fromEntries(hostsForTarget(target).map((host) => [
+    host,
+    managedProjectionDigest(buildManagedHooks(host, env)),
+  ])) as Record<HookHost, string>;
+}
+
+export function adapterPath(host: HookHost, env: NodeJS.ProcessEnv = process.env): string {
+  const home = env.HOME ?? homedir();
+  return host === 'codex' ? join(home, '.codex', 'hooks.json') : join(home, '.claude', 'settings.json');
+}
+
+export function installedAdapterProjectionDigest(path: string): string | null {
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as { hooks?: HooksByEvent };
+    return managedProjectionDigest(parsed.hooks ?? {});
+  } catch {
+    return null;
+  }
+}
+
+export function assertInstalledAdapterProjection(
+  target: InstallTargetSpec,
+  env: NodeJS.ProcessEnv = process.env,
+): Readonly<Record<HookHost, string>> {
+  const expected = expectedAdapterProjectionDigests(target, env);
+  for (const host of hostsForTarget(target)) {
+    const actual = installedAdapterProjectionDigest(adapterPath(host, env));
+    if (actual !== expected[host]) {
+      throw new Error(`adapter projection mismatch for ${host}: expected=${expected[host]}; actual=${actual ?? 'missing'}`);
+    }
+  }
+  return expected;
+}
+
+/**
+ * Candidate-side proof. This intentionally calculates expected projection from
+ * the currently executing package, never the predecessor that launched it.
+ */
+export function assertCandidateReconciliationReceipt(
+  receipt: CandidateReconciliationReceipt,
+  expected: CandidateReceiptExpectation,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (receipt.protocol !== CANDIDATE_RECONCILIATION_PROTOCOL) {
+    throw new Error(`candidate reconciliation protocol mismatch: expected=${CANDIDATE_RECONCILIATION_PROTOCOL}; actual=${String(receipt.protocol)}`);
+  }
+  if (receipt.transaction_id !== expected.transaction_id) {
+    throw new Error('candidate reconciliation transaction mismatch');
+  }
+  if (
+    receipt.candidate_package_root !== expected.candidate.root
+    || receipt.candidate_version !== expected.candidate.version
+    || receipt.candidate_package_digest !== expected.candidate.package_digest
+  ) {
+    throw new Error('candidate reconciliation package identity mismatch');
+  }
+  if (receipt.route_registry_digest !== routeRegistryDigest()) {
+    throw new Error('candidate reconciliation route registry mismatch');
+  }
+  if (receipt.selected_target !== expected.target) {
+    throw new Error('candidate reconciliation target mismatch');
+  }
+  if (expected.require_complete && receipt.reconciliation_scope !== 'complete') {
+    throw new Error('candidate reconciliation is partial');
+  }
+  if (expected.require_adapter_projection !== false) {
+    const expectedDigests = expectedAdapterProjectionDigests(expected.target, env);
+    for (const host of hostsForTarget(expected.target)) {
+      if (receipt.adapter_projection_digests[host] !== expectedDigests[host]) {
+        throw new Error(`adapter projection mismatch for ${host}`);
+      }
+    }
+  }
+  if (expected.require_complete && receipt.ownership_manifest_digest === null) {
+    throw new Error('candidate reconciliation ownership ledger is missing');
+  }
+}
+
+/**
+ * The parent's check that the candidate applied the selection it sent. A
+ * released candidate ignores an unknown request field, so a selection with no
+ * echo in the receipt was dropped: the step fails and the transaction rolls back.
+ */
+export function assertReceiptSelection(requested: OverrideSelection | undefined, receipt: CandidateReconciliationReceipt): void {
+  if (JSON.stringify(requested ?? []) !== JSON.stringify(receipt.overrides ?? [])) {
+    throw new Error(`candidate ${receipt.candidate_version} did not apply the --override selection; run rh update without --override, then rh install --override`);
+  }
+}
+
+export function parseCandidateReceipt(stdout: string): CandidateReconciliationReceipt {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout.trim());
+  } catch {
+    throw new Error('candidate reconciliation did not emit a JSON receipt');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('candidate reconciliation receipt is not an object');
+  }
+  const receipt = parsed as Record<string, unknown>;
+  const digestKeys = ['candidate_package_digest', 'route_registry_digest'];
+  if (
+    receipt.protocol !== CANDIDATE_RECONCILIATION_PROTOCOL
+    || typeof receipt.transaction_id !== 'string'
+    || typeof receipt.candidate_package_root !== 'string'
+    || typeof receipt.candidate_version !== 'string'
+    || digestKeys.some((key) => typeof receipt[key] !== 'string' || !(receipt[key] as string).startsWith('sha256:'))
+    || !['codex', 'claude', 'both'].includes(String(receipt.selected_target))
+    || !['complete', 'partial'].includes(String(receipt.reconciliation_scope))
+    || typeof receipt.verified_at !== 'string'
+    || typeof receipt.adapter_projection_digests !== 'object'
+    || receipt.adapter_projection_digests === null
+    || Array.isArray(receipt.adapter_projection_digests)
+    || (receipt.ownership_manifest_digest !== null && (
+      typeof receipt.ownership_manifest_digest !== 'string'
+      || !receipt.ownership_manifest_digest.startsWith('sha256:')
+    ))
+    || (receipt.overrides !== undefined && !isOverrideSelection(receipt.overrides))
+  ) {
+    throw new Error('candidate reconciliation receipt has invalid shape');
+  }
+  for (const [host, digest] of Object.entries(receipt.adapter_projection_digests as Record<string, unknown>)) {
+    if (!['codex', 'claude'].includes(host) || typeof digest !== 'string' || !digest.startsWith('sha256:')) {
+      throw new Error('candidate reconciliation receipt has invalid adapter projection digests');
+    }
+  }
+  return receipt as unknown as CandidateReconciliationReceipt;
+}
+
+export function encodeCandidateRequest(request: CandidateReconciliationRequest): string {
+  return Buffer.from(JSON.stringify(request), 'utf-8').toString('base64url');
+}
+
+/**
+ * A released parent that predates request protocol 2 still sends a profile.
+ * Its own update re-reads the install state after this candidate returns and
+ * cannot read protocol 3, so the cutover cannot run under it. The candidate
+ * refuses before any write and names the direct bootstrap.
+ */
+export class CandidateRequestProtocolRetiredError extends Error {
+  readonly code = 'candidate_request_protocol_retired';
+  constructor(protocol: number, candidateVersion: string) {
+    super(`repo-harness ${candidateVersion} does not accept a reconciliation request of protocol ${protocol} from an older repo-harness. `
+      + `Install the new CLI directly, then update: bun add -g repo-harness@${candidateVersion} --no-cache && ${CLI_NAME} update`);
+    this.name = 'CandidateRequestProtocolRetiredError';
+  }
+}
+
+function isOverrideSelection(value: unknown): boolean {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'object' && entry !== null && !Array.isArray(entry)
+    && Object.keys(entry).length === 2
+    && typeof entry.path === 'string' && isAbsolute(entry.path)
+    && typeof entry.selector === 'string' && entry.selector.length > 0);
+}
+
+export function parseCandidateRequest(encoded: string, candidateVersion: string): CandidateReconciliationRequest {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf-8'));
+  } catch {
+    throw new Error('candidate reconciliation request is not valid base64url JSON');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('candidate reconciliation request is not an object');
+  }
+  const request = parsed as Record<string, unknown>;
+  if (request.protocol === 1 || request.protocol === 2) {
+    throw new CandidateRequestProtocolRetiredError(request.protocol, candidateVersion);
+  }
+  const requiredStrings = ['transaction_id', 'transaction_backup_root', 'parent_token', 'cwd'];
+  const booleans = [
+    'sync_skill', 'host_adapters', 'external_skills', 'obsidian_skills', 'codegraph',
+  ];
+  // A field that this version does not read (a retired one, or one of a newer parent) is refused, not dropped.
+  const known = new Set([...requiredStrings, ...booleans, 'protocol', 'candidate', 'target', 'report_language', 'overrides']);
+  if (
+    request.protocol !== CANDIDATE_RECONCILIATION_PROTOCOL
+    || requiredStrings.some((key) => typeof request[key] !== 'string' || !(request[key] as string).length)
+    || typeof request.candidate !== 'object'
+    || request.candidate === null
+    || Array.isArray(request.candidate)
+    || !['codex', 'claude', 'both'].includes(String(request.target))
+    || Object.keys(request).some((key) => !known.has(key))
+    || booleans.some((key) => typeof request[key] !== 'boolean')
+    || (request.report_language !== undefined
+      && !REPORT_LANGUAGE_FLAG_VALUES.includes(request.report_language as ReportLanguageFlag))
+    || (request.overrides !== undefined && !isOverrideSelection(request.overrides))
+  ) {
+    throw new Error('candidate reconciliation request has invalid shape');
+  }
+  const candidate = request.candidate as Record<string, unknown>;
+  if (
+    typeof candidate.root !== 'string'
+    || typeof candidate.version !== 'string'
+    || typeof candidate.package_digest !== 'string'
+    || !candidate.package_digest.startsWith('sha256:')
+  ) {
+    throw new Error('candidate reconciliation request has invalid package identity');
+  }
+  return request as unknown as CandidateReconciliationRequest;
+}

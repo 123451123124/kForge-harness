@@ -1,0 +1,1260 @@
+import { version as PACKAGE_VERSION } from '../../../package.json';
+import { startRuntimeService } from './runtime-service';
+import { startDevActivityCollector } from '../dev-activity/collector';
+import { startWorktreeCollector } from './worktree-collector';
+import { OPERATOR_WORKTREES_CLEANUP_ROUTE, worktreeCleanupWriteRoute } from './worktree-cleanup';
+import { OPERATOR_WORKTREES_CLEANUP_EXECUTE_ROUTE, OPERATOR_WORKTREES_CLEANUP_PLAN_ROUTE, worktreeCleanupExecuteWriteRoute, worktreeCleanupPlanWriteRoute } from './worktree-cleanup-route';
+import {
+  OPERATOR_WORKTREES_CLEANUP_INVESTIGATION_ROUTE, OPERATOR_WORKTREES_CLEANUP_INVESTIGATION_STATUS_ROUTE, readCleanupInvestigationStatus, worktreeCleanupInvestigationWriteRoute,
+} from './worktree-cleanup-investigation';
+import { decodeWorktrees, unavailableWorktrees, type WorktreesSnapshot } from '../../core/public-projections/worktrees';
+import { decodeDevActivitySnapshot, unavailableDevActivitySnapshot } from '../../core/dev-activity/decode';
+import { architecturePullRequestsSource } from '../../core/dev-activity/architecture';
+import type { DevActivitySnapshotV2 } from '../../core/dev-activity/types';
+import { startSetupCollector } from '../setup/collector';
+import { decodeSetupSnapshot, unavailableSetupSnapshot } from '../../core/setup/decode';
+import type { SetupSnapshotV2 } from '../../core/setup/types';
+import { startBotAccessCollector, type BotAccessCacheV1 } from './bot-access';
+import { decodeBotAccessSnapshot } from '../../core/operator/bot-access';
+import { startSlackReviewCollector } from './slack-review-collector';
+import { decodeSlackReviews, slackReviewsUnavailable, type SlackReviewsSnapshotV1 } from '../../core/operator/slack-review';
+import { startCliInventoryCollector, type CliUsageSource } from '../setup/cli-inventory';
+import { decodeCliInventory, unavailableCliInventory, type CliInventorySnapshotV1 } from '../../core/setup/cli-inventory';
+import { startDocsCollector, type DocsRepositoryCache } from './docs-collector';
+import { startTestsCollector, type TestsRepositoryCache } from './tests-collector';
+import { startRulesCollector, type RulesRepositoryCache } from './rules-collector';
+import { OPERATOR_RULES_PROMOTIONS_ROUTE, OPERATOR_RULES_RECONCILE_ROUTE, rulesPromoteWriteRoute, rulesReconcileWriteRoute } from './rules-promote-route';
+import { decodeRulesSnapshot } from '../../core/operator/rules';
+import { startExecutionCollector, type ExecutionRepositoryCache } from './execution-collector';
+import { startArchitectureMapCollector, type ArchitectureMapRepositoryCache } from './architecture-map-collector';
+import { decodeArchitectureMap, OPERATOR_ARCHITECTURE_MAP_ROUTE, type ArchitectureMapRefusalV1 } from '../../core/operator/architecture-map';
+import { decodeTaskExecutionView, type TaskExecutionViewV1 } from '../../core/operator/execution-state';
+import { decodeTaskMessagesView, TASK_MESSAGES_FAILURES, type TaskMessagesRefusal } from '../../core/operator/task-messages';
+import { decodeTestsSnapshot } from '../../core/operator/tests';
+import { DocsReadError } from './docs-reader';
+import { startDiagramRenderer, docsDiagramState, type DiagramRendererHandle } from './diagram-renderer';
+import { readDiagramImage } from './diagram-render';
+import { decodeDocsFile, decodeDocsTree, OPERATOR_DOCS_FILE_KIND, type DocsRemoteMismatchV1 } from '../../core/operator/docs';
+import { decodeRuntimeOverlay, unavailableRuntimeOverlay, type RuntimeOverlay } from '../../core/operator/runtime-status';
+import { ARCHITECTURE_FAILURES, parseArchitectureRequest, decodeArchitectureModuleIndex, decodeArchitectureModuleDetail, decodeArchitectureRefactorDecisions, decodeArchitectureReviewPrompt, OPERATOR_ARCHITECTURE_HISTORY_ROUTE, OPERATOR_ARCHITECTURE_MODULES_ROUTE, OPERATOR_ARCHITECTURE_MODULE_ROUTE, OPERATOR_ARCHITECTURE_REFACTOR_ROUTE, OPERATOR_ARCHITECTURE_REVIEW_PROMPT_ROUTE } from '../../core/operator/architecture';
+import { ARCHITECTURE_HISTORY_TIMEOUT_MS, decodeArchitectureHistoryPage } from '../architecture/architecture-read';
+export { OPERATOR_ARCHITECTURE_HISTORY_ROUTE, OPERATOR_ARCHITECTURE_MODULES_ROUTE, OPERATOR_ARCHITECTURE_MODULE_ROUTE, OPERATOR_ARCHITECTURE_REFACTOR_ROUTE, OPERATOR_ARCHITECTURE_REVIEW_PROMPT_ROUTE } from '../../core/operator/architecture';
+import { decodeNotifyStatus } from '../../core/operator/notify-status';
+import { decodeQuotaReport, OPERATOR_QUOTA_PATH } from '../../core/board/quota';
+import { readQuotaReport } from '../board/quota';
+import { startBoardObserver, type BoardFactsCache, type BoardObserverOptions, type BoardObserverReads } from './board-observer';
+import { BoardReadError, readRepositoryAdvisorTranscript, type BoardReadInput } from './board-read';
+import { ADVISOR_SEAT_REFUSALS, OPERATOR_ADVISOR_BOSS_COMMANDS_ROUTE, OPERATOR_ADVISOR_MESSAGES_ROUTE, OPERATOR_ADVISOR_TRANSCRIPT_PATH, advisorBossCommandWriteRoute, advisorSeatWriteRoute } from './advisor-seat-route';
+import { decodeAdvisorSeatRequest, decodeAdvisorSeatTranscript } from '../../core/board/advisor-seat';
+import { startNotifyCollector, type NotifyCacheV1 } from './notify-collector';
+import { readOperatorRepositories } from './repositories';
+import type { OperatorRepositoriesV1 } from '../../core/operator/repositories';
+import { sha256Hex } from '../../core/evidence/sha256';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { readFileSync } from 'node:fs';
+import { reapOrphanedProcessGroups } from '../process-group-registry';
+import { resolve } from 'node:path';
+import { createBoundedTaskReadHandler, OPERATOR_READ_ONLY_GIT_ENVIRONMENT, repositoryWorkerEnvironment } from './supervised-read-process';
+import { architectureStatus, assertCollectionOption, assertLoopbackHost, assertPort, contentType, errorBody, expectedRequestAuthority, fallbackIndex, fileIfSafe, isHtmlNavigation, jsonHeaders, OperatorServerError, OPERATOR_SERVICE_NAME, sendJson, sendRefusal, staticHeaders } from './http-helpers';
+export { architectureStatus, OperatorServerError, OPERATOR_SERVICE_NAME, OPERATOR_STATIC_CONTENT_SECURITY_POLICY } from './http-helpers';
+import { createOperatorWriteToken, handleOperatorWrite, operatorWriteTokenCookie, type OperatorWriteRoute } from './write-channel';
+import { AGENTS_CONFIGURATION_FAILURES, OPERATOR_SETTINGS_AGENTS_PATH, OPERATOR_SETTINGS_AGENTS_ROUTE, agentsSettingsWriteRoute, readAgentsSettings } from './agents-settings-route';
+import { OPERATOR_REPORT_LANGUAGE_PATH, OPERATOR_REPORT_LANGUAGE_ROUTE, OPERATOR_DOCUMENTATION_LANGUAGE_ROUTE, requireLanguageSettings, readDocumentationLanguage, reportingLanguageWriteRoute, documentationLanguageWriteRoute, type OperatorLanguageSettingsAdapter } from './language-settings-route';
+import { OperatorWriteRefusal } from './write-run';
+import { OPERATOR_SETTINGS_SEATS_PATH, OPERATOR_SETTINGS_SEATS_ROUTE, SEATS_CONFIGURATION_FAILURES, readSeatsSettings, seatsSettingsWriteRoute } from './seats-settings-route';
+import { SeatsConfigurationError, readSeatsConfiguration } from '../board/seats-configuration';
+import { AgentsConfigurationError } from '../configuration/agents-configuration';
+import type { AgentRuntimesCacheV1 } from '../../core/board/agents-settings';
+import {
+  ARCHITECTURE_MAP_UNAVAILABLE, BOARD_PARENTS_UNAVAILABLE, BOARD_UNAVAILABLE, DOCS_READ_REFUSALS, DOCS_UNAVAILABLE, EXECUTION_UNAVAILABLE, NOTIFY_UNAVAILABLE,
+  OPERATOR_ADOPT_ACTION, OPERATOR_REGISTRY_ACTION, RULES_UNAVAILABLE, TASK_MESSAGES_REFUSALS, TESTS_UNAVAILABLE,
+} from './unavailable-responses';
+
+export const OPERATOR_SERVER_PROTOCOL = 3 as const;
+const OPERATOR_ASSET_ACTION = 'Run `rh update`, restart the server and reload the page.';
+
+/**
+ * The dispatcher's own matchers, exported so the inventory below and the test
+ * that gates it compare the values `handleRequest` matches on rather than a
+ * second copy of the same strings.
+ */
+export const OPERATOR_HEALTH_PATH = '/healthz' as const;
+export const OPERATOR_API_PATH_PREFIX = '/api' as const;
+/** The static fallback has no path shape of its own; it is whatever is left. */
+export const OPERATOR_STATIC_ASSET_PATTERN = '/*' as const;
+/**
+ * The repository id is matched loosely and resolved strictly: the registry is
+ * the authority on which ids exist, and duplicating its shape here would be a
+ * second opinion about it.
+ */
+export const OPERATOR_RULES_ROUTE = /^\/api\/v1\/repositories\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/rules$/u;
+export const OPERATOR_TESTS_ROUTE = /^\/api\/v1\/repositories\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/tests$/u;
+/** The board of one parent issue in one registered repository; `?parent=<issue number>` is required. */
+export const OPERATOR_BOARD_ROUTE = /^\/api\/v1\/repositories\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/board$/u;
+/** The open parent issues of one registered repository: the entry of the Board page. */
+export const OPERATOR_BOARD_PARENTS_ROUTE = /^\/api\/v1\/repositories\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/board\/parents$/u;
+export const OPERATOR_BOARD_SEATS_ROUTE = /^\/api\/v1\/repositories\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/board\/seats$/u;
+export const OPERATOR_EXECUTION_STATE_ROUTE = /^\/api\/v1\/repositories\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/execution$/u;
+/** The stored task inbox of one task that the execution view of the same repository lists as verified. */
+export const OPERATOR_TASK_MESSAGES_ROUTE = /^\/api\/v1\/repositories\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/tasks\/([0-9a-f]{64})\/messages$/u;
+export const OPERATOR_DOCS_TREE_ROUTE = /^\/api\/v1\/repositories\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/docs\/tree$/u;
+export const OPERATOR_DOCS_DIAGRAM_ROUTE = /^\/api\/v1\/docs\/diagrams\/([0-9a-f]{64})$/u;
+export const OPERATOR_DOCS_DIAGRAM_IMAGE_ROUTE = /^\/api\/v1\/docs\/diagrams\/([0-9a-f]{64})\/image$/u;
+export const OPERATOR_DOCS_FILE_ROUTE = /^\/api\/v1\/repositories\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/docs\/file$/u;
+export const OPERATOR_RUNTIME_STATUS_PATH = '/api/v1/runtime/status' as const;
+export const OPERATOR_NOTIFY_STATUS_PATH = '/api/v1/notify/status' as const;
+export const OPERATOR_DEV_ACTIVITY_PATH = '/api/v1/dev-activity' as const;
+/** The registered repositories: the one repository list of the console. */
+export const OPERATOR_REPOSITORIES_PATH = '/api/v1/repositories' as const;
+export const OPERATOR_WORKTREES_PATH = '/api/v1/worktrees' as const;
+export const OPERATOR_SETUP_PATH = '/api/v1/setup' as const;
+export const OPERATOR_BOT_ACCESS_PATH = '/api/v1/bot-access' as const;
+export const OPERATOR_BOT_REVIEWS_PATH = '/api/v1/bot-reviews' as const;
+export const OPERATOR_CLI_INVENTORY_PATH = '/api/v1/cli-inventory' as const;
+
+export interface OperatorRouteV1 {
+  readonly id: string;
+  readonly method: 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+  /** The literal path, or the route regexp's source for a parameterized one. */
+  readonly pattern: string;
+  /** True only for a route that can change repository state. */
+  readonly write: boolean;
+}
+
+/**
+ * The complete read-only route surface, as a value.
+ */
+export const OPERATOR_ROUTES: readonly OperatorRouteV1[] = Object.freeze([
+  Object.freeze({ id: 'health', method: 'GET', pattern: OPERATOR_HEALTH_PATH, write: false }),
+  Object.freeze({ id: 'runtime_status', method: 'GET', pattern: OPERATOR_RUNTIME_STATUS_PATH, write: false }),
+  Object.freeze({ id: 'notify_status', method: 'GET', pattern: OPERATOR_NOTIFY_STATUS_PATH, write: false }),
+  Object.freeze({ id: 'dev_activity', method: 'GET', pattern: OPERATOR_DEV_ACTIVITY_PATH, write: false }),
+  Object.freeze({ id: 'repositories', method: 'GET', pattern: OPERATOR_REPOSITORIES_PATH, write: false }),
+  Object.freeze({ id: 'worktrees', method: 'GET', pattern: OPERATOR_WORKTREES_PATH, write: false }),
+  // Removes only green worktrees; the effect runs in a supervised child process.
+  Object.freeze({ id: 'worktrees_cleanup', method: 'POST', pattern: OPERATOR_WORKTREES_CLEANUP_ROUTE.source, write: true }),
+  // Plans and runs the authorized removal of non-green worktrees; both effects run in a supervised child process.
+  Object.freeze({ id: 'worktrees_cleanup_plan', method: 'POST', pattern: OPERATOR_WORKTREES_CLEANUP_PLAN_ROUTE.source, write: true }),
+  Object.freeze({ id: 'worktrees_cleanup_execute', method: 'POST', pattern: OPERATOR_WORKTREES_CLEANUP_EXECUTE_ROUTE.source, write: true }),
+  // Starts the agent investigation of one plan session in a supervised job child; the status route reads its record.
+  Object.freeze({ id: 'worktrees_cleanup_investigation', method: 'POST', pattern: OPERATOR_WORKTREES_CLEANUP_INVESTIGATION_ROUTE.source, write: true }),
+  Object.freeze({ id: 'worktrees_cleanup_investigation_status', method: 'GET', pattern: OPERATOR_WORKTREES_CLEANUP_INVESTIGATION_STATUS_ROUTE.source, write: false }),
+  Object.freeze({ id: 'setup', method: 'GET', pattern: OPERATOR_SETUP_PATH, write: false }),
+  Object.freeze({ id: 'bot_access', method: 'GET', pattern: OPERATOR_BOT_ACCESS_PATH, write: false }),
+  Object.freeze({ id: 'bot_reviews', method: 'GET', pattern: OPERATOR_BOT_REVIEWS_PATH, write: false }),
+  Object.freeze({ id: 'cli_inventory', method: 'GET', pattern: OPERATOR_CLI_INVENTORY_PATH, write: false }),
+  Object.freeze({ id: 'tests', method: 'GET', pattern: OPERATOR_TESTS_ROUTE.source, write: false }),
+  Object.freeze({ id: 'rules', method: 'GET', pattern: OPERATOR_RULES_ROUTE.source, write: false }),
+  // Files one rules promotion task and completes its label and parent link; both run `rh rules promote` in a child process.
+  Object.freeze({ id: 'rules_promote', method: 'POST', pattern: OPERATOR_RULES_PROMOTIONS_ROUTE.source, write: true }),
+  Object.freeze({ id: 'rules_reconcile', method: 'POST', pattern: OPERATOR_RULES_RECONCILE_ROUTE.source, write: true }),
+  Object.freeze({ id: 'board', method: 'GET', pattern: OPERATOR_BOARD_ROUTE.source, write: false }),
+  Object.freeze({ id: 'board_seats', method: 'GET', pattern: OPERATOR_BOARD_SEATS_ROUTE.source, write: false }),
+  Object.freeze({ id: 'board_parents', method: 'GET', pattern: OPERATOR_BOARD_PARENTS_ROUTE.source, write: false }),
+  // The only console write into an agent terminal (#1756, D11): plain text to the one advisor seat of a board, in a board CLI child.
+  Object.freeze({ id: 'advisor_seat_messages', method: 'POST', pattern: OPERATOR_ADVISOR_MESSAGES_ROUTE.source, write: true }),
+  // The four boss commands (#1757): a command id, sent as its server-side text through the same advisor seat send.
+  Object.freeze({ id: 'advisor_boss_commands', method: 'POST', pattern: OPERATOR_ADVISOR_BOSS_COMMANDS_ROUTE.source, write: true }),
+  Object.freeze({ id: 'advisor_seat_transcript', method: 'GET', pattern: OPERATOR_ADVISOR_TRANSCRIPT_PATH, write: false }),
+  Object.freeze({ id: 'execution_state', method: 'GET', pattern: OPERATOR_EXECUTION_STATE_ROUTE.source, write: false }),
+  Object.freeze({ id: 'task_messages', method: 'GET', pattern: OPERATOR_TASK_MESSAGES_ROUTE.source, write: false }),
+  Object.freeze({ id: 'docs_tree', method: 'GET', pattern: OPERATOR_DOCS_TREE_ROUTE.source, write: false }),
+  Object.freeze({ id: 'docs_file', method: 'GET', pattern: OPERATOR_DOCS_FILE_ROUTE.source, write: false }),
+  Object.freeze({ id: 'docs_diagram', method: 'GET', pattern: OPERATOR_DOCS_DIAGRAM_ROUTE.source, write: false }),
+  Object.freeze({ id: 'docs_diagram_image', method: 'GET', pattern: OPERATOR_DOCS_DIAGRAM_IMAGE_ROUTE.source, write: false }),
+  Object.freeze({ id: 'settings_agents', method: 'GET', pattern: OPERATOR_SETTINGS_AGENTS_PATH, write: false }),
+  Object.freeze({ id: 'settings_report_language', method: 'GET', pattern: OPERATOR_REPORT_LANGUAGE_PATH, write: false }),
+  Object.freeze({ id: 'settings_report_language_write', method: 'POST', pattern: OPERATOR_REPORT_LANGUAGE_ROUTE.source, write: true }),
+  Object.freeze({ id: 'repository_documentation_language', method: 'GET', pattern: OPERATOR_DOCUMENTATION_LANGUAGE_ROUTE.source, write: false }),
+  Object.freeze({ id: 'repository_documentation_language_write', method: 'POST', pattern: OPERATOR_DOCUMENTATION_LANGUAGE_ROUTE.source, write: true }),
+  // The first write route: it changes only the host config's `agents` section.
+  Object.freeze({ id: 'settings_agents_write', method: 'POST', pattern: OPERATOR_SETTINGS_AGENTS_ROUTE.source, write: true }),
+  Object.freeze({ id: 'settings_seats', method: 'GET', pattern: OPERATOR_SETTINGS_SEATS_PATH, write: false }),
+  Object.freeze({ id: 'quota', method: 'GET', pattern: OPERATOR_QUOTA_PATH, write: false }),
+  // It changes only the host config's `seats` section; running panes keep their launch arguments.
+  Object.freeze({ id: 'settings_seats_write', method: 'POST', pattern: OPERATOR_SETTINGS_SEATS_ROUTE.source, write: true }),
+  Object.freeze({ id: 'architecture_modules', method: 'GET', pattern: OPERATOR_ARCHITECTURE_MODULES_ROUTE.source, write: false }),
+  Object.freeze({ id: 'architecture_module', method: 'GET', pattern: OPERATOR_ARCHITECTURE_MODULE_ROUTE.source, write: false }),
+  Object.freeze({ id: 'architecture_review_prompt', method: 'GET', pattern: OPERATOR_ARCHITECTURE_REVIEW_PROMPT_ROUTE.source, write: false }),
+  Object.freeze({ id: 'architecture_history', method: 'GET', pattern: OPERATOR_ARCHITECTURE_HISTORY_ROUTE.source, write: false }),
+  Object.freeze({ id: 'architecture_refactor', method: 'GET', pattern: OPERATOR_ARCHITECTURE_REFACTOR_ROUTE.source, write: false }),
+  Object.freeze({ id: 'architecture_map', method: 'GET', pattern: OPERATOR_ARCHITECTURE_MAP_ROUTE.source, write: false }),
+  Object.freeze({ id: 'static_asset', method: 'GET', pattern: OPERATOR_STATIC_ASSET_PATTERN, write: false }),
+] as const);
+
+export type OperatorServerHost = '127.0.0.1' | '::1';
+
+export interface OperatorServerOptions {
+  readonly language_settings?: OperatorLanguageSettingsAdapter;
+  /** Cache read only. Observation lifecycle runs outside the HTTP request. */
+  readonly read_runtime_status?: () => RuntimeOverlay;
+  readonly runtime_status_config?: string;
+  /** Notify cache reader. GET notify_status and the Bot access collector read only this cache; neither runs Herdr. */
+  readonly read_notify?: () => NotifyCacheV1;
+  /**
+   * Start the in-process notify collector (operator serve). The Bot access
+   * collector also starts it, because it reads its cache. Ignored when a cache reader is injected.
+   */
+  readonly notify_collector?: boolean;
+  /** Dev Activity cache reader. GET serves only this cache; it never collects. */
+  readonly read_dev_activity?: () => DevActivitySnapshotV2;
+  /** Start the in-process Dev Activity collector (operator serve). Ignored when a cache reader is injected. */
+  readonly dev_activity_collector?: boolean;
+  readonly read_worktrees?: () => WorktreesSnapshot;
+  readonly worktree_collector?: boolean;
+  /** Setup snapshot cache reader. GET serves only this cache; it never runs setup check. */
+  readonly read_setup?: () => SetupSnapshotV2;
+  /** Start the in-process setup collector (operator serve). Ignored when a cache reader is injected. */
+  readonly setup_collector?: boolean;
+  /** Bot access cache reader. GET serves only this cache; it never runs the doctor or Herdr. */
+  readonly read_bot_access?: () => BotAccessCacheV1;
+  /**
+   * Start the in-process Bot access collector (operator serve). The Dot review
+   * collector starts with it, because the Bots page reads both. Each one is
+   * ignored when its cache reader is injected.
+   */
+  readonly bot_access_collector?: boolean;
+  /** Dot review cache reader. GET serves only this cache; it never calls Slack. */
+  readonly read_bot_reviews?: () => SlackReviewsSnapshotV1;
+  /** CLI inventory cache reader. GET serves only this cache; it never probes a package manager. */
+  readonly read_cli_inventory?: () => CliInventorySnapshotV1;
+  /**
+   * Start the in-process CLI inventory collector (operator serve). The caller
+   * names the hook telemetry it reads for agent use. Ignored when a cache reader is injected.
+   */
+  readonly cli_inventory_collector?: { readonly usage_sources: () => readonly CliUsageSource[] };
+  /** Docs cache reader by repository id. A file GET sends one object request to the reader it holds. */
+  readonly read_docs?: (repositoryId: string) => DocsRepositoryCache;
+  /** Start the in-process docs collector (operator serve). Ignored when a cache reader is injected. */
+  readonly docs_collector?: boolean;
+  /** The render capability a diagram state read reports (tests only); the docs collector starts the renderer that owns it. */
+  readonly read_diagram_capability?: () => ReturnType<DiagramRendererHandle['capability']>;
+  /** Tests cache reader by repository id. GET serves only this cache; it never calls GitHub. */
+  readonly read_tests?: (repositoryId: string) => TestsRepositoryCache;
+  /** Start the in-process tests collector (operator serve). Ignored when a cache reader is injected. */
+  readonly tests_collector?: boolean;
+  /** Rules cache reader by repository id. GET starts no command. */
+  readonly read_rules?: (repositoryId: string) => RulesRepositoryCache;
+  /** Start the background rules collector in operator serve. */
+  readonly rules_collector?: boolean;
+  /** Task execution cache reader by repository id. GET serves only this cache; it reads no session record or process. */
+  readonly read_execution_state?: (repositoryId: string) => ExecutionRepositoryCache;
+  /** Start the in-process execution-state collector (operator serve). Ignored when a cache reader is injected. */
+  readonly execution_collector?: boolean;
+  /** Architecture map cache reader by repository id. GET serves only this cache; it runs no archctx or git. */
+  readonly read_architecture_map?: (repositoryId: string) => ArchitectureMapRepositoryCache;
+  /** Start the in-process architecture map collector (operator serve). Ignored when a cache reader is injected. */
+  readonly architecture_map_collector?: boolean;
+  readonly read_quota?: () => Promise<unknown>;
+  /** The board, parents and seats GETs read only memory. Tests inject the cache reads or the observer ports; production starts the observer. */
+  readonly board_cache?: BoardObserverReads;
+  readonly board_observer?: BoardObserverOptions;
+  /** The advisor seat send: the `board advisor send` CLI's JSON. Production runs the CLI; only tests inject another. */
+  readonly send_advisor?: (input: BoardReadInput & { readonly text: string }) => Promise<unknown>;
+  /** The advisor seat read-back: the `board advisor transcript` CLI's JSON. Production runs the CLI; only tests inject another. */
+  readonly read_advisor_transcript?: (input: BoardReadInput) => Promise<unknown>;
+  readonly host?: string;
+  /** Port 0 is accepted by the effect for ephemeral test servers. */
+  readonly port?: number;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly static_root?: string;
+  readonly static_error?: 'operator_assets_version_mismatch';
+  readonly max_concurrency?: number;
+  readonly timeout_ms?: number;
+  /**
+   * Write routes admitted for POST in addition to the production ones. Each
+   * one must match a `POST`, `write: true` entry of the route inventory, or the
+   * server does not start. Only tests pass this.
+   */
+  readonly write_routes?: readonly OperatorWriteRoute[];
+  /** The route inventory write routes bind to. Production uses OPERATOR_ROUTES; only tests inject another. */
+  readonly route_inventory?: readonly OperatorRouteV1[];
+  /** Agent runtime probe cache reader. GET and POST settings read only this cache; neither probes. */
+  readonly read_agent_runtimes?: () => AgentRuntimesCacheV1;
+}
+
+export interface OperatorServerHandle {
+  readonly host: OperatorServerHost;
+  readonly port: number;
+  readonly url: string;
+  readonly close: () => Promise<void>;
+}
+
+export interface OperatorHealthResponseV2 {
+  readonly ok: true;
+  readonly service: typeof OPERATOR_SERVICE_NAME;
+  readonly protocol: typeof OPERATOR_SERVER_PROTOCOL;
+  readonly version: string;
+}
+
+export interface OperatorErrorResponseV1 {
+  readonly error: {
+    readonly code: string;
+    readonly message: string;
+    readonly next_action: string;
+    /** Only `github_remote_missing` of the docs routes sends it. */
+    readonly detail?: DocsRemoteMismatchV1;
+  };
+}
+
+/** The methods a read resource implements; a write route implements POST only. */
+const OPERATOR_ALLOWED_METHODS = 'GET, HEAD' as const;
+const OPERATOR_WRITE_ALLOWED_METHODS = 'POST' as const;
+
+export async function startOperatorServer(
+  options: OperatorServerOptions = {},
+): Promise<OperatorServerHandle> {
+  const host = assertLoopbackHost(options.host);
+  const port = assertPort(options.port);
+  const maxConcurrency = assertCollectionOption(options.max_concurrency, 'max_concurrency', 1, 16);
+  const timeoutMs = assertCollectionOption(options.timeout_ms, 'timeout_ms', 1_000, 30_000);
+  const staticRoot = options.static_root === undefined ? null : resolve(options.static_root);
+  const activeTaskReadCancellers = new Set<() => void>();
+  const activeTaskReadCompletions = new Set<Promise<void>>();
+  const activeBoardReads = new Set<AbortController>();
+  const boardCompletions = new Set<Promise<void>>();
+  let quotaBusy = false;
+  const boardEnvironment: NodeJS.ProcessEnv = { ...process.env, ...repositoryWorkerEnvironment(options.env), ...OPERATOR_READ_ONLY_GIT_ENVIRONMENT, GH_PROMPT_DISABLED: '1' };
+
+  const handleBoundedTaskRead = createBoundedTaskReadHandler(
+    options, maxConcurrency, timeoutMs, activeTaskReadCancellers, activeTaskReadCompletions, () => closed,
+  );
+
+  /** A facts document from memory with the ETag of its version; a missing document answers its pending code. */
+  const sendFactsCache = <F extends string, P extends string>(
+    request: IncomingMessage, response: ServerResponse, headOnly: boolean, cache: BoardFactsCache<unknown, F>,
+    refusals: Readonly<Record<F | P, { readonly status: number; readonly message: string; readonly next_action: string }>>, pending: P,
+  ): void => {
+    if (cache.state !== 'ready') {
+      const code: F | P = cache.state === 'pending' ? pending : cache.reason;
+      const refusal = refusals[code];
+      sendRefusal(request, response, refusal.status, errorBody(code, refusal.message, refusal.next_action), headOnly);
+    } else if (request.headers['if-none-match'] === cache.etag) {
+      response.writeHead(304, { ...jsonHeaders(), ETag: cache.etag }); response.end();
+    } else sendJson(response, 200, cache.value, headOnly, { ETag: cache.etag });
+  };
+
+  /**
+   * One board CLI run under the cap that the advisor seat routes share. The
+   * server close aborts it and waits for it.
+   */
+  const admitBoardCli = <T>(run: (signal: AbortSignal) => Promise<T>): { readonly result: Promise<T>; readonly abort: () => void } | null => {
+    if (closed || activeBoardReads.size >= maxConcurrency) return null;
+    const controller = new AbortController();
+    activeBoardReads.add(controller);
+    const result = Promise.resolve().then(() => run(controller.signal));
+    const completion: Promise<void> = result.then(() => {}, () => {}).finally(() => {
+      activeBoardReads.delete(controller);
+      boardCompletions.delete(completion);
+    });
+    boardCompletions.add(completion);
+    return { result, abort: () => controller.abort() };
+  };
+
+  /**
+   * One board CLI read per request. The CLI's JSON is decoded once here; a
+   * client that leaves aborts the run.
+   */
+  const handleBoardCliRead = <F extends string, T>(
+    request: IncomingMessage, response: ServerResponse, headOnly: boolean,
+    refusals: Readonly<Record<F, { readonly status: number; readonly message: string; readonly next_action: string }>>,
+    codes: { readonly busy: F; readonly invalid: F; readonly unavailable: F },
+    read: (signal: AbortSignal) => Promise<unknown>, decode: (value: unknown) => T,
+  ): void => {
+    const refuse = (code: F) => {
+      const refusal = refusals[code];
+      sendRefusal(request, response, refusal.status, errorBody(code, refusal.message, refusal.next_action), headOnly);
+    };
+    const run = admitBoardCli(read);
+    if (run === null) { refuse(codes.busy); return; }
+    const onClose = () => run.abort();
+    response.once('close', onClose);
+    void run.result
+      .then((value) => {
+        let decoded;
+        try { decoded = decode(value); } catch { if (!response.destroyed) refuse(codes.invalid); return; }
+        if (response.destroyed) return;
+        sendJson(response, 200, decoded, headOnly);
+      }, (error: unknown) => {
+        if (response.destroyed) return;
+        refuse(error instanceof BoardReadError && Object.hasOwn(refusals, error.code) ? error.code as F : codes.unavailable);
+      })
+      .finally(() => response.removeListener('close', onClose));
+  };
+
+  /**
+   * One object request to the collector's resident process, under its own
+   * concurrency cap and deadline. A client that leaves gets no late reply.
+   */
+  let activeDocsReads = 0;
+  const handleDocsFile = (request: IncomingMessage, response: ServerResponse, headOnly: boolean,
+    cache: DocsRepositoryCache & { readonly state: 'ready' }, path: string): void => {
+    if (closed) { sendRefusal(request, response, 503, errorBody('docs_reader_unavailable', DOCS_UNAVAILABLE.docs_reader_unavailable.message), headOnly); return; }
+    if (activeDocsReads >= maxConcurrency) { sendRefusal(request, response, 503, errorBody('docs_busy', 'Too many docs reads are in progress.', 'Retry in a few seconds.'), headOnly); return; }
+    activeDocsReads += 1;
+    let settled = false;
+    const finish = (send: () => void) => {
+      if (settled) return;
+      settled = true;
+      activeDocsReads -= 1;
+      clearTimeout(timer);
+      response.removeListener('close', abandon);
+      if (!response.destroyed && !response.writableEnded) send();
+    };
+    const abandon = () => finish(() => {});
+    const timer = setTimeout(() => finish(() => sendRefusal(request, response, 504, errorBody('docs_timeout', 'The docs read did not finish in time.', 'Retry the read.'), headOnly)), timeoutMs);
+    response.once('close', abandon);
+    cache.reader.file(path).then(file => {
+      let body;
+      try {
+        body = decodeDocsFile({ protocol: 1, kind: OPERATOR_DOCS_FILE_KIND, repository_id: cache.tree.repository_id, ref: cache.tree.ref, ...file });
+      } catch {
+        finish(() => sendRefusal(request, response, 503, errorBody('docs_reader_unavailable', DOCS_UNAVAILABLE.docs_reader_unavailable.message), headOnly));
+        return;
+      }
+      finish(() => sendJson(response, 200, body, headOnly));
+    }, (error: unknown) => {
+      const code = error instanceof DocsReadError ? error.code : 'git_read_failed';
+      const refusal = DOCS_READ_REFUSALS[code];
+      finish(() => sendRefusal(request, response, refusal?.status ?? 503, refusal
+        ? errorBody(code, refusal.message, 'Choose a file from the docs tree.')
+        : code === 'pending' ? errorBody('docs_pending', DOCS_UNAVAILABLE.docs_pending.message, DOCS_UNAVAILABLE.docs_pending.next_action)
+          : errorBody('docs_reader_unavailable', DOCS_UNAVAILABLE.docs_reader_unavailable.message, DOCS_UNAVAILABLE.docs_reader_unavailable.next_action), headOnly));
+    });
+  };
+
+  const writeToken = createOperatorWriteToken();
+  const readAgentRuntimes = (): AgentRuntimesCacheV1 =>
+    (options.read_agent_runtimes ?? setup?.read_agent_runtimes ?? (() => ({ status: 'unavailable', reason: 'collection_pending' } as const)))();
+  // An injected route (tests only; the serve CLI strips write_routes) replaces
+  // the production binding with the same id, so a test serves its own handler
+  // behind the production inventory entry.
+  const injectedWriteRoutes = options.write_routes ?? [];
+  const writeRoutes = [
+    agentsSettingsWriteRoute(readAgentRuntimes, options.env),
+    reportingLanguageWriteRoute(options.language_settings),
+    documentationLanguageWriteRoute(options.env, options.language_settings),
+    seatsSettingsWriteRoute(options.env),
+    worktreeCleanupWriteRoute(options.env),
+    worktreeCleanupPlanWriteRoute({ env: options.env }),
+    worktreeCleanupExecuteWriteRoute({ env: options.env }),
+    worktreeCleanupInvestigationWriteRoute({ env: options.env, read_quota: options.read_quota }),
+    // A client that leaves does not abort a send; only the deadline or the server close does.
+    advisorSeatWriteRoute({ admit: run => admitBoardCli(run)?.result ?? null, env: boardEnvironment, send: options.send_advisor }),
+    advisorBossCommandWriteRoute({ admit: run => admitBoardCli(run)?.result ?? null, env: boardEnvironment, audit_env: options.env,
+      send: options.send_advisor, read: options.read_advisor_transcript }),
+    ...[rulesPromoteWriteRoute, rulesReconcileWriteRoute].map(route => route({
+      // The runtime status reader is bound after the runtime service starts, below.
+      admit: run => admitBoardCli(run)?.result ?? null, env: boardEnvironment, audit_env: options.env, read_herdr: () => readHerdr(),
+    })),
+  ].filter(route => !injectedWriteRoutes.some(injected => injected.id === route.id))
+    .concat(injectedWriteRoutes);
+  // The inventory is the one write authority: a handler it does not declare
+  // as a POST write route is a second authority, and a declared write route
+  // without a handler is a broken contract, so the server refuses to start.
+  const routeInventory = options.route_inventory ?? OPERATOR_ROUTES;
+  for (const route of writeRoutes) {
+    const entry = routeInventory.find(candidate => candidate.id === route.id);
+    if (entry?.method !== 'POST' || entry.write !== true || entry.pattern !== route.path.source) {
+      throw new OperatorServerError('invalid_argument', `write route ${JSON.stringify(route.id)} has no matching POST write entry in the route inventory`, 400);
+    }
+  }
+  for (const entry of routeInventory) {
+    if (entry.write && !writeRoutes.some(route => route.id === entry.id)) {
+      throw new OperatorServerError('invalid_argument', `route inventory entry ${JSON.stringify(entry.id)} has no write route`, 400);
+    }
+  }
+  const matchWriteRoute = (pathname: string): { readonly route: OperatorWriteRoute; readonly params: readonly string[] } | null => {
+    for (const route of writeRoutes) {
+      const match = route.path.exec(pathname);
+      if (match !== null && match[0] === pathname) return { route, params: match.slice(1) };
+    }
+    return null;
+  };
+
+  const handleRequest = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+    const method = request.method ?? 'GET';
+    const headOnly = method === 'HEAD';
+    const expectedAuthority = expectedRequestAuthority(host, request);
+    const requestHost = request.headers.host?.trim().toLowerCase();
+    if (expectedAuthority === null || requestHost !== expectedAuthority) {
+      sendRefusal(request, response, 421, errorBody('host_not_allowed', 'The request Host is not allowed.'), headOnly);
+      return;
+    }
+    const expectedOrigin = `http://${expectedAuthority}`;
+    const requestOrigin = request.headers.origin;
+    if (requestOrigin !== undefined && requestOrigin !== expectedOrigin) {
+      sendRefusal(request, response, 403, errorBody('origin_not_allowed', 'The request Origin is not allowed.'), headOnly);
+      return;
+    }
+    // A write is identified before it is routed: it must name this service as
+    // its Origin and come from a same-origin fetch, whatever path it targets.
+    const write = method === 'POST';
+    if (write && requestOrigin === undefined) {
+      sendRefusal(request, response, 403, errorBody('origin_required', 'A write request must send the Origin of this service.', 'Send the request from the operator page.'));
+      return;
+    }
+    if (write && request.headers['sec-fetch-site'] !== 'same-origin') {
+      sendRefusal(request, response, 403, errorBody('fetch_site_not_allowed', 'A write request must be a same-origin fetch.', 'Send the request from the operator page.'));
+      return;
+    }
+    if (!write && method !== 'GET' && method !== 'HEAD') {
+      sendRefusal(request, response, 405, errorBody('method_not_allowed', 'Only GET and HEAD are supported.'), false, {
+        Allow: OPERATOR_ALLOWED_METHODS,
+      });
+      return;
+    }
+
+    let url: URL;
+    try {
+      url = new URL(request.url ?? '/', expectedOrigin);
+      if (url.origin !== expectedOrigin) {
+        sendRefusal(request, response, 421, errorBody('host_not_allowed', 'The request URL authority is not allowed.'), headOnly);
+        return;
+      }
+    } catch (_error) {
+      sendRefusal(request, response, 400, errorBody('invalid_request', 'The request URL is invalid.'), headOnly);
+      return;
+    }
+    const pathname = url.pathname;
+    const writeMatch = matchWriteRoute(pathname);
+    if (write) {
+      if (writeMatch === null) {
+        sendRefusal(request, response, 405, errorBody('method_not_allowed', 'Only GET and HEAD are supported.'), false, {
+          Allow: OPERATOR_ALLOWED_METHODS,
+        });
+        return;
+      }
+      const reply = await handleOperatorWrite({
+        request,
+        route: writeMatch.route,
+        params: writeMatch.params,
+        token: writeToken,
+        port: request.socket.localPort!,
+        env: options.env,
+      });
+      const replyHeaders: Readonly<Record<string, string>> = reply.close ? { Connection: 'close' } : {};
+      if (reply.refused) sendRefusal(request, response, reply.status, reply.body as unknown as OperatorErrorResponseV1, false, replyHeaders);
+      else sendJson(response, reply.status, reply.body, false, replyHeaders);
+      return;
+    }
+    // A write path may also be a read resource; only a write-only path refuses GET.
+    if (writeMatch !== null && !routeInventory.some(entry => entry.method === 'GET'
+      && (entry.pattern === pathname || entry.pattern === writeMatch.route.path.source))) {
+      sendRefusal(request, response, 405, errorBody('method_not_allowed', 'Only POST is supported.'), headOnly, {
+        Allow: OPERATOR_WRITE_ALLOWED_METHODS,
+      });
+      return;
+    }
+    const fetchSite = request.headers['sec-fetch-site'];
+    if (pathname.startsWith('/api/') && fetchSite !== undefined && fetchSite !== 'same-origin' && fetchSite !== 'none') {
+      sendJson(response, 403, { code: 'fetch_site_not_allowed' }, headOnly); return;
+    }
+    if (OPERATOR_ARCHITECTURE_REFACTOR_ROUTE.test(pathname)) {
+      let input;
+      try { input = parseArchitectureRequest(url)!; }
+      catch { sendJson(response, 400, { code: 'invalid_request' }, headOnly); return; }
+      handleBoundedTaskRead(response, headOnly, input, (value, req) => {
+        if (req.kind !== 'architecture_refactor') throw new Error('identity');
+        return decodeArchitectureRefactorDecisions(value);
+      }, ARCHITECTURE_FAILURES, 'architecture', undefined, architectureStatus, request);
+      return;
+    }
+    if (OPERATOR_ARCHITECTURE_HISTORY_ROUTE.test(pathname)) {
+      let input;
+      try { input = parseArchitectureRequest(url)!; }
+      catch { sendJson(response, 400, { code: 'invalid_request' }, headOnly); return; }
+      handleBoundedTaskRead(response, headOnly, input, (value, request) => {
+        if (request.kind !== 'architecture_history') throw new Error('identity');
+        return decodeArchitectureHistoryPage(value, request);
+      }, ARCHITECTURE_FAILURES, 'architecture', undefined, architectureStatus, request, ARCHITECTURE_HISTORY_TIMEOUT_MS);
+      return;
+    }
+    if (pathname.startsWith('/api/v1/repositories/') && pathname.includes('/architecture/modules')) {
+      let input;
+      try { input = parseArchitectureRequest(url); }
+      catch { sendJson(response, 400, { code: 'invalid_request' }, headOnly); return; }
+      if (!input) { sendJson(response, 404, { code: 'capability_not_found' }, headOnly); return; }
+      handleBoundedTaskRead(response, headOnly, input, (value, request) => {
+        const result = request.kind === 'architecture_modules' ? decodeArchitectureModuleIndex(value)
+          : request.kind === 'architecture_module' ? decodeArchitectureModuleDetail(value) : decodeArchitectureReviewPrompt(value);
+        if ('capability_id' in request && ('module' in result ? result.module.id !== request.capability_id
+          : 'capability_id' in result && result.capability_id !== request.capability_id)) throw new Error('identity');
+        return result;
+      }, ARCHITECTURE_FAILURES, 'architecture', undefined, architectureStatus, request);
+      return;
+    }
+
+    if (pathname === OPERATOR_HEALTH_PATH) {
+      const health: OperatorHealthResponseV2 = {
+        ok: true,
+        service: OPERATOR_SERVICE_NAME,
+        protocol: OPERATOR_SERVER_PROTOCOL,
+        version: PACKAGE_VERSION,
+      };
+      sendJson(response, 200, health, headOnly);
+      return;
+    }
+
+    if (pathname === OPERATOR_RUNTIME_STATUS_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Runtime status takes no query parameters.', 'Remove query parameters.'), headOnly);
+        return;
+      }
+      try {
+        sendJson(response, 200, decodeRuntimeOverlay((options.read_runtime_status ?? runtimeService?.read ?? unavailableRuntimeOverlay)()), headOnly);
+      } catch {
+        sendJson(response, 200, unavailableRuntimeOverlay(), headOnly);
+      }
+      return;
+    }
+
+    if (pathname === OPERATOR_WORKTREES_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Worktrees accepts no query selectors.'), headOnly);
+        return;
+      }
+      let snapshot: WorktreesSnapshot;
+      try { snapshot = decodeWorktrees((options.read_worktrees ?? worktrees?.read ?? unavailableWorktrees)()); }
+      catch { snapshot = unavailableWorktrees(); }
+      sendJson(response, 200, snapshot, headOnly);
+      return;
+    }
+
+    if (pathname === OPERATOR_DEV_ACTIVITY_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Dev activity accepts no query selectors.'), headOnly);
+        return;
+      }
+      let snapshot: DevActivitySnapshotV2;
+      try {
+        snapshot = decodeDevActivitySnapshot((options.read_dev_activity ?? devActivity?.read ?? unavailableDevActivitySnapshot)());
+      } catch {
+        snapshot = unavailableDevActivitySnapshot();
+      }
+      sendJson(response, 200, snapshot, headOnly);
+      return;
+    }
+
+    if (pathname === OPERATOR_REPOSITORIES_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'The repository list accepts no query selectors.'), headOnly);
+        return;
+      }
+      let repositories: OperatorRepositoriesV1;
+      try { repositories = readOperatorRepositories(options.env ?? process.env); }
+      catch {
+        sendRefusal(request, response, 503, errorBody('registry_unavailable', 'The repository registry is unreadable.',
+          OPERATOR_REGISTRY_ACTION), headOnly);
+        return;
+      }
+      sendJson(response, 200, repositories, headOnly);
+      return;
+    }
+
+    if (pathname === OPERATOR_SETUP_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Setup accepts no query selectors.'), headOnly);
+        return;
+      }
+      let setupSnapshot: SetupSnapshotV2;
+      try {
+        setupSnapshot = decodeSetupSnapshot((options.read_setup ?? setup?.read ?? unavailableSetupSnapshot)());
+      } catch {
+        setupSnapshot = unavailableSetupSnapshot('setup_check_invalid');
+      }
+      sendJson(response, 200, setupSnapshot, headOnly);
+      return;
+    }
+
+    const documentationLanguage = OPERATOR_DOCUMENTATION_LANGUAGE_ROUTE.exec(pathname);
+    if (pathname === OPERATOR_REPORT_LANGUAGE_PATH || documentationLanguage !== null) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Language settings accept no query selectors.'), headOnly);
+        return;
+      }
+      try {
+        sendJson(response, 200, documentationLanguage === null ? requireLanguageSettings(options.language_settings).readReportingLanguage()
+          : readDocumentationLanguage(documentationLanguage[1]!, options.env, options.language_settings), headOnly);
+      } catch (error) {
+        if (!(error instanceof OperatorWriteRefusal)) throw error;
+        sendRefusal(request, response, error.status, errorBody(error.code, error.message, error.next_action), headOnly);
+      }
+      return;
+    }
+
+    if (pathname === OPERATOR_SETTINGS_AGENTS_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Agent settings accept no query selectors.'), headOnly);
+        return;
+      }
+      try {
+        sendJson(response, 200, readAgentsSettings(readAgentRuntimes, options.env), headOnly);
+      } catch (error) {
+        if (!(error instanceof AgentsConfigurationError)) throw error;
+        sendRefusal(request, response, AGENTS_CONFIGURATION_FAILURES[error.code].status,
+          errorBody(error.code, error.message, AGENTS_CONFIGURATION_FAILURES[error.code].next_action), headOnly);
+      }
+      return;
+    }
+
+    const investigation = OPERATOR_WORKTREES_CLEANUP_INVESTIGATION_STATUS_ROUTE.exec(pathname);
+    if (investigation !== null) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'The investigation status accepts no query selectors.'), headOnly);
+        return;
+      }
+      const status = readCleanupInvestigationStatus({ ...process.env, ...options.env }, investigation[1]!);
+      if (status === null) {
+        sendRefusal(request, response, 404, errorBody('investigation_not_found', 'No investigation of this cleanup session exists.', 'Start an investigation from the plan page.'), headOnly);
+        return;
+      }
+      sendJson(response, 200, status, headOnly);
+      return;
+    }
+
+    if (pathname === OPERATOR_QUOTA_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Quota accepts no query selectors.'), headOnly);
+        return;
+      }
+      if (quotaBusy) {
+        sendRefusal(request, response, 503, errorBody('quota_busy', 'A quota read is in progress.'), headOnly);
+        return;
+      }
+      quotaBusy = true;
+      try {
+        // The stored seats section is the one authority for the exhaustion line (#2909), so the account states that this
+        // route serves agree with the routes that the same section derives.
+        const exhaustion = readSeatsConfiguration(options.env ?? process.env).seats.routing.exhausted_at_or_above_used;
+        const value = await (options.read_quota ?? (() => readQuotaReport(options.env ?? process.env, exhaustion)))();
+        let report;
+        try { report = decodeQuotaReport(value); } catch {
+          sendRefusal(request, response, 502, errorBody('quota_invalid', 'The quota report failed validation.'), headOnly);
+          return;
+        }
+        sendJson(response, 200, report, headOnly);
+      } catch (error) {
+        if (!(error instanceof SeatsConfigurationError)) throw error;
+        sendRefusal(request, response, SEATS_CONFIGURATION_FAILURES[error.code].status,
+          errorBody(error.code, error.message, SEATS_CONFIGURATION_FAILURES[error.code].next_action), headOnly);
+      } finally { quotaBusy = false; }
+      return;
+    }
+
+    if (pathname === OPERATOR_SETTINGS_SEATS_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Seat settings accept no query selectors.'), headOnly);
+        return;
+      }
+      try {
+        sendJson(response, 200, readSeatsSettings(options.env), headOnly);
+      } catch (error) {
+        if (!(error instanceof SeatsConfigurationError)) throw error;
+        sendRefusal(request, response, SEATS_CONFIGURATION_FAILURES[error.code].status,
+          errorBody(error.code, error.message, SEATS_CONFIGURATION_FAILURES[error.code].next_action), headOnly);
+      }
+      return;
+    }
+
+    if (pathname === OPERATOR_BOT_ACCESS_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Bot access accepts no query selectors.'), headOnly);
+        return;
+      }
+      const cache = (options.read_bot_access ?? botAccess?.read ?? (() => ({ state: 'pending' }) as const))();
+      if (cache.state === 'pending') {
+        sendRefusal(request, response, 503, errorBody('bot_access_pending', 'The first Bot access collection has not finished.', 'Retry in a few seconds.'), headOnly);
+        return;
+      }
+      if (cache.state === 'failed') {
+        sendRefusal(request, response, 503, errorBody('bot_access_unavailable', 'Bot access is unavailable.', 'Restart `rh operator serve`.'), headOnly);
+        return;
+      }
+      let snapshot;
+      try { snapshot = decodeBotAccessSnapshot(cache.snapshot); }
+      catch {
+        sendRefusal(request, response, 503, errorBody('bot_access_invalid', 'The Bot access snapshot failed validation.'), headOnly);
+        return;
+      }
+      sendJson(response, 200, snapshot, headOnly);
+      return;
+    }
+
+    if (pathname === OPERATOR_BOT_REVIEWS_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Bot reviews accept no query selectors.'), headOnly);
+        return;
+      }
+      let reviews: SlackReviewsSnapshotV1;
+      try { reviews = decodeSlackReviews((options.read_bot_reviews ?? botReviews?.read ?? (() => slackReviewsUnavailable('slack_pending')))()); }
+      catch {
+        sendRefusal(request, response, 503, errorBody('bot_reviews_invalid', 'The Dot review snapshot failed validation.'), headOnly);
+        return;
+      }
+      sendJson(response, 200, reviews, headOnly);
+      return;
+    }
+
+    if (pathname === OPERATOR_CLI_INVENTORY_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'CLI inventory accepts no query selectors.'), headOnly);
+        return;
+      }
+      let inventory: CliInventorySnapshotV1;
+      try {
+        inventory = decodeCliInventory((options.read_cli_inventory ?? cliInventory?.read ?? unavailableCliInventory)());
+      } catch {
+        inventory = unavailableCliInventory('collection_failed');
+      }
+      sendJson(response, 200, inventory, headOnly);
+      return;
+    }
+
+    if (pathname === OPERATOR_NOTIFY_STATUS_PATH) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Notify status accepts no query selectors.'), headOnly);
+        return;
+      }
+      const cache = (options.read_notify ?? notify?.read ?? (() => ({ state: 'pending' }) as const))();
+      if (cache.state === 'pending') {
+        sendRefusal(request, response, 503, errorBody('notify_status_pending', 'The first notify status collection has not finished.', 'Retry in a few seconds.'), headOnly);
+        return;
+      }
+      if (cache.state === 'unavailable') {
+        const reason = NOTIFY_UNAVAILABLE[cache.reason];
+        sendRefusal(request, response, 503, errorBody(cache.reason, reason.message, reason.next_action), headOnly);
+        return;
+      }
+      let status;
+      try { status = decodeNotifyStatus(cache.value.status); }
+      catch {
+        sendRefusal(request, response, 503, errorBody('notify_status_invalid', 'The notify status failed validation.'), headOnly);
+        return;
+      }
+      sendJson(response, 200, status, headOnly);
+      return;
+    }
+
+    const boardRoute = OPERATOR_BOARD_ROUTE.exec(pathname);
+    if (boardRoute !== null) {
+      // The board answers from the observer's memory. HEAD would renew the lease, so only GET is served.
+      if (headOnly) {
+        sendRefusal(request, response, 405, errorBody('method_not_allowed', 'The board route supports only GET.'), true, { Allow: 'GET' });
+        return;
+      }
+      const keys = [...url.searchParams.keys()];
+      const parent = url.searchParams.get('parent');
+      if (keys.length !== 1 || parent === null || !/^[1-9][0-9]{0,9}$/u.test(parent)) {
+        const refusal = BOARD_UNAVAILABLE.board_parent_invalid;
+        sendRefusal(request, response, refusal.status, errorBody('board_parent_invalid', refusal.message, refusal.next_action), headOnly);
+        return;
+      }
+      sendFactsCache(request, response, headOnly, boardReads.board(boardRoute[1]!, Number(parent)), BOARD_UNAVAILABLE, 'board_pending');
+      return;
+    }
+
+    if (pathname === OPERATOR_ADVISOR_TRANSCRIPT_PATH) {
+      // A read-back runs the board CLI, one GitHub read and the hc reads; HEAD gets no read.
+      if (headOnly) {
+        sendRefusal(request, response, 405, errorBody('method_not_allowed', 'The advisor transcript route supports only GET.'), true, { Allow: 'GET' });
+        return;
+      }
+      let subject;
+      try {
+        // A repeated key would leave its first value unread, so it is refused.
+        if (new Set(url.searchParams.keys()).size !== [...url.searchParams.keys()].length) throw new TypeError('repeated query key');
+        subject = decodeAdvisorSeatRequest(Object.fromEntries(url.searchParams));
+      } catch {
+        const refusal = ADVISOR_SEAT_REFUSALS.invalid_request;
+        sendRefusal(request, response, refusal.status, errorBody('invalid_request', refusal.message, refusal.next_action), headOnly);
+        return;
+      }
+      const read = options.read_advisor_transcript ?? readRepositoryAdvisorTranscript;
+      handleBoardCliRead(request, response, headOnly, ADVISOR_SEAT_REFUSALS, { busy: 'advisor_busy', invalid: 'advisor_invalid', unavailable: 'advisor_unavailable' },
+        signal => read({ ...subject, env: boardEnvironment, signal }), decodeAdvisorSeatTranscript);
+      return;
+    }
+
+    const seatsRoute = OPERATOR_BOARD_SEATS_ROUTE.exec(pathname);
+    if (seatsRoute !== null) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'The board seats route accepts no query parameters.'), headOnly);
+        return;
+      }
+      const cache = boardReads.seats(seatsRoute[1]!);
+      if (cache.state === 'pending') { sendJson(response, 202, { state: 'pending' }, headOnly); return; }
+      if (cache.state === 'unavailable') {
+        const code = cache.reason;
+        const refusal = BOARD_PARENTS_UNAVAILABLE[code];
+        sendRefusal(request, response, refusal.status, errorBody(code, cache.cause === 'github_remote_missing' ? 'The repository has no GitHub remote.' : refusal.message, refusal.next_action), headOnly);
+        return;
+      }
+      const seats = cache.value;
+      const etag = `"${sha256Hex(JSON.stringify(seats))}"`;
+      if (request.headers['if-none-match'] === etag) { response.writeHead(304, { ...jsonHeaders(), ETag: etag }); response.end(); }
+      else sendJson(response, 200, seats, headOnly, { ETag: etag });
+      return;
+    }
+
+    const parentsRoute = OPERATOR_BOARD_PARENTS_ROUTE.exec(pathname);
+    if (parentsRoute !== null) {
+      if (headOnly) {
+        sendRefusal(request, response, 405, errorBody('method_not_allowed', 'The board parents route supports only GET.'), true, { Allow: 'GET' });
+        return;
+      }
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'The board parents route accepts no query parameters.'), headOnly);
+        return;
+      }
+      sendFactsCache(request, response, headOnly, boardReads.parents(parentsRoute[1]!), BOARD_PARENTS_UNAVAILABLE, 'parents_pending');
+      return;
+    }
+
+    const rulesRoute = OPERATOR_RULES_ROUTE.exec(pathname);
+    if (rulesRoute !== null) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Rules accept no query parameters.'), headOnly);
+        return;
+      }
+      const cache = readRules(rulesRoute[1]!);
+      if (cache.state !== 'ready') {
+        const refusal = RULES_UNAVAILABLE[cache.reason];
+        sendRefusal(request, response, refusal.status, errorBody(cache.reason, refusal.message, refusal.next_action), headOnly);
+        return;
+      }
+      let snapshot;
+      try {
+        snapshot = decodeRulesSnapshot(cache.snapshot);
+        if (snapshot.repository_id !== rulesRoute[1]) throw new Error('rules repository mismatch');
+      } catch {
+        sendRefusal(request, response, 503, errorBody('rules_invalid', 'The rules status failed validation.'), headOnly);
+        return;
+      }
+      sendJson(response, 200, snapshot, headOnly);
+      return;
+    }
+
+    const testsRoute = OPERATOR_TESTS_ROUTE.exec(pathname);
+    if (testsRoute !== null) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Tests accept no query parameters.'), headOnly);
+        return;
+      }
+      const cache = (options.read_tests ?? tests?.read ?? (() => ({ state: 'unavailable', reason: 'tests_pending' }) as const))(testsRoute[1]!);
+      if (cache.state !== 'ready') {
+        const refusal = TESTS_UNAVAILABLE[cache.reason];
+        sendRefusal(request, response, refusal.status, errorBody(cache.reason, refusal.message, refusal.next_action), headOnly);
+        return;
+      }
+      let snapshot;
+      try { snapshot = decodeTestsSnapshot(cache.snapshot); }
+      catch {
+        sendRefusal(request, response, 503, errorBody('tests_invalid', 'The test results failed validation.'), headOnly);
+        return;
+      }
+      sendJson(response, 200, snapshot, headOnly);
+      return;
+    }
+
+    const architectureMapRoute = OPERATOR_ARCHITECTURE_MAP_ROUTE.exec(pathname);
+    if (architectureMapRoute !== null) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'The architecture map accepts no query parameters.'), headOnly);
+        return;
+      }
+      const cache = (options.read_architecture_map ?? architectureMap?.read ?? (() => ({ state: 'unavailable', reason: 'architecture_map_pending' }) as const))(architectureMapRoute[1]!);
+      if (cache.state !== 'ready') {
+        const refusal = ARCHITECTURE_MAP_UNAVAILABLE[cache.reason];
+        const body: ArchitectureMapRefusalV1 = cache.reason === 'archctx_error'
+          ? { ...errorBody(cache.reason, refusal.message, refusal.next_action), archctx: { code: cache.code, reason_code: cache.reason_code } }
+          : errorBody(cache.reason, refusal.message, refusal.next_action);
+        sendRefusal(request, response, refusal.status, body, headOnly);
+        return;
+      }
+      let map;
+      try { map = decodeArchitectureMap(cache.map); }
+      catch {
+        sendRefusal(request, response, 503, errorBody('architecture_map_invalid', ARCHITECTURE_MAP_UNAVAILABLE.architecture_map_invalid.message), headOnly);
+        return;
+      }
+      sendJson(response, 200, map, headOnly);
+      return;
+    }
+
+    /** The decoded execution view of one repository; null after it sends the refusal. */
+    const executionView = (repositoryId: string): TaskExecutionViewV1 | null => {
+      const cache = (options.read_execution_state ?? execution?.read ?? (() => ({ state: 'unavailable', reason: 'execution_state_pending' }) as const))(repositoryId);
+      if (cache.state !== 'ready') {
+        const refusal = EXECUTION_UNAVAILABLE[cache.reason];
+        sendRefusal(request, response, refusal.status, errorBody(cache.reason, refusal.message, refusal.next_action), headOnly);
+        return null;
+      }
+      try { return decodeTaskExecutionView(cache.view); }
+      catch {
+        sendRefusal(request, response, 503, errorBody('execution_state_invalid', 'The task execution state failed validation.'), headOnly);
+        return null;
+      }
+    };
+
+    const executionRoute = OPERATOR_EXECUTION_STATE_ROUTE.exec(pathname);
+    if (executionRoute !== null) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Execution state accepts no query parameters.'), headOnly);
+        return;
+      }
+      const view = executionView(executionRoute[1]!);
+      if (view !== null) sendJson(response, 200, view, headOnly);
+      return;
+    }
+
+    const messagesRoute = OPERATOR_TASK_MESSAGES_ROUTE.exec(pathname);
+    if (messagesRoute !== null) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'Task messages accept no query parameters.'), headOnly);
+        return;
+      }
+      const input = { repository_id: messagesRoute[1]!, task_id: messagesRoute[2]! };
+      const view = executionView(input.repository_id);
+      if (view === null) return;
+      const task = view.tasks.find(entry => entry.task === input.task_id);
+      if (task === undefined || task.state !== 'verified') {
+        const code: TaskMessagesRefusal = task === undefined ? 'task_not_found' : 'task_unverified';
+        const refusal = TASK_MESSAGES_REFUSALS[code];
+        sendRefusal(request, response, refusal.status, errorBody(code, refusal.message, refusal.next_action), headOnly);
+        return;
+      }
+      handleBoundedTaskRead(response, headOnly, input, decodeTaskMessagesView, TASK_MESSAGES_FAILURES, 'task_messages', undefined,
+        code => code === 'repository_not_found' ? 404 : code === 'timeout' ? 504 : 503);
+      return;
+    }
+
+    // The artifact store is content-addressed and a read never starts a render.
+    const diagramRoute = OPERATOR_DOCS_DIAGRAM_ROUTE.exec(pathname);
+    const diagramImageRoute = diagramRoute === null ? OPERATOR_DOCS_DIAGRAM_IMAGE_ROUTE.exec(pathname) : null;
+    if (diagramRoute !== null || diagramImageRoute !== null) {
+      if (url.search !== '') {
+        sendRefusal(request, response, 400, errorBody('invalid_request', 'A diagram read accepts no query parameters.'), headOnly);
+        return;
+      }
+      const state = docsDiagramState(options.env ?? process.env, (diagramRoute ?? diagramImageRoute)![1]!, diagramCapability());
+      if (diagramRoute !== null) { sendJson(response, 200, state, headOnly); return; }
+      const image = state.state === 'rendered' || state.state === 'stale' ? readDiagramImage(options.env ?? process.env, state.hash) : null;
+      if (image === null) { sendRefusal(request, response, 404, errorBody('not_found', 'The diagram has no image.'), headOnly); return; }
+      // The image holds no script and no remote address; the policy keeps it so when opened as a document.
+      response.writeHead(200, {
+        'Cache-Control': 'no-store', 'Content-Type': 'image/svg+xml', 'Content-Length': String(image.length),
+        'Content-Security-Policy': "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:",
+        'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
+      });
+      if (headOnly) response.end(); else response.end(image);
+      return;
+    }
+
+    const docsTreeRoute = OPERATOR_DOCS_TREE_ROUTE.exec(pathname);
+    const docsFileRoute = docsTreeRoute === null ? OPERATOR_DOCS_FILE_ROUTE.exec(pathname) : null;
+    if (docsTreeRoute !== null || docsFileRoute !== null) {
+      const repositoryId = (docsTreeRoute ?? docsFileRoute)![1]!;
+      const filePath = docsFileRoute === null ? null : url.searchParams.getAll('path');
+      if (docsTreeRoute !== null ? url.search !== '' : filePath!.length !== 1 || [...url.searchParams.keys()].length !== 1) {
+        sendRefusal(request, response, 400, errorBody('invalid_request', docsTreeRoute !== null ? 'The docs tree accepts no query parameters.' : 'A docs file read takes exactly one path parameter.'), headOnly);
+        return;
+      }
+      const cache = (options.read_docs ?? docs?.read ?? (() => ({ state: 'unavailable', reason: 'docs_pending' }) as const))(repositoryId);
+      if (cache.state !== 'ready') {
+        const refusal = DOCS_UNAVAILABLE[cache.reason];
+        if (cache.reason === 'github_remote_missing' && cache.detail) {
+          // The message names what the collector compared; `detail` carries the same data for the console.
+          const { github, remote_repositories: found } = cache.detail;
+          const body = errorBody(cache.reason, `No git remote points to the GitHub repository ${github}. GitHub repositories of the remotes: ${found.length === 0 ? 'none' : found.join(', ')}.`, refusal.next_action);
+          sendRefusal(request, response, refusal.status, { error: { ...body.error, detail: cache.detail } }, headOnly);
+          return;
+        }
+        sendRefusal(request, response, refusal.status, errorBody(cache.reason, refusal.message, refusal.next_action), headOnly);
+        return;
+      }
+      if (docsFileRoute === null) {
+        let tree;
+        try { tree = decodeDocsTree(cache.tree); }
+        catch { sendRefusal(request, response, 503, errorBody('docs_reader_unavailable', DOCS_UNAVAILABLE.docs_reader_unavailable.message), headOnly); return; }
+        sendJson(response, 200, tree, headOnly);
+        return;
+      }
+      handleDocsFile(request, response, headOnly, cache, filePath![0]!);
+      return;
+    }
+
+    /**
+     * The API prefix is claimed case-insensitively while the routes above stay
+     * exact, because the static fallback resolves case-insensitively on macOS
+     * and Windows: `/API/v1/dev-activity` matched no API route, fell through
+     * to the SPA shell, and answered a navigation with 200 HTML. Anything under
+     * the API prefix that reached here is a missing API route and says so.
+     */
+    const apiPathname = pathname.toLowerCase();
+    if (apiPathname === OPERATOR_API_PATH_PREFIX || apiPathname.startsWith(`${OPERATOR_API_PATH_PREFIX}/`)) {
+      sendRefusal(request, response, 404, errorBody('not_found', 'The requested operator API route does not exist.'), headOnly);
+      return;
+    }
+
+    if (options.static_error || staticRoot === null) {
+      const code = options.static_error ?? 'operator_assets_unavailable';
+      const message = options.static_error ? 'Operator UI version does not match the CLI.' : 'Operator UI assets are unavailable.';
+      sendRefusal(request, response, 503, errorBody(code, message, OPERATOR_ASSET_ACTION), headOnly);
+      return;
+    }
+
+    const requestedFile = fileIfSafe(staticRoot, pathname);
+    const file = requestedFile ?? (isHtmlNavigation(request, pathname) ? fallbackIndex(staticRoot) : null);
+    if (file === null) {
+      if (pathname === '/' || isHtmlNavigation(request, pathname)) {
+        sendRefusal(request, response, 503, errorBody('operator_assets_unavailable', 'Operator UI assets are unavailable.', OPERATOR_ASSET_ACTION), headOnly);
+      } else {
+        sendRefusal(request, response, 404, errorBody('not_found', 'The requested operator asset does not exist.'), headOnly);
+      }
+      return;
+    }
+
+    let body: Buffer;
+    try {
+      body = readFileSync(file);
+    } catch (_error) {
+      sendRefusal(request, response, 503, errorBody('operator_assets_unavailable', 'Operator UI assets are unavailable.', OPERATOR_ASSET_ACTION), headOnly);
+      return;
+    }
+    const fileType = contentType(file);
+    const headers = {
+      ...staticHeaders(fileType),
+      'Content-Length': body.byteLength.toString(),
+      // The page response is the only place the write token is handed out.
+      ...(fileType.startsWith('text/html') ? { 'Set-Cookie': operatorWriteTokenCookie(request.socket.localPort!, writeToken) } : {}),
+    };
+    response.writeHead(200, headers);
+    if (headOnly) response.end();
+    else response.end(body);
+  };
+
+  if (options.runtime_status_config && options.read_runtime_status) throw new OperatorServerError('invalid_argument', 'Select runtime config or cache reader.', 400);
+  // Collector groups of a server that died with SIGKILL have no other owner.
+  reapOrphanedProcessGroups();
+  const runtimeService = options.runtime_status_config ? await startRuntimeService(options.runtime_status_config, { ...process.env, ...options.env }) : null;
+  const devActivity = options.dev_activity_collector && !options.read_dev_activity
+    ? startDevActivityCollector({
+      env: options.env,
+      read_runtime: options.read_runtime_status ?? runtimeService?.read ?? null,
+    })
+    : null;
+  const setup = options.setup_collector && !options.read_setup ? startSetupCollector({ env: options.env, agent_runtimes: {} }) : null;
+  const botAccessCollects = options.bot_access_collector === true && !options.read_bot_access;
+  const notify = (options.notify_collector || botAccessCollects) && !options.read_notify ? startNotifyCollector({ env: options.env }) : null;
+  const botAccess = botAccessCollects
+    ? startBotAccessCollector({ env: options.env, read_notify: options.read_notify ?? notify!.read, first_cycle_after: notify?.settled() })
+    : null;
+  const botReviews = options.bot_access_collector === true && !options.read_bot_reviews ? startSlackReviewCollector({ env: options.env }) : null;
+  const docs = options.docs_collector && !options.read_docs
+    ? startDocsCollector({ env: options.env, read_dev_activity: options.read_dev_activity ?? devActivity?.read ?? unavailableDevActivitySnapshot })
+    : null;
+  const diagramRenderer = docs ? startDiagramRenderer({ env: options.env ?? process.env, read_docs: docs.read }) : null;
+  const diagramCapability = options.read_diagram_capability ?? diagramRenderer?.capability ?? (() => ({ state: 'pending' }) as const);
+  const tests = options.tests_collector && !options.read_tests
+    ? startTestsCollector({ env: options.env, read_dev_activity: options.read_dev_activity ?? devActivity?.read ?? unavailableDevActivitySnapshot })
+    : null;
+  const readRuntimeStatus = options.read_runtime_status ?? runtimeService?.read ?? unavailableRuntimeOverlay;
+  const readHerdr = () => readRuntimeStatus().status;
+  const rules = options.rules_collector && !options.read_rules ? startRulesCollector({ env: options.env, read_herdr: readHerdr }) : null;
+  const readRules = options.read_rules ?? rules?.read ?? ((): RulesRepositoryCache => ({ state: 'unavailable', reason: 'rules_pending' }));
+  const execution = options.execution_collector && !options.read_execution_state ? startExecutionCollector({ env: options.env }) : null;
+  const worktrees = options.worktree_collector && !options.read_worktrees ? startWorktreeCollector({ env: options.env }) : null;
+  const architectureMap = options.architecture_map_collector && !options.read_architecture_map
+    ? startArchitectureMapCollector({
+      env: options.env,
+      read_pull_requests: repositoryId => architecturePullRequestsSource((options.read_dev_activity ?? devActivity?.read ?? unavailableDevActivitySnapshot)(), repositoryId),
+      read_tests: options.read_tests ?? tests?.read,
+      first_cycle_after: devActivity?.settled(),
+    })
+    : null;
+  const boardObserver = options.board_cache ? null : startBoardObserver({ env: options.env, ...options.board_observer });
+  const boardReads: BoardObserverReads = options.board_cache ?? boardObserver!;
+  const cliInventory = options.cli_inventory_collector && !options.read_cli_inventory
+    ? startCliInventoryCollector({ env: options.env, usage_sources: options.cli_inventory_collector.usage_sources })
+    : null;
+  const server: Server = createServer((request, response) => {
+    void handleRequest(request, response).catch((_error) => {
+      if (response.headersSent) {
+        response.destroy();
+        return;
+      }
+      sendRefusal(request, response, 500, errorBody('operator_server_unavailable', 'Operator server failed to handle the request.'));
+    });
+  });
+
+  await new Promise<void>((resolveListen, rejectListen) => {
+    const onError = (error: Error) => {
+      server.removeListener('listening', onListening);
+      runtimeService?.close();
+      void devActivity?.close();
+      void setup?.close();
+      void botAccess?.close();
+      void botReviews?.close();
+      void notify?.close();
+      void cliInventory?.close();
+      void docs?.close();
+      void diagramRenderer?.close();
+      void tests?.close();
+      void rules?.close();
+      void execution?.close();
+      void worktrees?.close();
+      void architectureMap?.close();
+      void boardObserver?.close();
+      rejectListen(error);
+    };
+    const onListening = () => {
+      server.removeListener('error', onError);
+      resolveListen();
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port, host);
+  });
+
+  const address = server.address();
+  if (address === null || typeof address === 'string') {
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    throw new OperatorServerError('operator_server_unavailable', 'Operator server did not expose a TCP address.');
+  }
+  const actualPort = address.port;
+  const urlHost = host === '::1' ? `[${host}]` : host;
+  let closed = false;
+  let closeCompletion: Promise<void> | null = null;
+  const close = (): Promise<void> => {
+    if (closeCompletion) return closeCompletion;
+    closed = true;
+    runtimeService?.close();
+    closeCompletion = Promise.resolve().then(async () => {
+      await Promise.all([boardObserver?.close(), devActivity?.close(), setup?.close(), botAccess?.close(), botReviews?.close(), notify?.close(), cliInventory?.close(), docs?.close(), diagramRenderer?.close(), tests?.close(), rules?.close(), execution?.close(), worktrees?.close(), architectureMap?.close()]);
+      // Close admission and cancel every owner before waiting for any one of
+      // them: a retiring read must not leave other queues launching work.
+      for (const cancel of activeTaskReadCancellers) cancel();
+      for (const controller of activeBoardReads) controller.abort();
+      await Promise.allSettled([
+        ...activeTaskReadCompletions,
+        ...boardCompletions,
+      ]);
+      if (!server.listening) return;
+      await new Promise<void>((resolveClose, rejectClose) => {
+        server.close((error?: Error) => {
+          if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') rejectClose(error);
+          else resolveClose();
+        });
+      });
+    });
+    return closeCompletion;
+  };
+
+  return Object.freeze({
+    host,
+    port: actualPort,
+    url: `http://${urlHost}:${actualPort}`,
+    close,
+  });
+}

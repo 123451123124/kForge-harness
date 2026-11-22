@@ -1,0 +1,491 @@
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { ArchitectureDebtReportV1 } from 'archctx-contracts';
+import { ARCHCONTEXT_MANIFEST, ARCHITECTURE_DEBT_COMMAND, ArchctxClientError, managedArchctxAction } from '../../core/architecture/projection';
+import { ARCHITECTURE_CONTRACT_VERSION, type AgentNotice, type AgentNoticePoint, type ArchctxProviderOptions, type ArchitectureNoticePort } from '../../core/architecture/contracts';
+import type { CapabilityOwnership } from '../../core/capabilities/registry';
+import { capabilitySource, changedSinceReviewBase, checkpointArchitectureDebt, prepareArchitectureTask, remainingTimeout } from '../../effects/architecture/archctx-provider';
+import { readGlobalArchitectureConfiguration } from '../../effects/architecture/projection-config';
+import { assertSafeRepoWritePath, writeHookStateFile } from '../../effects/hook-state-file';
+import { CapabilityOwnershipError, loadRegistryAuthority, parseIssueBranch, policyReviewBase, readWorkflowPolicy } from '../../effects/state/resolve-effective-state';
+import { boundedHookDiagnostic } from './hook-protocol';
+import { gitExecFileSync } from '../../effects/git/runner';
+
+const STATE_DIR = '.ai/harness/state/';
+const MARKER = `${STATE_DIR}agent-notice`;
+const STATUS_MARKER = `${STATE_DIR}agent-notice-status`;
+const ARCHIMAP_MARKER = `${STATE_DIR}agent-notice-archimap`;
+const ARCHIMAP_FILE = 'docs/architecture/archimap.html';
+const STATUS_COMMAND = 'rh arch projection status --json';
+const NOTICE_TIMEOUT_LINE = 'repo-harness: architecture notice: not finished in its time budget; the next hook measures again';
+const MAX_BYTES = 800;
+const MAX_MESSAGE_BYTES = 200;
+// The codes that archctx 0.9.1 checkpoint and package resolution throw for a setup step
+// that the operator has not done. They are not faults.
+const INACTIVE_CODES: ReadonlySet<string> = new Set([
+  'AC_MODEL_ADOPTION_REQUIRED', 'AC_CODE_FACTS_UNAVAILABLE', 'AC_CODE_FACTS_NOT_READY', 'RH_ARCHCTX_PACKAGE_MISSING',
+]);
+const REGISTRY_FILE = '.ai/context/capabilities.json';
+const modelPath = (path: string) => path.startsWith('.archcontext/model/') || path === REGISTRY_FILE;
+const singleLine = (text: string) => text.replace(/[\r\n\t]+/g, ' ');
+const clip = (text: string, bytes: number) => Buffer.from(text).subarray(0, bytes).toString('utf8').replace(/\uFFFD$/u, '');
+const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const errorText = (error: unknown) => singleLine(error instanceof Error ? error.message : String(error));
+const NOTICE_KINDS: readonly string[] = ['unowned-path', 'ambiguous-owner', 'stale-anchor', 'state-machine-rule', 'state-machine-stale'];
+const noticeItems = (report: ArchitectureDebtReportV1) => report.items.filter(item => NOTICE_KINDS.includes(item.kind));
+
+export interface NoticeBlock {
+  readonly content: string;
+  readonly systemMessage: string;
+  /** Commit delivery only after this complete block fits the output budget. */
+  readonly deliver?: () => void;
+}
+
+type Status =
+  | { readonly kind: 'active' }
+  | { readonly kind: 'disabled' }
+  | { readonly kind: 'inactive'; readonly cause: string }
+  | { readonly kind: 'failure'; readonly error: unknown }
+  /**
+   * A notice-path timeout or a transient ownership lookup failure: not a state change. Only diagnostics get it,
+   * no marker changes, and the next hook measures again.
+   */
+  | { readonly kind: 'quiet'; readonly error: unknown };
+
+interface Observation {
+  readonly status: Status;
+  readonly unowned: { readonly paths: readonly string[]; readonly block: NoticeBlock } | null;
+  readonly debt: { readonly branch: string; readonly ids: readonly string[]; readonly block: NoticeBlock } | null;
+  /** The unowned-path filter failed in a setup state. Only stderr gets it. */
+  readonly unmeasured?: unknown;
+  readonly archimap?: { readonly paths: readonly string[]; readonly block: NoticeBlock } | null;
+  readonly archimapError?: unknown;
+}
+
+type ChangedPaths = () => ReadonlySet<string>;
+
+/** Up to three rows and an exact overflow count. The overflow line and the footer are never cut. */
+function boundedBlock(header: string, rows: readonly string[], total: number, overflow: (count: number) => string, footer?: string): string {
+  const tail = footer === undefined ? [] : [footer];
+  const lines: string[] = [];
+  for (const row of rows.slice(0, 3)) {
+    const remainder = total - lines.length - 1;
+    const candidate = [header, ...lines, row, ...(remainder > 0 ? [overflow(remainder)] : []), ...tail].join('\n');
+    if (Buffer.byteLength(candidate, 'utf8') > MAX_BYTES) break;
+    lines.push(row);
+  }
+  const more = total - lines.length;
+  const content = [header, ...lines, ...(more > 0 ? [overflow(more)] : []), ...tail].join('\n');
+  // An upstream identifier can exceed the entire budget. Keep the command intact.
+  if (Buffer.byteLength(content, 'utf8') > MAX_BYTES) throw new Error('architecture notice identity exceeds the output budget');
+  return content;
+}
+
+/** What the row points at: the model field or citation, or the machine and its rule, break or anchor symbol. */
+function itemSubject(item: ArchitectureDebtReportV1['items'][number]): string {
+  const { details } = item;
+  if (item.kind === 'state-machine-rule' || item.kind === 'state-machine-stale') {
+    const target = item.kind === 'state-machine-stale' ? details.symbol ?? item.paths[0]
+      : details.ruleId ?? (details.region === undefined ? details.event === undefined ? undefined : `${details.event} step ${details.step}` : `${details.region}.${details.state}`);
+    return [details.stateMachineId, target, item.reasonCode].filter(part => part !== undefined).join(' ');
+  }
+  return typeof details.modelField === 'string' ? details.modelField
+    : details.origin === 'node-summary' ? 'summary'
+    : details.origin === 'node-responsibility' ? `responsibilities[${details.responsibilityIndex}]`
+    : 'human citations';
+}
+
+/** The checkpoint fallback has no severity or base classification. Only scoped ownership, citation and state machine debt reaches this renderer. */
+export function renderAgentNotice(report: ArchitectureDebtReportV1): NoticeBlock | null {
+  const items = noticeItems(report);
+  if (items.length === 0) return null;
+  const itemCapabilities = items.map(item => item.capabilityIds.length > 0 ? item.capabilityIds : [report.scope.capabilityIds[0] ?? 'unowned']);
+  const capabilities = [...new Set(itemCapabilities.flat())];
+  const rest = capabilities.length > 1 ? ` (+${capabilities.length - 1} capabilities)` : '';
+  const capability = `${singleLine(capabilities[0]!)}${rest}`;
+  const rows = items.slice(0, 3).map(item =>
+    `- ${item.kind} ${singleLine(item.capabilityIds[0] ?? report.scope.capabilityIds[0] ?? 'unowned')}; ${singleLine(itemSubject(item))}. Run: ${managedArchctxAction(item.action)}`);
+  return {
+    content: boundedBlock(`[ArchitectureDebt] ${items.length} new in ${capability}`, rows, items.length, count => `(+${count} more: ${ARCHITECTURE_DEBT_COMMAND})`),
+    systemMessage: `Architecture: ${items.length} debt ${items.length === 1 ? 'item' : 'items'} in ${capability}; run ${ARCHITECTURE_DEBT_COMMAND}.`,
+  };
+}
+
+/** Changed implementation paths that no registry capability owns. The ownership answer holds them; no checkpoint is needed. */
+function unownedBlock(paths: readonly string[]): NoticeBlock | null {
+  if (paths.length === 0) return null;
+  const subject = `unowned changed ${paths.length === 1 ? 'path' : 'paths'}`;
+  const rows = paths.slice(0, 3).map(path => `- unowned-path ${singleLine(path)}; no capability owns it. Fix: add an owner in ${REGISTRY_FILE}`);
+  return {
+    content: boundedBlock(`[ArchitectureDebt] ${paths.length} ${subject}`, rows, paths.length, count => `(+${count} more unowned changed paths)`),
+    systemMessage: `Architecture: ${paths.length} ${subject}; add an owner in ${REGISTRY_FILE}.`,
+  };
+}
+
+/**
+ * Ownership can measure from the last projection manifest commit, so its
+ * unowned list can hold paths that main changed. As in checkpoint, only the
+ * paths that differ from the review-base merge-base are this branch's changes.
+ */
+function changedUnownedPaths(owned: CapabilityOwnership | null, changedPaths: ChangedPaths | null): string[] {
+  if (!changedPaths || !owned || owned.unowned_paths.length === 0) return [];
+  const changed = changedPaths();
+  return owned.unowned_paths.filter(path => changed.has(path)).sort();
+}
+
+/** One git diff per review base per hook run for the unowned filter and the archimap check. Each reader of a base gets the same failure. */
+function memoChanged(repoRoot: string, options: ArchctxProviderOptions): (reviewBase: string) => ChangedPaths {
+  const results = new Map<string, { readonly set: ReadonlySet<string> } | { readonly error: unknown }>();
+  return reviewBase => () => {
+    let result = results.get(reviewBase);
+    if (!result) {
+      try { result = { set: changedSinceReviewBase(repoRoot, reviewBase, options) }; }
+      catch (error) { result = { error }; }
+      results.set(reviewBase, result);
+    }
+    if ('error' in result) throw result.error;
+    return result.set;
+  };
+}
+
+/** The map file marks adoption. Staleness needs only git and the review base, so an archctx setup state or failure does not hide it. */
+function archimapPaths(repoRoot: string, reviewBase: () => string | null, changedFor: (reviewBase: string) => ChangedPaths): string[] {
+  if (!existsSync(join(repoRoot, ARCHIMAP_FILE))) return [];
+  const base = reviewBase();
+  if (!base) return [];
+  const changed = changedFor(base)();
+  if (changed.has(ARCHIMAP_FILE)) return [];
+  return [...changed].filter(modelPath).sort();
+}
+
+function archimapBlock(paths: readonly string[]): NoticeBlock {
+  return {
+    content: boundedBlock(
+      `[Archimap] ${ARCHIMAP_FILE} was not updated, but this branch changed the architecture model.`,
+      paths.slice(0, 3).map(path => `- ${singleLine(path)}`), paths.length, count => `(+${count} more architecture model paths)`,
+      'Refresh the map with the repo-harness-archimap skill before the PR is ready.',
+    ),
+    systemMessage: `Archimap: the architecture model changed on this branch; refresh ${ARCHIMAP_FILE}.`,
+  };
+}
+
+function unignoredBlock(): NoticeBlock {
+  return {
+    content: `[Architecture] notice unavailable: ${STATE_DIR} is not Git-ignored. Fix: run rh init to register this repository, then rh update; update writes the runtime-state block to the repository's .git/info/exclude.`,
+    systemMessage: `Architecture: notice unavailable (${STATE_DIR} is not Git-ignored); run rh update.`,
+  };
+}
+
+function inactiveBlock(cause: string): NoticeBlock {
+  return {
+    content: `[Architecture] inactive: ${cause}. Run: ${STATUS_COMMAND}`,
+    systemMessage: `Architecture: inactive (${cause}); run ${STATUS_COMMAND}.`,
+  };
+}
+
+const failureCode = (error: unknown) => error instanceof ArchctxClientError ? singleLine(error.code) : 'error';
+
+function failureBlock(error: unknown): NoticeBlock {
+  const code = failureCode(error);
+  const text = error instanceof ArchctxClientError ? singleLine(error.providerMessage) : errorText(error);
+  return {
+    content: `[Architecture] notice unavailable (${code}): ${clip(text, MAX_MESSAGE_BYTES)}`,
+    systemMessage: `Architecture: notice unavailable (${code}); run ${ARCHITECTURE_DEBT_COMMAND}.`,
+  };
+}
+
+/**
+ * The one timeout classifier of the notice path: an archctx deadline or process
+ * timeout, the ownership resolve timeout, or a Git call killed by its timeout.
+ * Every other error keeps its block and its text.
+ */
+function noticeTimeout(error: unknown): boolean {
+  return (error instanceof ArchctxClientError && error.code === 'RH_ARCHCTX_TIMEOUT')
+    || (error instanceof CapabilityOwnershipError && error.blocker.code === 'ARCHCONTEXT_RESOLVE_TIMEOUT')
+    || (error instanceof Error && (error as NodeJS.ErrnoException).code === 'ETIMEDOUT');
+}
+
+/**
+ * Ownership that archctx did not compute (corrupt resolve output, a process or runtime failure) is a tool fault, not
+ * a model or setup fault. A model-facing line would wake an idle Stop loop at each flap, and the SessionStart state
+ * blockers already carry the cause once per session. A missing or mismatched archctx package stays visible: the
+ * operator repairs it with the blocker's `rh update` fix, which is the only package signal the blocker keeps.
+ */
+function transientOwnershipFailure(error: unknown): error is CapabilityOwnershipError {
+  return error instanceof CapabilityOwnershipError
+    && error.blocker.key === 'capability_ownership:unavailable'
+    && error.blocker.fix !== 'rh update';
+}
+
+function statusOf(error: unknown): Status {
+  if (noticeTimeout(error) || transientOwnershipFailure(error)) return { kind: 'quiet', error };
+  if (!(error instanceof ArchctxClientError) || !INACTIVE_CODES.has(error.code)) return { kind: 'failure', error };
+  return { kind: 'inactive', cause: singleLine(error.action ? `${error.code}, action ${error.action}` : error.code) };
+}
+
+/** Setup state before any archctx call, so a session without a diff still learns that the loop is off. */
+function readiness(repoRoot: string, env: NodeJS.ProcessEnv | undefined): Status {
+  const global = readGlobalArchitectureConfiguration(env);
+  if (global.initialized && global.policy.provider === 'disabled') return { kind: 'disabled' };
+  // archctx 0.9.1 checkpoint refuses a repository without this file (AC_MODEL_ADOPTION_REQUIRED, model-missing).
+  if (!existsSync(join(repoRoot, ARCHCONTEXT_MANIFEST))) return { kind: 'inactive', cause: `no ArchContext model (${ARCHCONTEXT_MANIFEST} is missing)` };
+  if (!global.initialized) return { kind: 'inactive', cause: 'global architecture configuration is missing; run rh update' };
+  return { kind: 'active' };
+}
+
+/** A registry repository declares no capability authority when the registry authority reports it absent. */
+function registryAbsent(repoRoot: string): boolean {
+  const read = (path: string): string | null => {
+    try { return readFileSync(join(repoRoot, path), 'utf8'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+  };
+  return loadRegistryAuthority(repoRoot, readWorkflowPolicy(repoRoot), read).status === 'absent';
+}
+
+function observe(repoRoot: string, ownership: (options: ArchctxProviderOptions) => CapabilityOwnership | null, options: ArchctxProviderOptions): Observation | null {
+  let source: ReturnType<typeof capabilitySource>;
+  try { source = capabilitySource(repoRoot); }
+  catch (error) { return { status: statusOf(error), unowned: null, debt: null }; }
+  if (source === 'unadopted') return null;
+  // No declared capability authority: the architecture loop does not apply (#737).
+  // Ownership cannot prove this, because Effective State leaves it null on a clean tree.
+  try { if (source === 'registry' && registryAbsent(repoRoot)) return null; }
+  catch (error) { return { status: statusOf(error), unowned: null, debt: null }; }
+  const now = options.nowMs ?? Date.now;
+  let owned: CapabilityOwnership | null = null;
+  let ownershipError: unknown;
+  // Ownership and checkpoint each get one bounded call. SessionStart reuses ownership.
+  try { owned = ownership({ ...options, deadlineMs: Math.min(options.deadlineMs ?? Infinity, now() + 3_000) }); }
+  catch (error) { ownershipError = error; }
+  const failed = ownershipError !== undefined;
+  const changedFor = memoChanged(repoRoot, options);
+  const changed = owned?.review_base ? changedFor(owned.review_base) : null;
+  // Measure debt before the optional map and posture reads spend the shared budget.
+  const rest = failed ? { status: statusOf(ownershipError), unowned: null, debt: null } : observeDebt(repoRoot, source, owned, changed, options);
+  // An ownership answer carries its review base. Without one (an archctx
+  // failure, or no answer on a clean tree), read the same policy base from Git.
+  const mapBase = () => !failed && owned ? owned.review_base : policyReviewBase(readWorkflowPolicy(repoRoot));
+  let archimap: Observation['archimap'] = null;
+  let archimapError: unknown;
+  try {
+    const paths = archimapPaths(repoRoot, mapBase, changedFor);
+    archimap = paths.length > 0 ? { paths, block: archimapBlock(paths) } : null;
+  } catch (error) { archimapError = error; }
+  return { ...rest, archimap, ...(archimapError === undefined ? {} : { archimapError }) };
+}
+
+function observeDebt(repoRoot: string, source: ReturnType<typeof capabilitySource>, owned: CapabilityOwnership | null, changed: ChangedPaths | null, options: ArchctxProviderOptions): Observation {
+  let unowned: Observation['unowned'] = null;
+  try {
+    const status = readiness(repoRoot, options.env);
+    let paths: string[];
+    // Only the registry is its own unowned-path authority. Under archcontext,
+    // archctx counts a path as unowned only inside declared source roots, so
+    // the broader resolver list would give the same fact a second meaning.
+    try { paths = source === 'registry' ? changedUnownedPaths(owned, changed) : []; }
+    catch (error) {
+      // A setup state runs no checkpoint, so a filter failure must not replace
+      // it with a failure line. The paths stay unmeasured for this hook.
+      if (status.kind !== 'active') return { status, unowned: null, debt: null, unmeasured: error };
+      throw error;
+    }
+    const ownerBlock = unownedBlock(paths);
+    unowned = ownerBlock && { paths, block: ownerBlock };
+    if (status.kind !== 'active') return { status, unowned, debt: null };
+    const measured = checkpointArchitectureDebt(repoRoot, owned, options);
+    const debtBlock = measured && renderAgentNotice(measured.report);
+    const debt = measured && debtBlock ? { branch: measured.branch, ids: noticeItems(measured.report).map(item => item.id).sort(), block: debtBlock } : null;
+    return { status, unowned, debt };
+  } catch (error) { return { status: statusOf(error), unowned, debt: null }; }
+}
+
+function currentBranch(repoRoot: string, options: ArchctxProviderOptions): string {
+  return gitExecFileSync(['-C', repoRoot, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+    encoding: 'utf8', env: options.env ?? process.env, stdio: ['ignore', 'pipe', 'ignore'], timeout: remainingTimeout(options, 3_000, 'notice branch'),
+  }).trim();
+}
+
+function ignored(repoRoot: string, path: string, options: ArchctxProviderOptions): boolean {
+  try { gitExecFileSync(['-C', repoRoot, 'check-ignore', '-q', '--', path], { env: options.env ?? process.env, stdio: 'ignore', timeout: remainingTimeout(options, 3_000, 'notice ignore') }); }
+  catch (error) {
+    // check-ignore exits 1 when no rule ignores the path.
+    if ((error as { status?: unknown }).status === 1) return false;
+    throw error;
+  }
+  return true;
+}
+
+/** True when the key is new. The key is written before delivery, so a failed write delivers nothing. */
+function claim(repoRoot: string, path: string, key: string, options: ArchctxProviderOptions): boolean {
+  const marker = join(repoRoot, path);
+  assertSafeRepoWritePath(repoRoot, marker);
+  try { if (readFileSync(marker, 'utf8').trim() === key) return false; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  if (!ignored(repoRoot, path, options)) throw new Error(`${path} is not Git-ignored`);
+  writeHookStateFile(repoRoot, marker, `${key}\n`);
+  return true;
+}
+
+/** Keep only current block keys. Shared markers retain each block's delivery independently. */
+function undelivered(repoRoot: string, path: string, entries: readonly { key: string; block: NoticeBlock }[], options: ArchctxProviderOptions): NoticeBlock[] {
+  const marker = join(repoRoot, path);
+  assertSafeRepoWritePath(repoRoot, marker);
+  let previous: string[] = [];
+  try { previous = readFileSync(marker, 'utf8').trim().split('\n'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  const delivered = new Set(previous.filter(key => entries.some(entry => entry.key === key)));
+  const pending = entries.filter(entry => !delivered.has(entry.key));
+  // Check Git before optional prepare spends the remaining time. Delivery itself
+  // only writes local state, so a prepare timeout cannot discard measured debt.
+  if (pending.length > 0 && !ignored(repoRoot, path, options)) throw new Error(`${path} is not Git-ignored`);
+  return pending.map(({ key, block }) => ({
+    ...block,
+    deliver: () => {
+      const keys = [...delivered, key];
+      writeHookStateFile(repoRoot, marker, `${keys.join('\n')}\n`);
+      delivered.add(key);
+    },
+  }));
+}
+
+/** One line per readiness change. A failure never touches the debt marker. */
+function statusNotice(repoRoot: string, options: ArchctxProviderOptions, status: Status): NoticeBlock | null {
+  switch (status.kind) {
+    // A Claude Stop block for a timeout or a transient tool fault would start one more turn with nothing to do.
+    case 'disabled': case 'quiet': return null;
+    case 'active':
+      // The active key ends the previous state, so a cause that returns prints again.
+      if (existsSync(join(repoRoot, STATUS_MARKER))) claim(repoRoot, STATUS_MARKER, digest(['active']), options);
+      return null;
+    case 'inactive': return undelivered(repoRoot, STATUS_MARKER, [{ key: digest(['inactive', status.cause]), block: inactiveBlock(status.cause) }], options)[0] ?? null;
+    case 'failure': {
+      const key = digest(['failure', currentBranch(repoRoot, options), failureCode(status.error)]);
+      return undelivered(repoRoot, STATUS_MARKER, [{ key, block: failureBlock(status.error) }], options)[0] ?? null;
+    }
+  }
+}
+
+/** Ownership and citation debt share one marker. Their key changes when a debt item or an unowned path changes. */
+function debtNotice(repoRoot: string, options: ArchctxProviderOptions, observation: Observation): NoticeBlock[] {
+  const { unowned, debt } = observation;
+  // A failed, timed-out or transient lookup has no measured set. Claiming the unowned paths alone would
+  // make every recovery print them again.
+  if (observation.status.kind === 'failure' || observation.status.kind === 'quiet' || (!unowned && !debt)) return [];
+  const key = [debt?.branch ?? currentBranch(repoRoot, options), debt?.ids ?? [], unowned?.paths ?? []];
+  return undelivered(repoRoot, MARKER, [
+    ...(unowned ? [{ key: digest([...key, 'unowned']), block: unowned.block }] : []),
+    ...(debt ? [{ key: digest([...key, 'checkpoint']), block: debt.block }] : []),
+  ], options);
+}
+
+/** Its own marker, so the map reminder never consumes or repeats the debt notice. */
+function archimapNotice(repoRoot: string, options: ArchctxProviderOptions, observation: Observation): NoticeBlock[] {
+  const { archimap } = observation;
+  if (!archimap) return [];
+  return undelivered(repoRoot, ARCHIMAP_MARKER, [{ key: digest([currentBranch(repoRoot, options), archimap.paths]), block: archimap.block }], options);
+}
+
+/**
+ * Every notice-path error goes through here. A timeout gives one fixed line per
+ * hook run, whichever reads timed out: it names no command and carries no raw
+ * error text. Each other failure keeps its text on one line.
+ */
+function noticeProblems() {
+  const texts: string[] = [];
+  let timedOut = false;
+  return {
+    add(error: unknown): void {
+      if (noticeTimeout(error)) { timedOut = true; return; }
+      texts.push(errorText(error));
+    },
+    lines(): string {
+      return [
+        ...(texts.length > 0 ? [boundedHookDiagnostic(`repo-harness: architecture notice unavailable: ${texts.join('; ')}`)] : []),
+        ...(timedOut ? [boundedHookDiagnostic(NOTICE_TIMEOUT_LINE)] : []),
+      ].map(line => `${line}\n`).join('');
+    },
+  };
+}
+
+function taskNotice(repoRoot: string, options: ArchctxProviderOptions): NoticeBlock | null {
+  const task = parseIssueBranch(currentBranch(repoRoot, options));
+  if (!task) return null;
+  const prepared = prepareArchitectureTask(repoRoot, `Issue #${task.issue}: ${task.slug.replace(/-/g, ' ')}`, options);
+  if (!prepared) return null;
+  const content = `[Architecture] posture: ${prepared.posture}; constraints: ${prepared.constraints}; run: rh arch prepare --task ... --json`;
+  return { content, systemMessage: content };
+}
+
+/** Debt wins. Keep complete blocks in their original order, including commands and overflow counts. */
+function fitNoticeBlocks(blocks: readonly NoticeBlock[]): NoticeBlock[] {
+  const debt = (block: NoticeBlock) => block.content.startsWith('[ArchitectureDebt]');
+  const selected = new Set<NoticeBlock>();
+  let bytes = 0;
+  for (const block of [...blocks.filter(debt), ...blocks.filter(block => !debt(block))]) {
+    const size = Buffer.byteLength(block.content, 'utf8') + (selected.size > 0 ? 1 : 0);
+    if (bytes + size > MAX_BYTES) continue;
+    selected.add(block);
+    bytes += size;
+  }
+  return blocks.filter(block => selected.has(block));
+}
+
+/**
+ * Shared by all host delivery points. The status and debt markers fail independently.
+ * Without an ignored marker path nothing is deduplicated, so only SessionStart,
+ * which runs once per session, names the cause. It checks both markers even when
+ * it writes none: a current marker or a quiet loop does not hide a removed rule.
+ * A Claude Stop line would start one more turn at each stop.
+ */
+export function collectAgentNotice(repoRoot: string, ownership: (options: ArchctxProviderOptions) => CapabilityOwnership | null, options: ArchctxProviderOptions = {}, point: AgentNoticePoint = 'turn'): AgentNotice {
+  const now = options.nowMs ?? Date.now;
+  if (point === 'session-start') options = { ...options, deadlineMs: Math.min(options.deadlineMs ?? Infinity, now() + 3_000) };
+  const observation = observe(repoRoot, ownership, options);
+  if (!observation) return {};
+  const blocks: NoticeBlock[] = [];
+  const problems = noticeProblems();
+  const { status } = observation;
+  if (status.kind === 'failure' || status.kind === 'quiet') problems.add(status.error);
+  if (observation.unmeasured !== undefined) problems.add(observation.unmeasured);
+  try {
+    const block = statusNotice(repoRoot, options, status);
+    if (block) blocks.push(block);
+  } catch (error) { problems.add(error); }
+  try { blocks.push(...debtNotice(repoRoot, options, observation)); }
+  catch (error) { problems.add(error); }
+  // A failure that the status or unowned filter already reported (the shared
+  // diff, or the same unavailable review subject) is not repeated.
+  const { archimapError } = observation;
+  const reported = status.kind === 'failure' || status.kind === 'quiet' ? status.error : observation.unmeasured;
+  if (archimapError !== undefined && (reported === undefined || errorText(archimapError) !== errorText(reported))) problems.add(archimapError);
+  try { blocks.push(...archimapNotice(repoRoot, options, observation)); }
+  catch (error) { problems.add(error); }
+  if (point === 'session-start') {
+    try { if (![STATUS_MARKER, MARKER, ARCHIMAP_MARKER].every(path => ignored(repoRoot, path, options))) blocks.push(unignoredBlock()); }
+    catch (error) { problems.add(error); }
+    if (status.kind === 'active') {
+      try {
+        const block = taskNotice(repoRoot, options);
+        if (block) blocks.push(block);
+      } catch (error) {
+        // The subprocess can echo task text or stderr. Report only its code.
+        problems.add(noticeTimeout(error) ? error : new Error(`architecture prepare unavailable (${failureCode(error)})`));
+      }
+    }
+  }
+  const chosen = fitNoticeBlocks(blocks).filter(block => {
+    try { block.deliver?.(); return true; }
+    catch (error) { problems.add(error); return false; }
+  });
+  const diagnostics = problems.lines();
+  return {
+    ...(chosen.length > 0 ? { content: chosen.map(block => block.content).join('\n'), systemMessage: chosen.map(block => block.systemMessage).join('\n') } : {}),
+    ...(diagnostics === '' ? {} : { diagnostics }),
+    // A timeout is load and keeps its fixed line only. The log gets the code, never the text: archctx output can carry private paths.
+    ...(status.kind === 'quiet' && transientOwnershipFailure(status.error) && !noticeTimeout(status.error)
+      ? { logReason: `architecture-notice-quiet:${singleLine(status.error.blocker.code)}` } : {}),
+  };
+}
+
+export const AGENT_NOTICE_PROVIDER: ArchitectureNoticePort = { contractVersion: ARCHITECTURE_CONTRACT_VERSION, collect: collectAgentNotice };

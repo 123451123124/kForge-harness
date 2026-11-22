@@ -1,0 +1,321 @@
+import { describe, expect, test } from 'bun:test';
+import { tmpWorkspace } from '../helpers/repo-fixture';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { ROUTES } from '../../src/cli/hook/route-registry';
+import { projectSetupSnapshot } from '../../src/core/setup/projection';
+import { decodeSetupSnapshot } from '../../src/core/setup/decode';
+import type { SetupSnapshotV2 } from '../../src/core/setup/types';
+import type { AgentRuntimeProbeV1 } from '../../src/core/board/agents-settings';
+import {
+  AGENT_RUNTIME_PROBE_ARGV,
+  SETUP_CHILD_ARGV,
+  SETUP_TIMEOUT_MS,
+  collectSetupSnapshot,
+  runSetupProcess,
+  startSetupCollector,
+  type SetupProcessResult,
+  type SetupProcessRunner,
+} from '../../src/effects/setup/collector';
+import { SETUP_FLEET_SOURCE_DIR, readFleetRoles } from '../../src/cli/commands/setup-snapshot';
+import { HOOK_EVENT_TELEMETRY_PATH, HOOK_EVENT_TELEMETRY_PROTOCOL } from '../../src/cli/hook/event-telemetry';
+import { appendSegmentedLog } from '../../src/effects/segmented-log';
+import { readHookUsage, readTailLines } from '../../src/effects/setup/hook-usage';
+import { FAILURE_LOG_FILE } from '../../src/effects/state/resolve-effective-state';
+import { parseSkillSurfaceCatalog } from '../../src/core/skill-surface/catalog';
+
+function snapshot(collectedAt: string): SetupSnapshotV2 {
+  return projectSetupSnapshot({
+    collected_at: collectedAt, setup_status: 'ok', summary: { ok: 1, warn: 0, fail: 0, na: 0, needs_agent: 0 },
+    checks: [{ id: 'doctor.cli-version', title: 'repo-harness CLI version', status: 'ok', detail: '0.21.1' }],
+    check_commands: new Map(), adapters: [], cli_versions: {}, skill_rows: [], skill_catalog: null, home: '/nowhere', skill_roots: [], install_selection: null,
+    routes: ROUTES, fleet_roles: [], fleet_hosts: null, hook_usage: null,
+  });
+}
+
+const ok = (value: unknown): SetupProcessResult => ({ ok: true, stdout: `${JSON.stringify(value)}\n` });
+
+async function until(condition: () => boolean, limit_ms = 2_500): Promise<void> {
+  for (let attempt = 0; attempt < limit_ms / 5 && !condition(); attempt++) await Bun.sleep(5);
+  expect(condition()).toBe(true);
+}
+
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+describe('setup collector', () => {
+  test('runs the constant child argv with a 90 second deadline and no update checks', async () => {
+    const seen: { argv: readonly string[]; timeout: number; env: NodeJS.ProcessEnv }[] = [];
+    const run: SetupProcessRunner = async (argv, options) => { seen.push({ argv, timeout: options.timeout_ms, env: options.env }); return ok(snapshot('2026-10-10T00:00:00.000Z')); };
+    const outcome = await collectSetupSnapshot({ run_process: run, env: { HOME: '/nowhere', REPO_HARNESS_CHECK_UPDATES: '1' }, signal: new AbortController().signal });
+    expect(outcome.ok).toBe(true);
+    expect(SETUP_TIMEOUT_MS).toBe(90_000);
+    expect(seen[0]!.argv).toBe(SETUP_CHILD_ARGV);
+    expect(SETUP_CHILD_ARGV).toEqual([join(import.meta.dir, '../../src/cli/commands/setup-check-child.ts')]);
+    expect(seen[0]!.timeout).toBe(90_000);
+    expect(seen[0]!.env.REPO_HARNESS_CHECK_UPDATES).toBeUndefined();
+  });
+
+  test('a deadline sends SIGTERM first, then kills the child and every process it spawned', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'repo-harness-setup-timeout-'));
+    try {
+      const pidFile = join(dir, 'grandchild.pid');
+      const termFile = join(dir, 'term-received');
+      const script = join(dir, 'hang.ts');
+      writeFileSync(script, `import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+process.on('SIGTERM', () => writeFileSync(${JSON.stringify(termFile)}, 'received'));
+const sleeper = spawn('sleep', ['30'], { stdio: 'ignore' });
+writeFileSync(${JSON.stringify(pidFile)}, String(sleeper.pid));
+setInterval(() => {}, 1000);
+`);
+      const deadline_ms = 8_000;
+      const started = Date.now();
+      const pending = runSetupProcess([script], { cwd: dir, env: process.env, timeout_ms: deadline_ms, signal: new AbortController().signal });
+      // The child writes its grandchild pid after startup; wait for it while the call is still pending.
+      await until(() => existsSync(pidFile) && readFileSync(pidFile, 'utf8') !== '', 5_000);
+      const grandchild = Number(readFileSync(pidFile, 'utf8'));
+      expect(alive(grandchild)).toBe(true);
+      const result = await pending;
+      expect(result).toEqual({ ok: false, code: 'timeout' });
+      expect(Date.now() - started).toBeLessThan(deadline_ms + 5_000);
+      // The result settles after the group is gone, so no polling is needed.
+      expect(alive(grandchild)).toBe(false);
+      expect(readFileSync(termFile, 'utf8')).toBe('received');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('cycles never overlap and reads never start work', async () => {
+    let active = 0;
+    let maxActive = 0;
+    let runs = 0;
+    const run: SetupProcessRunner = async () => {
+      runs++; active++; maxActive = Math.max(maxActive, active);
+      await Bun.sleep(15);
+      active--;
+      return ok(snapshot(new Date().toISOString()));
+    };
+    const collector = startSetupCollector({ run_process: run, interval_ms: 1 });
+    try {
+      for (let index = 0; index < 50; index++) collector.read();
+      expect(runs).toBe(1);
+      await until(() => runs >= 4);
+      expect(maxActive).toBe(1);
+    } finally { await collector.close(); }
+    const after = runs;
+    await Bun.sleep(30);
+    expect(runs).toBe(after);
+  });
+
+  test('probes agent runtimes after setup check in the same cycle and keeps the last good probe', async () => {
+    const probe: AgentRuntimeProbeV1 = { protocol: 1, kind: 'agent_runtime_probe', collected_at: '2026-10-27T00:00:00.000Z',
+      entries: [{ id: 'codex', group: 'default', installation: { kind: 'available', via: 'executable', version: 'codex-cli 0.164.0' } }] };
+    const order: string[] = [];
+    const probeResults: SetupProcessResult[] = [ok(probe), { ok: false, code: 'timeout' }, { ok: true, stdout: '{"protocol":1}' }];
+    const setupRun: SetupProcessRunner = async (argv) => { order.push(argv === SETUP_CHILD_ARGV ? 'setup' : 'other'); return ok(snapshot('2026-10-10T00:00:00.000Z')); };
+    const probeRun: SetupProcessRunner = async (argv, options) => {
+      order.push(argv === AGENT_RUNTIME_PROBE_ARGV ? 'probe' : 'other');
+      expect([options.timeout_ms, options.service]).toEqual([60_000, 'agent-runtime-probe']);
+      return probeResults.shift() ?? { ok: false, code: 'aborted' };
+    };
+    const collector = startSetupCollector({ run_process: setupRun, interval_ms: 1, agent_runtimes: { run_process: probeRun } });
+    try {
+      expect(collector.read_agent_runtimes()).toEqual({ status: 'unavailable', reason: 'collection_pending' });
+      await until(() => order.length >= 6);
+      expect(order.slice(0, 6)).toEqual(['setup', 'probe', 'setup', 'probe', 'setup', 'probe']);
+      await collector.settled();
+      expect(collector.read_agent_runtimes()).toEqual({ status: 'stale', reason: 'probe_invalid', probe });
+    } finally { await collector.close(); }
+
+    // Without the option, a cycle never starts the probe child.
+    const runs: (readonly string[])[] = [];
+    const plain = startSetupCollector({ run_process: async (argv) => { runs.push(argv); return ok(snapshot('2026-10-10T00:00:00.000Z')); }, interval_ms: 60_000 });
+    try {
+      await plain.settled();
+      expect(runs).toEqual([SETUP_CHILD_ARGV]);
+      expect(plain.read_agent_runtimes()).toEqual({ status: 'unavailable', reason: 'collection_pending' });
+    } finally { await plain.close(); }
+  });
+
+  test('serves the setup snapshot while the agent runtime probe is still running', async () => {
+    // Main published the setup result, then ran the probe, so a probe of up to 60 s never held the snapshot.
+    const good = snapshot('2026-10-10T00:00:00.000Z');
+    let releaseProbe!: () => void;
+    const probeGate = new Promise<void>((resolve) => { releaseProbe = resolve; });
+    let probeStarted!: () => void;
+    const probeStart = new Promise<void>((resolve) => { probeStarted = resolve; });
+    const collector = startSetupCollector({
+      run_process: async (argv) => (argv === SETUP_CHILD_ARGV ? ok(good) : { ok: false, code: 'failed' }),
+      interval_ms: 60_000,
+      agent_runtimes: { run_process: async (argv) => {
+        if (argv === AGENT_RUNTIME_PROBE_ARGV) { probeStarted(); await probeGate; }
+        return { ok: false, code: 'failed' };
+      } },
+    });
+    try {
+      // The setup child has settled and the probe is running: take the read the server would serve now.
+      await probeStart;
+      const duringProbe = collector.read();
+      const runtimesDuringProbe = collector.read_agent_runtimes();
+      releaseProbe();
+      await collector.settled();
+      expect(duringProbe).toEqual(good);
+      expect(runtimesDuringProbe).toEqual({ status: 'unavailable', reason: 'collection_pending' });
+      expect(collector.read()).toEqual(good);
+      expect(collector.read_agent_runtimes()).toEqual({ status: 'unavailable', reason: 'probe_failed' });
+    } finally {
+      releaseProbe();
+      await collector.close();
+    }
+  });
+
+  test('keeps the last good snapshot with its age and a fixed reason code', async () => {
+    const good = snapshot('2026-10-10T00:00:00.000Z');
+    const queue: SetupProcessResult[] = [
+      { ok: false, code: 'failed' },
+      ok(good),
+      { ok: false, code: 'timeout' },
+      { ok: true, stdout: 'not json' },
+      ok({ ...good, checks: [{ id: 'x', status: 'warn', title: 't', detail: 'at /Users/alice/secret', command: null }] }),
+      ok(good),
+    ];
+    let gate: (() => void) | null = null;
+    const run: SetupProcessRunner = async (_argv, options) => {
+      await new Promise<void>((resolve) => {
+        gate = resolve;
+        options.signal.addEventListener('abort', () => resolve(), { once: true });
+      });
+      return queue.shift() ?? { ok: false, code: 'aborted' };
+    };
+    const collector = startSetupCollector({ run_process: run, interval_ms: 1 });
+    const step = async () => {
+      await until(() => gate !== null);
+      const release = gate!;
+      gate = null;
+      release();
+      await collector.settled();
+    };
+    try {
+      expect(collector.read()).toMatchObject({ status: 'unavailable', reason: 'collection_pending', collected_at: null });
+      await step();
+      expect(collector.read()).toMatchObject({ status: 'unavailable', reason: 'setup_check_failed', collected_at: null });
+      await step();
+      expect(collector.read()).toEqual(good);
+      await step();
+      expect(collector.read()).toEqual({ ...good, status: 'stale', reason: 'setup_check_timeout' });
+      await step();
+      expect(collector.read()).toEqual({ ...good, status: 'stale', reason: 'setup_check_invalid' });
+      await step();
+      expect(collector.read()).toEqual({ ...good, status: 'stale', reason: 'setup_check_invalid' });
+      expect(JSON.stringify(collector.read())).not.toContain('/Users/');
+      await step();
+      expect(collector.read()).toEqual(good);
+      for (const value of [collector.read()]) expect(decodeSetupSnapshot(value)).toBe(value);
+    } finally { await collector.close(); }
+  });
+
+  test('reads every packaged fleet role through the shared frontmatter parser', () => {
+    const roles = readFleetRoles(SETUP_FLEET_SOURCE_DIR);
+    expect(roles.map(role => role.name)).toEqual(['deep-reasoner', 'explorer', 'harness-evaluator']);
+    expect(roles.every(role => role.model !== undefined && role.effort !== undefined && role.description !== undefined)).toBe(true);
+  });
+
+  test('every real catalog summary and fleet frontmatter value survives projection and decode verbatim', () => {
+    const manifest = readFileSync(join(import.meta.dir, '../../assets/skill-commands/manifest.json'), 'utf8');
+    const catalog = parseSkillSurfaceCatalog(manifest, { declared: true });
+    if (catalog.status !== 'valid') throw new Error('packaged catalog invalid');
+    const packages = catalog.catalog.packages;
+    const roles = readFleetRoles(SETUP_FLEET_SOURCE_DIR);
+    const projected = decodeSetupSnapshot(projectSetupSnapshot({
+      collected_at: '2026-10-10T00:00:00.000Z', setup_status: 'ok', summary: { ok: 0, warn: 0, fail: 0, na: 0, needs_agent: 0 },
+      checks: [], check_commands: new Map(), adapters: [], cli_versions: {},
+      skill_rows: packages.map(pkg => ({ host: 'claude' as const, name: pkg.name, state: 'ok link' as const, ok: true })),
+      skill_catalog: new Map(packages.map(pkg => [pkg.name, { summary: pkg.summary, hosts: pkg.hosts }])),
+      home: '/nowhere', skill_roots: [], install_selection: null,
+      routes: ROUTES, fleet_roles: roles, fleet_hosts: null, hook_usage: null,
+    }));
+    expect(packages.length).toBeGreaterThan(0);
+    expect(projected.skills.map(skill => [skill.name, skill.summary, skill.catalog_hosts])).toEqual(packages.map(pkg => [pkg.name, pkg.summary, [...pkg.hosts]]));
+    const expectedRoles: (string | null)[][] = roles.map(role => [role.name ?? null, role.description ?? null, role.model ?? null, role.effort ?? null]);
+    expect(projected.fleet.map(role => [role.name, role.description, role.model, role.effort])).toEqual(expectedRoles);
+    expect(JSON.stringify(projected)).not.toContain('[configured]');
+  });
+
+  test('the real child returns a public snapshot from an isolated HOME with fake credentials', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'repo-harness-setup-child-')));
+    const home = join(root, 'home');
+    const cwd = join(root, 'work');
+    const secrets = ['sk-proj-FAKEFAKEFAKEFAKEFAKEFAKE0003', 'ghp_FAKEFAKEFAKEFAKEFAKEFAKE0004', 'pi-fake-oauth-refresh-0005'];
+    try {
+      for (const dir of [cwd, join(home, '.pi/agent'), join(home, '.codex'), join(home, '.claude')]) mkdirSync(dir, { recursive: true });
+      // A user skill, a catalog package, a dot entry and a plain file in the scratch Claude skill root.
+      for (const dir of ['my-skill', 'repo-harness-test', '.hidden']) mkdirSync(join(home, '.claude/skills', dir), { recursive: true });
+      writeFileSync(join(home, '.claude/skills/notes.txt'), 'not a skill');
+      writeFileSync(join(home, '.pi/agent/auth.json'), JSON.stringify({ anthropic: { type: 'oauth', refresh: secrets[2], access: secrets[0] } }));
+      writeFileSync(join(home, '.codex/config.toml'), `[mcp_servers.x]\nbearer_token = "${secrets[1]}"\n`);
+      writeFileSync(join(home, '.claude/CLAUDE.md'), `# Notes\nOPENAI_API_KEY=${secrets[0]}\n`);
+      const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, BUN_INSTALL: join(home, '.bun') };
+      const outcome = await collectSetupSnapshot({ cwd, env, signal: new AbortController().signal });
+      if (!outcome.ok) throw new Error(`setup child failed: ${outcome.reason}`);
+      const text = JSON.stringify(outcome.snapshot);
+      expect(outcome.snapshot.status).toBe('ready');
+      expect(outcome.snapshot.hosts.map(host => [host.host, host.reported])).toEqual([['claude', true], ['codex', true], ['pi', true]]);
+      expect(outcome.snapshot.fleet.map(role => role.name)).toEqual(['deep-reasoner', 'explorer', 'harness-evaluator']);
+      expect(outcome.snapshot.hooks.flatMap(event => event.routes)).toHaveLength(ROUTES.length);
+      expect(outcome.snapshot.skills.length).toBeGreaterThan(0);
+      expect(outcome.snapshot.skill_roots).toEqual([
+        { host: 'claude', root: '~/.claude/skills', other_skills: ['my-skill'] },
+        { host: 'codex', root: '~/.codex/skills', other_skills: null },
+        { host: 'pi', root: '~/.pi/agent/skills', other_skills: null },
+      ]);
+      expect(outcome.snapshot.install_selection).toBeNull();
+      for (const forbidden of [root, home, '/Users/', '/private/', ...secrets]) expect(text).not.toContain(forbidden);
+      expect(existsSync(join(home, '.claude/agents'))).toBe(false);
+      expect(existsSync(join(home, '.codex/agents'))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
+});
+
+describe('setup hook usage reader', () => {
+  test('counts Pi telemetry only on routes that declare Pi', () => {
+    const root = tmpWorkspace('setup-pi-usage');
+    try {
+      const record = { protocol: HOOK_EVENT_TELEMETRY_PROTOCOL, started_at: '2026-10-10T11:00:00.000Z', host: 'pi', event: 'PreToolUse', route_id: 'edit', blocked: true };
+      appendSegmentedLog(join(root, HOOK_EVENT_TELEMETRY_PATH), `${JSON.stringify(record)}\n`, root);
+      const usage = readHookUsage(root, { path: HOOK_EVENT_TELEMETRY_PATH, protocol: HOOK_EVENT_TELEMETRY_PROTOCOL },
+        [{ event: 'PreToolUse', routeId: 'edit', hosts: ['claude', 'codex', 'pi'] }], Date.parse('2026-10-10T12:00:00.000Z'));
+      expect(usage.routes).toEqual([{ host: 'pi', event: 'PreToolUse', route_id: 'edit', calls: 1, blocked: 1, last_blocked_at: '2026-10-10T11:00:00.000Z' }]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test('reads the telemetry log and the failure log tail of one repository', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'setup-hook-usage-')));
+    try {
+      expect(readHookUsage(root, { path: HOOK_EVENT_TELEMETRY_PATH, protocol: HOOK_EVENT_TELEMETRY_PROTOCOL }, ROUTES, Date.parse('2026-10-10T12:00:00.000Z'))).toEqual({ window_hours: 24, routes: [], recent_denials: [] });
+      const record = { protocol: HOOK_EVENT_TELEMETRY_PROTOCOL, started_at: '2026-10-10T11:00:00.000Z', host: 'claude', event: 'PreToolUse', route_id: 'edit', blocked: true };
+      appendSegmentedLog(join(root, HOOK_EVENT_TELEMETRY_PATH), `${JSON.stringify(record)}\n`, root);
+      mkdirSync(join(root, '.ai/harness/failures'), { recursive: true });
+      writeFileSync(join(root, FAILURE_LOG_FILE), `${JSON.stringify({ ts: '2026-10-10T11:00:00Z', guard: 'EditScopeGuard', action: 'block', reason: `${root}/src/a.ts is outside scope` })}\n`);
+      const usage = readHookUsage(root, { path: HOOK_EVENT_TELEMETRY_PATH, protocol: HOOK_EVENT_TELEMETRY_PROTOCOL }, ROUTES, Date.parse('2026-10-10T12:00:00.000Z'));
+      expect(usage.routes).toEqual([{ host: 'claude', event: 'PreToolUse', route_id: 'edit', calls: 1, blocked: 1, last_blocked_at: '2026-10-10T11:00:00.000Z' }]);
+      expect(usage.recent_denials).toEqual([{ at: '2026-10-10T11:00:00.000Z', guard: 'EditScopeGuard', reason: '[private path] is outside scope' }]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('a tail read drops the partial first line', () => {
+    const root = mkdtempSync(join(tmpdir(), 'setup-tail-'));
+    try {
+      const file = join(root, 'log.jsonl');
+      writeFileSync(file, 'first line\nsecond\nthird\n');
+      expect(readTailLines(file, 1024)).toEqual(['first line', 'second', 'third']);
+      expect(readTailLines(file, 15)).toEqual(['second', 'third']);
+      expect(readTailLines(join(root, 'missing.jsonl'))).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

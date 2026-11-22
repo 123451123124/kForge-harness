@@ -1,0 +1,517 @@
+import { afterAll, describe, expect, spyOn, test } from 'bun:test';
+import * as fs from 'fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'fs';
+import { tmpdir } from 'os';
+import { join, relative } from 'path';
+import {
+  createEffectiveStateFixture,
+  resolveFixtureState,
+  writeFixture,
+  writeFixtureStateLock,
+} from './effective-state-fixture';
+import { withStateLock } from '../../src/effects/state/state-lock';
+import { acquireExclusiveDirectoryLock } from '../../src/effects/locking/exclusive-directory-lock';
+import {
+  commitStateVersionAfter,
+  currentStateVersion,
+  stateVersionOwnerPath,
+  type StateVersionWriteEffects,
+} from '../../src/effects/state/git-state-version-store';
+import { readWorkflowPolicy, resolveEffectiveState } from '../../src/effects/state/resolve-effective-state';
+import { contentRevision } from '../../src/effects/state/collect-state-inputs';
+import { sha256Prefixed } from '../../src/core/evidence/sha256';
+import { DEFAULT_RETENTION_DAYS, readRetentionConfig } from '../../src/effects/artifact-retention';
+import { mergeBackTarget } from '../../src/effects/state/coordination-worktree-topology';
+import { publishFileByRename, retryWindowsSharingRace } from '../../src/effects/atomic-append';
+import { capabilitySource } from '../../src/effects/architecture/archctx-provider';
+import { assertArchitecturePolicySelection } from '../../src/cli/installer/install-profile';
+
+describe('Effective State content revision', () => {
+  test('uses code-unit ordering when locale collation treats distinct keys as equal', () => {
+    const composed = 'plans/\u00e9.md';
+    const decomposed = 'plans/e\u0301.md';
+    const first = Object.fromEntries([
+      [composed, 'sha256:composed'],
+      [decomposed, 'sha256:decomposed'],
+    ]);
+    const reversed = Object.fromEntries(Object.entries(first).reverse());
+    const expected = sha256Prefixed(JSON.stringify({
+      [decomposed]: 'sha256:decomposed',
+      [composed]: 'sha256:composed',
+    }));
+
+    expect(contentRevision(first)).toBe(expected);
+    expect(contentRevision(reversed)).toBe(expected);
+  });
+});
+
+describe('Effective State lock effects', () => {
+  test('a malformed stale lock remains unknown even when its filename PID is dead', () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const lockPath = join(fixture.cwd, '.ai/harness/state/effective.lock');
+      const { ownerPath } = writeFixtureStateLock(fixture.cwd, {
+        pid: 99999999,
+        created_at: Date.now() - 60_000,
+        token: '99999999-0-00000000-0000-4000-8000-000000000000',
+      }, '{malformed');
+      const old = new Date(Date.now() - 60_000);
+      utimesSync(ownerPath, old, old);
+      expect(() => acquireExclusiveDirectoryLock(fixture.cwd, '.ai/harness/state/effective.lock', { waitTimeoutMs: 1 })).toThrow('timed out');
+      expect(readFileSync(ownerPath, 'utf-8')).toBe('{malformed');
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 30_000);
+
+  test('a token mismatch never deletes a lock now owned by another resolver', () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const lockPath = join(fixture.cwd, '.ai/harness/state/effective.lock');
+      withStateLock(fixture.cwd, () => {
+        writeFileSync(join(lockPath, 'replacement-owner.json'), `${JSON.stringify({
+          pid: process.pid,
+          created_at: Date.now(),
+          token: 'replacement-owner',
+        })}\n`);
+      });
+      expect(readdirSync(lockPath)).toEqual(['replacement-owner.json']);
+      expect(JSON.parse(readFileSync(join(lockPath, 'replacement-owner.json'), 'utf-8')).token).toBe('replacement-owner');
+      rmSync(lockPath, { recursive: true, force: true });
+    } finally {
+      fixture.cleanup();
+    }
+  }, 30_000);
+
+  test('a symlinked lock directory fails closed without deleting an external entry', () => {
+    const fixture = createEffectiveStateFixture();
+    const external = createEffectiveStateFixture();
+    try {
+      const lockPath = join(fixture.cwd, '.ai/harness/state/effective.lock');
+      mkdirSync(join(fixture.cwd, '.ai/harness/state'), { recursive: true });
+      const victim = join(external.cwd, 'external-victim');
+      writeFileSync(victim, 'preserve\n');
+      const old = new Date(Date.now() - 60_000);
+      utimesSync(victim, old, old);
+      symlinkSync(external.cwd, lockPath);
+      expect(() => withStateLock(fixture.cwd, () => undefined)).toThrow('unsafe lock path');
+      expect(readFileSync(victim, 'utf-8')).toBe('preserve\n');
+    } finally {
+      fixture.cleanup();
+      external.cleanup();
+    }
+  }, 30_000);
+
+  for (const ancestor of ['.ai', '.ai/harness', '.ai/harness/state']) {
+    test(`a symlinked repo-local lock ancestor ${ancestor} fails closed`, () => {
+      const fixture = createEffectiveStateFixture();
+      const external = createEffectiveStateFixture();
+      try {
+        const ancestorPath = join(fixture.cwd, ancestor);
+        rmSync(ancestorPath, { recursive: true, force: true });
+        const victim = join(external.cwd, 'victim');
+        writeFileSync(victim, 'preserve\n');
+        symlinkSync(external.cwd, ancestorPath);
+        const outsideBefore = readdirSync(external.cwd).sort();
+        let ran = false;
+        expect(() => withStateLock(fixture.cwd, () => { ran = true; })).toThrow('unsafe lock ancestor');
+        expect(ran).toBe(false);
+        expect(readdirSync(external.cwd).sort()).toEqual(outsideBefore);
+        const suffix = ['.ai', 'harness', 'state', 'effective.lock']
+          .slice(ancestor.split('/').length);
+        expect(existsSync(join(external.cwd, ...suffix))).toBe(false);
+        expect(readFileSync(victim, 'utf-8')).toBe('preserve\n');
+      } finally {
+        fixture.cleanup();
+        external.cleanup();
+      }
+    }, 30_000);
+  }
+
+  test('a symlinked canonical root fails closed before running the critical section', () => {
+    const fixture = createEffectiveStateFixture();
+    const link = `${fixture.cwd}-root-link`;
+    try {
+      symlinkSync(fixture.cwd, link);
+      let ran = false;
+      expect(() => withStateLock(link, () => { ran = true; })).toThrow('unsafe lock ancestor');
+      expect(ran).toBe(false);
+    } finally {
+      rmSync(link, { force: true });
+      fixture.cleanup();
+    }
+  }, 30_000);
+
+  test('a symlinked Git common-dir lock ancestor fails closed without external publication', () => {
+    const fixture = createEffectiveStateFixture();
+    const external = createEffectiveStateFixture();
+    try {
+      const commonDir = realpathSync(join(fixture.cwd, '.git'));
+      const sharedAncestor = join(commonDir, 'repo-harness');
+      const victim = join(external.cwd, 'victim');
+      writeFileSync(victim, 'preserve\n');
+      symlinkSync(external.cwd, sharedAncestor);
+      expect(() => resolveFixtureState(fixture.cwd)).toThrow('unsafe lock ancestor');
+      expect(existsSync(join(external.cwd, 'effective-state-version.json'))).toBe(false);
+      expect(existsSync(join(external.cwd, 'effective-state-version.json.lock'))).toBe(false);
+      expect(readFileSync(victim, 'utf-8')).toBe('preserve\n');
+    } finally {
+      fixture.cleanup();
+      external.cleanup();
+    }
+  }, 30_000);
+});
+
+describe('Effective State authority read faults', () => {
+  test('an authoritative path read error fails closed before version publication', () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const policyPath = join(fixture.cwd, '.ai/harness/policy.json');
+      rmSync(policyPath, { force: true });
+      mkdirSync(policyPath, { recursive: true });
+      expect(() => resolveFixtureState(fixture.cwd)).toThrow('EISDIR');
+      expect(existsSync(stateVersionOwnerPath(fixture.cwd))).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 30_000);
+
+});
+
+describe('Effective State version publication transaction', () => {
+  const risk = { targetPaths: ['src/feature.ts'], operationKind: 'feature' } as const;
+
+  function mutateAuthority(cwd: string): void {
+    writeFixture(cwd, '.ai/harness/policy.json', '{"worktree_strategy":{"review_base":"main"}}\n');
+  }
+
+  function tempNames(directory: string): string[] {
+    return readdirSync(directory).filter((name) => name.includes('.tmp-'));
+  }
+
+  function countingVersionEffects(): { readonly effects: StateVersionWriteEffects; calls(): number } {
+    let calls = 0;
+    return {
+      effects: {
+        writeTemp() { calls += 1; },
+        publish() { calls += 1; },
+        removeTemp() { calls += 1; },
+      },
+      calls: () => calls,
+    };
+  }
+
+  for (const fault of ['owner-temp', 'owner-publish'] as const) {
+    test(`${fault} failure preserves exact owner bytes and retry consumes only version 2`, () => {
+      const fixture = createEffectiveStateFixture();
+      try {
+        const first = resolveEffectiveState(fixture.cwd, Date.now(), risk);
+        const ownerPath = stateVersionOwnerPath(fixture.cwd);
+        const priorOwner = readFileSync(ownerPath);
+        mutateAuthority(fixture.cwd);
+
+        const version: StateVersionWriteEffects = {
+          writeTemp(path, content) {
+            if (fault === 'owner-temp') throw new Error('injected owner temp failure');
+            writeFileSync(path, content, { mode: 0o600 });
+          },
+          publish() {
+            throw new Error('injected owner publish failure');
+          },
+          removeTemp(path) { rmSync(path, { force: true }); },
+        };
+
+        expect(() => resolveEffectiveState(fixture.cwd, Date.now(), risk, { version }))
+          .toThrow(`injected ${fault.replace('-', ' ')} failure`);
+        expect(readFileSync(ownerPath).equals(priorOwner)).toBe(true);
+        expect(tempNames(join(ownerPath, '..'))).toEqual([]);
+        expect(resolveEffectiveState(fixture.cwd, Date.now(), risk).state_version)
+          .toBe(first.state_version + 1);
+      } finally {
+        fixture.cleanup();
+      }
+    }, 30_000);
+  }
+
+  test('a confirmSnapshot mismatch leaves owner bytes identical, writes no temp files, and the next successful call consumes exactly +1', () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const first = resolveEffectiveState(fixture.cwd, Date.now(), risk);
+      const ownerPath = stateVersionOwnerPath(fixture.cwd);
+      const priorOwner = readFileSync(ownerPath);
+      mutateAuthority(fixture.cwd);
+
+      const version = countingVersionEffects();
+      expect(() => commitStateVersionAfter(
+        fixture.cwd,
+        'revision-mismatch-probe',
+        version.effects,
+        () => false,
+      )).toThrow('effective-state confirm snapshot mismatch before version allocation');
+      expect(version.calls()).toBe(0);
+      expect(readFileSync(ownerPath).equals(priorOwner)).toBe(true);
+      expect(tempNames(join(ownerPath, '..'))).toEqual([]);
+      expect(resolveEffectiveState(fixture.cwd, Date.now(), risk).state_version)
+        .toBe(first.state_version + 1);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 30_000);
+
+  test('an unchanged revision never invokes version-owner write effects', () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const first = resolveEffectiveState(fixture.cwd, Date.now(), risk);
+      const version = countingVersionEffects();
+      const again = resolveEffectiveState(fixture.cwd, Date.now(), risk, { version: version.effects });
+      expect(again.state_version).toBe(first.state_version);
+      expect(version.calls()).toBe(0);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 30_000);
+});
+
+describe('Effective State authority metadata failures', () => {
+  function supportsPermissionProof(): boolean {
+    return process.platform !== 'win32'
+      && (typeof process.getuid !== 'function' || process.getuid() !== 0);
+  }
+
+  for (const authority of ['policy', 'capability-registry'] as const) {
+    test(`${authority} EACCES fails closed before version publication`, () => {
+      if (!supportsPermissionProof()) return;
+      const fixture = createEffectiveStateFixture();
+      let restrictedPath = '';
+      try {
+        if (authority === 'policy') {
+          restrictedPath = join(fixture.cwd, '.ai/harness/policy.json');
+          writeFileSync(restrictedPath, '{}\n');
+        } else {
+          restrictedPath = join(fixture.cwd, '.ai/context/capabilities.json');
+          writeFixture(fixture.cwd, '.ai/context/capabilities.json', '{"version":1,"capabilities":[]}\n');
+        }
+        chmodSync(restrictedPath, 0);
+        expect(() => resolveFixtureState(fixture.cwd)).toThrow();
+        expect(existsSync(stateVersionOwnerPath(fixture.cwd))).toBe(false);
+      } finally {
+        if (restrictedPath) chmodSync(restrictedPath, 0o600);
+        fixture.cleanup();
+      }
+    }, 30_000);
+  }
+
+  test('worktree-owner canonicalization errors fail closed before publication', () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const loop = join(fixture.cwd, 'worktree-owner-loop');
+      symlinkSync('worktree-owner-loop', loop);
+      writeFixture(fixture.cwd, '.ai/harness/active-worktree', `${loop}\n`);
+      expect(() => resolveFixtureState(fixture.cwd)).toThrow();
+      expect(existsSync(stateVersionOwnerPath(fixture.cwd))).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 30_000);
+});
+
+describe('Effective State version read effects', () => {
+  test('read-only version lookup returns zero only when Git metadata is absent', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'repo-harness-non-git-version-'));
+    try {
+      expect(currentStateVersion(cwd)).toBe(0);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('corrupt Git common-directory discovery is not downgraded to version zero', () => {
+    const fixture = createEffectiveStateFixture();
+    const gitPath = join(fixture.cwd, '.git');
+    const backupPath = join(fixture.cwd, '.git-backup');
+    try {
+      renameSync(gitPath, backupPath);
+      symlinkSync('.git', gitPath);
+      expect(() => currentStateVersion(fixture.cwd)).toThrow();
+    } finally {
+      rmSync(gitPath, { force: true });
+      if (existsSync(backupPath)) renameSync(backupPath, gitPath);
+      fixture.cleanup();
+    }
+  }, 30_000);
+
+  test('read-only version lookup takes no version lock and creates nothing in the Git common dir', () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const ownerPath = stateVersionOwnerPath(fixture.cwd);
+      const commonDir = realpathSync(join(fixture.cwd, '.git'));
+      expect(currentStateVersion(fixture.cwd)).toBe(0);
+      expect(existsSync(join(ownerPath, '..'))).toBe(false);
+
+      const first = resolveFixtureState(fixture.cwd);
+      const held = acquireExclusiveDirectoryLock(commonDir, relative(commonDir, `${ownerPath}.lock`));
+      try {
+        expect(currentStateVersion(fixture.cwd)).toBe(first.state_version);
+      } finally {
+        held.release();
+      }
+    } finally {
+      fixture.cleanup();
+    }
+  }, 30_000);
+
+  test('read-only version lookup preserves non-Git compatibility without hiding a corrupt owner', () => {
+    const fixture = createEffectiveStateFixture();
+    try {
+      const ownerPath = stateVersionOwnerPath(fixture.cwd);
+      mkdirSync(join(ownerPath, '..'), { recursive: true });
+      writeFileSync(ownerPath, '{"version":0,"revision":"invalid"}\n');
+      expect(() => currentStateVersion(fixture.cwd)).toThrow('invalid effective-state version owner');
+    } finally {
+      fixture.cleanup();
+    }
+  }, 30_000);
+});
+
+describe('policy loader: one reader of the file from disk', () => {
+  test('a policy key outside the tree loads and does not fail a reader', () => {
+    // `agentic_development` is not a tree key; the loader ignores it instead of rejecting the file.
+    expect(() => readWorkflowPolicy('/repo', () => JSON.stringify({
+      agentic_development: { routing: { design_plan: 'parent-agent:geju' } },
+      worktree_strategy: { base_branch: 'main', review_base: 'main', merge_back: { target: 'main' } },
+    }))).not.toThrow();
+  });
+
+  test('the loader keeps its two malformed-input messages and its absent-file null', () => {
+    expect(() => readWorkflowPolicy('/repo', () => '{"context": ')).toThrow(
+      'invalid workflow policy JSON: .ai/harness/policy.json',
+    );
+    expect(() => readWorkflowPolicy('/repo', () => '[]')).toThrow(
+      'invalid workflow policy object: .ai/harness/policy.json',
+    );
+    expect(readWorkflowPolicy('/repo', () => null)).toBeNull();
+  });
+});
+
+describe('each policy reader validates only the keys it reads', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'policy-reader-')));
+  afterAll(() => { rmSync(root, { recursive: true, force: true }); });
+  const repoWith = (name: string, policy: unknown): string => {
+    const repo = join(root, name);
+    mkdirSync(join(repo, '.ai/harness'), { recursive: true });
+    writeFileSync(join(repo, '.ai/harness/policy.json'), `${JSON.stringify(policy)}\n`);
+    return repo;
+  };
+  const env = { HOME: root } as NodeJS.ProcessEnv;
+
+  test('a value that the state resolver rejects does not stop another reader', () => {
+    const repo = repoWith('other-key', { worktree_strategy: { base_branch: 123 } });
+    expect(readRetentionConfig(repo).days).toBe(DEFAULT_RETENTION_DAYS);
+    expect(capabilitySource(repo)).toBe('registry');
+    expect(() => assertArchitecturePolicySelection(repo, ['product'], env)).not.toThrow();
+  });
+
+  test('the merge-back reader keeps its own message for its own key', () => {
+    for (const target of [123, '']) {
+      const repo = repoWith(`merge-back-${String(target)}`, { worktree_strategy: { merge_back: { target } } });
+      expect(() => mergeBackTarget(repo)).toThrow('integration target is invalid');
+    }
+  });
+
+  test('a [] or null root, or a non-object section, gives each lenient reader its absent result', () => {
+    const policies: Array<[string, unknown]> = [
+      ['array-root', []],
+      // A null root crashed these readers with a raw TypeError before #2398.
+      ['null-root', null],
+      ['scalar-sections', { worktree_strategy: 5, context: 5, information_lifecycle: 5, tooling: { codegraph: 5 } }],
+    ];
+    for (const [name, policy] of policies) {
+      const repo = repoWith(name, policy);
+      expect(readRetentionConfig(repo).days).toBe(DEFAULT_RETENTION_DAYS);
+      expect(capabilitySource(repo)).toBe('registry');
+      expect(() => assertArchitecturePolicySelection(repo, ['product'], env)).not.toThrow();
+      // The default target `main` reaches the Git probe; the fixture has no Git.
+      expect(() => mergeBackTarget(repo)).toThrow('local integration target is unavailable: refs/remotes/origin/main');
+    }
+  });
+
+  test('the state resolver keeps its non-object parent message', () => {
+    expect(() => readWorkflowPolicy('/repo', () => '{"worktree_strategy":5}'))
+      .toThrow('invalid workflow policy field .worktree_strategy.review_base: non-object parent');
+  });
+});
+
+describe('publish by rename', () => {
+  test('a rename that throws removes the temporary file and rethrows', () => {
+    const root = mkdtempSync(join(tmpdir(), 'publish-by-rename-'));
+    try {
+      const target = join(root, 'record.json');
+      mkdirSync(join(target, 'occupied'), { recursive: true });
+      const temporary = `${target}.tmp`;
+      expect(() => publishFileByRename(target, Buffer.from('{}'), temporary)).toThrow();
+      expect(existsSync(temporary)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+// Windows gives EPERM while another process holds the file open or deletes it (#2615).
+describe('windows sharing race', () => {
+  function onPlatform<T>(value: NodeJS.Platform, run: () => T): T {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { ...platform, value });
+    try { return run(); } finally { Object.defineProperty(process, 'platform', platform); }
+  }
+  const failure = (code: string) => Object.assign(new Error(`${code}: injected`), { code });
+
+  test.each([
+    ['a win32 EPERM that clears runs the operation again', 'win32', 1, 'EPERM', 2, true],
+    ['a win32 EPERM that lasts past the bound throws the first error', 'win32', Infinity, 'EPERM', 8, false],
+    ['an EPERM on another platform throws at once', 'darwin', 1, 'EPERM', 1, false],
+    ['another win32 code throws at once', 'win32', 1, 'EACCES', 1, false],
+  ] as const)('%s', (_name, platform, failures, code, attempts, resolves) => {
+    const errors: Error[] = [];
+    const operation = () => {
+      if (errors.length < failures) {
+        errors.push(failure(code));
+        throw errors.at(-1);
+      }
+      return 'done';
+    };
+    let thrown: unknown = null;
+    const result = onPlatform(platform, () => {
+      try { return retryWindowsSharingRace(operation); } catch (error) { thrown = error; return null; }
+    });
+    expect(errors.length + (resolves ? 1 : 0)).toBe(attempts);
+    if (resolves) expect(result).toBe('done');
+    else expect(thrown).toBe(errors[0]);
+  });
+
+  test('publish by rename replaces a target that a reader held open for one attempt', () => {
+    const root = mkdtempSync(join(tmpdir(), 'publish-by-rename-'));
+    const rename = spyOn(fs, 'renameSync').mockImplementationOnce(() => { throw failure('EPERM'); });
+    try {
+      const target = join(root, 'record.json');
+      writeFileSync(target, 'old');
+      onPlatform('win32', () => publishFileByRename(target, Buffer.from('new'), `${target}.tmp`));
+      expect(readFileSync(target, 'utf-8')).toBe('new');
+      expect(rename).toHaveBeenCalledTimes(2);
+    } finally {
+      rename.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

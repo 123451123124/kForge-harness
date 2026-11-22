@@ -1,0 +1,16 @@
+schemaVersion: archcontext.node/v2
+id: component.publication.primary-effects
+kind: component
+name: PR Readiness and Integration Evidence (effects)
+status: active
+parent: capability.organization.publication
+layer: effects
+summary: Collects live PR readiness and reads the stored TestBudget result from GitHub Actions.
+responsibilities:
+  - Collect provider facts and the newest completed Test budget attempt for the current PR head and base.
+  - Read exactly one typed result annotation, compute the live bound inputs from the base policy and PR body, and preserve unavailable results.
+source:
+  include:
+    - src/effects/publication/merge-readiness.ts
+    - src/effects/publication/draft-pull-request.ts
+    - src/effects/publication/new-remote-ref-push.ts

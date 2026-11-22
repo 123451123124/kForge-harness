@@ -1,0 +1,148 @@
+# Running tests
+
+Which coverage is sufficient is policy
+(`docs/reference-configs/global-working-rules.md#test-budget`).
+This file records how to actually run and measure it here.
+
+## Focused first
+
+```bash
+bun run test:files tests/skill-surface/catalog.test.ts --timeout 60000 --max-concurrency 1
+```
+
+Use the isolated launcher. Direct `bun test` can fail the HOME/cache startup guard.
+`test:files` accepts explicit file paths. Keep the timeout and concurrency visible.
+Files may also set a per-test timeout (see `references/authoring.md`).
+
+When timing a file locally, redirect instead of piping. A pipe swallows the
+exit status, and a long silent pipe is what makes a background runner look
+stalled:
+
+```bash
+bun run test:files tests/coordination-lease-store.test.ts --timeout 60000 --max-concurrency 1 > /tmp/rh.log 2>&1
+echo "EXIT=$?"
+```
+
+## Selecting files the way CI does
+
+`scripts/lib/ci-run-tests.sh` is the loop both `scripts/check-ci.sh` and the
+workflow use. With `BUN_TEST_ISOLATE_FILES=1` it runs one `bun test` per file
+and keeps going after a failure, then prints `[ci] failed test files (N):`.
+
+- `BUN_TEST_FILES` is a space-separated explicit list (`scripts/lib/ci-run-tests.sh#BUN_TEST_FILES`); no path
+  may contain a space. Unset, it discovers sorted `*.test.ts` and `*.test.tsx` files under `tests/`.
+- `BUN_TEST_JOBS` sets the bounded worker pool (`scripts/lib/ci-run-tests.sh#BUN_TEST_JOBS`). Each worker's log is
+  replayed whole by the parent, so a file's `[ci] test <path>` header and its
+  bun output stay contiguous.
+- `BUN_TEST_TIMEOUT_MS` and `BUN_TEST_MAX_CONCURRENCY` feed the per-file
+  `bun test` invocation (`scripts/lib/ci-run-tests.sh#run_bun_test_file`).
+
+## The gate lanes
+
+`scripts/check-ci.sh [affected|all|governance|functional|architecture]` defaults to `affected`. `ledger --base <ref>` runs LedgerEnforcement on `tasks/lessons.md`.
+PR checks select affected tests. Daily CI selects `governance`, `architecture`
+and `functional` as separate jobs. The release gate selects `all`, which runs
+all three.
+
+The `architecture` lane runs `rh arch projection check --json`
+and fails when the status is not `noop`. When `ARCHITECTURE_SUMMARY` names a
+file, the lane writes the JSON summary there. The daily report puts it in the
+repair issue. `architecture-advisory --base <ref>` is the PR lane, and
+`Required / CI` reads its job. It first runs the package-local archctx
+`constraints check --json` and fails unless `constraint.surface.plugin-internals` (ADR-0002 rule 5) was
+evaluated with 0 violations, `coverage: complete`, no reason codes and no
+unresolved imports. It does not read the archctx exit code or the global status.
+Then it runs `rh arch debt --json --base <ref>` and prints one
+`::warning::` line for each debt item that is new since the base, at most 20.
+It prints coverage gaps in the log. Then it runs the check and warns when the
+documents are stale. Only the constraint result can fail the lane.
+
+Only the `all`, `functional` (daily CI) and `release` lanes export
+`REPO_HARNESS_TEST_EXPENSIVE=1`, which is what unskips the real `npm pack`/install
+cases in `tests/harness-benchmark-matrix.test.ts`. Generic review domain fixtures are
+zero-model, with existing task-agent lifecycle coverage. A PR run (`affected`)
+does not exercise the expensive cases. The daily CI run does. Before a release, run
+`bun run check:release`. It runs the `release` lane: these expensive cases and the
+package/install smoke, not a second full suite. Read the `[gate] ... unset` lines
+in any other run as "not covered here" rather than "passed".
+
+## Which CI lane a push or PR gets
+
+`scripts/select-ci-coverage.ts#selectCoverage` picks the mode:
+
+- `affected`: a pull request. CI runs typecheck and the affected test files.
+  Three `verify` shards split the files by recorded duration
+  (`CI_SHARD=<index>/<total>`). Shard 0 also runs typecheck.
+- `report`: a push to `main`. CI records the result and runs no tests.
+- `daily`: the schedule or `workflow_dispatch` on `main`. CI runs the full
+  suite and the native matrices.
+
+An invalid or unavailable diff, or a checkout mismatch, fails selection.
+
+`selectAffectedTests` follows imports and AST path values for code paths.
+Exact file references propagate. Directory reads select direct consumers only.
+Directory execution propagates through imports. A constructed directory can be
+omitted only when every use is a known path derivation or inspection. Returned,
+exported and opaque values keep conservative directory edges. Product paths must be anchored
+to the module checkout; `process.cwd()` in product code names the target repo.
+Old changed-file sources retain removed imports. A deleted closure needs evidence
+of a deleted test before it can be retired without a live test.
+Dependency manifests select every test. The configured test preloads, their imports and `scripts/lib/ci-run-tests.sh` also select every test. They do not hide other unknown paths.
+Daily script exceptions come from commands in `check-ci.sh`, not a skip list.
+They report deferred coverage; a PR consumer test does not prove daily execution.
+An unknown path without a consumer fails selection. In a mixed diff, a path that
+passes `isDocumentationPath` selects every test that
+`scripts/ci-documentation-consumers.ts` finds. A documentation-only diff selects
+only the tests that name a changed document; with none, selection outputs mode
+`documentation` and no build or test job runs. Platform jobs have separate outputs: `home_isolation` and `native_oar`.
+The HOME matrix uses its workflow test imports and the configured test preloads.
+The macOS native OAR job uses the full local import closure of its workflow
+tests (tests, src and scripts), configured preloads, shell scripts, and the OAR host bundle inputs. Selection builds the
+hosts with the package scripts and reads their metafiles. CI implementation
+changes trigger both jobs. A job skips only when its output is `false`.
+Required / CI accepts a skip only with that exact output. Daily runs both jobs.
+On a PR, the native job runs only the cases that `darwinTest`
+(`tests/helpers/darwin-test.ts`) names with the `darwin: ` prefix. The daily run
+runs all its cases.
+Documentation paths select scanned consumers and usually skip both platform jobs.
+
+Replay the selector over recent history before claiming a lane split works:
+
+```bash
+bun scripts/replay-ci-coverage.ts --commits 120 --ref <main-sha> --baseline <old-selector-sha>
+```
+
+Fetch enough history first. The baseline must export a self-contained selector.
+Each row uses that commit's source tree and its parent's changed-file sources.
+Documentation consumers also come from that commit. Historical source is parsed,
+not executed. Rows report selected tests, unknown paths, deferred daily inputs,
+retired closures and tests removed from the baseline selection. Each dropped
+test has a baseline path witness. The audit checks every old edge that crosses
+from current reachability toward a dropped test, including alternative paths.
+The baseline adapter must preserve the original selected test list.
+The summary records immutable revisions and the code-commit median.
+A completed replay is not acceptance: require median at most 200, no unknown
+paths, and a reviewed removed-edge reason for every dropped test. A
+`requires-review` classification or any unexplained boundary edge blocks acceptance.
+Policy classification is evidence for independent review, not a substitute for it.
+
+## Where the suite time actually goes
+
+Pull per-file durations out of a finished run rather than guessing. The pool
+prints `[ci] test <file>` before each file and bun closes with
+`Ran N tests across 1 file. [<duration>]`:
+
+```bash
+gh run view <run-id> --log | awk '
+/\[ci\] test tests\//{f=$0;sub(/^.*\[ci\] test /,"",f);next}
+f&&/Ran [0-9]+ tests across 1 file\./{t=$0;sub(/^.*\[/,"",t);sub(/\].*$/,"",t);
+m=t+0;if(t~/[0-9]s$/)m*=1000;printf "%9.0f ms  %s\n",m,f;f=""}' | sort -rn | head -20
+```
+
+## Do not re-run what is already proven
+
+Evidence reuse follows the canonical policy and its subject/environment
+checks. After a rebase, task-sync digest rebinding
+(`references/verification-plan.md`) repairs the workflow binding; it does not
+prove that the changed tree passed old tests. Preserve required PR and main-push
+CI gates, and select any local delta verification from the actual change.

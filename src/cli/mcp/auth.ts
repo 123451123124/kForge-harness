@@ -1,0 +1,90 @@
+import { FileSyntaxError, parseJsonText } from '../../core/evidence/file-syntax';
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
+import { repoHarnessHome } from '../../effects/repo-harness-home';
+
+export interface McpLocalConfig {
+  version: 3;
+  repo?: string;
+  capabilities?: {
+    workspaceReader?: boolean;
+    workflowPlanner?: boolean;
+    workflowExecutor?: boolean;
+  };
+  permissions?: {
+    fullDiskRead?: boolean;
+    allowedRoots?: string[];
+    discoveryRoots?: string[];
+    legacyFullDiskReadDetected?: boolean;
+  };
+  profile?: string;
+}
+
+/**
+ * Keys of the removed ChatGPT, HTTP, OAuth, coding and orchestrator surface
+ * (#1354). A config that still carries one fails closed: nothing reads these
+ * keys, and no setup command rewrites the file.
+ */
+const RETIRED_CONFIG_KEYS = ['server', 'auth', 'chatgpt', 'coding', 'authorizationRevision'] as const;
+const RETIRED_CAPABILITY_KEYS = ['workspaceCoder', 'taskDispatch', 'publicationMerge'] as const;
+const RETIRED_PROFILES = ['orchestrator', 'coding'] as const;
+
+/** Single MCP storage authority: `~/.repo-harness/`, overridable with REPO_HARNESS_HOME. */
+export function mcpStorageDir(): string {
+  return repoHarnessHome();
+}
+
+export function mcpLocalConfigPath(): string {
+  return join(mcpStorageDir(), 'mcp.local.json');
+}
+
+function retiredConfigKeys(raw: Record<string, unknown>): string[] {
+  const keys: string[] = RETIRED_CONFIG_KEYS.filter((key) => Object.hasOwn(raw, key));
+  const capabilities = raw.capabilities;
+  if (typeof capabilities === 'object' && capabilities !== null) {
+    keys.push(...RETIRED_CAPABILITY_KEYS.filter((key) => Object.hasOwn(capabilities, key)).map((key) => `capabilities.${key}`));
+  }
+  if ((RETIRED_PROFILES as readonly unknown[]).includes(raw.profile)) keys.push(`profile=${String(raw.profile)}`);
+  return keys;
+}
+
+export function parseMcpLocalConfig(value: unknown): McpLocalConfig {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('MCP local config must be a JSON object');
+  }
+  const raw = value as Record<string, unknown>;
+  if (raw.version !== 3) {
+    throw new Error(`unsupported MCP local config version: ${String(raw.version)}; set "version": 3.`);
+  }
+  // Refused, not ignored: an old `"reader": false` that nothing reads would turn the planner's default reader on.
+  if (typeof raw.capabilities === 'object' && raw.capabilities !== null && Object.hasOwn(raw.capabilities, 'reader')) {
+    throw new Error('MCP local config capabilities.reader is retired; use capabilities.workspaceReader.');
+  }
+  const retired = retiredConfigKeys(raw);
+  if (retired.length > 0) {
+    throw new Error(`MCP_CONFIG_RETIRED_FIELD: ${retired.join(', ')}; the ChatGPT, HTTP, OAuth, coding and orchestrator MCP surface was removed. Remove these keys from the file.`);
+  }
+  const config = raw as unknown as McpLocalConfig;
+  if (config.permissions?.allowedRoots !== undefined && !Array.isArray(config.permissions.allowedRoots)) {
+    throw new Error('MCP local config permissions.allowedRoots must be an array');
+  }
+  if (config.permissions?.discoveryRoots !== undefined && !Array.isArray(config.permissions.discoveryRoots)) {
+    throw new Error('MCP local config permissions.discoveryRoots must be an array');
+  }
+  return config;
+}
+
+function readMcpLocalConfigFile(path: string): McpLocalConfig | null {
+  if (!existsSync(path)) return null;
+  const text = readFileSync(path, 'utf-8');
+  try {
+    return parseMcpLocalConfig(parseJsonText(text, path));
+  } catch (error) {
+    // The schema messages are fixed text; a syntax failure names the file only.
+    throw new Error(`invalid MCP local config at ${path}: ${error instanceof FileSyntaxError ? error.detail : error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+export function loadMcpLocalConfig(): McpLocalConfig | null {
+  return readMcpLocalConfigFile(mcpLocalConfigPath());
+}

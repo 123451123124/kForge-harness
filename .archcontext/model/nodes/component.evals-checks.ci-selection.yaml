@@ -1,0 +1,31 @@
+schemaVersion: archcontext.node/v2
+id: component.evals-checks.ci-selection
+kind: component
+name: CI Selection And Report
+status: active
+parent: capability.verification.evals-checks
+layer: scripts
+summary: "GitHub workflows, CI coverage selection, the local CI gate and the CI report."
+responsibilities:
+  - "Select full or documentation coverage from the event, the checked-out subject and the complete Git diff."
+  - "Plan the affected-test shards once in the selection job, weighted by the durations that the daily run on main caches."
+  - "Run the affected, governance, functional and daily architecture lanes and report CI results."
+  - "Check that the archimap module document links match the measured modules[].docs paths."
+  - "Run LedgerEnforcement on every PR and require its success in Required / CI, including documentation-only changes."
+  - "Check immutable Mistake pattern keys, cumulative Seen and promotion obligations against the Lessons Retro contract; a consolidation preserves the obligations of the replaced entries."
+  - "Run TestBudget in its own workflow on PR open, head update and body edit; store the result as a check annotation and append the same measured values to the job summary."
+source:
+  include:
+    - scripts/ci-edge-audit.ts
+    - scripts/ci-path-consumers.ts
+    - .github/**
+    - scripts/check-ci.sh
+    - scripts/check-changelog-released-sections.ts
+    - scripts/check-ledger-enforcement.ts
+    - scripts/changelog-fragments.ts
+    - scripts/check-protected-paths.ts
+    - scripts/select-*.ts
+    - scripts/replay-ci-coverage.ts
+    - scripts/report-ci.ts
+    - scripts/check-archimap-links.ts
+    - scripts/ci-documentation-consumers.ts

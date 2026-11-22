@@ -1,0 +1,261 @@
+import { Banner, Loader, cn } from '@cloudflare/kumo';
+import { WarningIcon } from '@phosphor-icons/react';
+import { useState, type ReactNode } from 'react';
+import type { RuleStatusV1, RuleThemeV1, TriageEvidenceErrorV1, TriageFieldErrorV1 } from '../core/ci/rule-candidates';
+import type { RulesSnapshotV1 } from '../core/operator/rules';
+import type { OperatorTranslate } from './i18n';
+import { ageWords } from './labels';
+import { GovernancePill, ProgressLabel, RulesCandidateDrawer, type RulesDrawerPorts } from './RulesCandidateDrawer';
+import { useRulesSnapshot, type RulesRead, type RulesReader } from './rules';
+import { BoardState, PageLink, StatusDot } from './ui';
+import { RULES_LEDGER_ITEM, rulesCandidateLocation, type WorkspaceLocation } from './workspace-location';
+
+export type RulesSegment = 'candidates' | 'ledger';
+
+export interface RulesPageProps {
+  /** The repository the page reads; the page names itself when none is selected. */
+  readonly repositoryId: string | null;
+  readonly readRules: RulesReader;
+  readonly generation: number;
+  readonly now: number;
+  readonly segment: RulesSegment;
+  /** The candidate whose drawer is open, from `#rules/candidate/<id>`. */
+  readonly candidateId: string | null;
+  readonly ports: RulesDrawerPorts;
+  readonly onOpen: (next: WorkspaceLocation) => void;
+  readonly t: OperatorTranslate;
+}
+
+const SEGMENT_LOCATION: Readonly<Record<RulesSegment, WorkspaceLocation>> = {
+  candidates: { workspace: 'rules', module: null, item: null },
+  ledger: { workspace: 'rules', module: null, item: RULES_LEDGER_ITEM },
+};
+
+function ThemeCell({ theme }: { readonly theme: RuleThemeV1 }) {
+  return (
+    <div className="flex min-w-0 flex-col">
+      <span className="font-mono text-sm text-kumo-strong [overflow-wrap:anywhere]">{theme.key}</span>
+      <span className="text-xs text-kumo-subtle">{theme.name ?? theme.theme}</span>
+    </div>
+  );
+}
+
+const Seen = ({ count, t }: { readonly count: number; readonly t: OperatorTranslate }) => (
+  <span className="font-mono text-sm tabular-nums text-kumo-default">{t('rules.seen', { count })}</span>
+);
+
+/** A header row above wide rows; below the small breakpoint each row stacks and the header hides. */
+function HeaderRow({ columns, labels }: { readonly columns: string; readonly labels: readonly string[] }) {
+  return (
+    <li aria-hidden="true" className={cn('hidden gap-3 px-3 text-xs font-medium text-kumo-subtle sm:grid', columns)}>
+      {labels.map(label => <span key={label}>{label}</span>)}
+    </li>
+  );
+}
+
+const CANDIDATE_COLUMNS = 'sm:grid-cols-[minmax(0,2fr)_6rem_minmax(0,1.4fr)_minmax(0,1.4fr)]';
+
+/** The whole row opens the drawer of its first action: the theme link stretches over the row, and a PR link sits above it. */
+function CandidateList({ themes, onOpen, t }: { readonly themes: readonly RuleThemeV1[]; readonly onOpen: (next: WorkspaceLocation) => void; readonly t: OperatorTranslate }) {
+  return (
+    <ul className="flex flex-col gap-1.5" data-rules-candidates={themes.length}>
+      <HeaderRow columns={CANDIDATE_COLUMNS} labels={[t('rules.column.theme'), t('rules.column.seen'), t('rules.column.governance'), t('rules.column.actions')]} />
+      {themes.map(theme => (
+        <li key={theme.key} className={cn('relative grid gap-2 rounded-lg border border-kumo-line bg-kumo-base p-3 hover:border-kumo-brand sm:items-center sm:gap-3', CANDIDATE_COLUMNS)} data-rules-candidate={theme.key}>
+          <PageLink to={rulesCandidateLocation(theme.actions[0]!.candidate_id)} onOpen={onOpen} className="min-w-0 after:absolute after:inset-0 after:rounded-lg focus-visible:outline-none focus-visible:after:ring-2 focus-visible:after:ring-kumo-brand" data-rules-open={theme.key}>
+            <ThemeCell theme={theme} />
+          </PageLink>
+          <Seen count={theme.seen} t={t} />
+          <div><GovernancePill governance={theme.governance} t={t} /></div>
+          <ul className="flex flex-col gap-1 text-sm text-kumo-default">
+            {theme.actions.map(action => (
+              <li key={action.kind} className="flex flex-col" data-rules-action={action.kind}>
+                <span>{t(`rules.action.${action.kind}`)}</span>
+                {action.task !== undefined && <span className="text-xs"><ProgressLabel task={action.task} t={t} /></span>}
+              </li>
+            ))}
+          </ul>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+const LEDGER_COLUMNS = 'sm:grid-cols-[minmax(0,2fr)_6rem_minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,1.4fr)_minmax(0,1fr)]';
+
+function LedgerList({ themes, t }: { readonly themes: readonly RuleThemeV1[]; readonly t: OperatorTranslate }) {
+  return (
+    <ul className="flex flex-col gap-1.5" data-rules-ledger={themes.length}>
+      <HeaderRow columns={LEDGER_COLUMNS} labels={[t('rules.column.theme'), t('rules.column.seen'), t('rules.column.enforcedBy'), t('rules.column.promoted'), t('rules.column.governance'), t('rules.column.lines')]} />
+      {themes.map(theme => (
+        <li key={theme.key} className={cn('grid gap-2 rounded-lg border border-kumo-line bg-kumo-base p-3 sm:items-center sm:gap-3', LEDGER_COLUMNS)} data-rules-theme={theme.key}>
+          <ThemeCell theme={theme} />
+          <Seen count={theme.seen} t={t} />
+          <span className="font-mono text-xs text-kumo-default [overflow-wrap:anywhere]">{theme.enforced_by}</span>
+          <span className="text-sm text-kumo-default">{theme.promoted ?? '—'}</span>
+          <div className="flex flex-col gap-1">
+            <GovernancePill governance={theme.governance} t={t} />
+            {theme.governance === 'structural' && <span className="text-xs text-kumo-subtle">{t('rules.ledger.enforcer.notConnected')}</span>}
+          </div>
+          <span className="font-mono text-xs text-kumo-subtle">{theme.lines.map(line => `L${line}`).join(', ')}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function FieldErrorList({ errors, t }: { readonly errors: readonly TriageFieldErrorV1[]; readonly t: OperatorTranslate }) {
+  return (
+    <ul className="flex flex-col gap-1.5" data-rules-field-errors={errors.length}>
+      {errors.map((error, index) => (
+        <li key={index} className="flex flex-col gap-1 rounded-lg border border-kumo-line bg-kumo-base p-3 text-sm" data-rules-field-error={error.line}>
+          <p className="flex flex-wrap items-center gap-x-2 text-kumo-strong">
+            <StatusDot tone="danger" />
+            <span className="font-mono">{t('rules.ledger.error.line', { line: error.line })}</span>
+            {error.theme !== '' && <span className="font-mono text-kumo-subtle">{error.theme}</span>}
+          </p>
+          <p className="font-mono text-xs text-kumo-default [overflow-wrap:anywhere]">{error.field}: {error.value}</p>
+          <p className="text-kumo-default">{t('rules.ledger.error.fix', { fix: error.fix })}</p>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** Evidence rows carry no line (D7): the theme and its trigger value only. */
+function EvidenceErrors({ errors, t }: { readonly errors: readonly TriageEvidenceErrorV1[]; readonly t: OperatorTranslate }) {
+  return (
+    <details className="text-sm" data-rules-evidence-errors={errors.length}>
+      <summary className="cursor-pointer text-kumo-link">{t('rules.ledger.evidence.show', { count: errors.length })}</summary>
+      <ul className="mt-1 flex flex-col gap-0.5">
+        {errors.map((error, index) => (
+          <li key={index} className="flex flex-wrap gap-x-2" data-rules-evidence-error={error.theme}>
+            <span className="font-mono">{error.theme}</span>
+            <span className="text-kumo-subtle">{t('rules.ledger.error.trigger', { trigger: error.trigger })}</span>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+/** One banner at most: invalid ledger, then evidence errors, then a dirty ledger. */
+function LedgerBanner({ ledger, t }: { readonly ledger: RuleStatusV1['ledger']; readonly t: OperatorTranslate }) {
+  if (ledger.field_errors.length > 0) {
+    return <Banner variant="error" data-rules-banner="invalid" title={t('rules.ledger.invalid.title')} description={t('rules.ledger.invalid.body', { count: ledger.field_errors.length })} />;
+  }
+  if (ledger.evidence_errors.length > 0) {
+    return (
+      <>
+        <Banner variant="alert" icon={<WarningIcon />} data-rules-banner="evidence" title={t('rules.ledger.evidence.title')}
+          description={t('rules.ledger.evidence.body', { count: ledger.evidence_errors.length })} />
+        <EvidenceErrors errors={ledger.evidence_errors} t={t} />
+      </>
+    );
+  }
+  if (ledger.dirty) return <Banner variant="alert" icon={<WarningIcon />} data-rules-banner="dirty" title={t('rules.ledger.dirty.title')} description={t('rules.ledger.dirty.body')} />;
+  return null;
+}
+
+function SegmentTabs({ segment, counts, onOpen, t }: {
+  readonly segment: RulesSegment;
+  readonly counts: Readonly<Record<RulesSegment, number>> | null;
+  readonly onOpen: (next: WorkspaceLocation) => void;
+  readonly t: OperatorTranslate;
+}) {
+  return (
+    <nav className="flex gap-1 border-b border-kumo-hairline" data-rules-segments>
+      {(['candidates', 'ledger'] as const).map(name => (
+        <PageLink key={name} to={SEGMENT_LOCATION[name]} onOpen={onOpen} data-rules-segment={name} aria-current={name === segment ? 'page' : undefined}
+          className={cn('-mb-px flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm', name === segment ? 'border-kumo-brand text-kumo-strong' : 'border-transparent text-kumo-subtle hover:text-kumo-default')}>
+          {t(`rules.segment.${name}`)}
+          {/* An invalid ledger has no theme list, so it shows no count rather than 0. */}
+          {counts !== null && <span className="rounded-full bg-kumo-recessed px-1.5 text-xs tabular-nums text-kumo-subtle">{counts[name]}</span>}
+        </PageLink>
+      ))}
+    </nav>
+  );
+}
+
+function RulesBody({ snapshot, failure, segment, candidateId, ports, generation, now, onOpen, t }: {
+  readonly snapshot: RulesSnapshotV1;
+  /** A background read that failed after `snapshot` was read; the page keeps the last snapshot and its drawer. */
+  readonly failure: RulesFailure | null;
+  readonly segment: RulesSegment; readonly candidateId: string | null; readonly ports: RulesDrawerPorts;
+  readonly generation: number; readonly now: number; readonly onOpen: (next: WorkspaceLocation) => void; readonly t: OperatorTranslate;
+}) {
+  const { ledger, themes } = snapshot.status;
+  const invalid = ledger.field_errors.length > 0;
+  const candidates = themes.filter(theme => theme.actions.length > 0);
+  let content: ReactNode;
+  if (segment === 'ledger') content = invalid ? <FieldErrorList errors={ledger.field_errors} t={t} /> : <LedgerList themes={themes} t={t} />;
+  else if (invalid) content = null;
+  else if (candidates.length > 0) content = <CandidateList themes={candidates} onOpen={onOpen} t={t} />;
+  else {
+    content = (
+      <div className="flex flex-col items-center gap-2" data-rules-empty>
+        <BoardState title={t('rules.empty.title')} description={t('rules.empty.body')} />
+        <PageLink to={SEGMENT_LOCATION.ledger} onOpen={onOpen} className="text-sm text-kumo-link hover:underline">{t('rules.empty.link')}</PageLink>
+      </div>
+    );
+  }
+  return (
+    <>
+      <p className="font-mono text-xs text-kumo-subtle" data-rules-source>
+        {t('rules.source', { path: ledger.path, head: ledger.head.slice(0, 7), age: ageWords(snapshot.collected_at, now, t) })}
+      </p>
+      {failure !== null && <RulesRefusal read={failure} t={t} />}
+      <SegmentTabs segment={segment} counts={invalid ? null : { candidates: candidates.length, ledger: themes.length }} onOpen={onOpen} t={t} />
+      <LedgerBanner ledger={ledger} t={t} />
+      {content}
+      {candidateId !== null && <RulesCandidateDrawer snapshot={snapshot} candidateId={candidateId} generation={generation} ports={ports} t={t}
+        onSelect={id => onOpen(rulesCandidateLocation(id))} onClose={() => onOpen(SEGMENT_LOCATION.candidates)} />}
+    </>
+  );
+}
+
+type RulesFailure = Exclude<RulesRead, { readonly state: 'ok' }>;
+
+/** A waiting reason warns; a broken one fails. */
+const WAITING_REASONS: readonly string[] = ['rules_pending', 'registry_unavailable', 'repository_not_found'];
+
+function RulesRefusal({ read, t }: { readonly read: RulesFailure; readonly t: OperatorTranslate }) {
+  const known = read.state === 'unavailable';
+  return (
+    <section className="flex min-w-0 flex-col gap-2 rounded-xl border border-kumo-line bg-kumo-base p-4 sm:p-5" data-rules-unavailable={known ? read.reason : read.code}>
+      <p className="flex items-center gap-2 text-sm text-kumo-default">
+        <StatusDot tone={known && WAITING_REASONS.includes(read.reason) ? 'warn' : 'danger'} />
+        {known ? t(`rules.reason.${read.reason}`) : t('rules.refused.unknown', { code: read.code, message: read.message })}
+      </p>
+    </section>
+  );
+}
+
+/**
+ * The Rules page: the promotion candidates and the full lessons ledger of one
+ * repository, as the cached `rh rules status` document states them. The page
+ * computes no candidate; its only writes are the drawer's `rules_promote` and
+ * `rules_reconcile`.
+ */
+export function RulesPage({ repositoryId, readRules, generation, now, segment, candidateId, ports, onOpen, t }: RulesPageProps) {
+  const read = useRulesSnapshot(readRules, repositoryId, generation);
+  const [kept, setKept] = useState<{ readonly id: string; readonly snapshot: RulesSnapshotV1 } | null>(null);
+  if (repositoryId !== null && read?.state === 'ok' && kept?.snapshot !== read.snapshot) setKept({ id: repositoryId, snapshot: read.snapshot });
+  // A failed read after a good one keeps that repository's last snapshot: RulesBody stays in the same slot, so the drawer's draft and pending write stay mounted.
+  const last = read !== null && read.state !== 'ok' && kept?.id === repositoryId ? kept.snapshot : null;
+  const body = (snapshot: RulesSnapshotV1, failure: RulesFailure | null) =>
+    <RulesBody snapshot={snapshot} failure={failure} segment={segment} candidateId={candidateId} ports={ports} generation={generation} now={now} onOpen={onOpen} t={t} />;
+  return (
+    <div className="flex min-w-0 flex-col gap-4" data-rules-page>
+      <header className="flex flex-col gap-1 border-b border-kumo-hairline pb-4">
+        <h1 className="text-xl font-semibold text-kumo-strong">{t('nav.rules')}</h1>
+        <p className="text-sm text-kumo-subtle">{t('rules.boundary')}</p>
+      </header>
+      {repositoryId === null ? <p role="status" className="text-sm text-kumo-subtle">{t('repository.select')}</p>
+        : read === null ? <p role="status" className="flex items-center gap-1.5 text-sm text-kumo-subtle" data-rules-loading><Loader size={12} />{t('rules.loading')}</p>
+        : read.state === 'ok' ? body(read.snapshot, null)
+        : last !== null ? body(last, read)
+        : <RulesRefusal read={read} t={t} />}
+    </div>
+  );
+}

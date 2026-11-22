@@ -1,0 +1,136 @@
+// A fake `hc` for operator tests. It speaks the wire format that hc 0.1.17 writes
+// (probed on a disposable core): `server status --json` prints StatusResult, and
+// `events --json` prints one snapshot line, then every line appended to the event
+// file. Each call logs its argv, and its HC_SOCKET and the names of the terminal identity keys it got. The registry names one repository.
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { HC_MIN_VERSION } from '../../src/core/terminal/herdr-pin';
+import { repoHarnessRepoIdFor } from '../../src/effects/repo-registry';
+import { tmpWorkspace, writeShellExecutableFixture } from './repo-fixture';
+
+const SCRIPT = `#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_HC/argv.log"
+printf '%s|%s|%s\\n' "$1" "\${HC_SOCKET-}" "\${HC_TERMINAL_ID+HC_TERMINAL_ID }\${HC_TERMINAL_SOCKET+HC_TERMINAL_SOCKET }\${HC_SCOPE+HC_SCOPE}" >> "$FAKE_HC/env.log"
+case "$1" in
+  server)
+    if [ -f "$FAKE_HC/status.json" ]; then cat "$FAKE_HC/status.json"; exit 0; fi
+    printf '%s' '{"error":{"kind":"unreachable","message":"no core"}}' >&2; exit 1 ;;
+  events)
+    if [ -f "$FAKE_HC/events-fail" ]; then printf '%s' '{"error":{"kind":"unreachable","message":"no core"}}' >&2; exit 1; fi
+    # hc subscribes before it sends the snapshot: the stream starts at the event file's end before the snapshot line.
+    from=$(($(wc -c < "$FAKE_HC/events.jsonl") + 1))
+    cat "$FAKE_HC/snapshot.json"; printf '\\n'
+    exec tail -c +"$from" -f "$FAKE_HC/events.jsonl" ;;
+esac
+exit 2
+`;
+
+/**
+ * A fake `hc` for install and readiness paths: `hc --skill` prints a manual, every other call prints the package floor.
+ * A fixture puts it first on PATH, so no test runs the developer's hc.
+ */
+export function writeFakeHc(bin: string): void {
+  writeShellExecutableFixture(bin, join(bin, 'hc'), `#!/bin/sh\nif [ "\${1:-}" = --skill ]; then printf "%s\\n" "# hc manual (herdr-core)" "" "\\\`\\$HC_TERMINAL_ID\\\` is your address."; else printf "hc ${HC_MIN_VERSION}\\n"; fi\n`);
+}
+
+// A herdr-core release server in its own process: the install step downloads with a synchronous curl.
+const RELEASE_SERVER = `import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+const [dir, log] = process.argv.slice(2);
+const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+  const path = new URL(request.url).pathname;
+  appendFileSync(log, path + '\\n');
+  return existsSync(dir + path) ? new Response(readFileSync(dir + path)) : new Response('not found', { status: 404 });
+} });
+console.log(server.port);
+`;
+
+/** Serve the files of `release` at http://127.0.0.1:<port>/<name>; `requests` lists the paths asked for. */
+export function startFakeHcRelease(root: string, release: string) {
+  const script = join(root, 'release-server.ts'), log = join(root, 'release-requests.log');
+  writeFileSync(script, RELEASE_SERVER);
+  writeFileSync(log, '');
+  const child = Bun.spawn([process.execPath, script, release, log], { stdout: 'pipe' });
+  return {
+    port: child.stdout.getReader().read().then(chunk => Number(new TextDecoder().decode(chunk.value).trim())),
+    requests: () => readFileSync(log, 'utf8').split('\n').filter(Boolean),
+    stop: () => child.kill(),
+  };
+}
+
+export interface FakeTerminal { readonly address: string; readonly name?: string | null; readonly status?: Record<string, unknown> | null; readonly state?: 'live' | 'finished' }
+
+/** A terminal row as hc writes it, with the fields the operator must never pass on (cwd, title, argv, foreground). */
+export function hcTerminalRow(terminal: FakeTerminal, labels: Record<string, string> = { 'repo-harness.role': 'task-session' }) {
+  return { address: terminal.address, name: terminal.name ?? null, state: terminal.state ?? 'live', labels, status: terminal.status ?? null,
+    turn: 1, pid: 4242, reason: null, cwd: '/private/fixture-repo', title: 'private title', argv: ['claude', '--private-arg'],
+    foreground: { pid: 4242, name: 'claude', argv: ['claude'], cwd: '/private/fixture-repo' }, cols: 80, rows: 24, created_ms: 1, screen: 'private screen' };
+}
+
+export function fakeHc(prefix: string, repoName = 'pinned') {
+  const root = tmpWorkspace(prefix);
+  const bin = join(root, 'bin'), state = join(root, 'hc'), home = join(root, 'home', '.repo-harness'), repo = join(root, 'repos', repoName);
+  for (const dir of [bin, state, home, repo]) mkdirSync(dir, { recursive: true });
+  writeFileSync(join(bin, 'hc'), SCRIPT); chmodSync(join(bin, 'hc'), 0o755);
+  writeFileSync(join(state, 'argv.log'), ''); writeFileSync(join(state, 'env.log'), ''); writeFileSync(join(state, 'events.jsonl'), '');
+  writeFileSync(join(home, 'registered-repos.json'), JSON.stringify({ version: 1, authorizationRevision: 1, repos: [{
+    id: repoHarnessRepoIdFor(repo), path: repo, accessMode: 'read_only', source: 'manual', registeredAt: '2026-11-03T00:00:00.000Z', lastSeenAt: '2026-11-03T00:00:00.000Z',
+  }] }));
+  const env: NodeJS.ProcessEnv = { PATH: `${bin}:/bin:/usr/bin`, FAKE_HC: state, HOME: join(root, 'home'), REPO_HARNESS_HOME: home };
+  const fake = {
+    root, env, repo,
+    /** The core's version; null makes `server status` fail as an unreachable core does. */
+    setVersion(version: string | null, coreId = 'core-1') {
+      const path = join(state, 'status.json');
+      if (version === null) rmSync(path, { force: true });
+      else writeFileSync(path, JSON.stringify({ core: { id: coreId, name: 'private-host' }, finished: 0, holder: null, holders: [], installed_by: null, live: 1, pid: 9, uptime_ms: 5, version }));
+    },
+    setSnapshot(seq: number, terminals: readonly FakeTerminal[]) {
+      writeFileSync(join(state, 'snapshot.json'), JSON.stringify({ channel: null, seq, terminals: terminals.map(terminal => hcTerminalRow(terminal)) }));
+    },
+    /** Every later `events` call fails, as a stopped or missing core does. */
+    failEvents(fail: boolean) { if (fail) writeFileSync(join(state, 'events-fail'), ''); else rmSync(join(state, 'events-fail'), { force: true }); },
+    /** One line to every open stream: an hc event notification, or raw text. */
+    emit(line: Record<string, unknown> | string) { appendFileSync(join(state, 'events.jsonl'), `${typeof line === 'string' ? line : JSON.stringify(line)}\n`); },
+    event(seq: number, terminal: string, type: string, data: Record<string, unknown> | null) { fake.emit({ jsonrpc: '2.0', method: 'event', params: { data, seq, terminal, type } }); },
+    argv: () => readFileSync(join(state, 'argv.log'), 'utf8').split('\n').filter(Boolean),
+    /** Per call: the subcommand, its HC_SOCKET and which of HC_TERMINAL_ID, HC_TERMINAL_SOCKET and HC_SCOPE were set. */
+    calls: () => readFileSync(join(state, 'env.log'), 'utf8').split('\n').filter(Boolean).map(line => {
+      const [command, socket, keys] = line.split('|');
+      return { command: command!, socket: socket!, terminal_keys: keys!.split(' ').filter(Boolean) };
+    }),
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
+  fake.setVersion(HC_MIN_VERSION); fake.setSnapshot(1, []);
+  return fake;
+}
+
+/**
+ * A fake Windows `powershell.exe` for the user Path scripts of
+ * src/effects/host-config/tools.ts: it decodes the real -EncodedCommand, logs
+ * its first line, and reads or compare-and-sets the value in `state` (JSON
+ * `{ existed, kind, raw }`; no file: no value) from the stdin payload. A
+ * `<state>.fail` file holding `exit` echoes
+ * its argv and stdin to stderr and exits 1; holding `timeout`, it hangs.
+ */
+export function writeFakeUserPathPowershell(file: string, state: string, log: string): void {
+  mkdirSync(join(file, '..'), { recursive: true });
+  writeFileSync(file, `#!${process.execPath}
+const { appendFileSync, copyFileSync, existsSync, readFileSync, writeFileSync, rmSync } = require('node:fs');
+const [marker, operation] = Buffer.from(process.argv.at(-1), 'base64').toString('utf16le').split('\\n')[0].split(' ').slice(1);
+const input = readFileSync(0, 'utf8');
+appendFileSync(${JSON.stringify(log)}, operation + '\\n');
+const fail = existsSync(${JSON.stringify(`${state}.fail`)}) ? readFileSync(${JSON.stringify(`${state}.fail`)}, 'utf8') : null;
+if (fail === 'exit') { process.stderr.write(process.argv.join(' ') + '\\n' + input + '\\n' + Buffer.from(input, 'base64').toString('utf8') + '\\n'); process.exit(1); }
+if (fail === 'write' && operation === 'write') process.exit(1);
+// A stop at the registry write: the file named after 'stop:' is copied as the run left it at that moment.
+if (fail?.startsWith('stop:') && operation === 'write') { copyFileSync(fail.slice(5), ${JSON.stringify(`${state}.at-stop`)}); process.exit(1); }
+if (fail === 'timeout') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000);
+if (marker !== 'rh-user-path') process.exit(3);
+const value = existsSync(${JSON.stringify(state)}) ? JSON.parse(readFileSync(${JSON.stringify(state)}, 'utf8')) : { existed: false, kind: 'ExpandString', raw: '' };
+if (operation === 'read') { console.log(Buffer.from(JSON.stringify(value)).toString('base64')); process.exit(0); }
+const { expected, next } = JSON.parse(Buffer.from(input.trim(), 'base64').toString('utf8'));
+if (expected.existed !== value.existed || expected.raw !== value.raw || (value.existed && expected.kind !== value.kind)) { console.log('changed'); process.exit(0); }
+if (next.existed) writeFileSync(${JSON.stringify(state)}, JSON.stringify(next)); else rmSync(${JSON.stringify(state)}, { force: true });
+console.log('written');
+`, { mode: 0o755 });
+}

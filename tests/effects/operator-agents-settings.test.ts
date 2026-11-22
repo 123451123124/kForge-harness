@@ -1,0 +1,1323 @@
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { defaultRuntimes } from '@botiverse/oar';
+
+import {
+  decodeAgentsConfig,
+  decodeAgentsSettings,
+  type AgentRuntimeProbeV1,
+  type AgentRuntimesCacheV1,
+} from '../../src/core/board/agents-settings';
+import { DEFAULT_SEATS_CONFIG, MODEL_FAMILY_LABELS, NATIVE_SEATS_PRESET, ROUTING_CLASSES, SEAT_IDS, WORKER_SEAT_IDS, decodeSeatsConfig, decodeSeatsSettings, type SeatRoutingV1 } from '../../src/core/board/seats-settings';
+import { SEAT_POOL_STALE_MS, buildSeatPool, emptySeatPoolProbe } from '../../src/core/board/seat-pool';
+import { fetchSeatsSettings } from '../../src/operator-web/seats';
+import { readSeatsSettings, seatsSettingsWriteRoute, SEATS_CONFIGURATION_FAILURES } from '../../src/effects/operator/seats-settings-route';
+import { applySeatsSettings, readSeatsConfiguration } from '../../src/effects/board/seats-configuration';
+import { buildSeatLaunch } from '../../src/core/board/seat-launch';
+import { migrateSeatsConfiguration } from '../../src/cli/commands/global-runtime';
+import { buildQuotaReport, OPERATOR_QUOTA_PATH, unknownQuotaReading } from '../../src/core/board/quota';
+import { probeAgentRuntimes, registryRuntimes } from '../../src/effects/setup/agent-runtime-probe';
+import { startOperatorServer, type OperatorServerHandle } from '../../src/effects/operator/server';
+import { repoHarnessRepoIdFor, canonicalRepoPath } from '../../src/effects/repo-registry';
+import { renderGlobalRulesBlock } from '../../src/cli/installer/global-context';
+import { createOperatorLanguageSettings } from '../../src/cli/commands/operator-actions';
+import { reportingLanguageWriteRoute } from '../../src/effects/operator/language-settings-route';
+import { acquireRuntimeTransactionLock, globalRuntimeScope } from '../../src/effects/locking/runtime-transaction-lock';
+import { operatorAuditPath } from '../../src/effects/operator/write-audit';
+
+const PROBE: AgentRuntimeProbeV1 = {
+  protocol: 1,
+  kind: 'agent_runtime_probe',
+  collected_at: '2026-10-27T00:00:00.000Z',
+  entries: [
+    { id: 'claude', group: 'default', installation: { kind: 'available', via: 'executable', version: '2.1.0' } },
+    { id: 'codex', group: 'default', installation: { kind: 'available', via: 'executable', version: 'codex-cli 0.164.0' } },
+    { id: 'grok', group: 'default', installation: { kind: 'not_found' } },
+    { id: 'morph', group: 'community', installation: { kind: 'not_found' } },
+    { id: 'cursor', group: 'host_dependency', installation: { kind: 'dependency_missing', package: '@cursor/sdk' } },
+  ],
+};
+
+interface Harness {
+  readonly server: OperatorServerHandle;
+  readonly home: string;
+  readonly harnessHome: string;
+  readonly configPath: string;
+  readonly cookie: string;
+  cache: AgentRuntimesCacheV1;
+}
+
+const cleanups: (() => Promise<void> | void)[] = [];
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+});
+
+/** HOME and REPO_HARNESS_HOME are separate temporary roots, so each authority is checked at its own place. */
+async function startHarness(config?: unknown, readQuota = async (): Promise<unknown> => buildQuotaReport([unknownQuotaReading('claude', 'no capture')], Date.now()), sourceRoot?: string): Promise<Harness> {
+  const home = mkdtempSync(join(tmpdir(), 'repo-harness-agents-home-'));
+  const harnessHome = mkdtempSync(join(tmpdir(), 'repo-harness-agents-state-'));
+  const staticRoot = mkdtempSync(join(tmpdir(), 'repo-harness-agents-ui-'));
+  writeFileSync(join(staticRoot, 'index.html'), '<!doctype html><main>operator</main>');
+  const configPath = join(home, '.repo-harness', 'config.json');
+  if (config !== undefined) {
+    mkdirSync(join(home, '.repo-harness'), { recursive: true });
+    writeFileSync(configPath, typeof config === 'string' ? config : `${JSON.stringify(config, null, 2)}\n`);
+  }
+  const state: { cache: AgentRuntimesCacheV1 } = { cache: { status: 'ready', probe: PROBE } };
+  const server = await startOperatorServer({
+    port: 0, static_root: staticRoot,
+    env: { HOME: home, REPO_HARNESS_HOME: harnessHome },
+    language_settings: createOperatorLanguageSettings({ HOME: home, REPO_HARNESS_HOME: harnessHome }, sourceRoot),
+    read_agent_runtimes: () => state.cache,
+    read_quota: readQuota,
+  });
+  const cookie = ((await fetch(`${server.url}/`)).headers.get('set-cookie') ?? '').split(';')[0]!;
+  cleanups.push(async () => {
+    await server.close();
+    for (const path of [home, harnessHome, staticRoot]) rmSync(path, { recursive: true, force: true });
+  });
+  return Object.defineProperty({ server, home, harnessHome, configPath, cookie } as Harness, 'cache', {
+    get: () => state.cache, set: (value: AgentRuntimesCacheV1) => { state.cache = value; },
+  });
+}
+
+function post(harness: Harness, body: Record<string, unknown>, section: 'agents' | 'seats' = 'agents'): Promise<Response> {
+  return fetch(`${harness.server.url}/api/v1/settings/${section}`, {
+    method: 'POST',
+    headers: { Origin: harness.server.url, 'Sec-Fetch-Site': 'same-origin', 'Content-Type': 'application/json', Cookie: harness.cookie },
+    body: JSON.stringify({ request_id: randomUUID(), ...body }),
+  });
+}
+
+async function settings(harness: Harness): Promise<ReturnType<typeof decodeAgentsSettings>> {
+  const response = await fetch(`${harness.server.url}/api/v1/settings/agents`);
+  expect(response.status).toBe(200);
+  return decodeAgentsSettings(await response.json());
+}
+
+const sha256 = (path: string) => `sha256:${createHash('sha256').update(readFileSync(path)).digest('hex')}`;
+
+describe('language settings routes', () => {
+  const reportPath = '/api/v1/settings/report-language';
+  const send = (h: Harness, path: string, body: unknown, requestId = randomUUID()) => fetch(`${h.server.url}${path}`, {
+    method: 'POST',
+    headers: { Origin: h.server.url, 'Sec-Fetch-Site': 'same-origin', 'Content-Type': 'application/json', Cookie: h.cookie },
+    body: JSON.stringify({ request_id: requestId, ...body as object }),
+  });
+  function repository(h: Harness) {
+    const root = join(canonicalRepoPath(h.home), 'repo');
+    mkdirSync(join(root, '.ai', 'harness'), { recursive: true });
+    const id = repoHarnessRepoIdFor(root);
+    writeFileSync(join(h.harnessHome, 'registered-repos.json'), JSON.stringify({ version: 1, authorizationRevision: 1,
+      repos: [{ id, path: root, accessMode: 'read_only', source: 'manual', registeredAt: '2026-11-07', lastSeenAt: '2026-11-07' }] }));
+    return { path: `/api/v1/repositories/${id}/documentation-language`, policy: join(root, '.ai', 'harness', 'policy.json') };
+  }
+
+  test('GET decodes recorded custom and unknown headers; POST changes both hosts and replays the result', async () => {
+    const h = await startHarness();
+    mkdirSync(join(h.home, '.claude'), { recursive: true });
+    mkdirSync(join(h.home, '.codex'), { recursive: true });
+    writeFileSync(join(h.home, '.claude', 'CLAUDE.md'), renderGlobalRulesBlock(resolve(import.meta.dir, '../..'), { preset: 'custom', instruction: 'Report in French.' }));
+    writeFileSync(join(h.home, '.codex', 'AGENTS.md'), readFileSync(resolve(import.meta.dir, '../fixtures/global-rules/released-v0.23.1-en.md')));
+    expect(await (await fetch(`${h.server.url}${reportPath}`)).json()).toEqual({ hosts: [
+      { host: 'claude', state: 'managed-current', preset: 'custom' }, { host: 'codex', state: 'managed-unrecorded', preset: null },
+    ] });
+    const id = randomUUID();
+    for (let i = 0; i < 2; i++) {
+      const response = await send(h, reportPath, { preset: 'en' }, id);
+      expect([response.status, await response.json()]).toEqual([200, { changed_hosts: ['claude', 'codex'] }]);
+    }
+    expect(await (await fetch(`${h.server.url}${reportPath}`)).json()).toEqual({ hosts: [
+      { host: 'claude', state: 'managed-current', preset: 'en' }, { host: 'codex', state: 'managed-current', preset: 'en' },
+    ] });
+    expect(existsSync(join(h.home, '.repo-harness', 'global-context-backups'))).toBe(false);
+    writeFileSync(join(h.home, '.codex', 'AGENTS.md'), '<!-- BEGIN: repo-harness global-working-rules -->');
+    const refused = await send(h, reportPath, { preset: 'zh-CN' });
+    expect([refused.status, (await refused.json()).error.code]).toEqual([409, 'report_language_refused']);
+  });
+
+  test('POST refuses an unrecorded block that no release rendered, and saves after the block is deleted', async () => {
+    const h = await startHarness();
+    mkdirSync(join(h.home, '.claude'), { recursive: true });
+    mkdirSync(join(h.home, '.codex'), { recursive: true });
+    const paths = [join(h.home, '.claude', 'CLAUDE.md'), join(h.home, '.codex', 'AGENTS.md')];
+    writeFileSync(paths[0]!, renderGlobalRulesBlock(resolve(import.meta.dir, '../..'), { preset: 'custom', instruction: 'Report in French.' }));
+    writeFileSync(paths[1]!, 'Personal rule.\n\n<!-- BEGIN: repo-harness global-working-rules -->\nunknown\n<!-- END: repo-harness global-working-rules -->\n');
+    const before = paths.map(path => readFileSync(path, 'utf8'));
+    const refused = await send(h, reportPath, { preset: 'en' });
+    expect([refused.status, (await refused.json()).error.code]).toEqual([409, 'report_language_edited']);
+    expect(paths.map(path => readFileSync(path, 'utf8'))).toEqual(before);
+    // The repair that the refusal names: delete the block with both markers, then save again.
+    writeFileSync(paths[1]!, 'Personal rule.\n');
+    const saved = await send(h, reportPath, { preset: 'en' });
+    expect([saved.status, await saved.json()]).toEqual([200, { changed_hosts: ['claude', 'codex'] }]);
+    expect(readFileSync(paths[1]!, 'utf8')).toStartWith('Personal rule.\n');
+  });
+
+  test('a read_only repository saves only documentation.language and keeps JSON bytes around it', async () => {
+    const h = await startHarness();
+    const repo = repository(h);
+    const raw = '{\r\n\t"other": [1,  2] \t,\r\n\t"documentation" : { "language":"en" , "profile": "full" }\r\n}\r\n';
+    writeFileSync(repo.policy, raw);
+    chmodSync(repo.policy, 0o640);
+    const before = statSync(repo.policy);
+    expect(await (await fetch(`${h.server.url}${repo.path}`)).json()).toEqual({ language: 'en' });
+    const response = await send(h, repo.path, { language: 'zh-CN' });
+    expect([response.status, await response.json()]).toEqual([200, { language: 'zh-CN' }]);
+    expect(readFileSync(repo.policy, 'utf8')).toBe(raw.replace('"en"', '"zh-CN"'));
+    expect(statSync(repo.policy).ino).not.toBe(before.ino);
+    expect(statSync(repo.policy).mode & 0o777).toBe(before.mode & 0o777);
+    expect(await (await fetch(`${h.server.url}${repo.path}`)).json()).toEqual({ language: 'zh-CN' });
+    writeFileSync(repo.policy, '{"other":1}\n');
+    expect(await (await fetch(`${h.server.url}${repo.path}`)).json()).toEqual({ language: null });
+    expect((await send(h, repo.path, { language: 'follow-user' })).status).toBe(200);
+    expect(JSON.parse(readFileSync(repo.policy, 'utf8'))).toEqual({ other: 1, documentation: { language: 'follow-user' } });
+  });
+
+  test('GET follows a linked rules file and returns null presets for an unreadable rules template', async () => {
+    const h = await startHarness(undefined, undefined, join(tmpdir(), randomUUID()));
+    mkdirSync(join(h.home, '.codex'), { recursive: true });
+    mkdirSync(join(h.home, '.claude'), { recursive: true });
+    const codex = join(h.home, '.codex', 'AGENTS.md');
+    writeFileSync(codex, renderGlobalRulesBlock(resolve(import.meta.dir, '../..'), { preset: 'en', instruction: 'Use English to report to user.' }));
+    symlinkSync(codex, join(h.home, '.claude', 'CLAUDE.md'));
+    const response = await fetch(`${h.server.url}${reportPath}`);
+    expect([response.status, await response.json()]).toEqual([200, { hosts: [
+      { host: 'claude', state: 'unreadable', preset: null }, { host: 'codex', state: 'unreadable', preset: null },
+    ] }]);
+  });
+
+  test('a missing reporting adapter refuses execution without rejecting a valid body', async () => {
+    const operation = reportingLanguageWriteRoute().decode({ preset: 'follow' }, []);
+    await expect(operation.execute()).rejects.toMatchObject({ status: 503, code: 'language_settings_unavailable' });
+  });
+
+  test('a held runtime transaction refuses reporting changes until install or update finishes', async () => {
+    const h = await startHarness();
+    expect((await send(h, reportPath, { preset: 'en' })).status).toBe(200);
+    const paths = [join(h.home, '.claude', 'CLAUDE.md'), join(h.home, '.codex', 'AGENTS.md')];
+    const before = paths.map(path => readFileSync(path, 'utf8'));
+    const lock = acquireRuntimeTransactionLock(globalRuntimeScope({ HOME: h.home }));
+    try {
+      const response = await send(h, reportPath, { preset: 'zh-CN' });
+      const { error } = await response.json();
+      expect([response.status, error.code, error.next_action]).toEqual([
+        409, 'runtime_busy', 'Wait for rh update or install to finish, then save again.',
+      ]);
+      expect(paths.map(path => readFileSync(path, 'utf8'))).toEqual(before);
+      lock.assertOwned();
+    } finally { lock.release(); }
+    expect((await send(h, reportPath, { preset: 'zh-CN' })).status).toBe(200);
+  });
+
+  test.skipIf(process.platform === 'win32')('GET and POST refuse a FIFO policy without opening it', async () => {
+    const h = await startHarness();
+    const repo = repository(h);
+    execFileSync('mkfifo', [repo.policy]);
+    for (const response of [await fetch(`${h.server.url}${repo.path}`), await send(h, repo.path, { language: 'en' })]) {
+      expect([response.status, (await response.json()).error.code]).toEqual([409, 'policy_unreadable']);
+    }
+    expect(lstatSync(repo.policy).isFIFO()).toBe(true);
+  });
+
+  test('refuses unknown repositories, missing policies and invalid JSON without a write', async () => {
+    const h = await startHarness();
+    const unknown = await send(h, '/api/v1/repositories/unknown/documentation-language', { language: 'en' });
+    expect([unknown.status, (await unknown.json()).error.code]).toEqual([404, 'repository_not_found']);
+    const repo = repository(h);
+    const missing = await send(h, repo.path, { language: 'en' });
+    expect([missing.status, (await missing.json()).error.next_action]).toEqual([409, 'rh init']);
+    expect(existsSync(repo.policy)).toBe(false);
+    writeFileSync(repo.policy, '{broken');
+    const invalid = await send(h, repo.path, { language: 'en' });
+    expect([invalid.status, (await invalid.json()).error.code]).toEqual([409, 'policy_invalid']);
+    expect(readFileSync(repo.policy, 'utf8')).toBe('{broken');
+    rmSync(repo.policy);
+    mkdirSync(repo.policy);
+    for (const response of [await fetch(`${h.server.url}${repo.path}`), await send(h, repo.path, { language: 'en' })]) {
+      const { error } = await response.json();
+      expect([response.status, error.code]).toEqual([409, 'policy_unreadable']);
+      expect(error.next_action).toContain('readable regular file');
+    }
+    expect(readdirSync(repo.policy)).toEqual([]);
+  });
+
+  test('both routes reject invalid bodies and require the shared same-origin write token', async () => {
+    const h = await startHarness();
+    mkdirSync(join(h.home, '.claude'));
+    const repo = repository(h);
+    for (const [path, valid, invalid] of [[reportPath, { preset: 'follow' }, { preset: 'custom' }], [repo.path, { language: 'en' }, { language: 'follow' }]] as const) {
+      expect((await send(h, path, invalid)).status).toBe(400);
+      expect((await send(h, path, { ...valid, extra: true })).status).toBe(400);
+      const guardHeaders: Record<string, string>[] = [
+        { Origin: h.server.url, 'Sec-Fetch-Site': 'same-origin' },
+        { Origin: 'http://other.invalid', 'Sec-Fetch-Site': 'same-origin', Cookie: h.cookie },
+      ];
+      for (const headers of guardHeaders) {
+        const denied = await fetch(`${h.server.url}${path}`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ request_id: randomUUID(), ...valid }) });
+        expect(denied.status).toBe(403);
+      }
+    }
+    expect(existsSync(repo.policy)).toBe(false);
+    expect(existsSync(join(h.home, '.claude', 'CLAUDE.md'))).toBe(false);
+  });
+});
+
+describe('agent settings routes', () => {
+  test('quota GET returns the report unchanged and refuses query selectors, PUT and invalid reports', async () => {
+    const report = buildQuotaReport([unknownQuotaReading('claude', 'no capture'), unknownQuotaReading('chatgpt', 'not logged in')], Date.now());
+    let value: unknown = report, reads = 0;
+    const harness = await startHarness(undefined, async () => { reads++; return value; });
+    const url = `${harness.server.url}${OPERATOR_QUOTA_PATH}`;
+    const response = await fetch(url);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(report);
+    for (const [target, method, status, code] of [[`${url}?account=claude`, 'GET', 400, 'invalid_request'], [url, 'PUT', 405, 'method_not_allowed']] as const) {
+      const refused = await fetch(target, { method });
+      expect([refused.status, (await refused.json()).error.code]).toEqual([status, code]);
+    }
+    expect(reads).toBe(1);
+    value = { ...report, extra: true };
+    const invalid = await fetch(url);
+    expect([invalid.status, (await invalid.json()).error.code]).toEqual([502, 'quota_invalid']);
+    value = report;
+    expect((await fetch(url)).status).toBe(200);
+    expect(reads).toBe(3);
+  });
+
+  test('quota admits one read at a time and releases the slot after completion', async () => {
+    const started = Promise.withResolvers<void>(), pending = Promise.withResolvers<unknown>();
+    let reads = 0;
+    const report = buildQuotaReport([], Date.now());
+    const harness = await startHarness(undefined, () => { reads++; started.resolve(); return pending.promise; });
+    const url = `${harness.server.url}${OPERATOR_QUOTA_PATH}`;
+    const first = fetch(url);
+    await started.promise;
+    const second = await fetch(url);
+    expect([second.status, (await second.json()).error.code]).toEqual([503, 'quota_busy']);
+    expect(reads).toBe(1);
+    pending.resolve(report);
+    expect(await (await first).json()).toEqual(report);
+    expect((await fetch(url)).status).toBe(200);
+    expect(reads).toBe(2);
+  });
+
+  test('Pi review fixture is admitted through the settings route and named in unsupported-runtime guidance', async () => {
+    const harness = await startHarness();
+    harness.cache = { status: 'ready', probe: { ...PROBE, entries: [...PROBE.entries,
+      { id: 'pi', group: 'default', installation: { kind: 'available', via: 'bundled', version: null } }] } };
+    const before = await settings(harness);
+    expect(before.runtimes.entries.find(entry => entry.id === 'pi')?.review_supported).toBe(true);
+    const response = await post(harness, { expected_revision: before.config.revision,
+      changes: [{ runtime: 'pi', enabled: true, uses: ['review'] }] });
+    expect(response.status).toBe(200);
+    const saved = await response.json();
+    expect((await settings(harness)).config.uses.review).toEqual(['pi']);
+    expect(JSON.parse(readFileSync(harness.configPath, 'utf8')).agents.uses.review).toEqual(['pi']);
+    const invalid = await post(harness, { expected_revision: saved.config_revision,
+      changes: [{ runtime: 'grok', enabled: true, uses: ['review'] }] });
+    expect(invalid.status).toBe(422);
+    const error = (await invalid.json()).error;
+    expect(error.message).toContain('pi'); expect(error.next_action).toContain('pi');
+  });
+
+  test('GET reads the absent section and the probe cache without command paths', async () => {
+    const harness = await startHarness();
+    const value = await settings(harness);
+    expect(value.config).toEqual({ revision: 'absent', enabled: [], uses: { docs: [], review: [] }, default_docs: null });
+    expect(value.runtimes).toMatchObject({ status: 'ready', reason: null, collected_at: PROBE.collected_at });
+    expect(value.runtimes.entries.map(entry => [entry.id, entry.review_supported])).toEqual([
+      ['claude', true], ['codex', true], ['grok', false], ['morph', false], ['cursor', false],
+    ]);
+    // The launch allowlist is empty (#1234), so no runtime reports docs support.
+    expect(value.runtimes.entries.filter(entry => entry.docs_supported).map(entry => entry.id)).toEqual([]);
+    expect(value.runtimes.entries[0]!.capabilities).toEqual({ stop: 'available', steer: 'session', withdraw: 'session' });
+    expect((await fetch(`${harness.server.url}/api/v1/settings/agents?x=1`)).status).toBe(400);
+    expect((await fetch(`${harness.server.url}/api/v1/settings/agents`, { method: 'PUT' })).status).toBe(405);
+
+    harness.cache = { status: 'unavailable', reason: 'collection_pending' };
+    expect((await settings(harness)).runtimes).toEqual({ status: 'unavailable', reason: 'collection_pending', collected_at: null, entries: [] });
+  });
+
+  test('POST writes only the agents section, under HOME, with an audit under REPO_HARNESS_HOME', async () => {
+    const harness = await startHarness({ security: { mode: 'strict' }, seats: { untouched: true } });
+    const before = await settings(harness);
+    const response = await post(harness, {
+      expected_revision: before.config.revision,
+      changes: [{ runtime: 'codex', enabled: true, uses: ['review'] }, { runtime: 'grok', enabled: true, uses: [] }],
+    });
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(result).toEqual({
+      config_revision: sha256(harness.configPath),
+      changed_keys: ['agents.enabled', 'agents.uses.review'],
+    });
+    const stored = JSON.parse(readFileSync(harness.configPath, 'utf8'));
+    expect(stored).toEqual({
+      security: { mode: 'strict' }, seats: { untouched: true },
+      agents: { enabled: ['codex', 'grok'], uses: { docs: [], review: ['codex'] }, default_docs: null },
+    });
+    expect((await settings(harness)).config.revision).toBe(result.config_revision);
+    expect(existsSync(join(harness.home, '.repo-harness', 'operator'))).toBe(false);
+    const audit = readFileSync(operatorAuditPath({ REPO_HARNESS_HOME: harness.harnessHome }), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(audit.map(record => [record.phase, record.operation ?? null, record.target ?? null])).toEqual([['intent', 'settings_agents', 'config'], ['result', null, null]]);
+
+    const same = await post(harness, { expected_revision: result.config_revision, changes: [{ runtime: 'codex', enabled: true, uses: ['review'] }] });
+    expect(await same.json()).toEqual({ config_revision: result.config_revision, changed_keys: [] });
+  });
+
+  test('an active installer transaction returns 503 busy without changing settings', async () => {
+    const harness = await startHarness({ security: { mode: 'strict' } });
+    const before = await settings(harness);
+    const original = readFileSync(harness.configPath, 'utf8');
+    const lock = acquireRuntimeTransactionLock(globalRuntimeScope({ HOME: harness.home }));
+    try {
+      const response = await post(harness, { expected_revision: before.config.revision, changes: [{ runtime: 'codex', enabled: true, uses: [] }] });
+      expect([response.status, (await response.json()).error.code]).toEqual([503, 'busy']);
+      expect(readFileSync(harness.configPath, 'utf8')).toBe(original);
+      lock.assertOwned();
+    } finally { lock.release(); }
+    const retry = await post(harness, { expected_revision: before.config.revision, changes: [{ runtime: 'codex', enabled: true, uses: [] }] });
+    expect(retry.status).toBe(200);
+    expect(JSON.parse(readFileSync(harness.configPath, 'utf8'))).toMatchObject({ security: { mode: 'strict' }, agents: { enabled: ['codex'] } });
+  });
+
+  test('a stale revision gets 409 revision_conflict and leaves the file unchanged', async () => {
+    const harness = await startHarness({ agents: { enabled: ['claude'], uses: { docs: [], review: [] }, default_docs: null } });
+    const read = (await settings(harness)).config.revision;
+    writeFileSync(harness.configPath, `${JSON.stringify({ agents: { enabled: ['claude', 'codex'], uses: { docs: [], review: [] }, default_docs: null } })}\n`);
+    const changed = readFileSync(harness.configPath, 'utf8');
+    const response = await post(harness, { expected_revision: read, changes: [{ runtime: 'grok', enabled: true, uses: [] }] });
+    expect(response.status).toBe(409);
+    expect((await response.json()).error).toMatchObject({ code: 'revision_conflict' });
+    expect(readFileSync(harness.configPath, 'utf8')).toBe(changed);
+  });
+
+  test('refuses an invalid change with a typed 422 and writes nothing', async () => {
+    const harness = await startHarness();
+    for (const [body, code] of [
+      [{ changes: [{ runtime: 'grok', enabled: true, uses: ['review'] }] }, 'use_not_supported'],
+      [{ changes: [{ runtime: 'claude', enabled: true, uses: ['docs'] }] }, 'docs_isolation_unverified'],
+      [{ changes: [{ runtime: 'nope', enabled: true, uses: [] }] }, 'runtime_unknown'],
+      [{ changes: [{ runtime: 'codex', enabled: false, uses: ['docs'] }] }, 'runtime_not_enabled'],
+      // No runtime is a docs host now, so a default is refused before the default_docs_invalid relation check.
+      [{ changes: [{ runtime: 'codex', enabled: true, uses: [] }], default_docs_runtime: 'codex' }, 'docs_isolation_unverified'],
+    ] as const) {
+      const response = await post(harness, { expected_revision: 'absent', ...body });
+      expect([response.status, (await response.json()).error.code]).toEqual([422, code]);
+    }
+    expect(existsSync(harness.configPath)).toBe(false);
+  });
+
+  test('3-SET-N1 a docs use stored before the docs host closed stays and can be removed, but none is added and it cannot become the default', async () => {
+    const harness = await startHarness({ agents: { enabled: ['claude', 'codex'], uses: { docs: ['claude', 'codex'], review: ['claude'] }, default_docs: 'codex' } });
+    const before = await settings(harness);
+    const keep = await post(harness, { expected_revision: before.config.revision, changes: [{ runtime: 'claude', enabled: true, uses: ['docs'] }] });
+    expect(keep.status).toBe(200);
+    const kept = await keep.json();
+    expect(JSON.parse(readFileSync(harness.configPath, 'utf8')).agents.uses).toEqual({ docs: ['claude', 'codex'], review: [] });
+
+    const unchanged = readFileSync(harness.configPath, 'utf8');
+    const promote = await post(harness, { expected_revision: kept.config_revision, changes: [], default_docs_runtime: 'claude' });
+    expect([promote.status, (await promote.json()).error.code]).toEqual([422, 'docs_isolation_unverified']);
+    expect(readFileSync(harness.configPath, 'utf8')).toBe(unchanged);
+
+    // Dropping the stored default's docs use leaves a reachable default_docs_invalid refusal.
+    const orphan = await post(harness, { expected_revision: kept.config_revision, changes: [{ runtime: 'codex', enabled: true, uses: [] }] });
+    expect([orphan.status, (await orphan.json()).error.code]).toEqual([422, 'default_docs_invalid']);
+    expect(readFileSync(harness.configPath, 'utf8')).toBe(unchanged);
+
+    const remove = await post(harness, { expected_revision: kept.config_revision, changes: [{ runtime: 'claude', enabled: true, uses: [] }] });
+    expect(remove.status).toBe(200);
+    const removed = await remove.json();
+    expect(JSON.parse(readFileSync(harness.configPath, 'utf8')).agents.uses.docs).toEqual(['codex']);
+    const readd = await post(harness, { expected_revision: removed.config_revision, changes: [{ runtime: 'claude', enabled: true, uses: ['docs'] }] });
+    expect([readd.status, (await readd.json()).error.code]).toEqual([422, 'docs_isolation_unverified']);
+  });
+
+  test('a stored legacy docs use stays inert: an unrelated write succeeds, removal works, and a new docs use still refuses', async () => {
+    const harness = await startHarness({ agents: { enabled: ['claude', 'codex'], uses: { docs: ['codex'], review: ['claude'] }, default_docs: 'codex' } });
+    const before = await settings(harness);
+    const stored = readFileSync(harness.configPath, 'utf8');
+
+    // Re-sending the stored docs value is not a new docs use, so it writes nothing and does not throw.
+    const unchanged = await post(harness, { expected_revision: before.config.revision, changes: [{ runtime: 'codex', enabled: true, uses: ['docs'] }] });
+    expect(unchanged.status).toBe(200);
+    expect((await unchanged.json()).changed_keys).toEqual([]);
+    expect(readFileSync(harness.configPath, 'utf8')).toBe(stored);
+
+    // An unrelated write on another runtime succeeds while the legacy docs use and default stay inert.
+    const unrelated = await post(harness, { expected_revision: before.config.revision, changes: [{ runtime: 'grok', enabled: true, uses: [] }] });
+    expect(unrelated.status).toBe(200);
+    const unrelatedResult = await unrelated.json();
+    expect(JSON.parse(readFileSync(harness.configPath, 'utf8')).agents).toEqual({
+      enabled: ['claude', 'codex', 'grok'], uses: { docs: ['codex'], review: ['claude'] }, default_docs: 'codex',
+    });
+
+    // A new docs use still refuses.
+    const enable = await post(harness, { expected_revision: unrelatedResult.config_revision, changes: [{ runtime: 'claude', enabled: true, uses: ['docs'] }] });
+    expect([enable.status, (await enable.json()).error.code]).toEqual([422, 'docs_isolation_unverified']);
+
+    // Removal of the stored docs use and its default stays allowed.
+    const remove = await post(harness, { expected_revision: unrelatedResult.config_revision, changes: [{ runtime: 'codex', enabled: true, uses: [] }], default_docs_runtime: null });
+    expect(remove.status).toBe(200);
+    expect(JSON.parse(readFileSync(harness.configPath, 'utf8')).agents).toEqual({
+      enabled: ['claude', 'codex', 'grok'], uses: { docs: [], review: ['claude'] }, default_docs: null,
+    });
+  });
+
+  test('refuses an unknown field, a missing probe, an invalid section and a linked file', async () => {
+    const harness = await startHarness();
+    const extra = await post(harness, { expected_revision: 'absent', changes: [], launch: true });
+    expect([extra.status, (await extra.json()).error.code]).toEqual([400, 'invalid_body']);
+
+    harness.cache = { status: 'unavailable', reason: 'probe_timeout' };
+    const pending = await post(harness, { expected_revision: 'absent', changes: [{ runtime: 'codex', enabled: true, uses: [] }] });
+    expect([pending.status, (await pending.json()).error.code]).toEqual([503, 'runtimes_unavailable']);
+    expect(existsSync(harness.configPath)).toBe(false);
+
+    const invalid = await startHarness({ agents: { enabled: ['codex'], uses: { docs: ['grok'], review: [] }, default_docs: null } });
+    const get = await fetch(`${invalid.server.url}/api/v1/settings/agents`);
+    expect([get.status, (await get.json()).error.code]).toEqual([503, 'config_invalid']);
+
+    for (const [seats, code] of [
+      [{}, 'seats_config_invalid'],
+      [{ ...DEFAULT_SEATS_CONFIG, routing: { mode: 'normal' } }, 'seats_config_migration_required'],
+    ] as const) {
+      const blocked = await startHarness({ agents: PANE_AGENTS, seats });
+      const before = (await settings(blocked)).config.revision;
+      const disable = await post(blocked, { expected_revision: before, changes: [{ runtime: 'codex', enabled: false, uses: [] }] });
+      expect([disable.status, (await disable.json()).error.code]).toEqual([503, code]);
+      expect(sha256(blocked.configPath)).toBe(before);
+    }
+
+    const linked = await startHarness();
+    const target = join(linked.home, 'elsewhere.json');
+    writeFileSync(target, '{}\n');
+    mkdirSync(join(linked.home, '.repo-harness'), { recursive: true });
+    symlinkSync(target, linked.configPath);
+    const revision = (await settings(linked)).config.revision;
+    const refused = await post(linked, { expected_revision: revision, changes: [{ runtime: 'codex', enabled: true, uses: [] }] });
+    const linkError = (await refused.json()).error;
+    expect([refused.status, linkError.code]).toEqual([409, 'config_is_link']);
+    expect(linkError.next_action).toContain('links to');
+    expect(readFileSync(target, 'utf8')).toBe('{}\n');
+  });
+
+  test('Hosts refuses to disable Codex until all seats using it move', async () => {
+    const codexSeats = {
+      ...DEFAULT_SEATS_CONFIG,
+      worker: { ...DEFAULT_SEATS_CONFIG.worker, runtime: 'codex' as const, model: 'gpt-6.1-terra' },
+      'worker-deep': { ...DEFAULT_SEATS_CONFIG['worker-deep'], runtime: 'codex' as const, model: 'gpt-6.2-sol' },
+      gatekeeper: { ...DEFAULT_SEATS_CONFIG.gatekeeper, runtime: 'codex' as const, model: 'gpt-6.2-sol' },
+    };
+    const harness = await startHarness({ agents: PANE_AGENTS, seats: codexSeats });
+    const { revision, ...section } = (await seats(harness)).config;
+    const original = readFileSync(harness.configPath, 'utf8');
+    const disable = [{ runtime: 'codex', enabled: false, uses: [] }];
+    const refused = await post(harness, { expected_revision: revision, changes: disable });
+    const { error } = await refused.json();
+    expect([refused.status, error?.code]).toEqual([422, 'runtime_in_use']);
+    const affected = ['worker', 'worker-deep', 'gatekeeper'] as const;
+    for (const id of affected) {
+      expect(error.message).toContain(`${id} (codex)`);
+    }
+    expect(readFileSync(harness.configPath, 'utf8')).toBe(original);
+
+    const moved = { ...section };
+    for (const id of affected) moved[id] = { ...section[id]!, runtime: 'claude', model: null };
+    const saved = await post(harness, { expected_revision: revision, seats: moved }, 'seats');
+    expect(saved.status).toBe(200);
+    const disabled = await post(harness, { expected_revision: (await saved.json()).config_revision, changes: disable });
+    expect(disabled.status).toBe(200);
+    expect((await settings(harness)).config.enabled).toEqual(['claude', 'pi']);
+    expect((await seats(harness)).config.gatekeeper.runtime).toBe('claude');
+  });
+
+  test('disables a runtime that left the registry, and still refuses to enable it', async () => {
+    const harness = await startHarness({ agents: { enabled: ['codex', 'gone'], uses: { docs: ['gone'], review: [] }, default_docs: 'gone' } });
+    const revision = (await settings(harness)).config.revision;
+    const enable = await post(harness, { expected_revision: revision, changes: [{ runtime: 'gone', enabled: true, uses: ['docs'] }] });
+    expect([enable.status, (await enable.json()).error.code]).toEqual([422, 'runtime_unknown']);
+
+    const disable = await post(harness, { expected_revision: revision, changes: [{ runtime: 'gone', enabled: false, uses: [] }], default_docs_runtime: null });
+    expect(disable.status).toBe(200);
+    expect((await disable.json()).changed_keys).toEqual(['agents.enabled', 'agents.uses.docs', 'agents.default_docs']);
+    expect(JSON.parse(readFileSync(harness.configPath, 'utf8')).agents).toEqual({ enabled: ['codex'], uses: { docs: [], review: [] }, default_docs: null });
+  });
+});
+
+const PANE_AGENTS = { enabled: ['claude', 'codex', 'pi'], uses: { docs: [], review: [] }, default_docs: null };
+
+async function seats(harness: Harness): Promise<ReturnType<typeof decodeSeatsSettings>> {
+  const response = await fetch(`${harness.server.url}/api/v1/settings/seats`);
+  expect(response.status).toBe(200);
+  return decodeSeatsSettings(await response.json());
+}
+
+const filesUnder = (root: string): string[] => readdirSync(root, { recursive: true, encoding: 'utf8' }).sort();
+
+describe('seat settings contract without transport', () => {
+  test('Claude advisors use the Claude families, round-trip on save, and reject other runtimes and models', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'seats-advisor-'));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    mkdirSync(join(home, '.repo-harness'));
+    writeFileSync(join(home, '.repo-harness', 'config.json'), JSON.stringify({ agents: PANE_AGENTS }));
+    const env = { HOME: home }, initial = readSeatsSettings(env), route = seatsSettingsWriteRoute(env);
+    for (const id of SEAT_IDS) if (initial.defaults[id] !== null) expect(initial.defaults[id]!.advisor_model).toBeNull();
+    const { advisor_model: _omitted, ...withoutAdvisor } = initial.config['worker-opus'];
+    const section = { ...DEFAULT_SEATS_CONFIG, 'worker-opus': withoutAdvisor };
+    expect(decodeSeatsConfig(section)['worker-opus'].advisor_model).toBeNull();
+    for (const advisor_model of [...Object.keys(MODEL_FAMILY_LABELS), null]) {
+      const { revision, ...seats } = readSeatsSettings(env).config;
+      const saved = await route.decode({ expected_revision: revision, seats: { ...seats,
+        'worker-opus': { ...seats['worker-opus'], advisor_model } } }, []).execute();
+      expect(saved).toMatchObject({ status: 200, body: { changed_keys: ['seats.worker-opus.advisor_model'] } });
+      expect(readSeatsSettings(env).config['worker-opus'].advisor_model).toBe(advisor_model);
+    }
+    for (const patch of [{ runtime: 'codex', advisor_model: 'fable' }, { runtime: 'pi', model: 'zai/glm-5.3', fleet: [], advisor_model: 'fable' },
+      ...['unknown', 'toString', '', 42].map(advisor_model => ({ advisor_model }))]) {
+      const seats = { ...DEFAULT_SEATS_CONFIG, worker: { ...DEFAULT_SEATS_CONFIG['worker-opus'], ...patch } };
+      expect(() => decodeSeatsConfig(seats)).toThrow('seats_config_invalid');
+      expect(() => route.decode({ expected_revision: 'absent', seats }, [])).toThrow('seats_settings_request_invalid');
+    }
+  });
+
+  test('saves a recommended or user-set Pi model and refuses a Pi model without a provider', async () => {
+    const model = 'magpie/cursor/deepseek-v41-flash-1017';
+    const worker = { ...DEFAULT_SEATS_CONFIG.worker, runtime: 'pi', model, effort: null, fleet: [] };
+    const home = mkdtempSync(join(tmpdir(), 'seats-pi-'));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    mkdirSync(join(home, '.repo-harness'));
+    writeFileSync(join(home, '.repo-harness', 'config.json'), JSON.stringify({ agents: PANE_AGENTS, seats: { ...DEFAULT_SEATS_CONFIG, worker } }));
+    const env = { HOME: home }, before = readSeatsSettings(env), route = seatsSettingsWriteRoute(env);
+    const addedModels = ['magpie/opencode-go/deepseek-v4.1-flash', 'magpie/group/deepseek-v4.1-flash', 'magpie/zcode/GLM-5.3', 'magpie/zcode/GLM-5.3-Flash'];
+    // The seat ranges recommend models in the owner's order. Other valid Pi ids still save.
+    const opus = { runtime: 'claude', model: 'opus' } as const;
+    const neon = { runtime: 'pi', model: 'magpie/agy-cli/gemini-4-neon' } as const;
+    expect(before.ranges.seats.orchestrator.models).toEqual([opus, neon]);
+    expect(before.ranges.seats.advisor.models).toEqual([opus, neon,
+      { runtime: 'claude', model: 'fable' }, { runtime: 'pi', model: 'magpie/agy-cli/gemini-4-carbon' },
+      ...['low', 'medium', 'high', 'xhigh'].map(effort => ({ runtime: 'agy' as const, model: `gemini-4-neon-${effort}` })),
+    ]);
+    for (const id of WORKER_SEAT_IDS) expect(before.ranges.seats[id].models).toEqual([
+      opus, neon,
+      ...['low', 'medium', 'high', 'xhigh'].map(effort => ({ runtime: 'agy' as const, model: `gemini-4-neon-${effort}` })),
+      { runtime: 'pi', model: 'magpie/codex/gpt-6.2-sol' }, { runtime: 'codex', model: 'gpt-6.2-sol' },
+      { runtime: 'pi', model: 'magpie/codex/gpt-6.1-terra' }, { runtime: 'codex', model: 'gpt-6.1-terra' },
+      { runtime: 'pi', model: 'zai/glm-5.3-flash' }, { runtime: 'pi', model: 'magpie/group/deepseek-v4.1-flash' },
+      { runtime: 'pi', model: 'magpie/agy-cli/gemini-4-hydrogen' }, { runtime: 'agy', model: 'gemini-4-hydrogen' },
+    ]);
+    const { revision, ...section } = before.config;
+    const saved = await route.decode({ expected_revision: revision, seats: { ...section, advisor: { ...section.advisor, effort: 'medium' } } }, []).execute();
+    expect(saved.status).toBe(200);
+    for (const addedModel of addedModels) {
+      const result = await route.decode({ expected_revision: readSeatsSettings(env).config.revision, seats: { ...section, worker: { ...worker, model: addedModel } } }, []).execute();
+      expect(result.status).toBe(200);
+      expect(readSeatsSettings(env).config.worker.model).toBe(addedModel);
+    }
+    const gpt = { ...worker, model: 'magpie/codex/gpt-6.1-terra', effort: 'high' };
+    expect((await route.decode({ expected_revision: readSeatsSettings(env).config.revision, seats: { ...section, worker: { ...gpt, fleet: ['explorer'] } } }, []).execute()).status).toBe(200);
+    expect(readSeatsSettings(env).config.worker).toMatchObject({ runtime: 'pi', model: gpt.model, effort: 'high', fleet: ['explorer'] });
+    expect((await route.decode({ expected_revision: readSeatsSettings(env).config.revision, seats: { ...section, reviewer: { ...section.reviewer!, runtime: 'pi', model: 'zai/glm-5.3' } } }, []).execute()).status).toBe(200);
+    expect(readSeatsSettings(env).config.reviewer).toMatchObject({ runtime: 'pi', model: 'zai/glm-5.3' });
+    // The recommended list does not limit the id (#3250); the decoder refuses only a shape that the Pi launcher cannot split.
+    expect((await route.decode({ expected_revision: readSeatsSettings(env).config.revision, seats: { ...section, worker: { ...worker, model: 'magpie/other' } } }, []).execute()).status).toBe(200);
+    expect(readSeatsSettings(env).config.worker.model).toBe('magpie/other');
+    expect(() => route.decode({ expected_revision: readSeatsSettings(env).config.revision, seats: { ...section, worker: { ...worker, model: 'magpie' } } }, []))
+      .toThrow('seats_settings_request_invalid');
+  });
+
+  test.each([
+    ['advisor', 'pi', 'magpie/agy-cli/gemini-4-carbon', ['pi', '--provider', 'magpie', '--model', 'agy-cli/gemini-4-carbon', '--thinking', 'high']],
+    ['advisor', 'pi', 'magpie/agy-cli/gemini-4-neon', ['pi', '--provider', 'magpie', '--model', 'agy-cli/gemini-4-neon', '--thinking', 'high']],
+    ['advisor', 'pi', 'magpie/codex/gpt-6.2-sol', ['pi', '--provider', 'magpie', '--model', 'codex/gpt-6.2-sol', '--thinking', 'high']],
+    ['council', 'pi', 'magpie/codex/gpt-6.2-astra', ['pi', '--provider', 'magpie', '--model', 'codex/gpt-6.2-astra', '--thinking', 'high']],
+    ['advisor', 'codex', 'gpt-6.2-sol', ['codex', '-m', 'gpt-6.2-sol', '-c', 'model_reasoning_effort="high"']],
+    ['council', 'codex', 'gpt-6.2-astra', ['codex', '-m', 'gpt-6.2-astra', '-c', 'model_reasoning_effort="high"']],
+  ] as const)('saves a %s on %s/%s and builds its launch argv', async (seatId, runtime, model, expectedArgv) => {
+    const seatConfig = {
+      ...(seatId === 'council' ? DEFAULT_SEATS_CONFIG.gatekeeper : DEFAULT_SEATS_CONFIG.advisor),
+      runtime,
+      model,
+      effort: 'high',
+      fleet: [],
+    };
+    const home = mkdtempSync(join(tmpdir(), 'seats-model-launch-'));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    mkdirSync(join(home, '.repo-harness'));
+    const gatekeeperFallback = { ...DEFAULT_SEATS_CONFIG.gatekeeper, runtime: 'codex' as const, model: 'gpt-6-astra' };
+    writeFileSync(join(home, '.repo-harness', 'config.json'), JSON.stringify({ agents: PANE_AGENTS,
+      seats: { ...DEFAULT_SEATS_CONFIG, 'gatekeeper-fallback': gatekeeperFallback } }));
+    const env = { HOME: home }, before = readSeatsSettings(env), route = seatsSettingsWriteRoute(env);
+    const { revision, ...section } = before.config;
+    const saved = await route.decode({ expected_revision: revision, seats: { ...section, [seatId]: seatConfig } }, []).execute();
+    expect(saved.status).toBe(200);
+    const storedConfig = readSeatsSettings(env).config;
+    const stored = storedConfig[seatId]!;
+    expect(storedConfig['gatekeeper-fallback']?.model).toBe('gpt-6-astra');
+    expect(stored).toMatchObject({ runtime, model, effort: 'high', fleet: [] });
+    const launch = buildSeatLaunch(seatId, stored, 'seats', []);
+    expect(launch.runtime).toBe(runtime);
+    const start = launch.argv.indexOf(runtime);
+    expect(launch.argv.slice(start, start + expectedArgv.length)).toEqual([...expectedArgv]);
+    for (const [badRuntime, badModel] of [['pi', 'magpie/codex/gpt-6.2-astra'], ['codex', 'gpt-6.2-astra']] as const) {
+      expect(() => route.decode({ expected_revision: storedConfig.revision, seats: { ...section, advisor: { ...DEFAULT_SEATS_CONFIG.advisor, runtime: badRuntime, model: badModel, effort: 'high', fleet: [] } } }, []))
+        .toThrow('seats_settings_request_invalid: seats.advisor.model');
+    }
+  });
+
+  test('saves both scaffold roles for a Neon advisor and persists independent Pi role model overrides', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'seats-pi-roles-'));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    mkdirSync(join(home, '.repo-harness'));
+    writeFileSync(join(home, '.repo-harness', 'config.json'), JSON.stringify({ agents: PANE_AGENTS, seats: DEFAULT_SEATS_CONFIG }));
+    const env = { HOME: home }, route = seatsSettingsWriteRoute(env);
+    const { revision, ...section } = readSeatsSettings(env).config;
+    const advisor = { ...section.advisor, runtime: 'pi' as const, model: 'magpie/agy-cli/gemini-4-neon', fleet: ['deep-reasoner', 'explorer'] };
+    const models = { explorer: 'magpie/group/deepseek-v4.1-flash', 'deep-reasoner': 'zai/GLM-5.3' };
+    const saved = await route.decode({ expected_revision: revision, seats: { ...section, advisor, pi_sub_agent_models: models } }, []).execute();
+    expect(saved.status).toBe(200);
+    expect(saved.body).toMatchObject({ changed_keys: ['seats.pi_sub_agent_models.deep-reasoner', 'seats.pi_sub_agent_models.explorer'] });
+    const stored = readSeatsSettings(env).config;
+    expect(stored.advisor).toEqual(advisor);
+    expect(stored.pi_sub_agent_models).toEqual(models);
+    const cleared = await route.decode({ expected_revision: stored.revision, seats: { ...section, advisor, pi_sub_agent_models: { 'deep-reasoner': models['deep-reasoner'] } } }, []).execute();
+    expect(cleared.body).toMatchObject({ changed_keys: ['seats.pi_sub_agent_models.explorer'] });
+    expect(readSeatsSettings(env).config.pi_sub_agent_models).toEqual({ 'deep-reasoner': models['deep-reasoner'] });
+  });
+
+  test('Pi models require a provider and model id', () => {
+    const route = seatsSettingsWriteRoute();
+    for (const model of ['deepseek', '/deepseek', 'magpie/']) {
+      expect(() => decodeSeatsConfig({ ...DEFAULT_SEATS_CONFIG, worker: { ...DEFAULT_SEATS_CONFIG.worker, runtime: 'pi', model } })).toThrow('seats_config_invalid');
+      const seats = { ...DEFAULT_SEATS_CONFIG, pi_sub_agent_models: { explorer: model } };
+      expect(() => decodeSeatsConfig(seats)).toThrow('seats_config_invalid: seats.pi_sub_agent_models.explorer');
+      expect(() => route.decode({ expected_revision: 'absent', seats }, [])).toThrow('seats_settings_request_invalid: seats.pi_sub_agent_models.explorer');
+    }
+    expect(() => decodeSeatsConfig({ ...DEFAULT_SEATS_CONFIG, pi_sub_agent_models: { 'fast-worker': 'zai/glm-5.3' } })).toThrow('seats_config_invalid');
+  });
+
+  test('review seats reject write tools and every fleet role at the decoder boundary', () => {
+    const route = seatsSettingsWriteRoute();
+    for (const id of ['gatekeeper', 'gatekeeper-fallback', 'reviewer'] as const) {
+      const seat = DEFAULT_SEATS_CONFIG[id] ?? { ...DEFAULT_SEATS_CONFIG.gatekeeper, runtime: 'pi', model: 'magpie/cursor/deepseek-v41-flash-1017', effort: null };
+      expect(decodeSeatsConfig({ ...DEFAULT_SEATS_CONFIG, [id]: seat })[id]).toEqual(seat);
+      for (const patch of [...['edit', 'gh', 'mcp', 'tasks'].map(tool => ({ tools: ['read', tool].sort() })), { fleet: ['explorer'] }]) {
+        const seats = { ...DEFAULT_SEATS_CONFIG, [id]: { ...seat, ...patch } };
+        expect(() => decodeSeatsConfig(seats), `${id} ${JSON.stringify(patch)}`).toThrow('seats_config_invalid');
+        expect(() => route.decode({ expected_revision: 'absent', seats }, [])).toThrow('seats_settings_request_invalid');
+      }
+    }
+  });
+
+  test('malformed present values stay invalid when introduced keys are missing', () => {
+    const { routing: _routing, ...withoutRouting } = DEFAULT_SEATS_CONFIG;
+    const { gatekeeper: _gatekeeper, ...withoutGatekeeper } = DEFAULT_SEATS_CONFIG;
+    for (const seats of [{ ...withoutRouting, advisor: {} }, { ...withoutGatekeeper, routing: {} }]) {
+      expect(() => decodeSeatsConfig(seats)).toThrow('seats_config_invalid');
+    }
+  });
+
+  test('old stored sections require update and GET exposes all seats and routing ranges', () => {
+    const original = { orchestrator: DEFAULT_SEATS_CONFIG.orchestrator, advisor: DEFAULT_SEATS_CONFIG.advisor,
+      worker: { ...DEFAULT_SEATS_CONFIG.worker, runtime: 'codex' as const, model: 'gpt-6.1-sol' } };
+    expect(() => decodeSeatsConfig(original)).toThrow(expect.objectContaining({ code: 'seats_config_migration_required', next_action: 'rh update' }));
+    expect(SEATS_CONFIGURATION_FAILURES.seats_config_migration_required.next_action).toBe('rh update');
+    expect(() => decodeSeatsConfig({ ...original, extra: {} })).toThrow('seats_config_invalid');
+    expect(() => decodeSeatsConfig({ advisor: original.advisor, worker: original.worker })).toThrow('seats_config_invalid');
+    const home = mkdtempSync(join(tmpdir(), 'seats-contract-'));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    const settings = readSeatsSettings({ HOME: home });
+    expect(Object.keys(settings.defaults)).toEqual([...SEAT_IDS, 'routing']);
+    expect(settings.ranges.routing).toEqual({ classes: ROUTING_CLASSES, worker_seats: ['worker', 'worker-deep', 'worker-opus', 'worker-neon', 'worker-light'],
+      frontend_seats: ['worker-opus', 'worker-neon'] });
+    for (const id of ['gatekeeper', 'gatekeeper-fallback', 'reviewer'] as const) expect(settings.ranges.seats[id]).toEqual({ tools: ['net', 'read', 'shell'], fleet: [],
+      models: [
+        { runtime: 'pi', model: 'magpie/codex/gpt-6.2-sol' }, { runtime: 'codex', model: 'gpt-6.2-sol' },
+        { runtime: 'claude', model: 'opus' }, { runtime: 'pi', model: 'zai/glm-5.3-flash' },
+        { runtime: 'pi', model: 'magpie/group/deepseek-v4.1-flash' }, { runtime: 'pi', model: 'magpie/agy-cli/gemini-4-hydrogen' },
+        { runtime: 'agy', model: 'gemini-4-hydrogen' },
+      ] });
+    expect(settings.defaults['gatekeeper-fallback']).toBeNull();
+    expect(settings.defaults.council).toBeNull();
+    expect(settings.ranges.seats.council).toEqual({ tools: ['net', 'read', 'shell'], fleet: ['explorer'], models: [
+      { runtime: 'claude', model: 'fable' }, { runtime: 'pi', model: 'magpie/agy-cli/gemini-4-carbon' },
+      { runtime: 'agy', model: 'gemini-4-carbon-high' },
+      { runtime: 'pi', model: 'magpie/codex/gpt-6.2-astra' }, { runtime: 'codex', model: 'gpt-6.2-astra' },
+    ] });
+    for (const id of SEAT_IDS.filter(id => id !== 'gatekeeper-fallback' && id !== 'council')) {
+      expect(settings.defaults[id]?.tools).toEqual(expect.arrayContaining(['net']));
+    }
+  });
+
+  test('the write route stores the full section and round-trips routing with Pi disabled', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'seats-contract-'));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    mkdirSync(join(home, '.repo-harness'));
+    const path = join(home, '.repo-harness', 'config.json');
+    const agents = { ...PANE_AGENTS, enabled: ['claude', 'codex'] };
+    const originalSeats = { orchestrator: DEFAULT_SEATS_CONFIG.orchestrator, advisor: { ...DEFAULT_SEATS_CONFIG.advisor, runtime: 'claude' as const, model: 'opus' },
+      worker: { ...DEFAULT_SEATS_CONFIG.worker, runtime: 'codex' as const, model: 'gpt-6.1-sol' },
+      'worker-light': DEFAULT_SEATS_CONFIG['worker-light'] };
+    writeFileSync(path, JSON.stringify({ agents, security: { mode: 'strict' }, seats: originalSeats }));
+    const env = { HOME: home };
+    expect(() => readSeatsSettings(env)).toThrow(expect.objectContaining({ code: 'seats_config_migration_required' }));
+    expect(migrateSeatsConfiguration(env)).toBe(true);
+    const migratedBytes = readFileSync(path, 'utf8');
+    expect(migrateSeatsConfiguration(env)).toBe(false);
+    expect(readFileSync(path, 'utf8')).toBe(migratedBytes);
+    const before = readSeatsSettings(env);
+    const decoded = decodeSeatsConfig(JSON.parse(migratedBytes).seats);
+    for (const id of ['orchestrator', 'advisor', 'worker', 'worker-light'] as const) expect(decoded[id]).toEqual(originalSeats[id]);
+    expect(decoded.worker.model).toBe('gpt-6.1-sol');
+    expect(decoded['worker-deep']).toEqual(DEFAULT_SEATS_CONFIG['worker-deep']);
+    expect(decoded.routing).toEqual(DEFAULT_SEATS_CONFIG.routing);
+    const routing: SeatRoutingV1 = { ...before.config.routing, claude_saving_below_remaining: 30, claude_hyper_at_or_above_remaining: 60, codex_credit_mode: 'review', codex_credit_floor: 2000,
+      important_fast: ['worker-opus', 'worker-neon', 'worker'], simple_fast: ['worker-deep', 'worker'], frontend: ['worker-neon'] };
+    const { revision: _revision, ...storedSection } = before.config;
+    const section = { ...storedSection,
+      'worker-deep': { ...storedSection['worker-deep'], runtime: 'codex' as const, model: 'gpt-6.2-sol' },
+      'worker-neon': { ...storedSection['worker-neon'], runtime: 'claude' as const, model: 'opus' },
+      'worker-light': null,
+      gatekeeper: { ...storedSection.gatekeeper, runtime: 'codex' as const, model: 'gpt-6.2-sol' },
+      routing };
+    const response = await seatsSettingsWriteRoute(env).decode({ expected_revision: before.config.revision, seats: section }, []).execute();
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ config_revision: sha256(path), changed_keys: [
+      'seats.worker-deep.runtime', 'seats.worker-deep.model', 'seats.worker-neon.runtime', 'seats.worker-neon.model',
+      'seats.worker-light',
+      'seats.gatekeeper.runtime', 'seats.gatekeeper.model',
+      'seats.routing.important_fast', 'seats.routing.simple_fast', 'seats.routing.frontend', 'seats.routing.claude_saving_below_remaining', 'seats.routing.claude_hyper_at_or_above_remaining',
+      'seats.routing.codex_credit_mode', 'seats.routing.codex_credit_floor'] });
+    const after = readSeatsSettings(env);
+    expect(after.config).toEqual({ revision: sha256(path), ...section });
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ agents, security: { mode: 'strict' }, seats: section });
+  });
+
+  test('the update migration refuses invalid sections without writing', () => {
+    const home = mkdtempSync(join(tmpdir(), 'seats-migration-'));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    mkdirSync(join(home, '.repo-harness'));
+    const path = join(home, '.repo-harness', 'config.json');
+    for (const seats of [
+      { orchestrator: DEFAULT_SEATS_CONFIG.orchestrator, advisor: {}, worker: DEFAULT_SEATS_CONFIG.worker },
+      { orchestrator: DEFAULT_SEATS_CONFIG.orchestrator, advisor: DEFAULT_SEATS_CONFIG.advisor, worker: DEFAULT_SEATS_CONFIG.worker, extra: {} },
+    ]) {
+      const original = JSON.stringify({ seats });
+      writeFileSync(path, original);
+      expect(() => migrateSeatsConfiguration({ HOME: home })).toThrow('seats_config_invalid');
+      expect(readFileSync(path, 'utf8')).toBe(original);
+    }
+  });
+
+  test('the routing explorer takes a required model id of the Claude shape and an effort in range before save', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'seats-overrides-'));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    mkdirSync(join(home, '.repo-harness'));
+    const path = join(home, '.repo-harness', 'config.json');
+    const original = JSON.stringify({ agents: PANE_AGENTS });
+    writeFileSync(path, original);
+    const env = { HOME: home }, { revision, ...seats } = readSeatsSettings(env).config;
+    for (const [field, value, code] of [['model', null, 'seat_model_invalid'], ['effort', 'extreme', 'seat_effort_invalid']] as const) {
+      const routing = { ...seats.routing, low_quota_explorer: { ...seats.routing.low_quota_explorer, [field]: value } };
+      if (value === null) expect(() => decodeSeatsConfig({ ...seats, routing })).toThrow('seats_config_invalid');
+      await expect(seatsSettingsWriteRoute(env).decode({ expected_revision: revision, seats: { ...seats, routing } }, []).execute())
+        .rejects.toMatchObject({ status: 422, code });
+      expect(readFileSync(path, 'utf8')).toBe(original);
+    }
+    const explorer = (model: string) => ({ ...seats, routing: { ...seats.routing, low_quota_explorer: { ...seats.routing.low_quota_explorer, model } } });
+    expect(() => seatsSettingsWriteRoute(env).decode({ expected_revision: revision, seats: explorer('Claude Opus') }, [])).toThrow('seats_settings_request_invalid');
+    expect((await seatsSettingsWriteRoute(env).decode({ expected_revision: revision, seats: explorer('claude-opus-5-5') }, []).execute()).status).toBe(200);
+    expect(readSeatsSettings(env).config.routing.low_quota_explorer.model).toBe('claude-opus-5-5');
+  });
+
+  test('routing accepts percent thresholds and the credit mode range and rejects old stored fields on save', () => {
+    const route = seatsSettingsWriteRoute();
+    for (const field of ['claude_saving_below_remaining', 'claude_hyper_at_or_above_remaining']) {
+      for (const value of [0, 100, 25.5]) expect(decodeSeatsConfig({ ...DEFAULT_SEATS_CONFIG,
+        routing: { ...DEFAULT_SEATS_CONFIG.routing, [field]: value } }).routing[field as keyof SeatRoutingV1]).toBe(value);
+      for (const value of [-1, 101, null, '20']) expect(() => route.decode({ expected_revision: 'absent', seats: {
+        ...DEFAULT_SEATS_CONFIG, routing: { ...DEFAULT_SEATS_CONFIG.routing, [field]: value },
+      } }, [])).toThrow('seats_settings_request_invalid');
+    }
+    // The exhaustion line has its own range (#2909); see EXHAUSTED_AT_OR_ABOVE_USED_RANGE.
+    for (const [field, valid, refused] of [['codex_credit_mode', ['off', 'review', 'all'], ['on', null]], ['codex_credit_floor', [0, 2000, 0.5], [-1, '2000', null]],
+      ['exhausted_at_or_above_used', [50, 95, 100], [49, 101, null, '95']]] as const) {
+      for (const value of valid) expect(decodeSeatsConfig({ ...DEFAULT_SEATS_CONFIG, routing: { ...DEFAULT_SEATS_CONFIG.routing, [field]: value } }).routing[field]).toBe(value);
+      for (const value of refused) expect(() => route.decode({ expected_revision: 'absent', seats: {
+        ...DEFAULT_SEATS_CONFIG, routing: { ...DEFAULT_SEATS_CONFIG.routing, [field]: value },
+      } }, [])).toThrow('seats_settings_request_invalid');
+    }
+    for (const field of ['mode', 'hyper', 'codex_hyper_at_or_above_remaining']) expect(() => route.decode({ expected_revision: 'absent', seats: {
+      ...DEFAULT_SEATS_CONFIG, routing: { ...DEFAULT_SEATS_CONFIG.routing, [field]: field === 'mode' ? 'hyper' : field === 'hyper' ? {} : 50 },
+    } }, [])).toThrow('seats_settings_request_invalid');
+  });
+
+  test('routing refuses unknown, duplicate, empty and non-worker routes and Codex frontend seats', () => {
+    const home = mkdtempSync(join(tmpdir(), 'seats-contract-'));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    mkdirSync(join(home, '.repo-harness'));
+    const path = join(home, '.repo-harness', 'config.json');
+    const original = JSON.stringify({ agents: PANE_AGENTS });
+    writeFileSync(path, original);
+    const env = { HOME: home }, settings = readSeatsSettings(env), route = seatsSettingsWriteRoute(env);
+    for (const [task, candidates] of [
+      ['simple_fast', ['unknown']], ['simple_fast', ['worker', 'worker']], ['simple_fast', []], ['simple_fast', ['advisor']],
+      ['frontend', ['worker']], ['frontend', ['worker-light']],
+    ]) {
+      expect(() => route.decode({ expected_revision: settings.config.revision, seats: {
+        ...settings.defaults, routing: { ...settings.defaults.routing, [task as string]: candidates },
+      } }, [])).toThrow('seats_settings_request_invalid');
+    }
+    expect(() => route.decode({ expected_revision: settings.config.revision, seats: {
+      ...settings.defaults, 'worker-light': null, routing: { ...settings.defaults.routing, simple_fast: ['worker-light'] },
+    } }, [])).toThrow('seats_settings_request_invalid');
+    const changedRuntime = { ...settings.defaults, 'worker-opus': { ...settings.defaults['worker-opus'], runtime: 'codex', model: 'gpt-6.1-terra' } };
+    expect(() => route.decode({ expected_revision: settings.config.revision, seats: changedRuntime }, []))
+      .toThrow('seats_settings_request_invalid');
+    expect(readFileSync(path, 'utf8')).toBe(original);
+  });
+
+  test('a save refuses a frontend route to a Pi DeepSeek seat as the read path does and writes nothing', () => {
+    const home = mkdtempSync(join(tmpdir(), 'seats-save-decoder-')), dir = join(home, '.repo-harness'), path = join(dir, 'config.json'), env = { HOME: home };
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    const written = JSON.stringify({ agents: PANE_AGENTS, seats: { ...DEFAULT_SEATS_CONFIG, routing: { ...DEFAULT_SEATS_CONFIG.routing, frontend: ['worker-opus'] },
+      'worker-neon': { ...DEFAULT_SEATS_CONFIG['worker-neon'], runtime: 'pi', model: 'magpie/cursor/deepseek-v41-flash-1017', effort: null, fleet: [] } } });
+    mkdirSync(dir); writeFileSync(path, written);
+    const { revision, seats } = readSeatsConfiguration(env);
+    // The request decoder takes this section; the read decoder refuses it, so the save refuses it with the read path's code.
+    expect(() => applySeatsSettings({ expected_revision: revision, seats: { ...seats, routing: { ...seats.routing, frontend: ['worker-neon'] } } }, env))
+      .toThrow(expect.objectContaining({ code: 'config_invalid' }));
+    expect(readFileSync(path, 'utf8')).toBe(written);
+    expect([applySeatsSettings({ expected_revision: revision, seats: { ...seats, advisor: { ...seats.advisor, effort: 'medium' } } }, env).changed_keys,
+      JSON.parse(readFileSync(path, 'utf8')).seats.advisor.effort]).toEqual([['seats.advisor.effort'], 'medium']);
+  });
+});
+
+describe('seat settings routes', () => {
+  test('saves agy on advisor, council, all workers (with gh on/off), and gatekeeper-fallback, and refuses to disable its host while in use', async () => {
+    const harness = await startHarness({ agents: { ...PANE_AGENTS, enabled: ['antigravity', ...PANE_AGENTS.enabled] } });
+    const advisor = { runtime: 'agy', model: 'gemini-4-neon-high', effort: null, advisor_model: null, fleet: [], tools: ['net', 'read', 'shell'] } as const;
+    for (const model of ['gemini-4-neon-high', 'well-shaped-free-model']) {
+      const { revision, ...section } = (await seats(harness)).config;
+      const response = await post(harness, { expected_revision: revision, seats: { ...section, advisor: { ...advisor, model } } }, 'seats');
+      expect(response.status).toBe(200);
+      expect((await seats(harness)).config.advisor).toEqual({ ...advisor, model });
+    }
+    const council = { runtime: 'agy', model: 'gemini-4-carbon-high', effort: null, advisor_model: null, fleet: [], tools: ['net', 'read', 'shell'] } as const;
+    const workerGhOn = { runtime: 'agy', model: 'gemini-4-neon-high', effort: null, advisor_model: null, fleet: [], tools: ['edit', 'gh', 'net', 'read', 'shell'] } as const;
+    const workerGhOff = { runtime: 'agy', model: 'gemini-4-hydrogen', effort: null, advisor_model: null, fleet: [], tools: ['edit', 'net', 'read', 'shell'] } as const;
+    const fallback = { runtime: 'agy', model: 'gemini-4-hydrogen', effort: null, advisor_model: null, fleet: [], tools: ['net', 'read', 'shell'] } as const;
+    {
+      const { revision, ...section } = (await seats(harness)).config;
+      const response = await post(harness, { expected_revision: revision, seats: {
+        ...section,
+        council,
+        worker: workerGhOn,
+        'worker-deep': workerGhOn,
+        'worker-opus': { ...workerGhOn, model: 'gemini-4-neon-xhigh' },
+        'worker-neon': workerGhOn,
+        'worker-light': workerGhOff,
+        'gatekeeper-fallback': fallback,
+      } }, 'seats');
+      expect(response.status).toBe(200);
+      const updated = (await seats(harness)).config;
+      expect(updated.council).toEqual(council);
+      expect(updated.worker).toEqual(workerGhOn);
+      expect(updated['worker-light']).toEqual(workerGhOff);
+      expect(updated['gatekeeper-fallback']).toEqual(fallback);
+    }
+    const { config: { revision } } = await settings(harness);
+    const disabled = await post(harness, { expected_revision: revision, changes: [{ runtime: 'antigravity', enabled: false, uses: [] }] });
+    expect(disabled.status).toBe(422);
+    expect((await disabled.json()).error.code).toBe('runtime_in_use');
+  });
+
+  test.each([
+    ['orchestrator', {}, 'seat_runtime_not_allowed'],
+    ['gatekeeper', {}, 'seat_runtime_not_allowed'],
+    ['reviewer', {}, 'seat_runtime_not_allowed'],
+    ['advisor', { model: null }, 'seat_model_invalid'],
+    ['advisor', { model: 'Malformed model' }, 'seat_model_invalid'],
+    ['advisor', { effort: 'high' }, 'seat_effort_invalid'],
+    ['advisor', { advisor_model: 'opus' }, 'seat_model_invalid'],
+    ['advisor', { fleet: ['explorer'] }, 'seat_fleet_not_allowed'],
+    ['advisor', { tools: ['edit', 'net', 'read', 'shell'] }, 'seat_tool_not_allowed'],
+    ['council', { model: 'gemini-4-carbon-high', tools: ['edit', 'net', 'read', 'shell'] }, 'seat_tool_not_allowed'],
+    ['worker', { tools: ['gh', 'net', 'read', 'shell'] }, 'seat_tool_not_allowed'],
+    ['worker', { tools: ['edit', 'gh', 'mcp', 'net', 'read', 'shell'] }, 'seat_tool_not_allowed'],
+    ['worker', { tools: ['edit', 'gh', 'net', 'read', 'shell', 'tasks'] }, 'seat_tool_not_allowed'],
+    ['worker', { tools: ['edit', 'gh', 'net', 'read', 'schedule', 'shell'] }, 'seat_tool_not_allowed'],
+    ['worker', { effort: 'high', tools: ['edit', 'gh', 'net', 'read', 'shell'] }, 'seat_effort_invalid'],
+    ['worker', { fleet: ['explorer'], tools: ['edit', 'gh', 'net', 'read', 'shell'] }, 'seat_fleet_not_allowed'],
+  ] as const)('refuses an invalid agy seat field on %s (%j)', async (id, patch, code) => {
+    const harness = await startHarness({ agents: { ...PANE_AGENTS, enabled: ['antigravity', ...PANE_AGENTS.enabled] } });
+    const { revision, ...section } = (await seats(harness)).config;
+    const agy = { runtime: 'agy', model: 'gemini-4-neon-high', effort: null, advisor_model: null, fleet: [], tools: ['net', 'read', 'shell'], ...patch };
+    const response = await post(harness, { expected_revision: revision, seats: { ...section, [id]: agy } }, 'seats');
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.error.code).toBe(code);
+    if (code === 'seat_runtime_not_allowed') {
+      expect(body.error.next_action).toBe('Use agy only on advisor, council, worker seats, or gatekeeper-fallback.');
+    }
+    expect(sha256(harness.configPath)).toBe(revision);
+  });
+
+  test('stored main@76675c2 11-seat Native preset with read-only agy workers decodes, survives rh update without silent edits, and allows unrelated saves and explicit edit opt-in', async () => {
+    const legacyNativeSeats = {
+      ...NATIVE_SEATS_PRESET,
+      'worker-neon': { ...NATIVE_SEATS_PRESET['worker-neon'], tools: ['net', 'read', 'shell'] as const },
+      'worker-light': { ...NATIVE_SEATS_PRESET['worker-light']!, tools: ['net', 'read', 'shell'] as const },
+    };
+    const harness = await startHarness({
+      agents: { ...PANE_AGENTS, enabled: ['antigravity', ...PANE_AGENTS.enabled] },
+      seats: legacyNativeSeats,
+    });
+    const beforeBytes = readFileSync(harness.configPath, 'utf8');
+    // rh update must not fail or silently add edit/gh to legacy read-only agy worker seats.
+    expect(migrateSeatsConfiguration({ HOME: harness.home })).toBe(false);
+    expect(readFileSync(harness.configPath, 'utf8')).toBe(beforeBytes);
+
+    const read = await seats(harness);
+    expect(read.config['worker-neon'].tools).toEqual(['net', 'read', 'shell']);
+    expect(read.config['worker-light']?.tools).toEqual(['net', 'read', 'shell']);
+    expect(read.config.orchestrator.runtime).toBe('claude');
+    expect(read.config.advisor.runtime).toBe('agy');
+
+    // Saving an unrelated seat keeps legacy read-only agy worker tools intact.
+    const { revision, ...section } = read.config;
+    const unrelatedSave = await post(harness, {
+      expected_revision: revision,
+      seats: { ...section, orchestrator: { ...section.orchestrator, effort: 'xhigh' } },
+    }, 'seats');
+    expect(unrelatedSave.status).toBe(200);
+    const afterUnrelated = await seats(harness);
+    expect(afterUnrelated.config.orchestrator.effort).toBe('xhigh');
+    expect(afterUnrelated.config['worker-neon'].tools).toEqual(['net', 'read', 'shell']);
+
+    // Explicitly enabling edit on worker-neon saves cleanly.
+    const { revision: rev2, ...section2 } = afterUnrelated.config;
+    const enableEdit = await post(harness, {
+      expected_revision: rev2,
+      seats: { ...section2, 'worker-neon': { ...section2['worker-neon'], tools: ['edit', 'net', 'read', 'shell'] } },
+    }, 'seats');
+    expect(enableEdit.status).toBe(200);
+    expect((await seats(harness)).config['worker-neon'].tools).toEqual(['edit', 'net', 'read', 'shell']);
+  });
+
+  test('an agy advisor refuses before save when Antigravity is disabled', async () => {
+    const harness = await startHarness({ agents: PANE_AGENTS });
+    const { revision, ...section } = (await seats(harness)).config;
+    const advisor = { runtime: 'agy', model: 'gemini-4-neon-high', effort: null, advisor_model: null, fleet: [], tools: ['net', 'read', 'shell'] };
+    const response = await post(harness, { expected_revision: revision, seats: { ...section, advisor } }, 'seats');
+    expect(response.status).toBe(422);
+    expect((await response.json()).error.code).toBe('seat_runtime_not_enabled');
+  });
+
+  test('saves agy gemini-4-hydrogen on worker-light and gatekeeper-fallback with role tools, and rejects it on disallowed seats', async () => {
+    const harness = await startHarness({ agents: { ...PANE_AGENTS, enabled: ['antigravity', ...PANE_AGENTS.enabled] } });
+    const workerHydrogen = { runtime: 'agy', model: 'gemini-4-hydrogen', effort: null, advisor_model: null, fleet: [], tools: ['edit', 'gh', 'net', 'read', 'shell'] } as const;
+    const fallbackHydrogen = { runtime: 'agy', model: 'gemini-4-hydrogen', effort: null, advisor_model: null, fleet: [], tools: ['net', 'read', 'shell'] } as const;
+    for (const [id, entry] of [['worker-light', workerHydrogen], ['gatekeeper-fallback', fallbackHydrogen]] as const) {
+      const { revision, ...section } = (await seats(harness)).config;
+      const response = await post(harness, { expected_revision: revision, seats: { ...section, [id]: entry } }, 'seats');
+      expect(response.status).toBe(200);
+      expect((await seats(harness)).config[id]).toEqual(entry);
+    }
+    const { revision, ...section } = (await seats(harness)).config;
+    for (const id of ['orchestrator', 'gatekeeper', 'reviewer'] as const) {
+      const response = await post(harness, { expected_revision: revision, seats: { ...section, [id]: fallbackHydrogen } }, 'seats');
+      expect([id, response.status, (await response.json()).error.code]).toEqual([id, 422, 'seat_runtime_not_allowed']);
+    }
+  });
+
+  test('settings GET and the browser decoder serve the cached pool, with a stale mark and no free model id in the pool', async () => {
+    const freeModel = 'custom/private-settings-model';
+    const config = { ...DEFAULT_SEATS_CONFIG, worker: { ...DEFAULT_SEATS_CONFIG.worker, model: freeModel } };
+    const harness = await startHarness({ agents: PANE_AGENTS, seats: config });
+    const directory = join(harness.home, '.repo-harness', 'seats');
+    const path = join(directory, 'pool.json');
+    const endpoint = `${harness.server.url}/api/v1/settings/seats`;
+    expect((await (await fetch(endpoint)).json()).model_pool).toBeUndefined();
+    expect(existsSync(directory)).toBe(false);
+    mkdirSync(directory);
+    const pi = emptySeatPoolProbe('pi', 'available');
+    const report = buildSeatPool(config, [pi], new Date().toISOString());
+    const previous = { ...report, seats: report.seats.filter(row => row.seat !== 'reviewer') };
+    writeFileSync(path, JSON.stringify(previous));
+    expect((await (await fetch(endpoint)).json()).model_pool).toBeUndefined();
+    writeFileSync(path, JSON.stringify(report));
+    const ready = await (await fetch(endpoint)).json();
+    expect(ready.model_pool).toEqual({ status: 'ready', report });
+    expect(ready.config.worker.model).toBe(freeModel);
+
+    const old = { ...report, collected_at: new Date(Date.now() - SEAT_POOL_STALE_MS).toISOString() };
+    const edited = { ...old, seats: old.seats.map(row => row.seat !== 'worker' ? row : {
+      ...row, configured: { ...row.configured, field: freeModel },
+      pool: row.pool.map(entry => ({ ...entry, reason: freeModel, account: freeModel })),
+    }) };
+    const written = JSON.stringify(edited);
+    writeFileSync(path, written);
+    const realFetch = globalThis.fetch;
+    const browserFetch = spyOn(globalThis, 'fetch').mockImplementation(Object.assign(
+      (...[url, init]: Parameters<typeof fetch>) => realFetch(url === '/api/v1/settings/seats' ? endpoint : url, init),
+      { preconnect: realFetch.preconnect },
+    ));
+    try {
+      const read = await fetchSeatsSettings(new AbortController().signal);
+      expect(read.state).toBe('ok');
+      if (read.state !== 'ok') throw new Error('Expected settings');
+      expect(read.settings.model_pool).toEqual({ status: 'stale', report: old });
+      expect(read.settings.model_pool?.report.seats.find(row => row.seat === 'worker')?.configured).toEqual({
+        field: 'seats.worker.model', table_entry: false, in_pool: false, reason: 'outside_recommendations',
+      });
+      expect(JSON.stringify(read.settings.model_pool)).not.toContain(freeModel);
+      expect(readFileSync(path, 'utf8')).toBe(written);
+    } finally { browserFetch.mockRestore(); }
+  });
+  test('a frontend route with a Pi Neon worker saves and reads back', async () => {
+    const harness = await startHarness({ agents: PANE_AGENTS });
+    const { revision, ...section } = (await seats(harness)).config;
+    const neon = { ...section['worker-opus'], runtime: 'pi' as const, model: 'magpie/agy-cli/gemini-4-neon' };
+    const response = await post(harness, { expected_revision: revision, seats: { ...section, 'worker-opus': neon } }, 'seats');
+    expect(response.status).toBe(200);
+    const stored = (await seats(harness)).config;
+    expect(stored['worker-opus']).toEqual(neon);
+    expect(stored.routing.frontend).toEqual(['worker-opus', 'worker-neon']);
+  });
+
+  test('a configured Pi worker-light in a non-frontend class saves and reads back', async () => {
+    const harness = await startHarness({ agents: PANE_AGENTS });
+    const { revision, ...section } = (await seats(harness)).config;
+    const routing = { ...section.routing, simple_fast: ['worker-light'] };
+    const response = await post(harness, { expected_revision: revision, seats: { ...section, routing } }, 'seats');
+    expect(response.status).toBe(200);
+    const stored = (await seats(harness)).config;
+    expect(stored['worker-light']).toEqual(DEFAULT_SEATS_CONFIG['worker-light']);
+    expect(stored.routing.simple_fast).toEqual(['worker-light']);
+  });
+
+  test('GET offers only read-only scaffold roles and matches the seat fleet defaults', async () => {
+    const harness = await startHarness({ agents: PANE_AGENTS });
+    const value = await seats(harness);
+    expect(value.config.orchestrator).toEqual({ runtime: 'claude', model: 'opus', advisor_model: null, effort: 'high', tools: ['gh', 'mcp', 'net', 'read', 'shell', 'tasks'], fleet: ['explorer'] });
+    const fleet = ['deep-reasoner', 'explorer'];
+    expect(value.config.advisor.fleet).toEqual(fleet);
+    expect(value.ranges.roles).toEqual(fleet.map(name => ({ name, writable: false })));
+    expect(value.ranges.seats.advisor.fleet).toEqual(fleet);
+    for (const id of ['orchestrator', 'council', 'worker', 'worker-deep', 'worker-opus', 'worker-neon'] as const) {
+      expect(value.ranges.seats[id].fleet).toEqual(['explorer']);
+    }
+    for (const id of WORKER_SEAT_IDS) {
+      expect(value.defaults[id]?.fleet).toEqual(id === 'worker-light' ? [] : ['explorer']);
+    }
+    for (const id of ['worker-light', 'gatekeeper', 'gatekeeper-fallback', 'reviewer'] as const) {
+      expect(value.ranges.seats[id].fleet).toEqual([]);
+    }
+    expect(value.ranges.runtimes.map(runtime => [runtime.id, runtime.enabled, runtime.fleet])).toEqual([['claude', true, true], ['codex', true, true], ['pi', true, true], ['agy', false, false]]);
+  });
+
+  test('POST replaces only the seats section and touches nothing outside config.json', async () => {
+    const harness = await startHarness({ security: { mode: 'strict' }, agents: PANE_AGENTS });
+    const before = await seats(harness);
+    const { revision, ...section } = before.config;
+    const homeFiles = filesUnder(harness.home);
+    const response = await post(harness, { expected_revision: revision, seats: { ...section, worker: { ...section.worker, runtime: 'claude', model: 'sonnet' } } }, 'seats');
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(result).toEqual({ config_revision: sha256(harness.configPath), changed_keys: ['seats.worker.runtime', 'seats.worker.model'] });
+    const stored = JSON.parse(readFileSync(harness.configPath, 'utf8'));
+    expect(stored).toEqual({ security: { mode: 'strict' }, agents: PANE_AGENTS, seats: { ...section, worker: { ...section.worker, runtime: 'claude', model: 'sonnet' } } });
+    // Running panes are not touched: besides config.json, the write leaves only the shared transaction lock under HOME.
+    expect(filesUnder(harness.home).filter(path => !path.startsWith('.repo-harness/transactions'))).toEqual(homeFiles);
+  });
+
+  test('refuses each seat rule with a typed 422 and writes nothing', async () => {
+    const harness = await startHarness({ agents: { ...PANE_AGENTS, enabled: ['claude', 'pi'] } });
+    const { revision, ...section } = (await seats(harness)).config;
+    const claudeWorker = { ...section.worker, runtime: 'claude', model: 'opus' };
+    const original = readFileSync(harness.configPath, 'utf8');
+    for (const [seat, patch, code] of [
+      ['advisor', { fleet: ['explorer', 'fast-worker'] }, 'seat_fleet_not_allowed'],
+      ['advisor', { tools: ['gh', 'read'] }, 'seat_tool_not_allowed'],
+      ['orchestrator', { tools: ['edit', 'read'] }, 'seat_tool_not_allowed'],
+      ['worker', { runtime: 'codex' }, 'seat_runtime_not_enabled'],
+      ['advisor', { effort: 'extreme' }, 'seat_effort_invalid'],
+    ] as const) {
+      const seats = { ...section, worker: claudeWorker, [seat]: { ...(seat === 'worker' ? claudeWorker : section[seat]), ...patch } };
+      const response = await post(harness, { expected_revision: revision, seats }, 'seats');
+      expect([seat, response.status, (await response.json()).error.code]).toEqual([seat, 422, code]);
+    }
+    expect(readFileSync(harness.configPath, 'utf8')).toBe(original);
+  });
+
+  test('a credit-mode save names the stale seat and succeeds when that seat is repaired', async () => {
+    const claudeSeat = { ...DEFAULT_SEATS_CONFIG.worker, runtime: 'claude' as const, model: null };
+    const harness = await startHarness({ agents: { ...PANE_AGENTS, enabled: ['claude', 'pi'] }, seats: {
+      ...DEFAULT_SEATS_CONFIG,
+      worker: claudeSeat,
+      'worker-deep': claudeSeat,
+      gatekeeper: { ...DEFAULT_SEATS_CONFIG.gatekeeper, runtime: 'codex', model: 'gpt-6.2-sol' },
+    } });
+    const { revision, ...section } = (await seats(harness)).config;
+    const edited = { ...section, routing: { ...section.routing, codex_credit_mode: 'review' } };
+    const refused = await post(harness, { expected_revision: revision, seats: edited }, 'seats');
+    expect(refused.status).toBe(422);
+    expect((await refused.json()).error).toMatchObject({
+      code: 'seat_runtime_not_enabled', message: expect.stringContaining('Fix the gatekeeper seat'),
+    });
+    expect((await seats(harness)).config.routing.codex_credit_mode).toBe('off');
+
+    const repaired = { ...edited, gatekeeper: { ...section.gatekeeper, runtime: 'claude', model: null } };
+    expect((await post(harness, { expected_revision: revision, seats: repaired }, 'seats')).status).toBe(200);
+    expect((await seats(harness)).config.routing.codex_credit_mode).toBe('review');
+  });
+
+  test('an advisor config with edit saves; an orchestrator config with edit stays refused', async () => {
+    const harness = await startHarness({ agents: PANE_AGENTS });
+    const { revision, ...section } = (await seats(harness)).config;
+    const advisor = { ...section.advisor, tools: ['edit', 'read'] as typeof section.advisor.tools };
+    const saved = await post(harness, { expected_revision: revision, seats: { ...section, advisor } }, 'seats');
+    expect(saved.status).toBe(200);
+    expect((await seats(harness)).config.advisor.tools).toEqual(['edit', 'read']);
+  });
+
+  test('a Codex seat with edit and net saves and reads back', async () => {
+    const editNet = ['edit', 'gh', 'mcp', 'net', 'read', 'shell', 'tasks'];
+    const harness = await startHarness({ agents: PANE_AGENTS, seats: { ...DEFAULT_SEATS_CONFIG, worker: { ...DEFAULT_SEATS_CONFIG.worker, tools: editNet } } });
+    const { revision, ...section } = (await seats(harness)).config;
+    expect(section.worker.tools).toEqual(editNet as typeof section.worker.tools);
+    const saved = await post(harness, { expected_revision: revision, seats: { ...section, advisor: { ...section.advisor, effort: 'high' } } }, 'seats');
+    expect(saved.status).toBe(200);
+    expect((await seats(harness)).config.worker.tools).toEqual(editNet as typeof section.worker.tools);
+  });
+
+  test('the council settings save accepts an explorer fleet and the decoder rejects other tool groups', async () => {
+    const harness = await startHarness({ agents: PANE_AGENTS });
+    const { revision, ...section } = (await seats(harness)).config;
+    const council = { ...section.reviewer, runtime: 'pi' as const, model: 'magpie/agy-cli/gemini-4-carbon', fleet: ['explorer'] };
+    for (const tool of ['edit', 'gh', 'mcp', 'schedule', 'tasks']) {
+      expect(() => decodeSeatsConfig({ ...section, council: { ...council, tools: [tool, 'read'].sort() } }))
+        .toThrow('seats_config_invalid: seats.council.tools');
+    }
+    const saved = await post(harness, { expected_revision: revision, seats: { ...section, council } }, 'seats');
+    expect(saved.status).toBe(200);
+    expect((await saved.json()).changed_keys).toEqual(['seats.council']);
+    expect((await seats(harness)).config.council).toEqual(council);
+  });
+
+  test('every seat refuses retired roles with 422 and the advisor can save the two scaffold roles', async () => {
+    const harness = await startHarness({ agents: PANE_AGENTS });
+    const { revision, ...section } = (await seats(harness)).config;
+    const original = readFileSync(harness.configPath, 'utf8');
+    for (const id of SEAT_IDS) {
+      const seat = id === 'council' ? { ...section.reviewer, runtime: 'claude' as const, model: 'fable' } : (section[id] ?? section.gatekeeper);
+      for (const role of ['deep-worker', 'fast-worker', 'gatekeeper', 'root-cause-prover']) {
+        const response = await post(harness, { expected_revision: revision, seats: { ...section, [id]: { ...seat, fleet: [role] } } }, 'seats');
+        expect([id, role, response.status, (await response.json()).error.code]).toEqual([id, role, 422, 'seat_fleet_not_allowed']);
+      }
+    }
+    for (const id of ['orchestrator', 'worker'] as const) {
+      const response = await post(harness, { expected_revision: revision, seats: { ...section, [id]: { ...section[id], fleet: ['harness-evaluator'] } } }, 'seats');
+      expect([id, response.status, (await response.json()).error.code]).toEqual([id, 422, 'seat_fleet_not_allowed']);
+    }
+    expect(readFileSync(harness.configPath, 'utf8')).toBe(original);
+    const advisor = { ...section.advisor, fleet: ['explorer'] };
+    const saved = await post(harness, { expected_revision: revision, seats: { ...section, advisor } }, 'seats');
+    expect(saved.status).toBe(200);
+    expect((await saved.json()).changed_keys).toEqual(['seats.advisor.fleet']);
+  });
+
+  test('a stale revision and a reused request_id with another body get 409', async () => {
+    const harness = await startHarness({ agents: PANE_AGENTS });
+    const { revision, ...section } = (await seats(harness)).config;
+    const send = (requestId: string, effort: string) => fetch(`${harness.server.url}/api/v1/settings/seats`, {
+      method: 'POST',
+      headers: { Origin: harness.server.url, 'Sec-Fetch-Site': 'same-origin', 'Content-Type': 'application/json', Cookie: harness.cookie },
+      body: JSON.stringify({ request_id: requestId, expected_revision: revision, seats: { ...section, orchestrator: { ...section.orchestrator, effort } } }),
+    });
+    const requestId = randomUUID();
+    expect((await send(requestId, 'xhigh')).status).toBe(200);
+    const saved = readFileSync(harness.configPath, 'utf8');
+    const mismatch = await send(requestId, 'low');
+    expect([mismatch.status, (await mismatch.json()).error.code]).toEqual([409, 'request_mismatch']);
+    const stale = await send(randomUUID(), 'low');
+    expect([stale.status, (await stale.json()).error.code]).toEqual([409, 'revision_conflict']);
+    expect(readFileSync(harness.configPath, 'utf8')).toBe(saved);
+  });
+});
+
+describe('agents config decoder', () => {
+  test('requires sorted distinct ids, uses within enabled, and a docs default', () => {
+    expect(decodeAgentsConfig({ enabled: ['claude', 'codex'], uses: { docs: ['codex'], review: ['claude'] }, default_docs: 'codex' }))
+      .toEqual({ enabled: ['claude', 'codex'], uses: { docs: ['codex'], review: ['claude'] }, default_docs: 'codex' });
+    for (const value of [
+      { enabled: ['codex', 'claude'], uses: { docs: [], review: [] }, default_docs: null },
+      { enabled: ['codex', 'codex'], uses: { docs: [], review: [] }, default_docs: null },
+      { enabled: [], uses: { docs: ['codex'], review: [] }, default_docs: null },
+      { enabled: ['codex'], uses: { docs: [], review: [] }, default_docs: 'codex' },
+      { enabled: ['Codex'], uses: { docs: [], review: [] }, default_docs: null },
+      { enabled: [], uses: { docs: [], review: [] }, default_docs: null, extra: 1 },
+    ]) expect(() => decodeAgentsConfig(value)).toThrow('agents_config_invalid');
+  });
+});
+
+describe('agent runtime probe', () => {
+  test('keeps the default probe ids in OAR registry order', () => {
+    expect(registryRuntimes().filter(runtime => runtime.group === 'default').map(runtime => runtime.id))
+      .toEqual(defaultRuntimes.list().map(runtime => runtime.id));
+  });
+
+  test('missing Cursor SDK skips its lazy installation probe', async () => {
+    let called = false;
+    const probe = await probeAgentRuntimes({
+      runtimes: [],
+      host_dependencies: [{ id: 'cursor', package: '@cursor/sdk', installation: async () => {
+        called = true;
+        throw new Error('optional SDK must stay unloaded');
+      } }],
+      package_resolves: () => false,
+    });
+    expect(called).toBe(false);
+    expect(probe.entries).toEqual([{ id: 'cursor', group: 'host_dependency',
+      installation: { kind: 'dependency_missing', package: '@cursor/sdk' } }]);
+  });
+
+  test('publishes no command path, redacts reasons and bounds every probe', async () => {
+    const probe = await probeAgentRuntimes({
+      runtimes: [
+        { id: 'claude', group: 'default', installation: async () => ({ kind: 'available', via: 'executable', command: '/Users/someone/.local/bin/claude', version: '2.1.0', shadowed: ['/usr/local/bin/claude'] }) },
+        { id: 'kimi', group: 'default', installation: async () => ({ kind: 'unsupported', reason: 'needs /Users/someone/.kimi/config' }) },
+        { id: 'grok', group: 'default', installation: async () => { throw new Error('/Users/someone/secret'); } },
+        { id: 'opencode', group: 'default', installation: () => new Promise(() => {}) },
+        { id: 'morph', group: 'community' },
+      ],
+      host_dependencies: [
+        { id: 'cursor', package: '@cursor/sdk', installation: async () => ({ kind: 'available', via: 'bundled' }) },
+        { id: 'pi-durable', package: '@earendil-works/pi-durable', installation: null },
+        { id: 'missing', package: '@example/absent', installation: null },
+      ],
+      package_resolves: name => name !== '@example/absent',
+      timeout_ms: 20,
+      now: () => Date.parse('2026-10-27T00:00:00.000Z'),
+    });
+    expect(probe.entries).toEqual([
+      { id: 'claude', group: 'default', installation: { kind: 'available', via: 'executable', version: '2.1.0' } },
+      { id: 'kimi', group: 'default', installation: { kind: 'unsupported', reason: 'needs [private path]' } },
+      { id: 'grok', group: 'default', installation: { kind: 'probe_failed' } },
+      { id: 'opencode', group: 'default', installation: { kind: 'probe_failed' } },
+      { id: 'morph', group: 'community', installation: { kind: 'probe_failed' } },
+      { id: 'cursor', group: 'host_dependency', installation: { kind: 'available', via: 'bundled', version: null } },
+      { id: 'pi-durable', group: 'host_dependency', installation: { kind: 'host_setup_required' } },
+      { id: 'missing', group: 'host_dependency', installation: { kind: 'dependency_missing', package: '@example/absent' } },
+    ]);
+    expect(JSON.stringify(probe)).not.toContain('/Users/');
+  });
+});
